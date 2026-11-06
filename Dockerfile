@@ -6,7 +6,7 @@
 #
 # The container listens on unprivileged ports (see deploy/mailserver.toml.example); compose maps the public ones.
 
-ARG CEESAFE_VERSION=v0.18.2
+ARG CEESAFE_VERSION=v0.21.0
 
 FROM debian:bookworm-slim AS build
 ARG CEESAFE_VERSION

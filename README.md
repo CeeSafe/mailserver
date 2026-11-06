@@ -155,7 +155,7 @@ cd mailserver
 ```
 
 **You need:**
-- `ceesafec`; the Dockerfile pins v0.18.2;
+- `ceesafec`; the Dockerfile pins v0.21.0;
 - a C compiler and OpenSSL 3 (on macOS, Homebrew's `openssl@3`);
 - Postgres 14 or later;
 - the sibling checkouts `../PostgresClient` and `../../CeeSafeLibs` (above).
