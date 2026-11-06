@@ -1,0 +1,10 @@
+size 560
+envelope ("Thu, 09 Jan 2025 10:26:14 -0500" "Test of text body with format=flowed; delsp=yes" (("MimeKit UnitTests" NIL "unit-tests" "mimekit.net")) (("MimeKit UnitTests" NIL "unit-tests" "mimekit.net")) (("MimeKit UnitTests" NIL "unit-tests" "mimekit.net")) (("MimeKit UnitTests" NIL "unit-tests" "mimekit.net")) NIL NIL NIL NIL)
+bodystructure ("text" "plain" ("format" "flowed" "delsp" "yes" "charset" "iso-8859-1") NIL NIL "quoted-printable" 225 7 NIL NIL NIL NIL)
+body ("text" "plain" ("format" "flowed" "delsp" "yes" "charset" "iso-8859-1") NIL NIL "quoted-printable" 225 7)
+section HEADER 335 ac986ade3beafea0ebccf3b02d3fcdbac5a30cb555569ba08c7cd80a38d7c02e
+section TEXT 225 a29f94cf775c765096c5fabaad754596d7d0a2797cf334254862f3d54804adbb
+section HEADER.FIELDS 271 40fb19a46cf8b872e63e9b866a2547903193f7ad1121099147f32368c61509fe
+section HEADER.FIELDS.NOT 66 78bca447b797776b17de856a8777ab49f7341463a0a8a9130d2522a1fd6ee446
+section 1 225 a29f94cf775c765096c5fabaad754596d7d0a2797cf334254862f3d54804adbb
+section 1.MIME 335 ac986ade3beafea0ebccf3b02d3fcdbac5a30cb555569ba08c7cd80a38d7c02e

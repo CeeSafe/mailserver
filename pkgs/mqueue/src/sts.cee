@@ -1,0 +1,162 @@
+// MTA-STS (RFC 8461): the `_mta-sts` TXT record, the policy file, and which MX hosts a policy allows.
+
+/// A policy's mode (§5): `none` asks nothing; `testing` asks for reports only (none are sent: TLSRPT is not
+/// implemented), so mail goes as without a policy; `enforce` sends only to the listed MX hosts, over TLS with a
+/// certificate valid for their names.
+public const STS_NONE: u8 = 0;
+public const STS_TESTING: u8 = 1;
+public const STS_ENFORCE: u8 = 2;
+
+/// The longest max_age a policy may give, a year (§3.2).
+const STS_MAX_AGE_LIMIT: i64 = 31557600;
+
+/// The most bytes a policy file may have: RFC 8461 §3.3 says senders may limit it, and 64 KiB is generous.
+public const STS_POLICY_LIMIT: usize = 65536;
+
+/// A parsed policy file.
+@noncopy
+public struct StsPolicy {
+    public mode: u8;
+    /// Seconds the policy may be cached and used.
+    public maxAge: i64;
+    /// The `mx:` patterns, lowercase, without a trailing dot.
+    public mx: Vector<String>;
+
+    public fn create() -> StsPolicy => StsPolicy { mode: STS_NONE, maxAge: 0, mx: Vector<String>.create() };
+
+    /// Whether `host` (an MX host's name) is one the policy allows (§4.1): it equals a pattern, or a pattern
+    /// `*.rest` stands for exactly one label in front of `rest`. Case and a trailing dot are ignored.
+    public fn allows(borrow this, host: StringView) -> bool {
+        let name = if (host.length > 0 && host.endsWith(".")) host[0..host.length - 1] else host;
+        for (pattern in this.mx.view()) {
+            if (mxPatternMatches(pattern.view(), name)) {
+                return true;
+            }
+        }
+        return false;
+    }
+}
+
+/// Whether `pattern` (lowercase, as `StsPolicy.mx` keeps them) matches `host`.
+fn mxPatternMatches(pattern: StringView, host: StringView) -> bool {
+    if (pattern.startsWith("*.")) {
+        let rest = pattern[1..]; // ".example.com"
+        if (host.length <= rest.length || !host[host.length - rest.length..].equalsIgnoreAsciiCase(rest)) {
+            return false;
+        }
+        // Exactly one label in front: not empty, and no dot in it.
+        let label = host[0..host.length - rest.length];
+        return label.length > 0 && label.indexOf(".").isNull();
+    }
+    return pattern.equalsIgnoreAsciiCase(host);
+}
+
+/// The policy id of an `_mta-sts` TXT record (§3.1): `v=STSv1` first, then an `id` of 1 to 32 letters and digits,
+/// with other fields ignored; null when the record is not one.
+public fn stsRecordId(text: StringView) -> StringView? {
+    var first = true;
+    var id: StringView? = null;
+    for (raw in text.split(";")) {
+        let field = raw.trim();
+        if (field.length == 0) {
+            continue;
+        }
+        let eq = match (field.indexOf("=")) {
+            Some(i) => i,
+            null => { return null; }
+        };
+        let key = field[0..eq].trim();
+        let value = field[eq + 1..].trim();
+        if (first) {
+            if (key != "v" || value != "STSv1") {
+                return null;
+            }
+            first = false;
+            continue;
+        }
+        if (key == "id") {
+            if (value.length == 0 || value.length > 32 || !isAlphanumeric(value)) {
+                return null;
+            }
+            id = Some(value);
+        }
+    }
+    return id;
+}
+
+fn isAlphanumeric(text: StringView) -> bool {
+    for (b in text.bytes()) {
+        let digit = b >= 0x30 && b <= 0x39;
+        let upper = b >= 0x41 && b <= 0x5A;
+        let lower = b >= 0x61 && b <= 0x7A;
+        if (!digit && !upper && !lower) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Parses a policy file (§3.2) into `into`: `key: value` lines ending in CRLF or LF. `version: STSv1`, `mode` and
+/// `max_age` are required, and `mx` unless the mode is `none`; unknown keys are ignored. False when it is not a valid
+/// policy.
+public fn parseStsPolicy(text: StringView, into: borrow mut StsPolicy) -> Result<bool, AllocError> {
+    into.mode = STS_NONE;
+    into.maxAge = -1;
+    into.mx.clear();
+    var version = false;
+    var mode = false;
+    for (raw in text.split("\n")) {
+        let line = if (raw.endsWith("\r")) raw[0..raw.length - 1] else raw;
+        if (line.trim().length == 0) {
+            continue;
+        }
+        let colon = match (line.indexOf(":")) {
+            Some(i) => i,
+            null => { return Ok(false); }
+        };
+        let key = line[0..colon].trim();
+        let value = line[colon + 1..].trim();
+        if (key == "version") {
+            if (value != "STSv1") {
+                return Ok(false);
+            }
+            version = true;
+        } else if (key == "mode") {
+            if (value == "enforce") {
+                into.mode = STS_ENFORCE;
+            } else if (value == "testing") {
+                into.mode = STS_TESTING;
+            } else if (value == "none") {
+                into.mode = STS_NONE;
+            } else {
+                return Ok(false);
+            }
+            mode = true;
+        } else if (key == "max_age") {
+            let seconds = match (value.parseInt<i64>()) {
+                Some(n) => n,
+                null => { return Ok(false); }
+            };
+            if (seconds < 0) {
+                return Ok(false);
+            }
+            into.maxAge = if (seconds > STS_MAX_AGE_LIMIT) STS_MAX_AGE_LIMIT else seconds;
+        } else if (key == "mx") {
+            let trimmed = if (value.endsWith(".")) value[0..value.length - 1] else value;
+            if (trimmed.length == 0) {
+                return Ok(false);
+            }
+            var lowered = Vector<u8>.create();
+            for (b in trimmed.bytes()) {
+                lowered.push(if (b >= 0x41 && b <= 0x5A) b + 0x20 else b)?;
+            }
+            var pattern = String.create();
+            pattern.append(StringView.fromUtf8(lowered.view()) ?? "")?;
+            into.mx.push(pattern)?;
+        }
+    }
+    if (!version || !mode || into.maxAge < 0) {
+        return Ok(false);
+    }
+    return Ok(into.mode == STS_NONE || into.mx.length > 0);
+}

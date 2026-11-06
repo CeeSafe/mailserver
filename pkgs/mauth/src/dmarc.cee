@@ -1,0 +1,383 @@
+// DMARC (RFC 7489): whether the domain in From is vouched for by an aligned SPF pass or DKIM pass, and what its
+// owner asks receivers to do when it is not. Organizational domains come from the Public Suffix List (src/psl.cee).
+
+import mdns.DnsAnswer;
+import mdns.DnsError;
+import mdns.RCODE_NOERROR;
+import mdns.RCODE_NXDOMAIN;
+import mdns.Resolver;
+import mdns.TYPE_TXT;
+
+// ---- Organizational domains (RFC 7489 §3.2) ----
+
+fn compareBytes(a: Slice<u8>, b: Slice<u8>) -> i32 {
+    let n = if (a.length < b.length) a.length else b.length;
+    for (i in 0..n) {
+        if (a[i] != b[i]) {
+            return if (a[i] < b[i]) -1 else 1;
+        }
+    }
+    if (a.length == b.length) {
+        return 0;
+    }
+    return if (a.length < b.length) -1 else 1;
+}
+
+/// Whether the list has the rule `rule`, which may begin with `!` or `*.`, as `prefix` + `name`.
+fn hasRule(prefix: StringView, name: Slice<u8>) -> bool {
+    var key = Vector<u8>.create();
+    match (key.extend(prefix.bytes())) {
+        Ok() => {}
+        Err(_) => { return false; }
+    }
+    match (key.extend(name)) {
+        Ok() => {}
+        Err(_) => { return false; }
+    }
+    var lo: usize = 0;
+    var hi = PSL_COUNT;
+    while (lo < hi) {
+        let mid = (lo + hi) / 2;
+        let c = compareBytes(PSL_RULES[mid].bytes(), key.view());
+        if (c == 0) {
+            return true;
+        }
+        if (c < 0) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return false;
+}
+
+/// The organizational domain of `domain` (lowercase, no final dot) into `out`: the public suffix and one label more.
+/// A domain that is itself a public suffix is its own.
+public fn organizationalDomain(domain: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    out.clear();
+    let d = trimDot(domain);
+    var lowered = Vector<u8>.create();
+    for (c in d) {
+        lowered.push(if (c >= 0x41 && c <= 0x5a) c + 0x20 else c)?;
+    }
+    let name = lowered.view();
+    // Label starts, from the left.
+    var starts = Vector<usize>.create();
+    starts.push(0)?;
+    for (i in 0..name.length) {
+        if (name[i] == 0x2e) {
+            starts.push(i + 1)?;
+        }
+    }
+    // The public suffix is the longest matching rule; an exception rule makes its parent the suffix; no match means
+    // the top label alone ("*").
+    var suffix = starts.length - 1;
+    for (k in 0..starts.length) {
+        let candidate = name[starts[k]..];
+        if (hasRule("!", candidate)) {
+            suffix = if (k + 1 < starts.length) k + 1 else k;
+            break;
+        }
+        if (hasRule("", candidate)) {
+            suffix = k;
+            break;
+        }
+        if (k + 1 < starts.length && hasRule("*.", name[starts[k + 1]..])) {
+            suffix = k;
+            break;
+        }
+    }
+    let org = if (suffix > 0) suffix - 1 else 0;
+    return out.extend(name[starts[org]..]);
+}
+
+fn sameText(a: Slice<u8>, b: Slice<u8>) -> bool {
+    return trimDot(a).equalsIgnoreAsciiCase(trimDot(b));
+}
+
+/// Whether `a` and `b` are aligned: the same domain (strict), or the same organizational domain (relaxed).
+public fn aligned(a: Slice<u8>, b: Slice<u8>, strict: bool) -> Result<bool, AllocError> {
+    if (sameText(a, b)) {
+        return Ok(true);
+    }
+    if (strict) {
+        return Ok(false);
+    }
+    var x = Vector<u8>.create();
+    var y = Vector<u8>.create();
+    organizationalDomain(a, mut x)?;
+    organizationalDomain(b, mut y)?;
+    return Ok(x.length > 0 && sameText(x.view(), y.view()));
+}
+
+// ---- Policy and evaluation (§6) ----
+
+public enum DmarcStatus {
+    /// No policy published, or no From domain to check.
+    None,
+    Pass,
+    Fail,
+    TempError,
+    PermError,
+}
+
+public fn dmarcName(s: DmarcStatus) -> StringView => match (s) {
+    DmarcStatus.None => "none",
+    DmarcStatus.Pass => "pass",
+    DmarcStatus.Fail => "fail",
+    DmarcStatus.TempError => "temperror",
+    DmarcStatus.PermError => "permerror",
+};
+
+/// What the domain owner asks for a failing message.
+public enum DmarcPolicy {
+    None,
+    Quarantine,
+    Reject,
+}
+
+public fn policyName(p: DmarcPolicy) -> StringView => match (p) {
+    DmarcPolicy.None => "none",
+    DmarcPolicy.Quarantine => "quarantine",
+    DmarcPolicy.Reject => "reject",
+};
+
+/// The outcome of a DMARC check.
+@noncopy
+public struct DmarcOutcome {
+    public status: DmarcStatus;
+    /// The published policy (p=, or sp= for a subdomain).
+    public policy: DmarcPolicy;
+    /// What to do: the policy for a failing message, after pct= sampling; None otherwise.
+    public disposition: DmarcPolicy;
+    /// The From domain.
+    public fromDomain: String;
+
+    public fn create() -> DmarcOutcome => DmarcOutcome {
+        status: DmarcStatus.None,
+        policy: DmarcPolicy.None,
+        disposition: DmarcPolicy.None,
+        fromDomain: String.create(),
+    };
+}
+
+/// A parsed DMARC record.
+struct DmarcRecord {
+    policy: DmarcPolicy;
+    subdomainPolicy: DmarcPolicy;
+    hasSubdomainPolicy: bool;
+    strictSpf: bool;
+    strictDkim: bool;
+    percent: u32;
+}
+
+fn policyOf(value: Slice<u8>) -> DmarcPolicy? {
+    if (value.equalsIgnoreAsciiCase("none".bytes())) {
+        return DmarcPolicy.None;
+    }
+    if (value.equalsIgnoreAsciiCase("quarantine".bytes())) {
+        return DmarcPolicy.Quarantine;
+    }
+    if (value.equalsIgnoreAsciiCase("reject".bytes())) {
+        return DmarcPolicy.Reject;
+    }
+    return null;
+}
+
+fn trimSpace(s: Slice<u8>) -> Slice<u8> {
+    var a: usize = 0;
+    var b = s.length;
+    while (a < b && (s[a] == 0x20 || s[a] == 0x09)) {
+        a += 1;
+    }
+    while (b > a && (s[b - 1] == 0x20 || s[b - 1] == 0x09)) {
+        b -= 1;
+    }
+    return s[a..b];
+}
+
+/// Parses a record; `null` when it is not a usable DMARC record (§6.6.3: then it is ignored).
+fn parseDmarc(text: Slice<u8>) -> DmarcRecord? {
+    var record = DmarcRecord {
+        policy: DmarcPolicy.None,
+        subdomainPolicy: DmarcPolicy.None,
+        hasSubdomainPolicy: false,
+        strictSpf: false,
+        strictDkim: false,
+        percent: 100,
+    };
+    var first = true;
+    var hasPolicy = false;
+    var at: usize = 0;
+    while (at < text.length) {
+        var stop = at;
+        while (stop < text.length && text[stop] != 0x3b) {
+            stop += 1;
+        }
+        let tag = trimSpace(text[at..stop]);
+        at = stop + 1;
+        if (tag.length == 0) {
+            continue;
+        }
+        let eq = match (tag.indexOfByte(0x3d)) {
+            Some(e) => e,
+            null => { return null; }
+        };
+        let name = trimSpace(tag[0..eq]);
+        let value = trimSpace(tag[eq + 1..]);
+        if (first) {
+            // v=DMARC1 must come first.
+            if (!name.equalsIgnoreAsciiCase("v".bytes()) || !value.equalsIgnoreAsciiCase("DMARC1".bytes())) {
+                return null;
+            }
+            first = false;
+            continue;
+        }
+        if (name.equalsIgnoreAsciiCase("p".bytes())) {
+            record.policy = policyOf(value)?;
+            hasPolicy = true;
+        } else if (name.equalsIgnoreAsciiCase("sp".bytes())) {
+            match (policyOf(value)) {
+                Some(p) => {
+                    record.subdomainPolicy = p;
+                    record.hasSubdomainPolicy = true;
+                }
+                null => {}
+            }
+        } else if (name.equalsIgnoreAsciiCase("aspf".bytes())) {
+            record.strictSpf = value.equalsIgnoreAsciiCase("s".bytes());
+        } else if (name.equalsIgnoreAsciiCase("adkim".bytes())) {
+            record.strictDkim = value.equalsIgnoreAsciiCase("s".bytes());
+        } else if (name.equalsIgnoreAsciiCase("pct".bytes())) {
+            match (value.parseInt<u32>()) {
+                Some(n) => { record.percent = if (n > 100) 100 else n; }
+                null => {}
+            }
+        }
+    }
+    if (first || !hasPolicy) {
+        return null;
+    }
+    return record;
+}
+
+/// The record at `_dmarc.<domain>`: Ok(record), Ok(null) none, Err for a DNS failure.
+async fn fetchPolicy(resolver: borrow Resolver, domain: Slice<u8>) -> Result<DmarcRecord?, DnsError> {
+    var name = Vector<u8>.create();
+    match (name.extend("_dmarc.".bytes())) {
+        Ok() => {}
+        Err(_) => { return Err(DnsError.OutOfMemory); }
+    }
+    match (name.extend(domain)) {
+        Ok() => {}
+        Err(_) => { return Err(DnsError.OutOfMemory); }
+    }
+    let text = match (StringView.fromUtf8(name.view())) {
+        Some(t) => t,
+        null => { return Ok(null); }
+    };
+    var answer = DnsAnswer.create();
+    match (await resolver.query(text, TYPE_TXT, mut answer)) {
+        Ok() => {}
+        Err(DnsError.BadName) => { return Ok(null); }
+        Err(e) => { return Err(e); }
+    }
+    if (answer.rcode != RCODE_NOERROR && answer.rcode != RCODE_NXDOMAIN) {
+        return Err(DnsError.Timeout);
+    }
+    var found: DmarcRecord? = null;
+    var count = 0u32;
+    for (i in 0..answer.count()) {
+        let t = answer.data(i);
+        if (t.length >= 8 && t[0..8].equalsIgnoreAsciiCase("v=DMARC1".bytes())) {
+            count += 1;
+            found = parseDmarc(t);
+        }
+    }
+    if (count != 1) {
+        return Ok(null); // none, or several (§6.6.3)
+    }
+    return Ok(found);
+}
+
+/// An authenticated identifier for DMARC: a domain that passed SPF (the MAIL FROM's) or DKIM (a signature's d=).
+public struct Identifier<region r> {
+    public domain: Slice<r, u8>;
+}
+
+/// Checks the message's From domain against the SPF and DKIM results. `spfDomain` is the MAIL FROM domain if SPF
+/// passed (else empty); `dkimDomains` the d= of each passing signature.
+public async fn checkDmarc(
+    resolver: borrow Resolver,
+    fromDomain: Slice<u8>,
+    spfDomain: Slice<u8>,
+    dkimDomains: borrow Vector<Vector<u8>>,
+    out: borrow mut DmarcOutcome,
+) -> Result<void, AllocError> {
+    out.status = DmarcStatus.None;
+    out.policy = DmarcPolicy.None;
+    out.disposition = DmarcPolicy.None;
+    out.fromDomain.clear();
+    match (StringView.fromUtf8(fromDomain)) {
+        Some(t) => { out.fromDomain.append(t)?; }
+        null => { return Ok(); }
+    }
+    if (fromDomain.length == 0) {
+        return Ok();
+    }
+    var org = Vector<u8>.create();
+    organizationalDomain(fromDomain, mut org)?;
+    var subdomain = false;
+    var record = match (await fetchPolicy(resolver, fromDomain)) {
+        Ok(r) => r,
+        Err(_) => {
+            out.status = DmarcStatus.TempError;
+            return Ok();
+        }
+    };
+    if (record == null && !sameText(org.view(), fromDomain)) {
+        subdomain = true;
+        record = match (await fetchPolicy(resolver, org.view())) {
+            Ok(r) => r,
+            Err(_) => {
+                out.status = DmarcStatus.TempError;
+                return Ok();
+            }
+        };
+    }
+    let policy = match (record) {
+        Some(r) => r,
+        null => { return Ok(); }
+    };
+    out.policy = if (subdomain && policy.hasSubdomainPolicy) policy.subdomainPolicy else policy.policy;
+    var pass = false;
+    if (spfDomain.length > 0 && aligned(spfDomain, fromDomain, policy.strictSpf)?) {
+        pass = true;
+    }
+    for (i in 0..dkimDomains.length) {
+        if (!pass && aligned(dkimDomains[i].view(), fromDomain, policy.strictDkim)?) {
+            pass = true;
+        }
+    }
+    if (pass) {
+        out.status = DmarcStatus.Pass;
+        return Ok();
+    }
+    out.status = DmarcStatus.Fail;
+    out.disposition = out.policy;
+    // pct= (§6.6.4): outside the sampled share, reject becomes quarantine and quarantine becomes none.
+    if (policy.percent < 100) {
+        var roll = [0u8; 1];
+        match (Random.fill(mut roll[..])) {
+            Ok() => {}
+            Err(_) => {}
+        }
+        if ((roll[0] as u32) * 100 / 256 >= policy.percent) {
+            out.disposition = match (out.disposition) {
+                DmarcPolicy.Reject => DmarcPolicy.Quarantine,
+                _ => DmarcPolicy.None,
+            };
+        }
+    }
+    return Ok();
+}

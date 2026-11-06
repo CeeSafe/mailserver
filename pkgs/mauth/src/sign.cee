@@ -1,0 +1,318 @@
+// DKIM signing (RFC 6376 §5), relaxed/relaxed, with RSA-SHA256 or Ed25519-SHA256 (RFC 8463). The message is fed
+// in pieces as it is read; the header is kept, the body only hashed. The signature covers the fields that matter
+// for display and threading, and signs From, To, Cc, Subject, Date and Reply-To once more than they appear
+// ("oversigning"), so none can be added after signing without breaking it.
+
+import encoding.Base64;
+import mmime.AddressList;
+import mmime.parseAddressList;
+import pkey.KeyError;
+import pkey.PrivateKey;
+import sha256.Sha256;
+
+/// The most header a signed message may have; past it the message is sent unsigned.
+const MAX_SIGN_HEADER: usize = 256 * 1024;
+
+/// The fields signed when present (lowercase), and whether each is oversigned.
+const SIGNED_COUNT: usize = 20;
+const SIGNED: [StringView; 20] = [
+    "from", "to", "cc", "subject", "date", "reply-to", "message-id", "in-reply-to", "references", "sender",
+    "mime-version", "content-type", "content-transfer-encoding", "content-disposition", "list-id", "list-unsubscribe",
+    "list-unsubscribe-post", "list-post", "auto-submitted", "resent-from",
+];
+const OVERSIGNED: usize = 6; // the first six
+
+/// Signs a message fed to it.
+@noncopy
+public struct DkimSigner {
+    header: Vector<u8>;
+    inHeader: bool;
+    /// The last bytes of the header seen, to find the blank line across pieces.
+    tail: [u8; 3];
+    overflow: bool;
+    body: BodyHash;
+
+    public fn create() -> DkimSigner => DkimSigner {
+        header: Vector<u8>.create(),
+        inHeader: true,
+        tail: [0u8; 3],
+        overflow: false,
+        body: bodyHash(true, -1),
+    };
+
+    /// Takes the next piece of the message.
+    public fn feed(borrow mut this, bytes: Slice<u8>) -> Result<void, AllocError> {
+        var at: usize = 0;
+        while (this.inHeader && at < bytes.length) {
+            let c = bytes[at];
+            at += 1;
+            if (this.header.length < MAX_SIGN_HEADER) {
+                this.header.push(c)?;
+            } else {
+                this.overflow = true;
+            }
+            // The blank line: LF after LF, or after CRLF.
+            let endsHeader = c == 0x0a && (this.tail[2] == 0x0a || (this.tail[2] == 0x0d && this.tail[1] == 0x0a));
+            this.tail[0] = this.tail[1];
+            this.tail[1] = this.tail[2];
+            this.tail[2] = c;
+            if (endsHeader) {
+                this.inHeader = false;
+            }
+        }
+        if (at < bytes.length) {
+            feedBody(mut this.body, bytes[at..]);
+        }
+        return Ok();
+    }
+
+    /// The domain of the From address (lowercase), into `out`; false when there is no one From address.
+    public fn fromDomain(borrow this, out: borrow mut Vector<u8>) -> Result<bool, AllocError> {
+        out.clear();
+        var value = Vector<u8>.create();
+        if (fieldCount(this.header.view(), "from".bytes()) != 1) {
+            return Ok(false);
+        }
+        fieldValue(this.header.view(), "from".bytes(), mut value)?;
+        var list = AddressList.create();
+        parseAddressList(value.view(), mut list)?;
+        if (list.count() != 1) {
+            return Ok(false);
+        }
+        match (list.host(0)) {
+            Some(host) => {
+                for (c in host) {
+                    out.push(if (c >= 0x41 && c <= 0x5a) c + 0x20 else c)?;
+                }
+                return Ok(out.length > 0 && host.indexOfByte(0x5b) == null);
+            }
+            null => { return Ok(false); }
+        }
+    }
+
+    /// The DKIM-Signature field (with its CRLF) for `domain` and `selector` with `key`, made at `now` (Unix
+    /// seconds), into `out`. Call it once, after the whole message is fed. False when the header was too large or
+    /// never ended, and then nothing is written.
+    public fn sign(
+        this,
+        key: borrow PrivateKey,
+        domain: StringView,
+        selector: StringView,
+        now: i64,
+        out: borrow mut Vector<u8>,
+    ) -> Result<bool, KeyError> {
+        out.clear();
+        if (this.overflow) {
+            return Ok(false);
+        }
+        let digest = finishBody(this.body);
+        let block = this.header.view();
+        // h=: each signed field as often as it appears, the oversigned ones once more.
+        var names = Vector<u8>.create();
+        for (i in 0..SIGNED_COUNT) {
+            let name = SIGNED[i];
+            var n = fieldCount(block, name.bytes());
+            if (i < OVERSIGNED) {
+                n += 1;
+            }
+            for (k in 0..n) {
+                if (names.length > 0) {
+                    grown(names.push(0x3a))?;
+                }
+                grown(names.extend(name.bytes()))?;
+            }
+        }
+        // The field, b= empty for now.
+        var field = Vector<u8>.create();
+        grown(field.extend("DKIM-Signature: v=1; a=".bytes()))?;
+        grown(field.extend(if (key.isRsa()) "rsa-sha256".bytes() else "ed25519-sha256".bytes()))?;
+        grown(field.extend("; c=relaxed/relaxed; d=".bytes()))?;
+        grown(field.extend(domain.bytes()))?;
+        grown(field.extend("; s=".bytes()))?;
+        grown(field.extend(selector.bytes()))?;
+        grown(field.extend(";\r\n\tt=".bytes()))?;
+        grown(appendNumber(mut field, now))?;
+        grown(field.extend("; h=".bytes()))?;
+        // h= folded at colons, so no line runs long.
+        var column: usize = 14;
+        for (c in names.view()) {
+            grown(field.push(c))?;
+            column += 1;
+            if (c == 0x3a && column > 70) {
+                grown(field.extend("\r\n\t".bytes()))?;
+                column = 1;
+            }
+        }
+        grown(field.extend(";\r\n\tbh=".bytes()))?;
+        grown(Base64.encode(digest[..], mut field))?;
+        grown(field.extend(";\r\n\tb=".bytes()))?;
+        // What is signed (§3.7): the h= fields, picked from the bottom up, then this field without its CRLF.
+        var data = Vector<u8>.create();
+        var taken = Vector<usize>.create(); // per name: how many of its instances are used so far
+        for (i in 0..SIGNED_COUNT) {
+            grown(taken.push(0))?;
+        }
+        var pos: usize = 0;
+        let h = names.view();
+        while (pos < h.length) {
+            var end = pos;
+            while (end < h.length && h[end] != 0x3a) {
+                end += 1;
+            }
+            let name = h[pos..end];
+            pos = end + 1;
+            var which: usize = 0;
+            for (i in 0..SIGNED_COUNT) {
+                if (SIGNED[i].bytes().equalsIgnoreAsciiCase(name)) {
+                    which = i;
+                }
+            }
+            let instance = taken[which];
+            taken[which] = instance + 1;
+            match (fieldFromBottom(block, name, instance)) {
+                Some(span) => { grown(canonicalHeader(block[span[0]..span[1]], true, true, mut data))?; }
+                null => {} // oversigned: an absent field signs as nothing
+            }
+        }
+        grown(canonicalHeader(field.view(), true, false, mut data))?;
+        var signature = Vector<u8>.create();
+        if (key.isRsa()) {
+            key.sign(data.view(), mut signature)?;
+        } else {
+            let hashed = Sha256.hash(data.view());
+            key.sign(hashed[..], mut signature)?;
+        }
+        var b64 = Vector<u8>.create();
+        grown(Base64.encode(signature.view(), mut b64))?;
+        // b= folded every 72 characters (FWS is ignored inside it).
+        var at: usize = 0;
+        let encoded = b64.view();
+        while (at < encoded.length) {
+            let stop = if (at + 72 < encoded.length) at + 72 else encoded.length;
+            if (at > 0) {
+                grown(field.extend("\r\n\t ".bytes()))?;
+            }
+            grown(field.extend(encoded[at..stop]))?;
+            at = stop;
+        }
+        grown(field.extend("\r\n".bytes()))?;
+        grown(out.extend(field.view()))?;
+        return Ok(true);
+    }
+}
+
+fn grown(r: Result<void, AllocError>) -> Result<void, KeyError> => match (r) {
+    Ok() => Ok(),
+    Err(_) => Err(KeyError.OutOfMemory),
+};
+
+fn appendNumber(out: borrow mut Vector<u8>, n: i64) -> Result<void, AllocError> {
+    if (n < 0) {
+        return out.push(0x30);
+    }
+    var digits = [0u8; 20];
+    var count: usize = 0;
+    var v = truncate<u64>(n);
+    loop {
+        digits[count] = 0x30 + truncate<u8>(v % 10);
+        count += 1;
+        v = v / 10;
+        if (v == 0) {
+            break;
+        }
+    }
+    while (count > 0) {
+        count -= 1;
+        out.push(digits[count])?;
+    }
+    return Ok();
+}
+
+/// The header's fields, each as [start, end) with its CRLF, in order.
+fn fieldSpans(block: Slice<u8>, spans: borrow mut Vector<[usize; 2]>) -> Result<void, AllocError> {
+    spans.clear();
+    var cursor: usize = 0;
+    while (cursor < block.length) {
+        let start = cursor;
+        var end = start;
+        loop {
+            match (block[end..].indexOfByte(0x0a)) {
+                Some(lf) => { end = end + lf + 1; }
+                null => {
+                    end = block.length;
+                    break;
+                }
+            }
+            if (end >= block.length || (block[end] != 0x20 && block[end] != 0x09)) {
+                break;
+            }
+        }
+        cursor = end;
+        let line = block[start..end];
+        if (line.length <= 2 && (line.length == 0 || line[0] == 0x0d || line[0] == 0x0a)) {
+            break; // the blank line
+        }
+        spans.push([start, end])?;
+    }
+    return Ok();
+}
+
+fn nameOf(field: Slice<u8>) -> Slice<u8> {
+    let colon = match (field.indexOfByte(0x3a)) {
+        Some(c) => c,
+        null => { return field[0..0]; }
+    };
+    return trimFws(field[0..colon]);
+}
+
+fn fieldCount(block: Slice<u8>, name: Slice<u8>) -> usize {
+    var spans = Vector<[usize; 2]>.create();
+    match (fieldSpans(block, mut spans)) {
+        Ok() => {}
+        Err(_) => { return 0; }
+    }
+    var n: usize = 0;
+    for (s in spans.view()) {
+        if (nameOf(block[s[0]..s[1]]).equalsIgnoreAsciiCase(name)) {
+            n += 1;
+        }
+    }
+    return n;
+}
+
+/// The `instance`-th field called `name` counting from the bottom (0 is the last), as [start, end).
+fn fieldFromBottom(block: Slice<u8>, name: Slice<u8>, instance: usize) -> [usize; 2]? {
+    var spans = Vector<[usize; 2]>.create();
+    match (fieldSpans(block, mut spans)) {
+        Ok() => {}
+        Err(_) => { return null; }
+    }
+    var seen: usize = 0;
+    var i = spans.length;
+    while (i > 0) {
+        i -= 1;
+        let s = spans[i];
+        if (nameOf(block[s[0]..s[1]]).equalsIgnoreAsciiCase(name)) {
+            if (seen == instance) {
+                return s;
+            }
+            seen += 1;
+        }
+    }
+    return null;
+}
+
+/// The value of the (first) field called `name`, into `out`.
+fn fieldValue(block: Slice<u8>, name: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    out.clear();
+    var spans = Vector<[usize; 2]>.create();
+    fieldSpans(block, mut spans)?;
+    for (s in spans.view()) {
+        let field = block[s[0]..s[1]];
+        if (nameOf(field).equalsIgnoreAsciiCase(name)) {
+            let colon = field.indexOfByte(0x3a)!;
+            return out.extend(field[colon + 1..]);
+        }
+    }
+    return Ok();
+}

@@ -1,0 +1,12 @@
+size 2996
+envelope ("Thu, 25 Apr 1996 03:26:57 -0700" "Multipart/signed message format" (("Raph Levien" NIL "raph" "callisto.hip.berkeley.edu")) (("Raph Levien" NIL "raph" "callisto.hip.berkeley.edu")) (("Raph Levien" NIL "raph" "callisto.hip.berkeley.edu")) ((NIL NIL "smime-dev" "rsa.com")) NIL NIL NIL "<199604251026.DAA00979@callisto.hip.berkeley.edu>")
+bodystructure (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 921 20 NIL NIL NIL NIL) ("application" "x-pkcs7-signature" NIL NIL NIL "base64" 760 NIL NIL NIL NIL) "signed" ("protocol" "application/x-pkcs7-signature" "micalg" "rsa-md5" "boundary" "7oU2Ma36WUas7M") NIL NIL NIL)
+body (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 921 20) ("application" "x-pkcs7-signature" NIL NIL NIL "base64" 760) "signed")
+section HEADER 1171 deb27b8986fe50d03bdd363001b85334190b567244c521007cb769bd18a3015b
+section TEXT 1825 59be73b6af582a5c05697381e1978bf24479509e100271dfce5f8f99a5e30c93
+section HEADER.FIELDS 342 bf92cb8093701265869fad2c756499b5006829c8443bb4227f802ce254c644a7
+section HEADER.FIELDS.NOT 831 85c894911e53775d28f73eb693583324b975b34e2bffe94943326f2fdf93c762
+section 1 921 f5b829cd174165c24fa7177be90511abfc8fee5426dada01e4935bc9c1176ca7
+section 1.MIME 2 7eb70257593da06f682a3ddda54a9d260d4fc514f645237f5ca74b08f8da61a6
+section 2 760 98d59cebe9038e8d9ec7d8345dc911243a85fc4984120035c157bdd448eedf34
+section 2.MIME 82 af8b694dbc1b5e2815df2ee1f9d95cbd0fdb1f8e4b090d554726052ef7099ebe

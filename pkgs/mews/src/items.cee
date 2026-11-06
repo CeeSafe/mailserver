@@ -1,0 +1,991 @@
+// Messages as EWS items: FindItem (paged, newest first), GetItem (with the MIME content), SyncFolderItems (with a
+// sync state the client keeps), UpdateItem (read flag, follow-up flag, categories), DeleteItem, MoveItem and CopyItem.
+//
+// SyncFolderItems' state is base64 of `s2:<uidvalidity>:<modseq>:<uid ranges>`: the uids the client has and the
+// modseq it saw. Creates are uids it lacks, deletes the uids it has that are gone, updates the messages it has whose
+// modseq is newer, so every change is reported however large the folder (the C# server stopped tracking deletes
+// and flag changes past 5000 messages). States in the C# server's format are refused with
+// ErrorInvalidSyncStateData: their item ids embed the old server's mailbox ids, so the client starts over.
+
+import diskio.RawFile;
+import mmime.MessageMeta;
+import mmime.containsFolded;
+import mmime.metaBodyStructure;
+import mmime.metaEnvelope;
+import mhttp.appendIsoTime;
+import mpim.Account;
+import msmtp.SmtpContext;
+import mstore.BlobStore;
+import mstore.CopyResult;
+import mstore.FLAG_DELETED;
+import mstore.FLAG_DRAFT;
+import mstore.FLAG_FLAGGED;
+import mstore.FLAG_SEEN;
+import mstore.FlagChange;
+import mstore.MessageList;
+import mstore.StoreError;
+import mstore.UidSet;
+import mxml.XmlDocument;
+import mxml.XmlWriter;
+import postgres.PgParams;
+import postgres.PgRows;
+import encoding.Base64;
+
+fn storeErr(r: Result<void, StoreError>) -> Result<void, EwsError> => match (r) {
+    Ok() => Ok(),
+    Err(StoreError.OutOfMemory) => Err(EwsError.OutOfMemory),
+    Err(_) => Err(EwsError.Unavailable),
+};
+
+fn isoTime(w: borrow mut XmlWriter, name: StringView, seconds: i64) -> Result<void, AllocError> {
+    var t = Vector<u8>.create();
+    appendIsoTime(mut t, seconds)?;
+    w.element(name, StringView.fromUtf8(t.view()) ?? "");
+    return Ok();
+}
+
+fn writeAddress(w: borrow mut XmlWriter, a: borrow MailAddress) {
+    w.start("t:Mailbox");
+    let email = StringView.fromUtf8(a.email.view()) ?? "";
+    let name = StringView.fromUtf8(a.name.view()) ?? "";
+    w.element("t:Name", if (name.length > 0) name else email);
+    w.element("t:EmailAddress", email);
+    w.element("t:RoutingType", "SMTP");
+    w.end();
+}
+
+fn writeAddresses(w: borrow mut XmlWriter, element: StringView, list: borrow Vector<MailAddress>) {
+    if (list.length == 0) {
+        return;
+    }
+    w.start(element);
+    for (a in list.view()) {
+        writeAddress(w, a);
+    }
+    w.end();
+}
+
+/// A message's `t:Message`, members in schema order (ItemType's, then MessageType's): MimeContent (with `mime`),
+/// ItemId, ParentFolderId, ItemClass, Subject, DateTimeReceived, Size, Categories, Importance, IsDraft,
+/// DateTimeSent, HasAttachments, ToRecipients, CcRecipients, From, InternetMessageId, IsRead.
+fn writeMessage(
+    w: borrow mut XmlWriter,
+    mailboxId: i64,
+    list: borrow MessageList,
+    i: usize,
+    metaBytes: Slice<u8>,
+    mime: Slice<u8>?,
+) -> Result<void, AllocError> {
+    let uid = list.uid(i);
+    let flags = list.flags(i);
+    var summary = Summary.create();
+    var meta = MessageMeta.create();
+    var hasAttachments = false;
+    if (meta.read(metaBytes)?) {
+        readEnvelope(metaEnvelope(meta, metaBytes), mut summary)?;
+        hasAttachments = containsFolded(metaBodyStructure(meta, metaBytes), "\"attachment\"".bytes());
+    }
+    let received = list.internalDate(i) / 1000;
+    let sent = dateSeconds(summary.date.view()) ?? received;
+    w.start("t:Message");
+    match (mime) {
+        Some(m) => {
+            var encoded = Vector<u8>.create();
+            Base64.encode(m, mut encoded)?;
+            w.start("t:MimeContent");
+            w.attribute("CharacterSet", "UTF-8");
+            w.raw(encoded.view());
+            w.end();
+        }
+        null => {}
+    }
+    var id = String.create();
+    itemId(mailboxId, uid, mut id)?;
+    var key = String.create();
+    messageChangeKey(flags, list.keywords(i), mut key)?;
+    w.start("t:ItemId");
+    w.attribute("Id", id.view());
+    w.attribute("ChangeKey", key.view());
+    w.end();
+    var parent = String.create();
+    folderId(mailboxId, mut parent)?;
+    w.start("t:ParentFolderId");
+    w.attribute("Id", parent.view());
+    w.attribute("ChangeKey", "AAAA");
+    w.end();
+    w.element("t:ItemClass", "IPM.Note");
+    textElement(w, "t:Subject", summary.subject.view());
+    isoTime(w, "t:DateTimeReceived", received)?;
+    w.number("t:Size", list.size(i));
+    let keywords = list.keywords(i);
+    if (keywords.length > 0) {
+        w.start("t:Categories");
+        for (k in keywords.split(" ")) {
+            if (k.length > 0) {
+                w.element("t:String", k);
+            }
+        }
+        w.end();
+    }
+    w.element("t:Importance", "Normal");
+    if ((flags & FLAG_DRAFT) != 0) {
+        w.element("t:IsDraft", "true");
+    }
+    isoTime(w, "t:DateTimeSent", sent)?;
+    w.element("t:HasAttachments", if (hasAttachments) "true" else "false");
+    writeAddresses(w, "t:ToRecipients", summary.to);
+    writeAddresses(w, "t:CcRecipients", summary.cc);
+    if (summary.from.length > 0) {
+        w.start("t:From");
+        writeAddress(w, summary.from[0]);
+        w.end();
+    }
+    if (summary.messageId.length > 0) {
+        textElement(w, "t:InternetMessageId", summary.messageId.view());
+    }
+    w.element("t:IsRead", if ((flags & FLAG_SEEN) != 0) "true" else "false");
+    w.end();
+    return Ok();
+}
+
+// ---- FindItem ----
+
+fn sqlPage() -> StringView =>
+    """
+    SELECT m.uid FROM mailboxes b JOIN messages m ON m.mailbox_id = b.id
+    WHERE b.id = $2 AND b.user_id = $1 ORDER BY m.uid DESC OFFSET $3 LIMIT $4
+    """;
+
+fn parseCount(text: StringView, otherwise: i64) -> i64 => text.trim().parseInt<i64>() ?? otherwise;
+
+async fn findItem(
+    mail: borrow SmtpContext,
+    account: borrow Account,
+    doc: borrow XmlDocument,
+    op: usize,
+    w: borrow mut XmlWriter,
+) -> Result<void, EwsError> {
+    let parent = match (findLocal(doc, op, "ParentFolderIds")) {
+        Some(p) => await resolveFolderIn(mail, account, doc, p)?,
+        null => null,
+    };
+    let folder = match (parent) {
+        Some(f) => f,
+        null => {
+            beginEnvelope(w, "FindItem");
+            failure(w, "FindItem", "ErrorItemNotFound", "Folder not found");
+            endEnvelope(w);
+            return Ok();
+        }
+    };
+    var offset: i64 = 0;
+    var max: i64 = 100;
+    match (findLocal(doc, op, "IndexedPageItemView")) {
+        Some(v) => {
+            var a = String.create();
+            mem(attributeOf(doc, v, "Offset", mut a))?;
+            offset = parseCount(a.view(), 0);
+            mem(attributeOf(doc, v, "MaxEntriesReturned", mut a))?;
+            max = parseCount(a.view(), 100);
+        }
+        null => {}
+    }
+    if (offset < 0) {
+        offset = 0;
+    }
+    if (max <= 0 || max > 1000) {
+        max = 1000;
+    }
+    var list = MessageList.create();
+    var uids = Vector<i64>.create();
+    if (folder.id > 0) {
+        var params = PgParams.create();
+        mem(boundAll(mut params, account.userId, folder.id, offset, max))?;
+        var rows = PgRows.create();
+        await ewsQuery(mail, sqlPage(), params, mut rows)?;
+        var set = UidSet.create();
+        for (r in 0..rows.rowCount()) {
+            let uid = rows.int64(r, 0) ?? 0;
+            mem(uids.push(uid))?;
+            storeErr(set.add(uid))?;
+        }
+        storeErr(await mail.store.fetchMessages(account.userId, folder.id, set, true, mut list))?;
+    }
+    let total = if (folder.id > 0) folder.total else 0;
+    beginEnvelope(w, "FindItem");
+    beginSuccess(w, "FindItem");
+    w.start("m:RootFolder");
+    var n = String.create();
+    mem(n.appendNumber(offset + truncate<i64>(list.count())))?;
+    w.attribute("IndexedPagingOffset", n.view());
+    var t = String.create();
+    mem(t.appendNumber(total))?;
+    w.attribute("TotalItemsInView", t.view());
+    w.attribute("IncludesLastItemInRange", if (offset + truncate<i64>(list.count()) >= total) "true" else "false");
+    w.start("t:Items");
+    var meta = Vector<u8>.create();
+    // Newest first: the page's uids in their order; fetchMessages gave them ascending.
+    for (u in uids.view()) {
+        let row = rowOf(list, u);
+        if (row == list.count()) {
+            continue;
+        }
+        storeErr(rowMeta(list, row, mut meta))?;
+        mem(writeMessage(w, folder.id, list, row, meta.view(), null))?;
+    }
+    w.end();
+    w.end();
+    w.end();
+    endEnvelope(w);
+    return Ok();
+}
+
+fn boundAll(params: borrow mut PgParams, a: i64, b: i64, c: i64, d: i64) -> Result<void, AllocError> {
+    for (v in [a, b, c, d]) {
+        match (params.int64(v)) {
+            Ok() => {}
+            Err(_) => { return Err(AllocError.OutOfMemory); }
+        }
+    }
+    return Ok();
+}
+
+/// The row of `uid` in `list` (ascending by uid), or `list.count()`.
+fn rowOf(list: borrow MessageList, uid: i64) -> usize {
+    var lo: usize = 0;
+    var hi = list.count();
+    while (lo < hi) {
+        let mid = (lo + hi) / 2;
+        let u = list.uid(mid);
+        if (u == uid) {
+            return mid;
+        }
+        if (u < uid) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return list.count();
+}
+
+fn rowMeta(list: borrow MessageList, row: usize, into: borrow mut Vector<u8>) -> Result<void, StoreError> {
+    match (list.meta(row, into)) {
+        Ok(_) => { return Ok(); }
+        Err(e) => { return Err(e); }
+    }
+}
+
+// ---- GetItem ----
+
+fn readWhole(blobs: borrow BlobStore, hash: Slice<u8>, size: usize) -> Vector<u8>? {
+    let file = match (blobs.open(hash)) {
+        Ok(f) => f,
+        Err(_) => { return null; }
+    };
+    var into = Vector<u8>.create();
+    match (into.resize(size, 0)) {
+        Ok() => {}
+        Err(_) => { return null; }
+    }
+    if (size == 0) {
+        return into;
+    }
+    match (file.readExactAt(mut into[..], 0)) {
+        Ok() => { return into; }
+        Err(_) => { return null; }
+    }
+}
+
+/// A message's content: its blob, or (when the blob is missing) a stub with what the summary knows, since macOS
+/// Mail aborts on a message without content.
+async fn contentOf(
+    mail: borrow SmtpContext,
+    list: borrow MessageList,
+    row: usize,
+    into: borrow mut Vector<u8>,
+) -> Result<void, EwsError> {
+    var hash = Vector<u8>.create();
+    storeErr(list.blob(row, mut hash))?;
+    let blobs = mail.store.blobs();
+    let h = hash.view();
+    let n = truncate<usize>(list.size(row));
+    let read: Vector<u8>? = await Async.blocking(() => readWhole(blobs, h, n));
+    into.clear();
+    match (read) {
+        Some(bytes) => {
+            mem(into.extend(bytes.view()))?;
+            return Ok();
+        }
+        null => {}
+    }
+    mem(
+        into.extend(
+            "MIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n(The message's content is not available.)\r\n".bytes(),
+        ),
+    )?;
+    return Ok();
+}
+
+/// The ItemIds of a request, as [mailbox, uid]; malformed ones as [0, 0].
+fn requestedItems(
+    doc: borrow XmlDocument,
+    container: usize,
+    into: borrow mut Vector<[i64; 2]>,
+) -> Result<void, AllocError> {
+    into.clear();
+    var ids = Vector<usize>.create();
+    findAllLocal(doc, container, "ItemId", mut ids)?;
+    for (e in ids.view()) {
+        let parsed = match (doc.attribute(e, "Id")) {
+            Some(a) => parseItemId(doc.value(a)),
+            null => null,
+        };
+        into.push(parsed ?? [0i64, 0i64])?;
+    }
+    return Ok();
+}
+
+async fn getItem(
+    mail: borrow SmtpContext,
+    account: borrow Account,
+    doc: borrow XmlDocument,
+    op: usize,
+    w: borrow mut XmlWriter,
+) -> Result<void, EwsError> {
+    // MIME content unless the client asked for ids only and no MIME (the C# server sent it for the default shapes).
+    var shape = String.create();
+    mem(localText(doc, op, "BaseShape", mut shape))?;
+    var includeMime = String.create();
+    mem(localText(doc, op, "IncludeMimeContent", mut includeMime))?;
+    let withMime = includeMime.view() == "true" || (shape.view() != "IdOnly" && includeMime.view() != "false");
+    let ids = findLocal(doc, op, "ItemIds") ?? op;
+    var items = Vector<[i64; 2]>.create();
+    mem(requestedItems(doc, ids, mut items))?;
+    beginEnvelope(w, "GetItem");
+    if (items.length == 0) {
+        failure(w, "GetItem", "ErrorItemNotFound", "No items specified");
+    }
+    var meta = Vector<u8>.create();
+    var content = Vector<u8>.create();
+    for (item in items.view()) {
+        if (item[0] <= 0) {
+            failure(w, "GetItem", "ErrorInvalidIdMalformed", "Id is malformed.");
+            continue;
+        }
+        var set = UidSet.create();
+        storeErr(set.add(item[1]))?;
+        var list = MessageList.create();
+        // fetchMessages checks that the mailbox is the user's.
+        storeErr(await mail.store.fetchMessages(account.userId, item[0], set, true, mut list))?;
+        if (list.count() == 0) {
+            failure(w, "GetItem", "ErrorItemNotFound", "Message not found");
+            continue;
+        }
+        storeErr(rowMeta(list, 0, mut meta))?;
+        if (withMime) {
+            await contentOf(mail, list, 0, mut content)?;
+        }
+        beginSuccess(w, "GetItem");
+        w.start("m:Items");
+        mem(writeMessage(w, item[0], list, 0, meta.view(), if (withMime) content.view() else null))?;
+        w.end();
+        w.end();
+    }
+    endEnvelope(w);
+    return Ok();
+}
+
+// ---- SyncFolderItems ----
+
+/// No uid: every change at the state's modseq has been sent.
+const ALL_SENT: i64 = 4294967296;
+
+/// A sync state: the folder's UIDVALIDITY, how far the client has the changes (those with a lower modseq, and
+/// those at `modseq` up to uid `after`: several messages can share a modseq), and the uids it has (ascending).
+struct ItemState {
+    validity: i64;
+    modseq: i64;
+    after: i64;
+    uids: Vector<i64>;
+}
+
+/// Reads a state; null when `text` is not one of ours (an empty `text` is the empty state).
+fn readItemState(text: StringView) -> Result<ItemState?, AllocError> {
+    var state = ItemState { validity: 0, modseq: 0, after: ALL_SENT, uids: Vector<i64>.create() };
+    if (text.length == 0) {
+        return Ok(state);
+    }
+    var raw = Vector<u8>.create();
+    if (!unbase64(text.bytes(), mut raw)) {
+        return Ok(null);
+    }
+    let s = StringView.fromUtf8(raw.view()) ?? "";
+    if (!s.startsWith("s2:")) {
+        return Ok(null);
+    }
+    var field: usize = 0;
+    for (part in s[3..].split(":")) {
+        if (field == 0) {
+            state.validity = part.parseInt<i64>() ?? -1;
+        } else if (field == 1) {
+            // <modseq> or <modseq>.<uid>
+            let dot = part.indexOf(".");
+            state.modseq = (match (dot) {
+                Some(d) => part[0..d],
+                null => part,
+            }).parseInt<i64>() ?? -1;
+            match (dot) {
+                Some(d) => { state.after = part[(d + 1)..].parseInt<i64>() ?? -1; }
+                null => {}
+            }
+        } else if (field == 2) {
+            for (range in part.split(",")) {
+                if (range.length == 0) {
+                    continue;
+                }
+                let dash = range.indexOf("-");
+                let first = (match (dash) {
+                    Some(d) => range[0..d],
+                    null => range,
+                }).parseInt<i64>() ?? 0;
+                let last = (match (dash) {
+                    Some(d) => range[(d + 1)..],
+                    null => range,
+                }).parseInt<i64>() ?? 0;
+                if (first <= 0 || last < first || last - first > 10000000) {
+                    return Ok(null);
+                }
+                for (u in first..(last + 1)) {
+                    state.uids.push(u)?;
+                }
+            }
+        }
+        field += 1;
+    }
+    if (field != 3 || state.validity < 0 || state.modseq < 0 || state.after < 0) {
+        return Ok(null);
+    }
+    return Ok(state);
+}
+
+/// Writes a state: base64 of `s2:<validity>:<modseq>[.<uid>]:<ranges>`.
+fn writeItemState(
+    validity: i64,
+    modseq: i64,
+    after: i64,
+    uids: borrow Vector<i64>,
+    into: borrow mut String,
+) -> Result<void, AllocError> {
+    var raw = Vector<u8>.create();
+    raw.extend("s2:".bytes())?;
+    decimal(mut raw, validity)?;
+    raw.push(0x3a)?;
+    decimal(mut raw, modseq)?;
+    if (after != ALL_SENT) {
+        raw.push(0x2e)?;
+        decimal(mut raw, after)?;
+    }
+    raw.push(0x3a)?;
+    var i: usize = 0;
+    var first = true;
+    while (i < uids.length) {
+        var j = i;
+        while (j + 1 < uids.length && uids[j + 1] == uids[j] + 1) {
+            j += 1;
+        }
+        if (!first) {
+            raw.push(0x2c)?;
+        }
+        first = false;
+        decimal(mut raw, uids[i])?;
+        if (j > i) {
+            raw.push(0x2d)?;
+            decimal(mut raw, uids[j])?;
+        }
+        i = j + 1;
+    }
+    into.clear();
+    return base64Of(raw.view(), into);
+}
+
+fn hasUid(sorted: borrow Vector<i64>, uid: i64) -> bool {
+    var lo: usize = 0;
+    var hi = sorted.length;
+    while (lo < hi) {
+        let mid = (lo + hi) / 2;
+        if (sorted[mid] == uid) {
+            return true;
+        }
+        if (sorted[mid] < uid) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return false;
+}
+
+async fn syncFolderItems(
+    mail: borrow SmtpContext,
+    account: borrow Account,
+    doc: borrow XmlDocument,
+    op: usize,
+    w: borrow mut XmlWriter,
+) -> Result<void, EwsError> {
+    let target = match (findLocal(doc, op, "SyncFolderId")) {
+        Some(s) => await resolveFolderIn(mail, account, doc, s)?,
+        null => null,
+    };
+    let folder = match (target) {
+        Some(f) => f,
+        null => {
+            beginEnvelope(w, "SyncFolderItems");
+            failure(w, "SyncFolderItems", "ErrorItemNotFound", "Folder not found");
+            endEnvelope(w);
+            return Ok();
+        }
+    };
+    var stateText = String.create();
+    mem(localText(doc, op, "SyncState", mut stateText))?;
+    let read = match (readItemState(stateText.view())) {
+        Ok(s) => s,
+        Err(_) => { return Err(EwsError.OutOfMemory); }
+    };
+    var state = match (read) {
+        Some(s) => s,
+        null => {
+            beginEnvelope(w, "SyncFolderItems");
+            failure(w, "SyncFolderItems", "ErrorInvalidSyncStateData", "The sync state is not valid.");
+            endEnvelope(w);
+            return Ok();
+        }
+    };
+    var maxText = String.create();
+    mem(localText(doc, op, "MaxChangesReturned", mut maxText))?;
+    var budget = parseCount(maxText.view(), 100);
+    if (budget <= 0 || budget > 512) {
+        budget = 512;
+    }
+    // Another UIDVALIDITY (or the first sync): everything is new.
+    if (state.validity != folder.uidValidity) {
+        state.uids.clear();
+        state.modseq = 0;
+        state.after = ALL_SENT;
+    }
+    var all = MessageList.create();
+    if (folder.id > 0) {
+        storeErr(await mail.store.messages(account.userId, folder.id, 0, mut all))?;
+    }
+    var present = Vector<i64>.create();
+    for (i in 0..all.count()) {
+        mem(present.push(all.uid(i)))?;
+    }
+    var deletes = Vector<i64>.create();
+    for (u in state.uids.view()) {
+        if (!hasUid(present, u)) {
+            mem(deletes.push(u))?;
+        }
+    }
+    // Updates by modseq, oldest change first, so a cut-off state can resume from the last one sent.
+    var updates = Vector<usize>.create();
+    var creates = Vector<usize>.create();
+    for (i in 0..all.count()) {
+        if (!hasUid(state.uids, all.uid(i))) {
+            mem(creates.push(i))?;
+        } else if (all.modseq(i) > state.modseq || (all.modseq(i) == state.modseq && all.uid(i) > state.after)) {
+            mem(updates.push(i))?;
+        }
+    }
+    for (i in 1..updates.length) {
+        var j = i;
+        while (j > 0 && all.modseq(updates[j]) < all.modseq(updates[j - 1])) {
+            updates.swap(j, j - 1);
+            j -= 1;
+        }
+    }
+    let total = deletes.length + updates.length + creates.length;
+    let cap = truncate<usize>(budget);
+    let emitDeletes = if (deletes.length < cap) deletes.length else cap;
+    var left = cap - emitDeletes;
+    let emitUpdates = if (updates.length < left) updates.length else left;
+    left -= emitUpdates;
+    let emitCreates = if (creates.length < left) creates.length else left;
+    // The new state: the old uids, less those reported deleted, plus those reported created.
+    var kept = Vector<i64>.create();
+    for (u in state.uids.view()) {
+        var gone = false;
+        for (k in 0..emitDeletes) {
+            if (deletes[k] == u) {
+                gone = true;
+                break;
+            }
+        }
+        if (!gone) {
+            mem(kept.push(u))?;
+        }
+    }
+    for (k in 0..emitCreates) {
+        mem(kept.push(all.uid(creates[k])))?;
+    }
+    for (i in 1..kept.length) {
+        var j = i;
+        while (j > 0 && kept[j] < kept[j - 1]) {
+            kept.swap(j, j - 1);
+            j -= 1;
+        }
+    }
+    // Every update sent: the client is current up to the folder's modseq (creates not sent yet are not in its
+    // uids, so they come as creates, whatever their modseq). Updates cut off: up to the last one sent, by modseq
+    // and then uid (the order they were sent in).
+    var modseq = state.modseq;
+    var after = state.after;
+    if (emitUpdates == updates.length) {
+        if (folder.highestModseq > state.modseq) {
+            modseq = folder.highestModseq;
+            after = ALL_SENT;
+        }
+    } else if (emitUpdates > 0) {
+        let last = updates[emitUpdates - 1];
+        modseq = all.modseq(last);
+        after = all.uid(last);
+    }
+    var next = String.create();
+    mem(writeItemState(folder.uidValidity, modseq, after, kept, mut next))?;
+    // The emitted creates and updates, with their summaries.
+    var wanted = UidSet.create();
+    for (k in 0..emitUpdates) {
+        storeErr(wanted.add(all.uid(updates[k])))?;
+    }
+    for (k in 0..emitCreates) {
+        storeErr(wanted.add(all.uid(creates[k])))?;
+    }
+    var full = MessageList.create();
+    if (folder.id > 0 && emitUpdates + emitCreates > 0) {
+        storeErr(await mail.store.fetchMessages(account.userId, folder.id, wanted, true, mut full))?;
+    }
+    beginEnvelope(w, "SyncFolderItems");
+    beginSuccess(w, "SyncFolderItems");
+    w.element("m:SyncState", next.view());
+    w.element("m:IncludesLastItemInRange", if (emitDeletes + emitUpdates + emitCreates == total) "true" else "false");
+    w.start("m:Changes");
+    var id = String.create();
+    for (k in 0..emitDeletes) {
+        mem(itemId(folder.id, deletes[k], mut id))?;
+        w.start("t:Delete");
+        w.start("t:ItemId");
+        w.attribute("Id", id.view());
+        w.end();
+        w.end();
+    }
+    var meta = Vector<u8>.create();
+    for (k in 0..(emitUpdates + emitCreates)) {
+        let uid = if (k < emitUpdates) all.uid(updates[k]) else all.uid(creates[k - emitUpdates]);
+        let row = rowOf(full, uid);
+        if (row == full.count()) {
+            continue;
+        }
+        storeErr(rowMeta(full, row, mut meta))?;
+        w.start(if (k < emitUpdates) "t:Update" else "t:Create");
+        mem(writeMessage(w, folder.id, full, row, meta.view(), null))?;
+        w.end();
+    }
+    w.end();
+    w.end();
+    endEnvelope(w);
+    return Ok();
+}
+
+// ---- UpdateItem ----
+
+/// Writes `m:Items` with the message's id and its new change key.
+fn writeIdOnly(
+    w: borrow mut XmlWriter,
+    mailboxId: i64,
+    uid: i64,
+    flags: u16,
+    keywords: StringView,
+) -> Result<void, AllocError> {
+    var id = String.create();
+    itemId(mailboxId, uid, mut id)?;
+    var key = String.create();
+    messageChangeKey(flags, keywords, mut key)?;
+    w.start("m:Items");
+    w.start("t:Message");
+    w.start("t:ItemId");
+    w.attribute("Id", id.view());
+    w.attribute("ChangeKey", key.view());
+    w.end();
+    w.end();
+    w.end();
+    return Ok();
+}
+
+/// An IMAP keyword for an EWS category: atom characters only, others as `_`.
+fn keywordOf(category: StringView, into: borrow mut String) -> Result<void, AllocError> {
+    var bytes = Vector<u8>.create();
+    for (c in category.trim().bytes()) {
+        let bad =
+            c <= 0x20 || c >= 0x7f || c == 0x28 || c == 0x29 || c == 0x7b || c == 0x25 || c == 0x2a || c == 0x22 ||
+                c == 0x5c || c == 0x5d;
+        bytes.push(if (bad) 0x5f else c)?;
+    }
+    into.clear();
+    return into.append(StringView.fromUtf8(bytes.view()) ?? "");
+}
+
+/// What the field URI of a SetItemField, AppendToItemField or DeleteItemField is.
+fn fieldOf(doc: borrow XmlDocument, change: usize, into: borrow mut String) -> Result<void, AllocError> {
+    into.clear();
+    match (findLocal(doc, change, "FieldURI")) {
+        Some(f) => { attributeOf(doc, f, "FieldURI", into)?; }
+        null => {}
+    }
+    return Ok();
+}
+
+async fn updateItem(
+    mail: borrow SmtpContext,
+    account: borrow Account,
+    doc: borrow XmlDocument,
+    op: usize,
+    w: borrow mut XmlWriter,
+) -> Result<void, EwsError> {
+    var changes = Vector<usize>.create();
+    mem(findAllLocal(doc, op, "ItemChange", mut changes))?;
+    beginEnvelope(w, "UpdateItem");
+    if (changes.length == 0) {
+        success(w, "UpdateItem");
+    }
+    var fields = Vector<usize>.create();
+    var field = String.create();
+    var value = String.create();
+    var keyword = String.create();
+    for (c in changes.view()) {
+        let item = match (findLocal(doc, c, "ItemId")) {
+            Some(e) => match (doc.attribute(e, "Id")) {
+                Some(a) => parseItemId(doc.value(a)),
+                null => null,
+            },
+            null => null,
+        };
+        let target = match (item) {
+            Some(t) => t,
+            null => {
+                failure(w, "UpdateItem", "ErrorInvalidIdMalformed", "Id is malformed.");
+                continue;
+            }
+        };
+        var set = UidSet.create();
+        storeErr(set.add(target[1]))?;
+        var current = MessageList.create();
+        storeErr(await mail.store.fetchMessages(account.userId, target[0], set, false, mut current))?;
+        if (current.count() == 0) {
+            failure(w, "UpdateItem", "ErrorItemNotFound", "Message not found");
+            continue;
+        }
+        var change = FlagChange.create();
+        var replaceKeywords = false;
+        var newKeywords = String.create();
+        let updates = findLocal(doc, c, "Updates") ?? c;
+        mem(doc.children(updates, mut fields))?;
+        for (f in fields.view()) {
+            let kind = doc.localName(f);
+            mem(fieldOf(doc, f, mut field))?;
+            let removing = kind == "DeleteItemField".bytes();
+            if (field.view() == "message:IsRead") {
+                mem(localText(doc, f, "IsRead", mut value))?;
+                if (!removing && value.view() == "true") {
+                    change.add = change.add | FLAG_SEEN;
+                    change.remove = change.remove & (FLAG_SEEN ^ 0xffff);
+                } else {
+                    change.remove = change.remove | FLAG_SEEN;
+                    change.add = change.add & (FLAG_SEEN ^ 0xffff);
+                }
+            } else if (field.view() == "item:Flag") {
+                mem(localText(doc, f, "FlagStatus", mut value))?;
+                if (!removing && value.view() == "Flagged") {
+                    change.add = change.add | FLAG_FLAGGED;
+                } else {
+                    change.remove = change.remove | FLAG_FLAGGED;
+                }
+            } else if (field.view() == "item:Categories") {
+                replaceKeywords = true;
+                if (kind == "AppendToItemField".bytes()) {
+                    mem(newKeywords.append(current.keywords(0)))?;
+                }
+                if (!removing) {
+                    var strings = Vector<usize>.create();
+                    mem(findAllLocal(doc, f, "String", mut strings))?;
+                    for (s in strings.view()) {
+                        mem(keywordOf(doc.trimmed(s), mut keyword))?;
+                        if (keyword.length > 0) {
+                            if (newKeywords.length > 0) {
+                                mem(newKeywords.append(" "))?;
+                            }
+                            mem(newKeywords.append(keyword.view()))?;
+                        }
+                    }
+                }
+            }
+        }
+        if (replaceKeywords) {
+            mem(change.removeKeywords.append(current.keywords(0)))?;
+            mem(change.addKeywords.append(newKeywords.view()))?;
+        }
+        var after = MessageList.create();
+        if (change.add != 0 || change.remove != 0 || replaceKeywords) {
+            if (replaceKeywords) {
+                // Remove the old set first, then add the new: one change cannot do both for the same keyword.
+                var removal = FlagChange.create();
+                mem(removal.removeKeywords.append(current.keywords(0)))?;
+                storeErr(await mail.store.setFlags(account.userId, target[0], set, removal, mut after))?;
+                change.removeKeywords.clear();
+            }
+            storeErr(await mail.store.setFlags(account.userId, target[0], set, change, mut after))?;
+        }
+        var now = MessageList.create();
+        storeErr(await mail.store.fetchMessages(account.userId, target[0], set, false, mut now))?;
+        beginSuccess(w, "UpdateItem");
+        if (now.count() > 0) {
+            mem(writeIdOnly(w, target[0], target[1], now.flags(0), now.keywords(0)))?;
+        }
+        w.start("m:ConflictResults");
+        w.element("t:Count", "0");
+        w.end();
+        w.end();
+    }
+    endEnvelope(w);
+    return Ok();
+}
+
+// ---- DeleteItem, MoveItem, CopyItem ----
+
+/// Removes message `uid` of `mailboxId` outright: flagged \Deleted, then expunged by uid (only it).
+async fn expungeOne(mail: borrow SmtpContext, userId: i64, mailboxId: i64, uid: i64) -> Result<bool, EwsError> {
+    var set = UidSet.create();
+    storeErr(set.add(uid))?;
+    var change = FlagChange.create();
+    change.add = FLAG_DELETED;
+    var changed = MessageList.create();
+    storeErr(await mail.store.setFlags(userId, mailboxId, set, change, mut changed))?;
+    var gone = Vector<i64>.create();
+    storeErr(await mail.store.expungeUids(userId, mailboxId, set, mut gone))?;
+    return Ok(gone.length > 0);
+}
+
+async fn deleteItem(
+    mail: borrow SmtpContext,
+    account: borrow Account,
+    doc: borrow XmlDocument,
+    op: usize,
+    w: borrow mut XmlWriter,
+) -> Result<void, EwsError> {
+    var kind = String.create();
+    mem(attributeOf(doc, op, "DeleteType", mut kind))?;
+    let toTrash = kind.length == 0 || kind.view() == "MoveToDeletedItems";
+    var items = Vector<[i64; 2]>.create();
+    mem(requestedItems(doc, op, mut items))?;
+    var trashId: i64 = 0;
+    if (toTrash) {
+        match (await specialFolder(mail, account.userId, "\\Trash", "Trash")?) {
+            Some(t) => { trashId = t.id; }
+            null => {}
+        }
+    }
+    beginEnvelope(w, "DeleteItem");
+    if (items.length == 0) {
+        success(w, "DeleteItem");
+    }
+    for (item in items.view()) {
+        if (item[0] <= 0) {
+            failure(w, "DeleteItem", "ErrorInvalidIdMalformed", "Id is malformed.");
+            continue;
+        }
+        var set = UidSet.create();
+        storeErr(set.add(item[1]))?;
+        var found = MessageList.create();
+        storeErr(await mail.store.fetchMessages(account.userId, item[0], set, false, mut found))?;
+        if (found.count() == 0) {
+            failure(w, "DeleteItem", "ErrorItemNotFound", "Item not found");
+            continue;
+        }
+        if (toTrash && trashId > 0 && trashId != item[0]) {
+            var moved = CopyResult.create();
+            storeErr(await mail.store.copy(account.userId, item[0], trashId, set, true, mut moved))?;
+        } else {
+            await expungeOne(mail, account.userId, item[0], item[1])?;
+        }
+        success(w, "DeleteItem");
+    }
+    endEnvelope(w);
+    return Ok();
+}
+
+async fn transferItem(
+    mail: borrow SmtpContext,
+    account: borrow Account,
+    doc: borrow XmlDocument,
+    op: usize,
+    name: StringView,
+    w: borrow mut XmlWriter,
+) -> Result<void, EwsError> {
+    let moving = name == "MoveItem";
+    let target = match (findLocal(doc, op, "ToFolderId")) {
+        Some(t) => await resolveFolderIn(mail, account, doc, t)?,
+        null => null,
+    };
+    let destination = match (target) {
+        Some(f) => f.id,
+        null => 0,
+    };
+    beginEnvelope(w, name);
+    if (destination <= 0) {
+        failure(w, name, "ErrorItemNotFound", "Destination folder not found");
+        endEnvelope(w);
+        return Ok();
+    }
+    let ids = findLocal(doc, op, "ItemIds") ?? op;
+    var items = Vector<[i64; 2]>.create();
+    mem(requestedItems(doc, ids, mut items))?;
+    if (items.length == 0) {
+        failure(w, name, "ErrorItemNotFound", "No items specified");
+    }
+    for (item in items.view()) {
+        if (item[0] <= 0) {
+            failure(w, name, "ErrorInvalidIdMalformed", "Id is malformed.");
+            continue;
+        }
+        var set = UidSet.create();
+        storeErr(set.add(item[1]))?;
+        var result = CopyResult.create();
+        match (await mail.store.copy(account.userId, item[0], destination, set, moving, mut result)) {
+            Ok() => {}
+            Err(StoreError.NotFound) => {
+                failure(w, name, "ErrorItemNotFound", "Item not found");
+                continue;
+            }
+            Err(StoreError.OutOfMemory) => { return Err(EwsError.OutOfMemory); }
+            Err(_) => { return Err(EwsError.Unavailable); }
+        }
+        if (result.target.length == 0) {
+            // Every ItemId gets its own message; ErrorItemNotFound makes Apple Mail drop a stale replayed action.
+            failure(w, name, "ErrorItemNotFound", "Item not found");
+            continue;
+        }
+        beginSuccess(w, name);
+        var id = String.create();
+        mem(itemId(destination, result.target[0], mut id))?;
+        w.start("m:Items");
+        w.start("t:Message");
+        w.start("t:ItemId");
+        w.attribute("Id", id.view());
+        w.attribute("ChangeKey", "AAAA");
+        w.end();
+        w.end();
+        w.end();
+        w.end();
+    }
+    endEnvelope(w);
+    return Ok();
+}

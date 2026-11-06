@@ -1,0 +1,281 @@
+// What every connection of the server shares, behind an `Arc`: the store, TLS, limits, and the failed-login guard.
+
+import mdns.IpAddress;
+import mdns.Resolver;
+import mdns.appendIpCanonical;
+import mscan.Breaker;
+import mstore.MailStore;
+import tls.SharedTlsConfig;
+import tls.TlsConfig;
+
+/// The listener a connection came in on.
+public enum SmtpMode {
+    /// Port 25: mail from other servers to local recipients. No AUTH.
+    Mx,
+    /// Port 587: submission by local users, AUTH required, after STARTTLS (RFC 6409, RFC 8314).
+    Submission,
+    /// Port 465: submission over implicit TLS (RFC 8314).
+    SubmissionTls,
+}
+
+fn isSubmission(mode: SmtpMode) -> bool => match (mode) {
+    SmtpMode.Mx => false,
+    _ => true,
+};
+
+/// Settings of an SMTP server.
+@noncopy
+public struct SmtpSettings {
+    /// The name in the banner, EHLO and Received headers.
+    public hostname: String;
+    /// The largest message accepted, in bytes (advertised as SIZE).
+    public maxMessageSize: u64;
+    /// The most recipients of one message.
+    public maxRecipients: usize;
+    /// Allow AUTH without TLS (only behind a TLS-terminating proxy on a trusted network).
+    public plaintextAuth: bool;
+    /// Idle and DATA timeouts, in milliseconds (RFC 5321 §4.5.3.2 asks for 5 and 10 minutes).
+    public commandTimeout: u64;
+    public dataTimeout: u64;
+    /// SRS (see srs.cee): the secret, and the domain of rewritten addresses (this server's hostname by default). An
+    /// empty secret turns SRS off: forwarded mail keeps its original envelope sender.
+    public srsSecret: String;
+    public srsDomain: String;
+    /// The proxies (CosmoProxy, HAProxy) whose connections start with a PROXY header giving the client's address
+    /// (see proxy.cee). Empty: no proxy, and no header is read.
+    public proxyFrom: Vector<ProxyNetwork>;
+
+    public fn create(hostname: StringView) -> Result<SmtpSettings, AllocError> {
+        var name = String.create();
+        name.append(hostname)?;
+        return Ok(SmtpSettings {
+            hostname: name,
+            maxMessageSize: 50 * 1024 * 1024,
+            maxRecipients: 500,
+            plaintextAuth: false,
+            commandTimeout: 5 * 60 * 1000,
+            dataTimeout: 10 * 60 * 1000,
+            srsSecret: String.create(),
+            srsDomain: String.create(),
+            proxyFrom: Vector<ProxyNetwork>.create(),
+        });
+    }
+}
+
+/// Content scanning: ClamAV (both ports) and SpamAssassin (port 25). Either may be absent.
+@noncopy
+public struct ScanSettings {
+    public clamd: SocketAddress?;
+    public spamd: SocketAddress?;
+    public clamdTimeout: u64;
+    public spamdTimeout: u64;
+    /// Larger messages are not virus-scanned (clamd's own StreamMaxLength is 25 MB by default).
+    public maxScanSize: u64;
+    /// Larger messages are not spam-scored (as spamc's default, 512 KB: spam is small, and scoring is slow).
+    public maxSpamSize: u64;
+    /// Scores, in tenths: at `junkTenths` a message goes to Junk, at `rejectTenths` it is refused.
+    public junkTenths: i64;
+    public rejectTenths: i64;
+    /// When clamd cannot scan: false refuses for now (451, the sender retries), true accepts unscanned.
+    public acceptUnscanned: bool;
+
+    public fn create() -> ScanSettings => ScanSettings {
+        clamd: null,
+        spamd: null,
+        clamdTimeout: 30000,
+        spamdTimeout: 30000,
+        maxScanSize: 25 * 1024 * 1024,
+        maxSpamSize: 512 * 1024,
+        junkTenths: 50,
+        rejectTenths: 100,
+        acceptUnscanned: false,
+    };
+}
+
+/// Failed logins per client address: after `LIMIT` failures within `WINDOW`, the address may not try again until
+/// `BLOCK` has passed. Kept in memory, at most `CAPACITY` addresses (the oldest is forgotten first).
+const THROTTLE_LIMIT: u32 = 10;
+const THROTTLE_WINDOW: i64 = 15 * 60 * 1000;
+const THROTTLE_BLOCK: i64 = 15 * 60 * 1000;
+const THROTTLE_CAPACITY: usize = 10000;
+
+struct ThrottleEntry {
+    address: [u8; 16];
+    failures: u32;
+    windowStart: i64;
+    blockedUntil: i64;
+}
+
+@noncopy
+public struct AuthThrottle {
+    entries: AsyncMutex<Vector<ThrottleEntry>>;
+
+    public fn create() -> Result<AuthThrottle, AllocError> =>
+        Ok(AuthThrottle { entries: AsyncMutex<Vector<ThrottleEntry>>.create(Vector<ThrottleEntry>.create())? });
+
+    /// Whether `address` may try to log in now.
+    public async fn allows(borrow this, address: [u8; 16], now: i64) -> bool {
+        var guard = match (await this.entries.lock()) {
+            Ok(g) => g,
+            Err(_) => { return false; }
+        };
+        let list = guard.data();
+        for (i in 0..list.length) {
+            if (sameAddress(list[i].address, address)) {
+                return list[i].blockedUntil <= now;
+            }
+        }
+        return true;
+    }
+
+    /// Notes a failed login from `address`.
+    public async fn failed(borrow this, address: [u8; 16], now: i64) {
+        var guard = match (await this.entries.lock()) {
+            Ok(g) => g,
+            Err(_) => { return; }
+        };
+        let list = guard.data();
+        for (i in 0..list.length) {
+            if (sameAddress(list[i].address, address)) {
+                if (now - list[i].windowStart > THROTTLE_WINDOW) {
+                    list[i].windowStart = now;
+                    list[i].failures = 0;
+                }
+                list[i].failures += 1;
+                if (list[i].failures >= THROTTLE_LIMIT) {
+                    list[i].blockedUntil = now + THROTTLE_BLOCK;
+                    list[i].failures = 0;
+                    list[i].windowStart = now;
+                }
+                return;
+            }
+        }
+        if (list.length >= THROTTLE_CAPACITY) {
+            var oldest: usize = 0;
+            for (i in 1..list.length) {
+                if (list[i].windowStart < list[oldest].windowStart) {
+                    oldest = i;
+                }
+            }
+            let last = list.length - 1;
+            list.swap(oldest, last);
+            list.pop();
+        }
+        match (list.push(ThrottleEntry { address: address, failures: 1, windowStart: now, blockedUntil: 0 })) {
+            Ok() => {}
+            Err(_) => {}
+        }
+    }
+
+    /// Forgets `address`'s failures after a successful login.
+    public async fn succeeded(borrow this, address: [u8; 16]) {
+        var guard = match (await this.entries.lock()) {
+            Ok(g) => g,
+            Err(_) => { return; }
+        };
+        let list = guard.data();
+        for (i in 0..list.length) {
+            if (sameAddress(list[i].address, address)) {
+                let last = list.length - 1;
+                list.swap(i, last);
+                list.pop();
+                return;
+            }
+        }
+    }
+}
+
+/// The address the brute-force guard counts for a client: an IPv4 address as it is, an IPv6 address by its /64,
+/// since one attacker holds a whole /64 and could otherwise try 2^64 addresses.
+public fn guardAddress(peer: [u8; 16]) -> [u8; 16] {
+    let ip = IpAddress { bytes: peer };
+    if (ip.isV4()) {
+        return peer;
+    }
+    var masked = peer;
+    for (i in 8..16) {
+        masked[i] = 0;
+    }
+    return masked;
+}
+
+/// `guardAddress(peer)` as the store's key: `192.0.2.1`, or `2001:db8:1:2::/64`.
+public fn guardKey(peer: [u8; 16], out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    let address = guardAddress(peer);
+    let ip = IpAddress { bytes: address };
+    appendIpCanonical(out, ip)?;
+    if (!ip.isV4()) {
+        out.extend("/64".bytes())?;
+    }
+    return Ok();
+}
+
+fn sameAddress(a: [u8; 16], b: [u8; 16]) -> bool {
+    for (i in 0..16) {
+        if (a[i] != b[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Everything a connection needs.
+@noncopy
+public struct SmtpContext {
+    public store: MailStore;
+    public settings: SmtpSettings;
+    /// The server's TLS configuration, or `null` when TLS is not set up (then STARTTLS is not offered). Replaced
+    /// in place when the certificate is renewed: each connection takes the current one when it starts TLS.
+    private tls: SharedTlsConfig?;
+    /// The failed-login guard and the dummy hash (see login.cee).
+    public login: LoginGuard;
+    /// The resolver for SPF, DKIM and DMARC on port 25; `null` turns inbound authentication off.
+    public resolver: Resolver?;
+    public scan: ScanSettings;
+    public clamdBreaker: Breaker;
+    public spamdBreaker: Breaker;
+
+    public fn create(
+        store: MailStore,
+        settings: SmtpSettings,
+        tlsConfig: SharedTlsConfig?,
+        resolver: Resolver?,
+        scan: ScanSettings,
+    ) -> Result<SmtpContext, AllocError> {
+        return Ok(SmtpContext {
+            store: store,
+            settings: settings,
+            tls: tlsConfig,
+            resolver: resolver,
+            scan: scan,
+            clamdBreaker: Breaker.create(),
+            spamdBreaker: Breaker.create(),
+            login: LoginGuard.create()?,
+        });
+    }
+
+    /// Whether TLS is set up.
+    public fn hasTls(borrow this) -> bool => this.tls != null;
+
+    /// The TLS configuration for a connection starting TLS now.
+    public fn tlsConfig(borrow this) -> TlsConfig? {
+        match (borrow this.tls) {
+            Some(holder) => { return holder.current(); }
+            null => { return null; }
+        }
+    }
+
+    /// Makes `config` the configuration for connections starting TLS from now on (a renewed certificate).
+    /// False when TLS was not set up at start, or `config` is not a server's.
+    public fn replaceTls(borrow this, config: TlsConfig) -> bool {
+        match (borrow this.tls) {
+            Some(holder) => {
+                return match (holder.replace(config)) {
+                    Ok() => true,
+                    Err(_) => false,
+                };
+            }
+            null => { return false; }
+        }
+    }
+}

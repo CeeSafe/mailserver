@@ -1,0 +1,12 @@
+size 6783
+envelope ("Mon, 17 Mar 1997 17:17:35 -0800" "This is signed" (("Dan Hugo" NIL "dhugo" "netscape.com")) (("Dan Hugo" NIL "dhugo" "netscape.com")) (("Dan Hugo" NIL "dhugo" "netscape.com")) ((NIL NIL "jwz" "netscape.com")) NIL NIL NIL "<332DED2F.F5365D61@netscape.com>")
+bodystructure (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 42 1 NIL NIL NIL NIL) ("application" "x-pkcs7-signature" ("name" "smime.p7s") NIL NIL "base64" 5632 NIL ("attachment" ("filename" "smime.p7s")) NIL NIL) "signed" ("protocol" "application/x-pkcs7-signature" "micalg" "sha1" "boundary" "------------ms088B4AC60B9FCF022C11E60D") NIL NIL NIL)
+body (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 42 1) ("application" "x-pkcs7-signature" ("name" "smime.p7s") NIL NIL "base64" 5632) "signed")
+section HEADER 681 98cd1d65dedd52a206181829d1d38937f85673b31a6b8ccfe3e62903e72925c7
+section TEXT 6102 8de62d85aff60bd5a3412c3968399486661ac44bb9e72dd9efc9fb5d42e99db6
+section HEADER.FIELDS 309 a89741627d39978e09d9c98ee05c952635cc6ad59a8451229a8fd4fdc5bd4e34
+section HEADER.FIELDS.NOT 374 0cc9dc841fb576a8dfbee4bff39b31d7c532846f59c1787c8d6f5f46afe349f2
+section 1 42 94284b22c1d8a7c285f75ee6479a55042c77c97455c68fb2e352eb3f4c51ae7a
+section 1.MIME 79 0c7232bcecc3ffb84bb1ae647f2ba1256591d4391f0f1b8a41938a97660cddcb
+section 2 5632 cb9c80dd7e73ebbf4a0330745515ca910461acc851d9d5af345ca3348036056b
+section 2.MIME 155 3f494fd607c17db262e344f14322972ba00d06304621f71328434bf52fff5389

@@ -1,0 +1,370 @@
+// An XML document as a tape of nodes (as mhttp's JsonDocument): elements, their attributes and their text, in
+// document order, each knowing where it ends, so walking needs no tree of allocations. Names are kept as namespace
+// and local name, the prefixes resolved; strings live in one buffer.
+//
+// `parseXml` reads XML 1.0 text with namespaces (DAV, SOAP). A DOCTYPE is refused: no protocol here uses one, and
+// refusing it rules out entity expansion. The builder methods (`openElement`, `addAttribute`, `addText`,
+// `closeElement`) are public so that other encodings (ActiveSync's WBXML) decode into the same document.
+
+/// The deepest nesting accepted.
+const XML_MAX_DEPTH: usize = 128;
+
+/// Why a document was refused.
+public enum XmlError {
+    Malformed,
+    TooDeep,
+    /// A DOCTYPE: not accepted.
+    Unsupported,
+    OutOfMemory,
+}
+
+/// What a node is.
+public enum XmlKind {
+    Element,
+    Attribute,
+    Text,
+}
+
+struct XmlSpan {
+    start: usize;
+    end: usize;
+}
+
+struct XmlNode {
+    kind: XmlKind;
+    /// An index into the namespaces; 0 is no namespace.
+    space: usize;
+    name: XmlSpan;
+    /// An attribute's value or a text node's text.
+    value: XmlSpan;
+    parent: usize;
+    /// The index after this node and everything inside it.
+    next: usize;
+}
+
+fn oomXml(r: Result<void, AllocError>) -> Result<void, XmlError> => match (r) {
+    Ok() => Ok(),
+    Err(_) => Err(XmlError.OutOfMemory),
+};
+
+/// A checked XML document. Nodes are named by index; the root element is 0.
+@noncopy
+public struct XmlDocument {
+    bytes: Vector<u8>;
+    nodes: Vector<XmlNode>;
+    spaces: Vector<XmlSpan>;
+    /// The elements open while building.
+    open: Vector<usize>;
+
+    /// An empty document, to build with `openElement` and the rest.
+    public fn create() -> Result<XmlDocument, AllocError> {
+        var spaces = Vector<XmlSpan>.create();
+        spaces.push(XmlSpan { start: 0, end: 0 })?;
+        return Ok(XmlDocument {
+            bytes: Vector<u8>.create(),
+            nodes: Vector<XmlNode>.create(),
+            spaces: spaces,
+            open: Vector<usize>.create(),
+        });
+    }
+
+    fn keep(borrow mut this, text: Slice<u8>) -> Result<XmlSpan, XmlError> {
+        let start = this.bytes.length;
+        oomXml(this.bytes.extend(text))?;
+        return Ok(XmlSpan { start: start, end: this.bytes.length });
+    }
+
+    fn spaceOf(borrow mut this, uri: Slice<u8>) -> Result<usize, XmlError> {
+        if (uri.length == 0) {
+            return Ok(0);
+        }
+        for (i in 1..this.spaces.length) {
+            let s = this.spaces[i];
+            if (this.bytes[s.start..s.end] == uri) {
+                return Ok(i);
+            }
+        }
+        let span = this.keep(uri)?;
+        oomXml(this.spaces.push(span))?;
+        return Ok(this.spaces.length - 1);
+    }
+
+    fn parentNow(borrow this) -> usize => if (this.open.length > 0) this.open[this.open.length - 1] else 0;
+
+    fn addNode(borrow mut this, kind: XmlKind, space: usize, name: XmlSpan, value: XmlSpan) -> Result<usize, XmlError> {
+        let index = this.nodes.length;
+        let parent = this.parentNow();
+        oomXml(this.nodes.push(XmlNode {
+            kind: kind,
+            space: space,
+            name: name,
+            value: value,
+            parent: parent,
+            next: index + 1,
+        }))?;
+        return Ok(index);
+    }
+
+    /// Opens an element in namespace `space` (empty: none) named `local`, inside the open one.
+    public fn openElement(borrow mut this, space: Slice<u8>, local: Slice<u8>) -> Result<void, XmlError> {
+        if (this.open.length == 0 && this.nodes.length > 0) {
+            return Err(XmlError.Malformed); // a second root
+        }
+        if (this.open.length >= XML_MAX_DEPTH) {
+            return Err(XmlError.TooDeep);
+        }
+        let s = this.spaceOf(space)?;
+        let name = this.keep(local)?;
+        let index = this.addNode(XmlKind.Element, s, name, XmlSpan { start: 0, end: 0 })?;
+        oomXml(this.open.push(index))?;
+        return Ok();
+    }
+
+    /// An attribute of the element just opened (before its content).
+    public fn addAttribute(borrow mut this, space: Slice<u8>, local: Slice<u8>, value: Slice<u8>) -> Result<void, XmlError> {
+        if (this.open.length == 0) {
+            return Err(XmlError.Malformed);
+        }
+        let s = this.spaceOf(space)?;
+        let name = this.keep(local)?;
+        let v = this.keep(value)?;
+        this.addNode(XmlKind.Attribute, s, name, v)?;
+        return Ok();
+    }
+
+    /// Text in the open element; text right after text joins it.
+    public fn addText(borrow mut this, text: Slice<u8>) -> Result<void, XmlError> {
+        if (this.open.length == 0) {
+            return Err(XmlError.Malformed);
+        }
+        if (text.length == 0) {
+            return Ok();
+        }
+        let last = this.nodes.length - 1;
+        let joins = match (this.nodes[last].kind) {
+            XmlKind.Text => this.nodes[last].value.end == this.bytes.length,
+            _ => false,
+        };
+        if (joins && this.nodes[last].parent == this.parentNow()) {
+            oomXml(this.bytes.extend(text))?;
+            this.nodes[last].value.end = this.bytes.length;
+            return Ok();
+        }
+        let v = this.keep(text)?;
+        this.addNode(XmlKind.Text, 0, XmlSpan { start: 0, end: 0 }, v)?;
+        return Ok();
+    }
+
+    /// Closes the open element.
+    public fn closeElement(borrow mut this) -> Result<void, XmlError> {
+        let index = match (this.open.pop()) {
+            Some(i) => i,
+            null => { return Err(XmlError.Malformed); }
+        };
+        this.nodes[index].next = this.nodes.length;
+        return Ok();
+    }
+
+    /// Checks that the document is complete: one root element, closed.
+    public fn finish(borrow this) -> Result<void, XmlError> =>
+        if (this.open.length == 0 && this.nodes.length > 0) Ok() else Err(XmlError.Malformed);
+
+    // ── Reading ─────────────────────────────────────────────────────────
+
+    /// The root element.
+    public fn root(borrow this) -> usize => 0;
+
+    public fn kind(borrow this, node: usize) -> XmlKind => this.nodes[node].kind;
+
+    public fn isElement(borrow this, node: usize) -> bool => match (this.nodes[node].kind) {
+        XmlKind.Element => true,
+        _ => false,
+    };
+
+    /// A node's local name (an element's or attribute's).
+    public fn localName(borrow this, node: usize) -> Slice<u8> {
+        let s = this.nodes[node].name;
+        return this.bytes[s.start..s.end];
+    }
+
+    /// A node's namespace; empty when it has none.
+    public fn spaceName(borrow this, node: usize) -> Slice<u8> {
+        let s = this.spaces[this.nodes[node].space];
+        return this.bytes[s.start..s.end];
+    }
+
+    /// Whether `node` is the element `local` in namespace `space` (empty: none).
+    public fn is(borrow this, node: usize, space: StringView, local: StringView) -> bool =>
+        this.isElement(node) && this.localName(node) == local.bytes() && this.spaceName(node) == space.bytes();
+
+    /// The parent element of `node`; the root's is itself.
+    public fn parent(borrow this, node: usize) -> usize => this.nodes[node].parent;
+
+    /// The first child element of `element`.
+    public fn firstChild(borrow this, element: usize) -> usize? {
+        var at = element + 1;
+        let stop = this.nodes[element].next;
+        while (at < stop) {
+            if (this.isElement(at)) {
+                return at;
+            }
+            at = this.nodes[at].next;
+        }
+        return null;
+    }
+
+    /// The next element after `node` in the same parent.
+    public fn nextSibling(borrow this, node: usize) -> usize? {
+        if (node == 0) {
+            return null;
+        }
+        let stop = this.nodes[this.nodes[node].parent].next;
+        var at = this.nodes[node].next;
+        while (at < stop) {
+            if (this.isElement(at)) {
+                return at;
+            }
+            at = this.nodes[at].next;
+        }
+        return null;
+    }
+
+    /// The child elements of `element`, in order.
+    public fn children(borrow this, element: usize, into: borrow mut Vector<usize>) -> Result<void, AllocError> {
+        into.clear();
+        var at = this.firstChild(element);
+        loop {
+            match (at) {
+                Some(c) => {
+                    into.push(c)?;
+                    at = this.nextSibling(c);
+                }
+                null => { break; }
+            }
+        }
+        return Ok();
+    }
+
+    /// The first child element of `element` named `local` in `space`.
+    public fn child(borrow this, element: usize, space: StringView, local: StringView) -> usize? {
+        var at = this.firstChild(element);
+        loop {
+            match (at) {
+                Some(c) => {
+                    if (this.is(c, space, local)) {
+                        return c;
+                    }
+                    at = this.nextSibling(c);
+                }
+                null => { return null; }
+            }
+        }
+    }
+
+    /// The first element inside `element` (at any depth, not itself) named `local` in `space`.
+    public fn find(borrow this, element: usize, space: StringView, local: StringView) -> usize? {
+        let stop = this.nodes[element].next;
+        for (at in (element + 1)..stop) {
+            if (this.is(at, space, local)) {
+                return at;
+            }
+        }
+        return null;
+    }
+
+    /// Every element inside `element` (at any depth) named `local` in `space`, in document order.
+    public fn findAll(
+        borrow this,
+        element: usize,
+        space: StringView,
+        local: StringView,
+        into: borrow mut Vector<usize>,
+    ) -> Result<void, AllocError> {
+        into.clear();
+        let stop = this.nodes[element].next;
+        for (at in (element + 1)..stop) {
+            if (this.is(at, space, local)) {
+                into.push(at)?;
+            }
+        }
+        return Ok();
+    }
+
+    /// `element`'s attribute `local` that has no namespace (as nearly every attribute); read it with `value`.
+    public fn attribute(borrow this, element: usize, local: StringView) -> usize? {
+        var at = element + 1;
+        let stop = this.nodes[element].next;
+        while (at < stop) {
+            match (this.nodes[at].kind) {
+                XmlKind.Attribute => {}
+                _ => { return null; }
+            }
+            if (this.nodes[at].space == 0 && this.localName(at) == local.bytes()) {
+                return at;
+            }
+            at += 1;
+        }
+        return null;
+    }
+
+    /// An attribute's value, or a text node's text.
+    public fn value(borrow this, node: usize) -> Slice<u8> {
+        let v = this.nodes[node].value;
+        return this.bytes[v.start..v.end];
+    }
+
+    /// `value` as a string; empty when it is not UTF-8.
+    public fn valueText(borrow this, node: usize) -> StringView => StringView.fromUtf8(this.value(node)) ?? "";
+
+    /// Whether `element` has attribute `local` with exactly `expected` as its value.
+    public fn attributeIs(borrow this, element: usize, local: StringView, expected: StringView) -> bool => match (this.attribute(
+        element,
+        local,
+    )) {
+        Some(a) => this.value(a) == expected.bytes(),
+        null => false,
+    };
+
+    /// The text directly inside `element` (its first run of text; for a text-only element, all of it).
+    public fn text(borrow this, element: usize) -> Slice<u8> {
+        var at = element + 1;
+        let stop = this.nodes[element].next;
+        while (at < stop) {
+            match (this.nodes[at].kind) {
+                XmlKind.Text => {
+                    let v = this.nodes[at].value;
+                    return this.bytes[v.start..v.end];
+                }
+                _ => {}
+            }
+            at = this.nodes[at].next;
+        }
+        return this.bytes[0..0];
+    }
+
+    /// `text` as a string; empty when it is not UTF-8 (WBXML opaque data can be anything).
+    public fn textView(borrow this, element: usize) -> StringView => StringView.fromUtf8(this.text(element)) ?? "";
+
+    /// `text` with white space trimmed, as a string.
+    public fn trimmed(borrow this, element: usize) -> StringView => this.textView(element).trim();
+
+    /// All the text inside `element`, at any depth, in order, appended to `into`.
+    public fn allText(borrow this, element: usize, into: borrow mut Vector<u8>) -> Result<void, AllocError> {
+        let stop = this.nodes[element].next;
+        for (at in (element + 1)..stop) {
+            match (this.nodes[at].kind) {
+                XmlKind.Text => {
+                    let v = this.nodes[at].value;
+                    into.extend(this.bytes[v.start..v.end])?;
+                }
+                _ => {}
+            }
+        }
+        return Ok();
+    }
+
+    /// The index after `node` and everything inside it.
+    public fn end(borrow this, node: usize) -> usize => this.nodes[node].next;
+
+    public fn nodeCount(borrow this) -> usize => this.nodes.length;
+}

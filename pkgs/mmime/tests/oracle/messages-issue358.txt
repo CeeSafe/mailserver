@@ -1,0 +1,12 @@
+size 7793
+envelope ("Wed, 15 Nov 2017 14:16:14 +0000" "R: R: R: I: FR-selca LA selcaE" ((NIL NIL "jang.abcdef" "xyzlinu")) ((NIL NIL "jang.abcdef" "xyzlinu")) ((NIL NIL "jang.abcdef" "xyzlinu")) (("jang12@linux12.org.new" NIL "jang12" "linux12.org.new")) NIL NIL "<5185e377-81c5-4361-91ba-11d42f4c5cc9@AM5EUR02FT056.eop-EUR02.prod.protection.outlook.com>" "<AM4PR01MB1444B3F21AE7DA9C8128C28FF7290@AM4PR01MB1444.eurprd01.prod.exchangelabs.com>")
+bodystructure (("text" "plain" ("charset" "iso-8859-1") NIL NIL "quoted-printable" 16 2 NIL NIL NIL NIL) ("text" "html" ("charset" "iso-8859-1") NIL NIL "quoted-printable" 494 12 NIL NIL NIL NIL) "alternative" ("boundary" "----=_NextPart_000_0031_01D36222.8A648550") NIL ("it-IT") NIL)
+body (("text" "plain" ("charset" "iso-8859-1") NIL NIL "quoted-printable" 16 2) ("text" "html" ("charset" "iso-8859-1") NIL NIL "quoted-printable" 494 12) "alternative")
+section HEADER 6899 1e008015cf3e44fa59f8b6eb25b49f931039a5eb121d9c483461d5a3a62116d8
+section TEXT 894 4242b39952eab52df46613cd92faf37e8f8e9219142a725f994ada143f92f0a0
+section HEADER.FIELDS 390 0f03ea4cd659e95eb6526bab55dcde32db01f9973151094fc6714ec4238a2950
+section HEADER.FIELDS.NOT 6511 e150bdfe7311d8b79eb1a428689efed7848e55a4d411a16d03c45b54c110be8e
+section 1 16 738221e0b29976802f29698bf94afe9e81b02a8ed987984f35c8caa2a308dfbf
+section 1.MIME 97 45a4994b6d5b21519aceb7afea3a53810456bb583774f4cf0d926a9bbf4fb508
+section 2 494 d2432eacbd5e568a2a34c4a5e7863025e6202e64bca4aab51524b199fa8c9277
+section 2.MIME 96 ce61f4b261703138460b26fe657541ce1f74aeb9fcd6180f1a95e7e945b5b865

@@ -1,0 +1,12 @@
+size 48878
+envelope ("Tue, 25 Apr 95 15:09:57 est" "Car for Sale, 1994 626 LX (NY) - 626lx.jpg [1/1]" (("B Sudesh Tiwari" NIL "bst1" "cornell.edu")) (("Verified" NIL "bst1" "cornell.edu")) (("B Sudesh Tiwari" NIL "bst1" "cornell.edu")) NIL NIL NIL NIL "<3njhl5$f8e@newsstand.cit.cornell.edu>")
+bodystructure (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 668 18 NIL NIL NIL NIL) ("Image" "JPEG" NIL NIL NIL "Base64" 47214 NIL NIL NIL NIL) "mixed" ("Boundary" "*-*-*- Next Section -*-*-*") NIL NIL NIL)
+body (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 668 18) ("Image" "JPEG" NIL NIL NIL "Base64" 47214) "mixed")
+section HEADER 835 57a8a51112ef727a3c2a90831afda3ed82c2ce67669165ed3f5b6d2e0cf6c659
+section TEXT 48043 1f1053444c463d6070a9259af8b9e6391f6199b5746b222d7c7e120266879559
+section HEADER.FIELDS 266 fed406b30d6ee5372d3bde4af54720436dde2d5aa9fa3bfa696f49e49437c2f4
+section HEADER.FIELDS.NOT 571 30760c9c77907c52278c439e6153ae0cdc47cc1ed46afd7599baa624e0848b25
+section 1 668 85bd9be68c8dfa0b43c8ac48eca4f25234465c7401793fed4608fc0f90d47f87
+section 1.MIME 2 7eb70257593da06f682a3ddda54a9d260d4fc514f645237f5ca74b08f8da61a6
+section 2 47214 59af6a3041032e47c7e924a659ff7f86e86aaeef6826e1475bd80bd8cb940d36
+section 2.MIME 63 b9560a8d015a213e16031981743ae8b31745e5b5b3f448cd5456432a121077c8

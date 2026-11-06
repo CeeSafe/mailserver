@@ -1,0 +1,266 @@
+// Delivery through a user's Sieve script (msieve): its actions become the message's mailboxes and flags, redirects
+// join the outbound queue, and vacation replies go once the message is stored.
+
+import msieve.ACTION_FILEINTO;
+import msieve.ACTION_KEEP;
+import msieve.ACTION_REDIRECT;
+import msieve.ACTION_VACATION;
+import msieve.Script;
+import msieve.SieveAction;
+import msieve.SieveMessage;
+import msieve.SieveResult;
+import msieve.buildVacation;
+import msieve.parseScript;
+import msieve.runScript;
+import msieve.vacationAllowed;
+import mstore.BlobWriter;
+import mstore.Delivered;
+import mstore.Delivery;
+import mstore.FLAG_ANSWERED;
+import mstore.FLAG_DELETED;
+import mstore.FLAG_DRAFT;
+import mstore.FLAG_FLAGGED;
+import mstore.FLAG_SEEN;
+import mstore.MailboxList;
+import mstore.Outbound;
+import mstore.StoreError;
+import encoding.Hex;
+
+/// A vacation reply to send once the message is stored.
+@noncopy
+struct PendingReply {
+    userId: i64;
+    user: String;
+    action: SieveAction;
+}
+
+fn oom<T>(r: Result<T, AllocError>) -> Result<T, StoreError> => match (r) {
+    Ok(v) => Ok(v),
+    Err(_) => Err(StoreError.OutOfMemory),
+};
+
+/// The system flags and keywords of a space-separated flag list.
+fn applyFlags(flags: StringView, d: borrow mut Delivery) -> Result<void, AllocError> {
+    let b = flags.bytes();
+    var at: usize = 0;
+    while (at < b.length) {
+        var end = at;
+        while (end < b.length && b[end] != 0x20) {
+            end += 1;
+        }
+        let flag = b[at..end];
+        at = end + 1;
+        if (flag.length == 0) {
+            continue;
+        }
+        if (flag.equalsIgnoreAsciiCase("\\seen".bytes())) {
+            d.flags = d.flags | FLAG_SEEN;
+        } else if (flag.equalsIgnoreAsciiCase("\\answered".bytes())) {
+            d.flags = d.flags | FLAG_ANSWERED;
+        } else if (flag.equalsIgnoreAsciiCase("\\flagged".bytes())) {
+            d.flags = d.flags | FLAG_FLAGGED;
+        } else if (flag.equalsIgnoreAsciiCase("\\deleted".bytes())) {
+            d.flags = d.flags | FLAG_DELETED;
+        } else if (flag.equalsIgnoreAsciiCase("\\draft".bytes())) {
+            d.flags = d.flags | FLAG_DRAFT;
+        } else if (flag[0] != 0x5c && isAtom(flag)) {
+            // A keyword (RFC 3501 atom); other system-looking flags are dropped.
+            if (d.keywords.length > 0) {
+                d.keywords.append(" ")?;
+            }
+            d.keywords.append(StringView.fromUtf8(flag)!)?;
+        }
+    }
+    return Ok();
+}
+
+fn isAtom(flag: Slice<u8>) -> bool {
+    for (c in flag) {
+        if (c <= 0x20 || c >= 0x7f || c == 0x28 || c == 0x29 || c == 0x7b || c == 0x25 || c == 0x2a || c == 0x22 ||
+            c == 0x5c || c == 0x5d) {
+            return false;
+        }
+    }
+    return flag.length > 0;
+}
+
+/// Adds a copy into `mailboxId` for `userId`, unless one is already there (then their flags merge).
+fn addTarget(
+    targets: borrow mut Vector<Delivery>,
+    userId: i64,
+    mailboxId: i64,
+    now: i64,
+    flags: StringView,
+    meta: Slice<u8>,
+) -> Result<void, AllocError> {
+    for (i in 0..targets.length) {
+        if (targets[i].userId == userId && targets[i].mailboxId == mailboxId) {
+            return applyFlags(flags, mut targets[i]);
+        }
+    }
+    var d = Delivery.to(userId, mailboxId, now);
+    applyFlags(flags, mut d)?;
+    d.meta.extend(meta)?;
+    return targets.push(d);
+}
+
+/// Runs `script` for one local recipient and adds what it asks for: mailboxes to `targets`, redirects to
+/// `outbound`, vacation replies to `replies`. A script that does not compile, or fails as it runs, keeps the message
+/// in the INBOX (RFC 5228 §2.10.6). Gives the problem, if there was one, in `problem`.
+async fn sieveTargets(
+    ctx: borrow SmtpContext,
+    sender: Slice<u8>,
+    local: borrow LocalTarget,
+    header: Slice<u8>,
+    size: u64,
+    meta: Slice<u8>,
+    now: i64,
+    targets: borrow mut Vector<Delivery>,
+    outbound: borrow mut Outbound,
+    replies: borrow mut Vector<PendingReply>,
+    problem: borrow mut String,
+) -> Result<void, StoreError> {
+    var script = Script.create();
+    var result = SieveResult.create();
+    if (oom(parseScript(local.script.view().bytes(), mut script))?) {
+        let message = SieveMessage {
+            header: header,
+            envelopeFrom: sender,
+            envelopeTo: local.rcpt.view(),
+            size: size,
+        };
+        oom(runScript(script, message, mut result))?;
+        if (result.error.length > 0) {
+            oom(problem.append(result.error.view()))?;
+        }
+    } else {
+        oom(problem.append(script.error.view()))?;
+    }
+    var mailboxes = MailboxList.create();
+    for (i in 0..result.actions.length) {
+        let a = borrow result.actions[i];
+        if (a.kind == ACTION_KEEP || a.kind == ACTION_FILEINTO) {
+            var mailbox = local.mailboxId;
+            if (a.kind == ACTION_FILEINTO && a.target.view() != "INBOX") {
+                // A mailbox that does not exist: the INBOX, as Pigeonhole without :create.
+                if (await ctx.store.findMailbox(local.userId, a.target.view(), mut mailboxes)?) {
+                    mailbox = mailboxes.id(0);
+                } else if (problem.length == 0) {
+                    oom(problem.append("no such mailbox, kept in INBOX"))?;
+                }
+            }
+            oom(addTarget(targets, local.userId, mailbox, now, a.flags.view(), meta))?;
+        } else if (a.kind == ACTION_REDIRECT) {
+            var known = false;
+            for (k in 0..outbound.recipients.length) {
+                if (outbound.recipients[k].view().equalsIgnoreAsciiCase(a.target.view())) {
+                    known = true;
+                }
+            }
+            if (!known) {
+                var r = String.create();
+                oom(r.append(a.target.view()))?;
+                oom(outbound.recipients.push(r))?;
+            }
+        } else if (a.kind == ACTION_VACATION) {
+            if (oom(vacationAllowed(header, sender, local.email.view().bytes(), a))?) {
+                var user = String.create();
+                oom(user.append(local.email.view()))?;
+                let action = oom(cloneAction(a))?;
+                oom(replies.push(PendingReply { userId: local.userId, user: user, action: action }))?;
+            }
+        }
+    }
+    if (result.implicitKeep) {
+        oom(addTarget(targets, local.userId, local.mailboxId, now, result.implicitFlags.view(), meta))?;
+    }
+    return Ok();
+}
+
+fn cloneAction(a: borrow SieveAction) -> Result<SieveAction, AllocError> {
+    var c = SieveAction {
+        kind: a.kind,
+        target: String.create(),
+        flags: String.create(),
+        days: a.days,
+        subject: String.create(),
+        from: String.create(),
+        reason: String.create(),
+        handle: String.create(),
+        addresses: String.create(),
+        mime: a.mime,
+    };
+    c.subject.append(a.subject.view())?;
+    c.from.append(a.from.view())?;
+    c.reason.append(a.reason.view())?;
+    c.handle.append(a.handle.view())?;
+    c.addresses.append(a.addresses.view())?;
+    return Ok(c);
+}
+
+/// Sends the vacation replies due: each is noted in the store first (so two deliveries at once send one), then
+/// written as its own message and queued from the null sender. Failures are logged and otherwise ignored: the
+/// message itself is already stored.
+async fn sendVacations(
+    ctx: borrow SmtpContext,
+    sender: Slice<u8>,
+    header: Slice<u8>,
+    replies: borrow Vector<PendingReply>,
+) -> Result<usize, StoreError> {
+    var lowered = Vector<u8>.create();
+    for (c in sender) {
+        oom(lowered.push(if (c >= 0x41 && c <= 0x5a) c + 0x20 else c))?;
+    }
+    let senderText = match (StringView.fromUtf8(lowered.view())) {
+        Some(t) => t,
+        null => { return Ok(0); }
+    };
+    var sent: usize = 0;
+    for (i in 0..replies.length) {
+        let r = borrow replies[i];
+        if (!await ctx.store.vacationDue(r.userId, senderText, r.action.handle.view(), r.action.days)?) {
+            continue;
+        }
+        var date = Vector<u8>.create();
+        oom(appendDate(mut date, Clock.unixMillis() / 1000))?;
+        var random = [0u8; 12];
+        match (Random.fill(mut random[..])) {
+            Ok() => {}
+            Err(_) => {}
+        }
+        var messageId = Vector<u8>.create();
+        oom(messageId.push(0x3c))?;
+        oom(Hex.encode(random[..], mut messageId))?;
+        oom(messageId.push(0x40))?;
+        oom(messageId.extend(ctx.settings.hostname.view().bytes()))?;
+        oom(messageId.push(0x3e))?;
+        var reply = Vector<u8>.create();
+        oom(
+            buildVacation(r.action, header, sender, r.user.view().bytes(), date.view(), messageId.view(), mut reply),
+        )?;
+        let blobs = ctx.store.blobs();
+        var w = await Async.blocking(() => blobs.begin())?;
+        let bytes = reply.view();
+        let wrote: Result<void, StoreError> = await Async.blocking(() => {
+            w.write(bytes)?;
+            return w.finish();
+        });
+        match (wrote) {
+            Ok() => {}
+            Err(e) => {
+                await Async.blocking(() => w.discard());
+                return Err(e);
+            }
+        }
+        var outbound = Outbound.create();
+        var to = String.create();
+        oom(to.append(senderText))?;
+        oom(outbound.recipients.push(to))?;
+        outbound.userId = r.userId;
+        let none = Vector<Delivery>.create();
+        var done = Vector<Delivered>.create();
+        await ctx.store.accept(mut w, none, outbound, mut done)?;
+        sent += 1;
+    }
+    return Ok(sent);
+}

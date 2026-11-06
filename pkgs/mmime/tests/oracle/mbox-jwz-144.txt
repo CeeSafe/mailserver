@@ -1,0 +1,14 @@
+size 32165
+envelope ("Sat, 13 Jun 92 08:53:19 JST" "Re: MIME & int'l mail" (("Yutaka Sato =?ISO-2022-JP?B?GyRAOjRGI0stGyhK?=" NIL "ysato" "etl.go.jp")) (("Yutaka Sato =?ISO-2022-JP?B?GyRAOjRGI0stGyhK?=" NIL "ysato" "etl.go.jp")) (("Yutaka Sato =?ISO-2022-JP?B?GyRAOjRGI0stGyhK?=" NIL "ysato" "etl.go.jp")) ((NIL NIL "nsb" "thumper.bellcore.com")) (("Ned Freed" NIL "ned" "innosoft.com") ("Yutaka Sato =?ISO-2022-JP?B?GyRAOjRGI0stGyhK?=" NIL "ysato" "etl.go.jp")) NIL NIL "<gEJO+.ysato@etl.go.jp>")
+bodystructure (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 341 8 NIL NIL NIL NIL) ("image" "gif" NIL NIL NIL "base64" 30390 NIL NIL NIL NIL) ("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 181 9 NIL NIL NIL NIL) "mixed" ("boundary" "=(+_+)=") NIL NIL NIL)
+body (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 341 8) ("image" "gif" NIL NIL NIL "base64" 30390) ("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 181 9) "mixed")
+section HEADER 1135 f2d5571f6acbf6744b01ec9c1238d41301d28b59c26c21a397b8a47b84c86b22
+section TEXT 31030 8b73c63848d340da2411d2b5c6accd189ef0536d83da77e7932d4a965a9b9b89
+section HEADER.FIELDS 369 52903715754d71326dfab19c9e33b89d6e195f937e7bb0c0851c6e36953793d4
+section HEADER.FIELDS.NOT 768 460dbaa1429a5c68f790fc0bd34d6c0c14d0167faa4540fe31c97ab343d1afc5
+section 1 341 745f41730cce998a5b9e1eac19119b14087d1eaac014a8e693704e7606a2ca41
+section 1.MIME 2 7eb70257593da06f682a3ddda54a9d260d4fc514f645237f5ca74b08f8da61a6
+section 2 30390 61503941a7fb93e349d9ec310dac157911dc4816282b94750316c94a8cf3a38b
+section 2.MIME 62 651c2a4624c769411dab87e9700a5b009aa02afb2a7700436ebf501e97bc1a23
+section 3 181 eefe981f922d6c627da5058c18b6b4beedbe0cb8cafd0649be87355ddd099841
+section 3.MIME 2 7eb70257593da06f682a3ddda54a9d260d4fc514f645237f5ca74b08f8da61a6

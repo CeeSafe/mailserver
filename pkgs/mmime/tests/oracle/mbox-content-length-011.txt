@@ -1,0 +1,10 @@
+size 2867
+envelope ("Fri, 13 Dec 1996 15:09:42 -0800" "Re: can you send me an encrypted message?" (("Blake Ramsdell" NIL "blaker" "craswell.com")) (("Blake Ramsdell" NIL "blaker" "craswell.com")) (("Blake Ramsdell" NIL "blaker" "craswell.com")) (("Jamie Zawinski" NIL "jwz" "netscape.com")) NIL NIL NIL "<3.0.32.19961213150855.009172e0@mail.craswell.com>")
+bodystructure ("application" "x-pkcs7-mime" ("name" "smime.p7m") NIL NIL "base64" 1452 NIL ("attachment" ("filename" "smime.p7m")) NIL NIL)
+body ("application" "x-pkcs7-mime" ("name" "smime.p7m") NIL NIL "base64" 1452)
+section HEADER 1415 492fe75141aa578457f6303ac19262ac8e150929cdd9c7166d0c191d9617c94e
+section TEXT 1452 a7e7aaf95782dc1fae6ac1459a0ad873d0e80f9e2d71ee9a160c11657a785337
+section HEADER.FIELDS 300 ac0cb98bca68a1d26acd8aee68df63860c85afcce954ba30042ed180f899e724
+section HEADER.FIELDS.NOT 1117 1cad2180e5c63ba3f7b1cf3c72f18193aec4a0ea7eabd2a2afacb4b3561a511a
+section 1 1452 a7e7aaf95782dc1fae6ac1459a0ad873d0e80f9e2d71ee9a160c11657a785337
+section 1.MIME 1415 492fe75141aa578457f6303ac19262ac8e150929cdd9c7166d0c191d9617c94e

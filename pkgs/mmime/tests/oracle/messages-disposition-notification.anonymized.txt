@@ -1,0 +1,20 @@
+size 1439
+envelope ("Wed, 20 Sep 1995 00:19:00 (EDT) -0400" "xxxxxxxxxxx xxxxxxxxxxxx" (("xxx xxxxxxxxx" NIL "xxxxxxxxxxxxx" "xxxxxxx.xxx")) (("xxx xxxxxxxxx" NIL "xxxxxxxxxxxxx" "xxxxxxx.xxx")) (("xxx xxxxxxxxx" NIL "xxxxxxxxxxxxx" "xxxxxxx.xxx")) (("xxxx xxxxxx" NIL "xxxxxxxxxxx" "xxxxxxx.xxx")) NIL NIL NIL "<xxxxxxxxxxxx.xxxxx@xxxxxxx.xxx>")
+bodystructure (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 230 4 NIL NIL NIL NIL) ("message" "disposition-notification" NIL NIL NIL "7bit" 269 NIL NIL NIL NIL) ("message" "rfc822" NIL NIL NIL "7bit" 358 ("Tue, 19 Sep 1995 13:30:00 (EDT) -0400" "xxxxx xxxxx xx xxxxxx" (("xxxx xxxxxx" NIL "xxxxxxxxxxx" "xxxxxxx.xxx")) (("xxxx xxxxxx" NIL "xxxxxxxxxxx" "xxxxxxx.xxx")) (("xxxx xxxxxx" NIL "xxxxxxxxxxx" "xxxxxxx.xxx")) (("xxx xxxxxxxxx" NIL "xxxxxxxxxxxxx" "xxxxxxx.xxx")) NIL NIL NIL "<xxxxxxxxxxxx.xxxxx@xxxxxxx.xxx>") ("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 96 5 NIL NIL NIL NIL) 13 NIL NIL NIL NIL) "report" ("report-type" "xxxxxxxxxxxxxxxxxxxxxxxx" "boundary" "RAA14128.773615765/example.com") NIL NIL NIL)
+body (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 230 4) ("message" "disposition-notification" NIL NIL NIL "7bit" 269) ("message" "rfc822" NIL NIL NIL "7bit" 358 ("Tue, 19 Sep 1995 13:30:00 (EDT) -0400" "xxxxx xxxxx xx xxxxxx" (("xxxx xxxxxx" NIL "xxxxxxxxxxx" "xxxxxxx.xxx")) (("xxxx xxxxxx" NIL "xxxxxxxxxxx" "xxxxxxx.xxx")) (("xxxx xxxxxx" NIL "xxxxxxxxxxx" "xxxxxxx.xxx")) (("xxx xxxxxxxxx" NIL "xxxxxxxxxxxxx" "xxxxxxx.xxx")) NIL NIL NIL "<xxxxxxxxxxxx.xxxxx@xxxxxxx.xxx>") ("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 96 5) 13) "report")
+section HEADER 354 cd72808e5d19311fd6a63f9432f8b2abea2083012ab32c839b99ebff7a277d8c
+section TEXT 1085 ce07352391629025bfc63b6cf688f45663f691754409e1e7fd14f1a857da18ee
+section HEADER.FIELDS 335 9f6c360b13dfae3cf801e499c7597ced0f66b55404d3bf08824c7ab04721e6e5
+section HEADER.FIELDS.NOT 21 07a26ab8981ff3b1de28da29cf47f47e315b9c25685121dc5ebb60391005b2de
+section 1 230 70e91b68d8a5a747cc34dd7c034371a28d55995a8c42f023cb849a97e2a58172
+section 1.MIME 2 7eb70257593da06f682a3ddda54a9d260d4fc514f645237f5ca74b08f8da61a6
+section 2 269 4cfe295332afdf843153d54d639810a537172a0601411d595f68839bafb31f5f
+section 2.MIME 50 be90df866f3dd9474ee99af1630a6691a249b4fffbdb65f0e9380157032cdd90
+section 3 358 c929798e5e597d5673d51d6bea42de1bfde33b5aa46534916188fe572787cfe1
+section 3.MIME 32 031bec329191d10a9cfd7c87f7463862064d3770325b672c16b3abc1b8e4f167
+section 3.HEADER 262 87c81322118ff95e3cc69527d0cfef5d0cb71de38f0b0ce48661733d11a9b01d
+section 3.TEXT 96 cd57aa8f6a439e427659af407d334a4c2937a51ca7299d9cff63238ea1b955f3
+section 3.HEADER.FIELDS 243 37b8be41c1f51f29a444133b838dd6e49f298ec9c3da90976c1d2529996421cf
+section 3.HEADER.FIELDS.NOT 21 07a26ab8981ff3b1de28da29cf47f47e315b9c25685121dc5ebb60391005b2de
+section 3.1 96 cd57aa8f6a439e427659af407d334a4c2937a51ca7299d9cff63238ea1b955f3
+section 3.1.MIME 262 87c81322118ff95e3cc69527d0cfef5d0cb71de38f0b0ce48661733d11a9b01d

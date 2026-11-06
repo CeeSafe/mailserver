@@ -1,0 +1,26 @@
+size 10349
+envelope ("Mon, 12 May 1997 22:46:45 -0700 (PDT)" "Re: [Fwd: the one true mail client?]" (("Jason Lawrence Weisberger" NIL "jweis" "why.bother.com")) (("Jason Lawrence Weisberger" NIL "jweis" "why.bother.com")) (("Jason Lawrence Weisberger" NIL "jweis" "why.bother.com")) (("Bob Lord" NIL "lord" "netscape.com")) NIL NIL "<3377D934.E7717CD0@netscape.com>" "<Pine.LNX.3.95.970512224621.25674T-311000@why.bother.com>")
+bodystructure (("TEXT" "PLAIN" ("charset" "US-ASCII") NIL NIL "7bit" 107 6 NIL NIL NIL NIL) (("TEXT" "PLAIN" ("CHARSET" "us-ascii") "<Pine.LNX.3.95.970512224621.25674W@why.bother.com>" NIL "7bit" 95 4 NIL NIL NIL NIL) ("message" "rfc822" NIL "<Pine.LNX.3.95.970512224621.25674X@why.bother.com>" NIL "7bit" 1406 ("Mon, 12 May 1997 18:52:22 -0700 (PDT)" "Re: the one true mail client?" (("Noah Friedman" NIL "friedman" "netscape.com")) (("Noah Friedman" NIL "friedman" "netscape.com")) ((NIL NIL "friedman" "netscape.com")) ((NIL NIL "lord" "netscape.com")) NIL NIL "<lord@netscape.com> Mon, 12 May 1997 18:49:12 -0700" "<199705130152.SAA20422@oink.mcom.com>") ("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 210 5 NIL NIL NIL NIL) 34 NIL NIL NIL NIL) ("TEXT" "X-VCARD" ("CHARSET" "us-ascii" "NAME" "vcard.vcf") "<Pine.LNX.3.95.970512224621.25674Y@why.bother.com>" "Card for Bob Lord" "7bit" 490 11 NIL NIL NIL NIL) "MIXED" ("BOUNDARY" "------------17C9EB5ADCB1A825510CE07C") NIL NIL NIL) ("APPLICATION" "X-PKCS7-SIGNATURE" ("NAME" "smime.p7s") "<Pine.LNX.3.95.970512224621.25674Z@why.bother.com>" "S/MIME Cryptographic Signature" "BASE64" 5294 NIL NIL NIL NIL) "SIGNED" ("PROTOCOL" "application/x-pkcs7-signature" "MICALG" "sha1" "BOUNDARY" "------------ms7014A498B2DAEA7AB832BC0A") NIL NIL NIL)
+body (("TEXT" "PLAIN" ("charset" "US-ASCII") NIL NIL "7bit" 107 6) (("TEXT" "PLAIN" ("CHARSET" "us-ascii") "<Pine.LNX.3.95.970512224621.25674W@why.bother.com>" NIL "7bit" 95 4) ("message" "rfc822" NIL "<Pine.LNX.3.95.970512224621.25674X@why.bother.com>" NIL "7bit" 1406 ("Mon, 12 May 1997 18:52:22 -0700 (PDT)" "Re: the one true mail client?" (("Noah Friedman" NIL "friedman" "netscape.com")) (("Noah Friedman" NIL "friedman" "netscape.com")) ((NIL NIL "friedman" "netscape.com")) ((NIL NIL "lord" "netscape.com")) NIL NIL "<lord@netscape.com> Mon, 12 May 1997 18:49:12 -0700" "<199705130152.SAA20422@oink.mcom.com>") ("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 210 5) 34) ("TEXT" "X-VCARD" ("CHARSET" "us-ascii" "NAME" "vcard.vcf") "<Pine.LNX.3.95.970512224621.25674Y@why.bother.com>" "Card for Bob Lord" "7bit" 490 11) "MIXED") ("APPLICATION" "X-PKCS7-SIGNATURE" ("NAME" "smime.p7s") "<Pine.LNX.3.95.970512224621.25674Z@why.bother.com>" "S/MIME Cryptographic Signature" "BASE64" 5294) "SIGNED")
+section HEADER 1367 afb22aed53fb89827730a46c55c688e500d75680166eafb5a9c26d2a11d60bda
+section TEXT 8982 cebbdeb8ad6fa50d36dd975747f88eb6c7090070269da0aab4697f17c982ed63
+section HEADER.FIELDS 391 99edee9f12e6b1375cfc88a48581bafd124273c5548da10c33dd8d24c6603eac
+section HEADER.FIELDS.NOT 978 8ae92346e5de4fd1924640f5676641d3afe394b91a1b40736b70ac294eb2a776
+section 1 107 57a80c03c8f5e0443380fefb8cfa02e0e8a03a841eb2c2c4e2aa7241b7919260
+section 1.MIME 46 e0917e11d2e8bcd58d80ba1e647a49f0dbbf197d378a0dac0834b429bc70a802
+section 2 2755 5cab3156621321d057ad282548aeeb13c0da8446dd669a005356a016a877ab34
+section 2.MIME 167 78a5f9e1fadc1aa8fa29cfec3a0a34cde95a7cd845325e808a22fa0e790e9c23
+section 2.1 95 1749370a163659f645ab1085d0608c37accb138c5ef7c0d91c3cafa55c06f617
+section 2.1.MIME 110 85ca5eaac76e620133011779005666954b7c2a0b93e44978d9f9d9b0e19d4edd
+section 2.2 1406 d65f49d58852c8ecc083f0d6166f1a7cfe12a8059cfeb4bbd8b1728ce71b218b
+section 2.2.MIME 96 b39fe6e54f02e51a66e3d74f23bc204b7fb74eee9faea9821ea1fd2635342bf7
+section 2.2.HEADER 1196 5cdc9b30838f75c1e59cd01cfa77ba7524321ff43a564b4ba7cd871c07e0c893
+section 2.2.TEXT 210 1ee80e39136664227a428741c33ad73f993fbad38149c300ee4af8593565dbcc
+section 2.2.HEADER.FIELDS 250 aa43b0af9bfd1771333f8ca9e86705cb38f35df7df4e5516b99a8cadb5095cad
+section 2.2.HEADER.FIELDS.NOT 948 bf7f4ced8ff956fdd46838f50b3c6c6496e045c2c4f5eb1a1c2e0179b844844d
+section 2.2.1 210 1ee80e39136664227a428741c33ad73f993fbad38149c300ee4af8593565dbcc
+section 2.2.1.MIME 1196 5cdc9b30838f75c1e59cd01cfa77ba7524321ff43a564b4ba7cd871c07e0c893
+section 2.3 490 9f135d8b58729e2ae9fa9fe73d0e1f490257b0d46b3eaa85ccd7869b8cef0df4
+section 2.3.MIME 170 5953b2856f69af0b43d919f4cb903ed02e3c09c155fee9902a461052b4926a4d
+section 3 5294 9dc604560e1e694c8e9073f7169a02b32b44ad99646fde7df3cf034be6962c11
+section 3.MIME 217 a234c1d3fd0848980bc55fddc8708cf10d31fcd21918367d085d01cde05ed6f3

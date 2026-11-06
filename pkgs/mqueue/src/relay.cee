@@ -1,0 +1,856 @@
+// The relay workers: each claims a due queue row, delivers it (local recipients into their INBOX, remote ones
+// through their MX hosts, one transaction per domain), bounces what failed for good, and settles the row: dropped
+// when done, else put off by the retry schedule until the message is too old, when the rest bounce too.
+
+import diskio.FileError;
+import diskio.RawFile;
+import encoding.Hex;
+import mauth.DkimSigner;
+import mdns.Resolver;
+import msmtp.ClientSettings;
+import msmtp.HOST_DONE;
+import msmtp.HOST_TLS_FAILED;
+import msmtp.HOST_TLS_POLICY;
+import msmtp.HOST_UNUSABLE;
+import msmtp.HostResult;
+import msmtp.Message;
+import msmtp.OUTCOME_DELIVERED;
+import msmtp.OUTCOME_PERMANENT;
+import msmtp.OUTCOME_TRANSIENT;
+import msmtp.RecipientResult;
+import msmtp.appendDate;
+import msmtp.SESSION_REUSABLE;
+import msmtp.SESSION_STALE;
+import msmtp.SmtpSession;
+import msmtp.TLS_DANE;
+import msmtp.TLS_NONE;
+import msmtp.TLS_OPPORTUNISTIC;
+import msmtp.TLS_VERIFIED;
+import msmtp.closeSession;
+import msmtp.openSession;
+import msmtp.transact;
+import mstore.BlobWriter;
+import mstore.Delivered;
+import mstore.Delivery;
+import mstore.MailStore;
+import mstore.Outbound;
+import mstore.QueueItem;
+import mstore.Recipient;
+import mstore.StoreError;
+import mstore.StoreErrors;
+import pkey.PrivateKey;
+import tls.TlsConfig;
+import tls.TlsError;
+
+/// The relay's settings.
+@noncopy
+public struct RelaySettings {
+    /// The SMTP client's settings; its `helo` is also the name bounces come from.
+    public client: ClientSettings;
+    /// The port MX hosts listen on: 25 (another only for tests).
+    public port: u16;
+    /// Seconds to wait after the first, second, … failed attempt; the last repeats.
+    public retryDelays: Vector<i64>;
+    /// After this many seconds in the queue, what is left bounces (RFC 5321 §4.5.4.1 suggests 4 to 5 days).
+    public maxAge: i64;
+    /// How long a claim lasts: longer than any one delivery can take.
+    public claimSeconds: i64;
+    /// How long an idle worker waits before looking at the queue again, in milliseconds.
+    public idleMs: u64;
+    /// STARTTLS when the server offers it (opportunistic: the certificate is not checked, RFC 7435).
+    public startTls: bool;
+    /// What TLS recipient domains get (a TLS_POLICY_ constant, tlspolicy.cee): `published` by default, which honours
+    /// DANE and MTA-STS.
+    public tlsPolicy: u8;
+    /// Roots trusted for checked certificates besides the system's (PEM): a private CA, or tests'.
+    public tlsTrustPem: Vector<u8>;
+    /// The port MTA-STS policies are fetched from: 443 (another only for tests).
+    public stsPort: u16;
+    /// After this many seconds undelivered, the sender is told once that the message is delayed (0: never).
+    public delayNotice: i64;
+    /// How long an address that does not exist (a 5.1.x failure) is suppressed, in days (0: not at all).
+    public suppressDays: i64;
+    /// A domain whose MX hosts were all unusable this many times in a row is not tried for a while.
+    public breakerThreshold: u32;
+    /// How long, in seconds: this at first, doubling each time it trips again, up to `breakerMax`.
+    public breakerBase: i64;
+    public breakerMax: i64;
+    /// Idle sessions kept for reuse (0: none, a connection per message), how long one may idle (milliseconds),
+    /// and how many messages one carries before it is closed.
+    public poolSize: usize;
+    public poolIdleMs: i64;
+    public poolMaxUses: u32;
+
+    public fn create(hostname: StringView) -> Result<RelaySettings, AllocError> {
+        var delays = Vector<i64>.create();
+        // As the C# server's QueueService: 5 and 15 minutes, half an hour, then 1, 2, 4, 8, 16 and 24 hours.
+        let schedule = [300i64, 900, 1800, 3600, 7200, 14400, 28800, 57600, 86400];
+        for (d in schedule) {
+            delays.push(d)?;
+        }
+        return Ok(RelaySettings {
+            client: ClientSettings.create(hostname)?,
+            port: 25,
+            retryDelays: delays,
+            maxAge: 5 * 86400,
+            claimSeconds: 30 * 60,
+            idleMs: 2000,
+            startTls: true,
+            tlsPolicy: TLS_POLICY_PUBLISHED,
+            tlsTrustPem: Vector<u8>.create(),
+            stsPort: 443,
+            delayNotice: 4 * 3600,
+            suppressDays: 30,
+            breakerThreshold: 3,
+            breakerBase: 60,
+            breakerMax: 3600,
+            poolSize: 64,
+            poolIdleMs: 60 * 1000,
+            poolMaxUses: 100,
+        });
+    }
+}
+
+/// What the workers share.
+@noncopy
+public struct Relay {
+    public settings: RelaySettings;
+    resolver: Resolver;
+    /// For opportunistic and unauthenticated TLS: no certificate checks.
+    tlsConfig: TlsConfig;
+    /// For TLS_VERIFIED and policy fetches: the system's roots and `settings.tlsTrustPem`, and the host name.
+    verifiedConfig: TlsConfig;
+    /// For TLS_DANE: the MX host's TLSA records instead of roots.
+    daneConfig: TlsConfig;
+    stsCache: StsCache;
+    breakers: DomainBreakers;
+    sessions: SessionPool;
+
+    /// The relay, or why its TLS configurations could not be made.
+    public fn create(settings: RelaySettings, resolver: Resolver) -> Result<Relay, TlsError> {
+        var config = TlsConfig.clientWithoutRoots()?;
+        config.verifyPeer(false);
+        var verified = TlsConfig.client()?;
+        if (settings.tlsTrustPem.length > 0) {
+            verified.trustPem(settings.tlsTrustPem.view())?;
+        }
+        verified.verifyPeer(true);
+        var dane = TlsConfig.clientWithoutRoots()?;
+        dane.enableDane()?;
+        let cache = match (StsCache.create()) {
+            Ok(c) => c,
+            Err(_) => { return Err(TlsError.OutOfMemory); }
+        };
+        let breakers = match (DomainBreakers.create()) {
+            Ok(b) => b,
+            Err(_) => { return Err(TlsError.OutOfMemory); }
+        };
+        let sessions = match (SessionPool.create()) {
+            Ok(p) => p,
+            Err(_) => { return Err(TlsError.OutOfMemory); }
+        };
+        return Ok(
+            Relay {
+                settings: settings,
+                resolver: resolver,
+                tlsConfig: config,
+                verifiedConfig: verified,
+                daneConfig: dane,
+                stsCache: cache,
+                breakers: breakers,
+                sessions: sessions,
+            },
+        );
+    }
+}
+
+/// Closes idle sessions that have waited too long, every few seconds, until the task is cancelled. Run one.
+public async fn relayJanitor(relay: borrow Relay) -> Result<void, AllocError> {
+    var old = Vector<SmtpSession>.create();
+    loop {
+        match (await Timer.sleep(5000)) {
+            Ok() => {}
+            Err(_) => { return Ok(); }
+        }
+        await relay.sessions.expired(Clock.unixMillis() - relay.settings.poolIdleMs, mut old)?;
+        await closeAll(mut old, relay.settings.client);
+    }
+}
+
+/// One worker, until the task is cancelled. Run several: rows are claimed with SKIP LOCKED, so they never collide.
+public async fn relayWorker(relay: borrow Relay, store: borrow MailStore) -> Result<void, AllocError> {
+    var items = Vector<QueueItem>.create();
+    loop {
+        var token = [0u8; 8];
+        match (Random.fill(mut token[..])) {
+            Ok() => {}
+            Err(_) => {}
+        }
+        var bits: u64 = 0;
+        for (b in token) {
+            bits = (bits << 8) | (b as u64);
+        }
+        // Positive, never 0.
+        let claim = truncate<i64>(bits >> 1) + 1;
+        match (await store.claim(1, claim, relay.settings.claimSeconds, mut items)) {
+            Ok() => {}
+            Err(StoreError.OutOfMemory) => { return Err(AllocError.OutOfMemory); }
+            Err(e) => {
+                // The database is away: wait, and try again. A claim whose reply was lost stays claimed until its
+                // claim ends, so say so.
+                await logLine("relay: claiming from the queue failed:", StoreErrors.describe(e));
+                items.clear();
+            }
+        }
+        if (items.length == 0) {
+            match (await Timer.sleep(relay.settings.idleMs)) {
+                Ok() => {}
+                Err(_) => { return Ok(); }
+            }
+            continue;
+        }
+        // Every row claimed is processed: one left behind would stay claimed, untouched, until its claim ran out.
+        while (items.length > 0) {
+            let item = items.pop()!;
+            await process(relay, store, item)?;
+        }
+    }
+}
+
+/// A recipient being worked on.
+@noncopy
+struct Pending {
+    address: String;
+    outcome: u8;
+    reply: String;
+    remote: String;
+}
+
+fn setPending(p: borrow mut Pending, outcome: u8, reply: StringView, remote: StringView) -> Result<void, AllocError> {
+    p.outcome = outcome;
+    p.reply.clear();
+    p.reply.append(reply)?;
+    p.remote.clear();
+    p.remote.append(remote)?;
+    return Ok();
+}
+
+fn domainOf(address: StringView) -> StringView {
+    match (address.lastIndexOf("@")) {
+        Some(at) => { return address[at + 1..]; }
+        null => { return ""; }
+    }
+}
+
+async fn process(relay: borrow Relay, store: borrow MailStore, queued: QueueItem) -> Result<void, AllocError> {
+    var item = queued;
+    let blobs = store.blobs();
+    let hash = item.blob.view();
+    let opened: Result<RawFile, StoreError> = await Async.blocking(() => blobs.open(hash));
+    var pending = Vector<Pending>.create();
+    for (i in 0..item.recipients.length) {
+        var a = String.create();
+        a.append(item.recipients[i].view())?;
+        var reply = String.create();
+        reply.append("451 4.3.0 Not tried")?;
+        pending.push(Pending { address: a, outcome: OUTCOME_TRANSIENT, reply: reply, remote: String.create() })?;
+    }
+    var locals = Vector<Delivery>.create();
+    match (opened) {
+        Ok(file) => {
+            await deliverAll(relay, store, item, file, mut pending, mut locals)?;
+        }
+        Err(_) => {
+            for (i in 0..pending.length) {
+                setPending(mut pending[i], OUTCOME_TRANSIENT, "451 4.3.0 The message's content cannot be read", "")?;
+            }
+        }
+    }
+    // Too old to try again: what is left fails for good.
+    let next = if (item.attempts < 0) 0 else truncate<usize>(item.attempts);
+    let delays = borrow relay.settings.retryDelays;
+    let delay = if (next < delays.length) delays[next] else delays[delays.length - 1];
+    let expired = item.age + delay > relay.settings.maxAge;
+    var failures = Vector<Failure>.create();
+    var delayed = Vector<Failure>.create();
+    var remaining = Vector<String>.create();
+    var lastError = String.create();
+    let notify = relay.settings.delayNotice > 0 && !item.delayNotified && item.age >= relay.settings.delayNotice;
+    for (i in 0..pending.length) {
+        let p = borrow pending[i];
+        if (p.outcome == OUTCOME_TRANSIENT && !expired) {
+            var r = String.create();
+            r.append(p.address.view())?;
+            remaining.push(r)?;
+            if (lastError.length == 0) {
+                lastError.append(p.reply.view())?;
+            }
+            if (notify) {
+                var f = Failure { recipient: String.create(), reply: String.create(), remote: String.create() };
+                f.recipient.append(p.address.view())?;
+                f.reply.append(p.reply.view())?;
+                f.remote.append(p.remote.view())?;
+                delayed.push(f)?;
+            }
+        } else if (p.outcome != OUTCOME_DELIVERED) {
+            if (p.outcome == OUTCOME_PERMANENT && relay.settings.suppressDays > 0 && addressFailed(p.reply.view())) {
+                match (await store.suppress(p.address.view(), p.reply.view(), relay.settings.suppressDays)) {
+                    Ok() => {}
+                    Err(_) => {}
+                }
+            }
+            var f = Failure { recipient: String.create(), reply: String.create(), remote: String.create() };
+            f.recipient.append(p.address.view())?;
+            if (p.outcome == OUTCOME_TRANSIENT) {
+                f.reply.append("451 4.4.7 Delivery time expired; the last attempt said: ")?;
+            }
+            f.reply.append(p.reply.view())?;
+            f.remote.append(p.remote.view())?;
+            failures.push(f)?;
+        }
+        await logResult(item.id, p)?;
+    }
+    if (failures.length > 0 && item.sender.length > 0) {
+        match (await bounce(relay, store, item, failures, "".bytes())) {
+            Ok() => {}
+            Err(_) => { await logLine("relay: a bounce could not be queued for", item.sender.view()); }
+        }
+    }
+    if (delayed.length > 0 && item.sender.length > 0) {
+        var until = Vector<u8>.create();
+        appendDate(mut until, Clock.unixMillis() / 1000 - item.age + relay.settings.maxAge)?;
+        match (await bounce(relay, store, item, delayed, until.view())) {
+            Ok() => { item.delayNotified = true; }
+            Err(_) => { await logLine("relay: a delay notice could not be queued for", item.sender.view()); }
+        }
+    } else if (notify) {
+        item.delayNotified = true; // nothing delayed, or no one to tell
+    }
+    var done = Vector<Delivered>.create();
+    match (await store.settle(item, locals, remaining, delay, lastError.view(), mut done)) {
+        Ok(true) => {}
+        Ok(false) => { await logLine("relay: claim lost, another worker has", item.sender.view()); }
+        Err(StoreError.OutOfMemory) => { return Err(AllocError.OutOfMemory); }
+        Err(_) => {
+            await logLine(
+                "relay: the queue row could not be settled; it is retried when its claim ends for",
+                item.sender.view(),
+            );
+        }
+    }
+    return Ok();
+}
+
+/// Local recipients become `locals`; remote ones are delivered by domain.
+async fn deliverAll(
+    relay: borrow Relay,
+    store: borrow MailStore,
+    item: borrow QueueItem,
+    file: RawFile,
+    pending: borrow mut Vector<Pending>,
+    locals: borrow mut Vector<Delivery>,
+) -> Result<void, AllocError> {
+    var to = Recipient.create();
+    var remote = Vector<usize>.create();
+    for (i in 0..pending.length) {
+        match (await store.resolve(pending[i].address.view(), mut to)) {
+            Ok() => {}
+            Err(StoreError.OutOfMemory) => { return Err(AllocError.OutOfMemory); }
+            Err(_) => {
+                setPending(mut pending[i], OUTCOME_TRANSIENT, "451 4.3.0 Temporary lookup failure", "")?;
+                continue;
+            }
+        }
+        if (to.isUser()) {
+            if (to.overQuota(item.size)) {
+                setPending(mut pending[i], OUTCOME_TRANSIENT, "452 4.2.2 Mailbox full", "")?;
+            } else {
+                locals.push(Delivery.to(to.userId, to.inboxId, Clock.unixMillis()))?;
+                setPending(mut pending[i], OUTCOME_DELIVERED, "250 2.0.0 Delivered locally", "")?;
+            }
+        } else if (to.isUnknownUser()) {
+            setPending(mut pending[i], OUTCOME_PERMANENT, "550 5.1.1 No such user here", "")?;
+        } else {
+            if (to.isRemote()) {
+                // An alias to a remote address: that is where it goes.
+                pending[i].address.clear();
+                pending[i].address.append(to.address.view())?;
+            }
+            var reason = String.create();
+            match (await store.suppressed(pending[i].address.view(), mut reason)) {
+                Ok(true) => {
+                    var reply = String.create();
+                    reply.append("550 5.1.1 The address failed recently, and is not tried again for now: ")?;
+                    reply.append(reason.view())?;
+                    setPending(mut pending[i], OUTCOME_PERMANENT, reply.view(), "")?;
+                    continue;
+                }
+                Ok(false) => {}
+                Err(StoreError.OutOfMemory) => { return Err(AllocError.OutOfMemory); }
+                Err(_) => {}
+            }
+            remote.push(i)?;
+        }
+    }
+    // Signed once for every domain: with the From domain's active DKIM key, when it has one.
+    var signature = Vector<u8>.create();
+    if (remote.length > 0) {
+        await signMessage(store, file, item.size, mut signature)?;
+    }
+    // Remote recipients by domain, in the order first met.
+    var done = Vector<bool>.create();
+    for (k in 0..remote.length) {
+        done.push(false)?;
+    }
+    for (k in 0..remote.length) {
+        if (done[k]) {
+            continue;
+        }
+        var group = Vector<usize>.create();
+        let domain = domainOf(pending[remote[k]].address.view());
+        for (j in k..remote.length) {
+            if (!done[j] && domainOf(pending[remote[j]].address.view()).equalsIgnoreAsciiCase(domain)) {
+                group.push(remote[j])?;
+                done[j] = true;
+            }
+        }
+        var domainText = String.create();
+        domainText.append(domain)?;
+        await deliverDomain(relay, store, item, file, signature.view(), domainText.view(), group, pending)?;
+    }
+    return Ok();
+}
+
+async fn deliverDomain(
+    relay: borrow Relay,
+    store: borrow MailStore,
+    item: borrow QueueItem,
+    file: borrow RawFile,
+    signature: Slice<u8>,
+    domain: StringView,
+    group: borrow Vector<usize>,
+    pending: borrow mut Vector<Pending>,
+) -> Result<void, AllocError> {
+    let now = Clock.unixMillis() / 1000;
+    if (!(await relay.breakers.allows(domain, now))) {
+        for (g in group.view()) {
+            setPending(
+                mut pending[g],
+                OUTCOME_TRANSIENT,
+                "451 4.4.1 The domain's mail servers have been unreachable; not tried this time",
+                "",
+            )?;
+        }
+        return Ok();
+    }
+    var hops = Vector<Hop>.create();
+    var mxSecure = false;
+    let route = await routeOf(relay.resolver, domain, mut hops, mut mxSecure)?;
+    if (route != ROUTE_OK) {
+        let outcome = if (route == ROUTE_TEMPORARY) OUTCOME_TRANSIENT else OUTCOME_PERMANENT;
+        let reply =
+            if (route ==
+                ROUTE_NO_DOMAIN) "550 5.1.2 The recipient's domain does not exist" else (if (route ==
+                ROUTE_NULL_MX) "556 5.1.10 The recipient's domain does not accept mail" else "451 4.4.3 The recipient's domain could not be looked up");
+        for (g in group.view()) {
+            setPending(mut pending[g], outcome, reply, "")?;
+        }
+        return Ok();
+    }
+    var recipients = Vector<String>.create();
+    for (g in group.view()) {
+        var r = String.create();
+        r.append(pending[g].address.view())?;
+        recipients.push(r)?;
+    }
+    let message = Message {
+        prefix: signature,
+        file: file,
+        size: truncate<u64>(item.size) + (signature.length as u64),
+        eightBit: true,
+    };
+    var results = Vector<RecipientResult>.create();
+    var host = HostResult { kind: HOST_DONE, reply: String.create(), tls: false, security: 0 };
+    var lastReply = String.create();
+    lastReply.append("451 4.4.1 No MX host of the domain could be reached")?;
+    var lastHost = String.create();
+    var policy = DomainTls.create();
+    await domainTls(relay, store, domain, mxSecure, mut policy)?;
+    var need = HostTls.create();
+    var addresses = Vector<SocketAddress>.create();
+    for (h in 0..hops.length) {
+        addresses.clear();
+        var addressSecure = false;
+        await secureAddressesOf(
+            relay.resolver,
+            hops[h].name.view(),
+            relay.settings.port,
+            mut addresses,
+            mut addressSecure,
+        )?;
+        if (await hostTls(relay, policy, hops[h].name.view(), addressSecure, mut need)? != HOST_TLS_USE) {
+            lastReply.clear();
+            lastReply.append(need.reason.view())?;
+            lastHost.clear();
+            lastHost.append(hops[h].name.view())?;
+            continue;
+        }
+        for (a in 0..addresses.length) {
+            await sendThrough(
+                relay,
+                addresses[a],
+                hops[h].name.view(),
+                need,
+                item.sender.view(),
+                recipients,
+                message,
+                mut results,
+                mut host,
+            )?;
+            if (host.kind == HOST_DONE) {
+                await relay.breakers.succeeded(domain);
+                for (i in 0..group.length) {
+                    setPending(
+                        mut pending[group[i]],
+                        results[i].outcome,
+                        results[i].reply.view(),
+                        hops[h].name.view(),
+                    )?;
+                }
+                return Ok();
+            }
+            lastReply.clear();
+            lastReply.append(host.reply.view())?;
+            lastHost.clear();
+            lastHost.append(hops[h].name.view())?;
+        }
+    }
+    for (g in group.view()) {
+        setPending(mut pending[g], OUTCOME_TRANSIENT, lastReply.view(), lastHost.view())?;
+    }
+    if (await relay.breakers.failed(domain, now, relay.settings)) {
+        await logLine("relay: too many failures in a row, waiting before trying again:", domain);
+    }
+    return Ok();
+}
+
+/// One transaction with the server at `address`: on an idle session with it, secure enough for `need`, when there
+/// is one, else on a new one (in the clear after a failed STARTTLS only when `need` is opportunistic). The session
+/// goes back to the pool afterwards, when it is still good.
+async fn sendThrough(
+    relay: borrow Relay,
+    address: SocketAddress,
+    name: StringView,
+    need: borrow HostTls,
+    sender: StringView,
+    recipients: borrow Vector<String>,
+    message: Message,
+    results: borrow mut Vector<RecipientResult>,
+    host: borrow mut HostResult,
+) -> Result<void, AllocError> {
+    let settings = borrow relay.settings;
+    var found = Vector<SmtpSession>.create();
+    var closing = Vector<SmtpSession>.create();
+    // Pooled sessions first; a stale one is closed and the next tried.
+    loop {
+        await relay.sessions.take(address, name, need.level, mut found)?;
+        if (found.length == 0) {
+            break;
+        }
+        var session = found.pop()!;
+        let state = await transact(mut session, true, settings.client, sender, recipients, message, results)?;
+        if (state == SESSION_STALE) {
+            await closeSession(session, settings.client);
+            continue;
+        }
+        host.kind = HOST_DONE;
+        host.tls = session.tls;
+        host.security = session.security;
+        await keepOrClose(relay, session, state, mut closing)?;
+        return Ok();
+    }
+    var level = need.level;
+    loop {
+        let config =
+            if (level ==
+                TLS_DANE) borrow relay.daneConfig else (if (level ==
+                TLS_VERIFIED) borrow relay.verifiedConfig else borrow relay.tlsConfig);
+        await openSession(address, name, settings.client, config, level, need.tlsa, host, mut found)?;
+        if (host.kind == HOST_TLS_FAILED && level == TLS_OPPORTUNISTIC) {
+            level = TLS_NONE; // opportunistic: the same host, in the clear
+            continue;
+        }
+        break;
+    }
+    if (found.length == 0) {
+        results.clear();
+        for (i in 0..recipients.length) {
+            var reason = String.create();
+            reason.append(host.reply.view())?;
+            results.push(RecipientResult { outcome: OUTCOME_TRANSIENT, reply: reason })?;
+        }
+        return Ok();
+    }
+    var session = found.pop()!;
+    let state = await transact(mut session, false, settings.client, sender, recipients, message, results)?;
+    if (state != SESSION_REUSABLE) {
+        // Broken before any recipient was settled: the server was not usable after all.
+        var finished = false;
+        for (i in 0..results.length) {
+            if (results[i].outcome != OUTCOME_TRANSIENT) {
+                finished = true;
+            }
+        }
+        if (!finished) {
+            host.kind = HOST_UNUSABLE;
+            host.reply.clear();
+            host.reply.append("451 4.4.2 Connection to the receiving server was lost")?;
+        }
+    }
+    await keepOrClose(relay, session, state, mut closing)?;
+    return Ok();
+}
+
+async fn keepOrClose(
+    relay: borrow Relay,
+    session: SmtpSession,
+    state: u8,
+    closing: borrow mut Vector<SmtpSession>,
+) -> Result<void, AllocError> {
+    let settings = borrow relay.settings;
+    if (state == SESSION_REUSABLE && session.uses < settings.poolMaxUses && settings.poolSize > 0) {
+        await relay.sessions.give(session, settings.poolSize, closing)?;
+    } else {
+        closing.push(session)?;
+    }
+    await closeAll(closing, settings.client);
+    return Ok();
+}
+
+/// Whether `reply` says the address itself does not exist (5.1.x: bad mailbox, bad domain, null MX), as opposed
+/// to a policy or content rejection, which says nothing about the address.
+fn addressFailed(reply: StringView) -> bool {
+    var status = Vector<u8>.create();
+    match (statusOf(reply.bytes(), mut status)) {
+        Ok() => {}
+        Err(_) => { return false; }
+    }
+    let s = status.view();
+    return s.length >= 4 && s[0] == 0x35 && s[1] == 0x2e && s[2] == 0x31 && s[3] == 0x2e;
+}
+
+/// The DKIM-Signature field for the message in `file`, into `out`, when its From domain has an active key; nothing
+/// otherwise. A failure to sign is logged, and the message goes unsigned rather than not at all.
+async fn signMessage(
+    store: borrow MailStore,
+    file: borrow RawFile,
+    size: i64,
+    out: borrow mut Vector<u8>,
+) -> Result<void, AllocError> {
+    out.clear();
+    var signer = DkimSigner.create();
+    var chunk = Vector<u8>.create();
+    chunk.resize(64 * 1024, 0)?;
+    var offset: u64 = 0;
+    let total = truncate<u64>(size);
+    while (offset < total) {
+        let at = offset;
+        let read: Result<usize, FileError> = await Async.blocking(() => file.readAt(mut chunk[..], at));
+        let n = match (read) {
+            Ok(n) => n,
+            Err(_) => { return Ok(); }
+        };
+        if (n == 0) {
+            return Ok();
+        }
+        signer.feed(chunk[0..n])?;
+        offset += n as u64;
+    }
+    var domain = Vector<u8>.create();
+    if (!signer.fromDomain(mut domain)?) {
+        return Ok();
+    }
+    let domainText = match (StringView.fromUtf8(domain.view())) {
+        Some(d) => d,
+        null => { return Ok(); }
+    };
+    var selector = String.create();
+    var der = Vector<u8>.create();
+    match (await store.dkimKey(domainText, "", mut selector, mut der)) {
+        Ok(true) => {}
+        Ok(false) => { return Ok(); }
+        Err(StoreError.OutOfMemory) => { return Err(AllocError.OutOfMemory); }
+        Err(_) => {
+            await logLine("relay: the DKIM key could not be read for", domainText);
+            return Ok();
+        }
+    }
+    let key = match (PrivateKey.fromDer(der.view())) {
+        Ok(k) => k,
+        Err(_) => {
+            await logLine("relay: the stored DKIM key is unusable for", domainText);
+            return Ok();
+        }
+    };
+    match (signer.sign(key, domainText, selector.view(), Clock.unixMillis() / 1000, out)) {
+        Ok(_) => {}
+        Err(_) => {
+            out.clear();
+            await logLine("relay: DKIM signing failed for", domainText);
+        }
+    }
+    return Ok();
+}
+
+/// Queues the bounce for `failures` to the item's sender, from the null sender.
+async fn bounce(
+    relay: borrow Relay,
+    store: borrow MailStore,
+    item: borrow QueueItem,
+    failures: borrow Vector<Failure>,
+    retryUntil: Slice<u8>,
+) -> Result<void, StoreError> {
+    // The original's header, from the start of its content.
+    var start = Vector<u8>.create();
+    grown(start.resize(64 * 1024, 0))?;
+    let blobs = store.blobs();
+    let hash = item.blob.view();
+    var got: usize = 0;
+    let opened: Result<RawFile, StoreError> = await Async.blocking(() => blobs.open(hash));
+    match (opened) {
+        Ok(file) => {
+            let read: Result<usize, FileError> = await Async.blocking(() => file.readAt(mut start[..], 0));
+            got = match (read) {
+                Ok(n) => n,
+                Err(_) => 0,
+            };
+        }
+        Err(_) => {}
+    }
+    let hostname = relay.settings.client.helo.view().bytes();
+    var date = Vector<u8>.create();
+    grown(appendDate(mut date, Clock.unixMillis() / 1000))?;
+    var random = [0u8; 12];
+    match (Random.fill(mut random[..])) {
+        Ok() => {}
+        Err(_) => {}
+    }
+    var token = Vector<u8>.create();
+    grown(Hex.encode(random[..], mut token))?;
+    var messageId = Vector<u8>.create();
+    grown(messageId.push(0x3c))?;
+    grown(messageId.extend(token.view()))?;
+    grown(messageId.push(0x40))?;
+    grown(messageId.extend(hostname))?;
+    grown(messageId.push(0x3e))?;
+    var boundary = Vector<u8>.create();
+    grown(boundary.extend("=_bounce_".bytes()))?;
+    grown(boundary.extend(token.view()))?;
+    var text = Vector<u8>.create();
+    grown(buildBounce(
+        retryUntil,
+        hostname,
+        item.sender.view().bytes(),
+        failures,
+        start[0..got],
+        date.view(),
+        messageId.view(),
+        boundary.view(),
+        mut text,
+    ))?;
+    var w = await Async.blocking(() => blobs.begin())?;
+    let bytes = text.view();
+    let wrote: Result<void, StoreError> = await Async.blocking(() => {
+        w.write(bytes)?;
+        return w.finish();
+    });
+    match (wrote) {
+        Ok() => {}
+        Err(e) => {
+            await Async.blocking(() => w.discard());
+            return Err(e);
+        }
+    }
+    var outbound = Outbound.create();
+    var to = String.create();
+    grown(to.append(item.sender.view()))?;
+    grown(outbound.recipients.push(to))?;
+    let none = Vector<Delivery>.create();
+    var done = Vector<Delivered>.create();
+    await store.accept(mut w, none, outbound, mut done)?;
+    return Ok();
+}
+
+fn grown(r: Result<void, AllocError>) -> Result<void, StoreError> => match (r) {
+    Ok() => Ok(),
+    Err(_) => Err(StoreError.OutOfMemory),
+};
+
+async fn logResult(id: i64, p: borrow Pending) -> Result<void, AllocError> {
+    var line = String.create();
+    line.append("relay ")?;
+    var n = Vector<u8>.create();
+    msmtpDecimal(mut n, truncate<u64>(id))?;
+    line.append(StringView.fromUtf8(n.view())!)?;
+    line.append(" to=<")?;
+    line.append(p.address.view())?;
+    line.append(
+        if (p.outcome ==
+            OUTCOME_DELIVERED) "> sent" else (if (p.outcome == OUTCOME_PERMANENT) "> failed" else "> deferred"),
+    )?;
+    if (p.remote.length > 0) {
+        line.append(" via=")?;
+        line.append(p.remote.view())?;
+    }
+    line.append(": ")?;
+    line.append(p.reply.view())?;
+    line.append("\n")?;
+    match (await AsyncConsole.writeError(line.view())) {
+        Ok() => {}
+        Err(_) => {}
+    }
+    return Ok();
+}
+
+fn msmtpDecimal(out: borrow mut Vector<u8>, n: u64) -> Result<void, AllocError> {
+    var digits = [0u8; 20];
+    var count: usize = 0;
+    var v = n;
+    loop {
+        digits[count] = 0x30 + truncate<u8>(v % 10);
+        count += 1;
+        v = v / 10;
+        if (v == 0) {
+            break;
+        }
+    }
+    while (count > 0) {
+        count -= 1;
+        out.push(digits[count])?;
+    }
+    return Ok();
+}
+
+async fn logLine(event: StringView, detail: StringView) {
+    var line = String.create();
+    match (line.append(event)) {
+        Ok() => {}
+        Err(_) => { return; }
+    }
+    match (line.append(" ")) {
+        Ok() => {}
+        Err(_) => { return; }
+    }
+    match (line.append(detail)) {
+        Ok() => {}
+        Err(_) => { return; }
+    }
+    match (line.append("\n")) {
+        Ok() => {}
+        Err(_) => { return; }
+    }
+    match (await AsyncConsole.writeError(line.view())) {
+        Ok() => {}
+        Err(_) => {}
+    }
+}

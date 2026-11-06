@@ -1,0 +1,458 @@
+// Contacts: vCards (3.0 and 4.0) as ActiveSync Contacts items (MS-ASCNTC), and back as vCard 3.0. Names, up to
+// three addresses, the phones by kind, the three postal addresses, the company, birthday, notes, nickname,
+// categories and photo are carried both ways; a contact the device changes is rewritten from its fields, keeping
+// its UID.
+
+import mpim.ContentLines;
+import mpim.appendLine;
+import mpim.escapeText;
+import mpim.unescapeText;
+import mxml.XmlDocument;
+
+/// Component `index` of a structured value (`;`-separated, as N and ADR), unescaped, into `into`.
+fn component(raw: Slice<u8>, index: usize, into: borrow mut Vector<u8>) -> Result<void, EasFail> {
+    into.clear();
+    var at: usize = 0;
+    var n: usize = 0;
+    var start: usize = 0;
+    while (at <= raw.length) {
+        if (at == raw.length || (raw[at] == 0x3b && (at == 0 || raw[at - 1] != 0x5c))) {
+            if (n == index) {
+                mem(unescapeText(raw[start..at], into))?;
+                return Ok();
+            }
+            n += 1;
+            start = at + 1;
+        }
+        at += 1;
+    }
+    return Ok();
+}
+
+fn writePart(
+    w: borrow mut WbxmlWriter,
+    raw: Slice<u8>,
+    index: usize,
+    page: u8,
+    name: StringView,
+) -> Result<void, EasFail> {
+    var v = Vector<u8>.create();
+    component(raw, index, mut v)?;
+    let t = v.view().trim();
+    if (t.length > 0) {
+        w.elementBytes(page, name, t);
+    }
+    return Ok();
+}
+
+/// `1990-05-01T00:00:00.000Z` (or the `--0501` of a vCard 4 date without a year, on 1604).
+fn easDate(raw: Slice<u8>, into: borrow mut String) -> Result<bool, EasFail> {
+    into.clear();
+    var digits = Vector<u8>.create();
+    for (b in raw.trim()) {
+        if (b == 0x54 || b == 0x74) {
+            break;
+        }
+        if (b >= 0x30 && b <= 0x39) {
+            mem(digits.push(b))?;
+        }
+    }
+    let d = digits.view();
+    if (d.length == 8) {
+        mem(into.append(StringView.fromUtf8(d[0..4]) ?? ""))?;
+        mem(into.append("-"))?;
+        mem(into.append(StringView.fromUtf8(d[4..6]) ?? ""))?;
+        mem(into.append("-"))?;
+        mem(into.append(StringView.fromUtf8(d[6..8]) ?? ""))?;
+    } else if (d.length == 4) {
+        mem(into.append("1604-"))?;
+        mem(into.append(StringView.fromUtf8(d[0..2]) ?? ""))?;
+        mem(into.append("-"))?;
+        mem(into.append(StringView.fromUtf8(d[2..4]) ?? ""))?;
+    } else {
+        return Ok(false);
+    }
+    mem(into.append("T00:00:00.000Z"))?;
+    return Ok(true);
+}
+
+/// A contact's ApplicationData.
+fn writeContact(w: borrow mut WbxmlWriter, data: Slice<u8>, opts: BodyOptions) -> Result<void, EasFail> {
+    let lines = match (ContentLines.parse(data)) {
+        Ok(l) => l,
+        Err(_) => { return Err(EasFail.Memory); }
+    };
+    if (lines.count() == 0 || !lines.begins(0, "VCARD")) {
+        return Ok();
+    }
+    let to = lines.componentEnd(0);
+    let from: usize = 1;
+    var value = Vector<u8>.create();
+    match (lines.property(from, to, 1, "N")) {
+        Some(n) => {
+            let raw = lines.rawValue(n);
+            writePart(w, raw, 0, PAGE_CONTACTS, "LastName")?;
+            writePart(w, raw, 1, PAGE_CONTACTS, "FirstName")?;
+            writePart(w, raw, 2, PAGE_CONTACTS, "MiddleName")?;
+            writePart(w, raw, 3, PAGE_CONTACTS, "Title")?;
+            writePart(w, raw, 4, PAGE_CONTACTS, "Suffix")?;
+        }
+        null => {}
+    }
+    match (lines.property(from, to, 1, "FN")) {
+        Some(l) => {
+            value.clear();
+            mem(lines.textValue(l, mut value))?;
+            if (value.length > 0) {
+                w.elementBytes(PAGE_CONTACTS, "FileAs", value.view());
+            }
+        }
+        null => {}
+    }
+    var emails: usize = 0;
+    var phones = [false; 12];
+    // Indexes into `phones`: mobile, work, work2, home, home2, work fax, home fax, pager, car.
+    for (i in from..to) {
+        if (lines.depth(i) != 1) {
+            continue;
+        }
+        if (lines.nameIs(i, "EMAIL") && emails < 3) {
+            value.clear();
+            mem(lines.textValue(i, mut value))?;
+            emails += 1;
+            w.elementBytes(
+                PAGE_CONTACTS,
+                if (emails == 1) "Email1Address" else if (emails == 2) "Email2Address" else "Email3Address",
+                value.view().trim(),
+            );
+        } else if (lines.nameIs(i, "TEL")) {
+            value.clear();
+            mem(lines.textValue(i, mut value))?;
+            let whole = value.view().trim();
+            let t = if (whole.length > 4 && whole[0..4].equalsIgnoreAsciiCase("tel:".bytes())) whole[4..] else whole;
+            let fax = lines.paramHas(i, "TYPE", "FAX");
+            let work = lines.paramHas(i, "TYPE", "WORK");
+            let home = lines.paramHas(i, "TYPE", "HOME");
+            var slot: usize = 99;
+            if (fax) {
+                slot = if (home) 6 else 5;
+            } else if (lines.paramHas(i, "TYPE", "CELL")) {
+                slot = 0;
+            } else if (lines.paramHas(i, "TYPE", "PAGER")) {
+                slot = 7;
+            } else if (lines.paramHas(i, "TYPE", "CAR")) {
+                slot = 8;
+            } else if (work) {
+                slot = if (phones[1]) 2 else 1;
+            } else if (home) {
+                slot = if (phones[3]) 4 else 3;
+            } else {
+                slot = if (!phones[0]) 0 else if (!phones[3]) 3 else 4;
+            }
+            if (slot < 9 && !phones[slot]) {
+                phones[slot] = true;
+                let names = [
+                    "MobilePhoneNumber",
+                    "BusinessPhoneNumber",
+                    "Business2PhoneNumber",
+                    "HomePhoneNumber",
+                    "Home2PhoneNumber",
+                    "BusinessFaxNumber",
+                    "HomeFaxNumber",
+                    "PagerNumber",
+                    "CarPhoneNumber",
+                ];
+                w.elementBytes(PAGE_CONTACTS, names[slot], t);
+            }
+        } else if (lines.nameIs(i, "ADR")) {
+            let raw = lines.rawValue(i);
+            let work = lines.paramHas(i, "TYPE", "WORK");
+            let home = lines.paramHas(i, "TYPE", "HOME");
+            let prefix: StringView = if (work) "Business" else if (home) "Home" else "Other";
+            let fields = ["Street", "City", "State", "PostalCode", "Country"];
+            for (k in 0..5) {
+                var name = String.create();
+                mem(name.append(prefix))?;
+                mem(name.append(fields[k]))?;
+                writePart(w, raw, k + 2, PAGE_CONTACTS, name.view())?;
+            }
+        }
+    }
+    match (lines.property(from, to, 1, "ORG")) {
+        Some(l) => {
+            let raw = lines.rawValue(l);
+            writePart(w, raw, 0, PAGE_CONTACTS, "CompanyName")?;
+            writePart(w, raw, 1, PAGE_CONTACTS, "Department")?;
+        }
+        null => {}
+    }
+    match (lines.property(from, to, 1, "TITLE")) {
+        Some(l) => {
+            value.clear();
+            mem(lines.textValue(l, mut value))?;
+            if (value.length > 0) {
+                w.elementBytes(PAGE_CONTACTS, "JobTitle", value.view());
+            }
+        }
+        null => {}
+    }
+    match (lines.property(from, to, 1, "URL")) {
+        Some(l) => { w.elementBytes(PAGE_CONTACTS, "WebPage", lines.rawValue(l).trim()); }
+        null => {}
+    }
+    var date = String.create();
+    match (lines.property(from, to, 1, "BDAY")) {
+        Some(l) => {
+            if (easDate(lines.rawValue(l), mut date)?) {
+                w.element(PAGE_CONTACTS, "Birthday", date.view());
+            }
+        }
+        null => {}
+    }
+    match (lines.property(from, to, 1, "ANNIVERSARY") ?? lines.property(from, to, 1, "X-ANNIVERSARY")) {
+        Some(l) => {
+            if (easDate(lines.rawValue(l), mut date)?) {
+                w.element(PAGE_CONTACTS, "Anniversary", date.view());
+            }
+        }
+        null => {}
+    }
+    match (lines.property(from, to, 1, "CATEGORIES")) {
+        Some(l) => {
+            let raw = lines.rawValue(l);
+            w.start(PAGE_CONTACTS, "Categories");
+            var at: usize = 0;
+            while (at <= raw.length) {
+                var e = at;
+                while (e < raw.length && !(raw[e] == 0x2c && (e == 0 || raw[e - 1] != 0x5c))) {
+                    e += 1;
+                }
+                var one = Vector<u8>.create();
+                mem(unescapeText(raw[at..e], mut one))?;
+                if (one.length > 0) {
+                    w.elementBytes(PAGE_CONTACTS, "Category", one.view());
+                }
+                at = e + 1;
+            }
+            w.end();
+        }
+        null => {}
+    }
+    match (lines.property(from, to, 1, "NOTE")) {
+        Some(l) => {
+            value.clear();
+            mem(lines.textValue(l, mut value))?;
+            let cut = cutAt(value.view(), opts.truncation);
+            w.start(PAGE_BASE, "Body");
+            w.element(PAGE_BASE, "Type", "1");
+            w.number(PAGE_BASE, "EstimatedDataSize", truncate<i64>(value.length));
+            if (cut < value.length) {
+                w.element(PAGE_BASE, "Truncated", "1");
+            }
+            if (cut > 0) {
+                w.elementBytes(PAGE_BASE, "Data", value.view()[0..cut]);
+            }
+            w.end();
+        }
+        null => {}
+    }
+    match (lines.property(from, to, 1, "PHOTO")) {
+        Some(l) => {
+            let whole = lines.rawValue(l).trim();
+            // vCard 4: a data: URI.
+            let text = StringView.fromUtf8(whole) ?? "";
+            let skip = match (text.indexOf("base64,")) {
+                Some(comma) => comma + 7,
+                null => 0,
+            };
+            let raw = whole[skip..];
+            if (raw.length > 0 && raw.length < 65536 && !(raw.length > 4 && raw[0..4].equalsIgnoreAsciiCase(
+                "http".bytes(),
+            ))) {
+                w.elementBytes(PAGE_CONTACTS, "Picture", raw);
+            }
+        }
+        null => {}
+    }
+    match (lines.property(from, to, 1, "NICKNAME")) {
+        Some(l) => {
+            value.clear();
+            mem(lines.textValue(l, mut value))?;
+            if (value.length > 0) {
+                w.elementBytes(PAGE_CONTACTS2, "NickName", value.view());
+            }
+        }
+        null => {}
+    }
+    return Ok();
+}
+
+// ---- From the device ----
+
+fn escaped(value: StringView, into: borrow mut Vector<u8>) -> Result<void, EasFail> =>
+    mem(escapeText(value.bytes(), into));
+
+fn joinParts(
+    doc: borrow XmlDocument,
+    data: usize,
+    names: Slice<StringView>,
+    into: borrow mut Vector<u8>,
+) -> Result<bool, EasFail> {
+    into.clear();
+    var any = false;
+    for (i in 0..names.length) {
+        if (i > 0) {
+            mem(into.push(0x3b))?;
+        }
+        let v = childValue(doc, data, NS_CONTACTS, names[i]);
+        if (v.length > 0) {
+            any = true;
+        }
+        escaped(v, into)?;
+    }
+    return Ok(any);
+}
+
+fn simpleLine(into: borrow mut Vector<u8>, name: StringView, value: StringView) -> Result<void, EasFail> {
+    if (value.length == 0) {
+        return Ok();
+    }
+    var v = Vector<u8>.create();
+    escaped(value, mut v)?;
+    return mem(appendLine(into, name, v.view()));
+}
+
+fn vcardDate(text: StringView, into: borrow mut Vector<u8>, name: StringView) -> Result<void, EasFail> {
+    let t = text.trim();
+    if (t.length < 10) {
+        return Ok();
+    }
+    return mem(appendLine(into, name, t.bytes()[0..10]));
+}
+
+/// A vCard 3.0 made from a device's Contacts ApplicationData, with UID `uid`.
+fn contactFromEas(
+    doc: borrow XmlDocument,
+    data: usize,
+    uid: StringView,
+    into: borrow mut Vector<u8>,
+) -> Result<void, EasFail> {
+    into.clear();
+    mem(into.extend("BEGIN:VCARD\r\nVERSION:3.0\r\nPRODID:-//mailserver//ActiveSync//EN\r\n".bytes()))?;
+    simpleLine(into, "UID", uid)?;
+    var structured = Vector<u8>.create();
+    let named = joinParts(doc, data, ["LastName", "FirstName", "MiddleName", "Title", "Suffix"][..], mut structured)?;
+    // FN is required: the FileAs, else the name, else the company, else the address.
+    var full = String.create();
+    let fileAs = childValue(doc, data, NS_CONTACTS, "FileAs");
+    if (fileAs.length > 0) {
+        mem(full.append(fileAs))?;
+    } else {
+        for (part in [
+            childValue(doc, data, NS_CONTACTS, "FirstName"),
+            childValue(doc, data, NS_CONTACTS, "MiddleName"),
+            childValue(doc, data, NS_CONTACTS, "LastName"),
+        ]) {
+            if (part.length > 0) {
+                if (full.length > 0) {
+                    mem(full.append(" "))?;
+                }
+                mem(full.append(part))?;
+            }
+        }
+    }
+    if (full.length == 0) {
+        mem(full.append(childValue(doc, data, NS_CONTACTS, "CompanyName")))?;
+    }
+    if (full.length == 0) {
+        mem(full.append(childValue(doc, data, NS_CONTACTS, "Email1Address")))?;
+    }
+    var formatted = Vector<u8>.create();
+    escaped(full.view(), mut formatted)?;
+    mem(appendLine(into, "FN", formatted.view()))?;
+    if (named) {
+        mem(appendLine(into, "N", structured.view()))?;
+    } else {
+        mem(appendLine(into, "N", ";;;;".bytes()))?;
+    }
+    for (e in ["Email1Address", "Email2Address", "Email3Address"]) {
+        simpleLine(into, "EMAIL;TYPE=INTERNET", childValue(doc, data, NS_CONTACTS, e))?;
+    }
+    simpleLine(into, "TEL;TYPE=CELL", childValue(doc, data, NS_CONTACTS, "MobilePhoneNumber"))?;
+    simpleLine(into, "TEL;TYPE=WORK,VOICE", childValue(doc, data, NS_CONTACTS, "BusinessPhoneNumber"))?;
+    simpleLine(into, "TEL;TYPE=WORK,VOICE", childValue(doc, data, NS_CONTACTS, "Business2PhoneNumber"))?;
+    simpleLine(into, "TEL;TYPE=HOME,VOICE", childValue(doc, data, NS_CONTACTS, "HomePhoneNumber"))?;
+    simpleLine(into, "TEL;TYPE=HOME,VOICE", childValue(doc, data, NS_CONTACTS, "Home2PhoneNumber"))?;
+    simpleLine(into, "TEL;TYPE=WORK,FAX", childValue(doc, data, NS_CONTACTS, "BusinessFaxNumber"))?;
+    simpleLine(into, "TEL;TYPE=HOME,FAX", childValue(doc, data, NS_CONTACTS, "HomeFaxNumber"))?;
+    simpleLine(into, "TEL;TYPE=PAGER", childValue(doc, data, NS_CONTACTS, "PagerNumber"))?;
+    simpleLine(into, "TEL;TYPE=CAR", childValue(doc, data, NS_CONTACTS, "CarPhoneNumber"))?;
+    var address = Vector<u8>.create();
+    for (kind in ["Business", "Home", "Other"]) {
+        var names = Vector<String>.create();
+        for (field in ["Street", "City", "State", "PostalCode", "Country"]) {
+            var n = String.create();
+            mem(n.append(kind))?;
+            mem(n.append(field))?;
+            mem(names.push(n))?;
+        }
+        address.clear();
+        mem(address.extend(";;".bytes()))?;
+        var any = false;
+        for (k in 0..names.length) {
+            if (k > 0) {
+                mem(address.push(0x3b))?;
+            }
+            let v = childValue(doc, data, NS_CONTACTS, names[k].view());
+            if (v.length > 0) {
+                any = true;
+            }
+            escaped(v, mut address)?;
+        }
+        if (any) {
+            let label: StringView =
+                if (kind == "Business") "ADR;TYPE=WORK" else if (kind == "Home") "ADR;TYPE=HOME" else "ADR";
+            mem(appendLine(into, label, address.view()))?;
+        }
+    }
+    if (joinParts(doc, data, ["CompanyName", "Department"][..], mut structured)?) {
+        mem(appendLine(into, "ORG", structured.view()))?;
+    }
+    simpleLine(into, "TITLE", childValue(doc, data, NS_CONTACTS, "JobTitle"))?;
+    let web = childValue(doc, data, NS_CONTACTS, "WebPage");
+    if (web.length > 0) {
+        mem(appendLine(into, "URL", web.bytes()))?;
+    }
+    vcardDate(childValue(doc, data, NS_CONTACTS, "Birthday"), into, "BDAY")?;
+    vcardDate(childValue(doc, data, NS_CONTACTS, "Anniversary"), into, "X-ANNIVERSARY")?;
+    match (doc.child(data, NS_CONTACTS, "Categories")) {
+        Some(cats) => {
+            var list = Vector<usize>.create();
+            mem(doc.children(cats, mut list))?;
+            var joined = Vector<u8>.create();
+            for (c in list.view()) {
+                if (joined.length > 0) {
+                    mem(joined.push(0x2c))?;
+                }
+                escaped(doc.trimmed(c), mut joined)?;
+            }
+            if (joined.length > 0) {
+                mem(appendLine(into, "CATEGORIES", joined.view()))?;
+            }
+        }
+        null => {}
+    }
+    var note = String.create();
+    match (doc.child(data, NS_BASE, "Body")) {
+        Some(b) => { mem(note.append(childValue(doc, b, NS_BASE, "Data")))?; }
+        null => { mem(note.append(childValue(doc, data, NS_CONTACTS, "Body")))?; }
+    }
+    simpleLine(into, "NOTE", note.view())?;
+    simpleLine(into, "NICKNAME", childValue(doc, data, NS_CONTACTS2, "NickName"))?;
+    let picture = childValue(doc, data, NS_CONTACTS, "Picture");
+    if (picture.length > 0) {
+        mem(appendLine(into, "PHOTO;ENCODING=b;TYPE=JPEG", picture.bytes()))?;
+    }
+    mem(into.extend("END:VCARD\r\n".bytes()))?;
+    return Ok();
+}

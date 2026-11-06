@@ -1,0 +1,10 @@
+size 138409
+envelope ("Fri, 3 Nov 2017 12:00:00 -0800" "Message Subject" (("test" NIL "test" "test.com")) (("test" NIL "test" "test.com")) (("test" NIL "test" "test.com")) (("test" NIL "test" "test.com") (NIL NIL "=?utf-8?Q?date=3E2017-08-20T10" NIL) (NIL NIL "08" "MISSING_DOMAIN") (NIL NIL NIL NIL)) NIL NIL NIL "<aasfasdfasdfa@bb>")
+bodystructure ("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 16 2 NIL NIL NIL NIL)
+body ("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 16 2)
+section HEADER 138393 ea41e881648215757727b0fd3f6e12d24f55953c56d1d66b0bd4e06f7c4fafd4
+section TEXT 16 00f38f8c11e1b2d649fc3bb1b47af9787f004dac2a8aff405b2eb86874f4c875
+section HEADER.FIELDS 138393 ea41e881648215757727b0fd3f6e12d24f55953c56d1d66b0bd4e06f7c4fafd4
+section HEADER.FIELDS.NOT 2 7eb70257593da06f682a3ddda54a9d260d4fc514f645237f5ca74b08f8da61a6
+section 1 16 00f38f8c11e1b2d649fc3bb1b47af9787f004dac2a8aff405b2eb86874f4c875
+section 1.MIME 138393 ea41e881648215757727b0fd3f6e12d24f55953c56d1d66b0bd4e06f7c4fafd4

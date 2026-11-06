@@ -1,0 +1,12 @@
+size 93103
+envelope ("Thu, 12 Dec 91 11:38:21 EST" "Singing today?" (("Nathaniel Borenstein" NIL "nsb" "MISSING_DOMAIN")) (("Nathaniel Borenstein" NIL "nsb" "MISSING_DOMAIN")) (("Nathaniel Borenstein" NIL "nsb" "MISSING_DOMAIN")) (("David A. Braun" NIL "braun" "MISSING_DOMAIN") ("John Lamb" NIL "lamb" "MISSING_DOMAIN") ("Michael Littman" NIL "mlittman" "MISSING_DOMAIN")) ((NIL NIL "nsb" "MISSING_DOMAIN")) NIL NIL "<9112121638.AA06481@greenbush.bellcore.com>")
+bodystructure (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 41 1 NIL NIL NIL NIL) ("audio" "basic" NIL NIL NIL "base64" 92498 NIL NIL NIL NIL) "mixed" ("boundary" "foobar") NIL NIL NIL)
+body (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 41 1) ("audio" "basic" NIL NIL NIL "base64" 92498) "mixed")
+section HEADER 458 181aa3614cb782f37ebd09d6f7343987d5be4227673487a3952708e59bb8023c
+section TEXT 92645 e83d696c2c706305cac2fc290b9faf4019f9233517434a15ad2d320c22159b3d
+section HEADER.FIELDS 286 d73865137ab8bc20f24afc255c0a649167ccf45e4ef2ecdd014a816082ee868f
+section HEADER.FIELDS.NOT 174 36df42b25f288b4410ea503939ee247ecd85461134208c8febd16c9bbd1bf549
+section 1 41 4e44766911cb25ea8f0784196285467b0e8c7c4fd55c9fbf28cab302f707873b
+section 1.MIME 2 7eb70257593da06f682a3ddda54a9d260d4fc514f645237f5ca74b08f8da61a6
+section 2 92498 6ec9939c14edf79e3123ee1b18037eb1d0364cdc377667b304d6ac35612ef504
+section 2.MIME 64 2a5df9264c21eeb7f8e96c1da14d672046d13d976ab8e9ecdf41bab0c5e64c0e

@@ -1,0 +1,798 @@
+// The admin JSON API, for the admin UI (CosmoMailAdmin's Nuxt frontend): its routes and response shapes are the C#
+// server's, including their mixed casing, so the frontend works unchanged. Postgres builds the response JSON and
+// reads request bodies (passed as one jsonb parameter), so most routes are an authorization check and one statement.
+//
+// Who may call: a bearer JWT (HS256, from POST /api/auth/login) or the static token in X-CosmoMail-Admin-Token.
+// Server admins reach everything; domain admins only their domain's rows (others are "not found"); mail users only
+// /api/profile. Errors are {"error": "..."}; 401 only for missing or bad credentials, since the UI logs out on any 401.
+
+import mhttp.JsonDocument;
+import mhttp.JsonKind;
+import mhttp.JsonWriter;
+import mhttp.Request;
+import mhttp.Response;
+import mhttp.segment;
+import mhttp.segmentCount;
+import msmtp.checkLogin;
+import msmtp.hashPassword;
+import msmtp.loginBlocked;
+import msmtp.loginFailed;
+import msmtp.peerBytes;
+import msmtp.verifyPassword;
+import postgres.PgParams;
+import postgres.PgRows;
+import sha256.constantTimeEqual;
+
+/// The admin API's settings.
+@noncopy
+public struct AdminSettings {
+    /// The JWT signing secret; at least `JWT_MIN_SECRET` bytes, else logins answer 503.
+    public jwtSecret: String;
+    /// A static token for scripts (X-CosmoMail-Admin-Token), acting as a server admin; empty for none.
+    public staticToken: String;
+    public tokenHours: i64;
+
+    public fn create() -> AdminSettings =>
+        AdminSettings { jwtSecret: String.create(), staticToken: String.create(), tokenHours: 24 };
+}
+
+const ROLE_SERVER: u8 = 1;
+const ROLE_DOMAIN: u8 = 2;
+const ROLE_USER: u8 = 3;
+
+/// Who is calling.
+@noncopy
+struct Principal {
+    id: i64;
+    role: u8;
+    /// The domain a domain admin or mail user belongs to; 0 for a server admin.
+    domainId: i64;
+    /// Whether the account is a mail user (`users`) rather than an `admin_users` row.
+    mailUser: bool;
+    username: String;
+}
+
+impl Principal {
+    /// The scope for statements: 0 (everything) for a server admin, else the domain.
+    fn scope(borrow this) -> i64 => if (this.role == ROLE_SERVER) 0 else this.domainId;
+}
+
+/// A refusal to answer with, or the caller.
+enum Authorized {
+    Caller(Principal),
+    Refused(Response),
+}
+
+async fn authorize(
+    ctx: borrow WebContext,
+    request: borrow Request,
+    admin: bool,
+    server: bool,
+) -> Result<Authorized, AllocError> {
+    let settings = borrow ctx.admin;
+    let bearer = match (request.header("Authorization")) {
+        Some(v) => v.view(),
+        null => "",
+    };
+    if (bearer.length > 7 && bearer[0..7].equalsIgnoreAsciiCase("Bearer ")) {
+        let token = bearer[7..].trim();
+        let claims = match (verifyJwt(settings.jwtSecret.bytes(), token.bytes(), Clock.unixMillis() / 1000)) {
+            Ok(c) => c,
+            Err(_) => { return Ok(Authorized.Refused(Response.error(401, "Invalid or expired token.")?)); }
+        };
+        let root = claims.root();
+        var role = String.create();
+        var text = String.create();
+        match (claims.member(root, "admin_role")) {
+            Some(v) => { claims.string(v, mut role)?; }
+            null => {}
+        }
+        var who = Principal { id: 0, role: ROLE_USER, domainId: 0, mailUser: false, username: String.create() };
+        match (claims.member(root, "sub")) {
+            Some(v) => {
+                claims.string(v, mut text)?;
+                who.id = text.view().parseInt<i64>() ?? 0;
+            }
+            null => {}
+        }
+        match (claims.member(root, "domain_id")) {
+            Some(v) => {
+                claims.string(v, mut text)?;
+                who.domainId = text.view().parseInt<i64>() ?? 0;
+            }
+            null => {}
+        }
+        match (claims.member(root, "source")) {
+            Some(v) => {
+                claims.string(v, mut text)?;
+                who.mailUser = text.view() == "users";
+            }
+            null => {}
+        }
+        match (claims.member(root, "unique_name")) {
+            Some(v) => { claims.string(v, mut who.username)?; }
+            null => {}
+        }
+        who.role =
+            if (role.view() == "server") ROLE_SERVER else if (role.view() == "domain" ||
+                role.view() == "domain_admin") ROLE_DOMAIN else ROLE_USER;
+        if (admin) {
+            if (who.role == ROLE_USER) {
+                return Ok(Authorized.Refused(Response.error(403, "Admin access required.")?));
+            }
+            if (who.role == ROLE_DOMAIN && server) {
+                return Ok(Authorized.Refused(Response.error(403, "Server-level access required.")?));
+            }
+            if (who.role == ROLE_DOMAIN && who.domainId == 0) {
+                return Ok(Authorized.Refused(Response.error(403, "Token has no domain scope.")?));
+            }
+        }
+        return Ok(Authorized.Caller(who));
+    }
+    let given = match (request.header("X-CosmoMail-Admin-Token")) {
+        Some(v) => v.view(),
+        null => "",
+    };
+    if (!admin || settings.staticToken.length == 0) {
+        return Ok(Authorized.Refused(Response.error(401, "Authentication required.")?));
+    }
+    if (!constantTimeEqual(given.bytes(), settings.staticToken.bytes())) {
+        return Ok(Authorized.Refused(Response.error(401, "Unauthorized")?));
+    }
+    var name = String.create();
+    name.append("token")?;
+    return Ok(Authorized.Caller(Principal { id: 0, role: ROLE_SERVER, domainId: 0, mailUser: false, username: name }));
+}
+
+/// The request body as a JSON object's text, for a statement's jsonb parameter; null when it is not an object.
+fn bodyObject(request: borrow Request) -> StringView? {
+    let text = StringView.fromUtf8(request.body.view()) ?? "";
+    let doc = match (JsonDocument.parse(text.bytes())) {
+        Ok(d) => d,
+        Err(_) => { return null; }
+    };
+    return match (doc.kind(doc.root())) {
+        JsonKind.Object => text,
+        _ => null,
+    };
+}
+
+/// Runs `sql`, whose single row is (status, body JSON), and answers it: no row is a 404 with `missing`. Constraint
+/// violations are 409 (a duplicate) or 400 (a bad value); anything else is 500.
+async fn answer(
+    ctx: borrow WebContext,
+    sql: StringView,
+    params: borrow PgParams,
+    missing: StringView,
+) -> Result<Response, AllocError> {
+    var lease = match (await ctx.mail.get().store.connections().acquire()) {
+        Ok(l) => l,
+        Err(_) => { return Response.error(503, "The database is not available."); }
+    };
+    let connection = lease.connection();
+    match (await connection.query(sql, params)) {
+        Ok(rows) => {
+            if (rows.rowCount() == 0) {
+                return Response.error(404, missing);
+            }
+            let status = truncate<u16>(rows.int64(0, 0) ?? 200);
+            let text = rows.text(0, 1) ?? "{}";
+            if (status == 204) {
+                return Ok(Response.create(204));
+            }
+            var body = Vector<u8>.create();
+            body.extend(text.bytes())?;
+            return Response.json(status, body);
+        }
+        Err(_) => {
+            let code = connection.lastError().code();
+            if (code == "23505") {
+                return Response.error(409, "It exists already.");
+            }
+            if (code.startsWith("22") || code.startsWith("23")) {
+                var message = String.create();
+                message.append("Invalid value: ")?;
+                message.append(connection.lastError().field(0x4d) ?? code)?;
+                return Response.error(400, message.view());
+            }
+            return Response.error(500, "The server could not answer.");
+        }
+    }
+}
+
+/// $1 user id, $2 username, $3 action, $4 resource type, $5 resource id, $6 details, $7 ip, $8 user agent,
+/// $9 severity, $10 success.
+fn sqlAudit() -> StringView =>
+    """
+    INSERT INTO audit_logs (user_id, username, action, resource_type, resource_id, details, ip_address, user_agent,
+        severity, success)
+    VALUES (nullif($1, 0), nullif($2, ''), $3, nullif($4, ''), nullif($5, ''), nullif($6, ''), nullif($7, ''),
+        nullif($8, ''), $9, $10)
+    """;
+
+/// Records an admin action; a failure to record is ignored, as the C# server did.
+async fn audit(
+    ctx: borrow WebContext,
+    request: borrow Request,
+    userId: i64,
+    username: StringView,
+    action: StringView,
+    resource: StringView,
+    resourceId: StringView,
+    details: StringView,
+    success: bool,
+) {
+    var params = PgParams.create();
+    let ip = match (request.header("X-Forwarded-For")) {
+        Some(v) => v.view(),
+        null => "",
+    };
+    let first = ip[0..ip.indexOf(",") ?? ip.length].trim();
+    let agent = match (request.header("User-Agent")) {
+        Some(v) => v.view(),
+        null => "",
+    };
+    let bound = bound(params.int64(userId)) && bound(params.text(username)) && bound(params.text(action)) &&
+        bound(params.text(resource)) && bound(params.text(resourceId)) && bound(params.text(details)) &&
+        bound(params.text(first)) && bound(params.text(agent)) &&
+        bound(params.text(if (success) "info" else "warning")) && bound(params.bool(success));
+    if (!bound) {
+        return;
+    }
+    var rows = PgRows.create();
+    let ignored = await queryRows(ctx, sqlAudit(), params, mut rows);
+}
+
+/// `audit` for the caller.
+async fn audited(
+    ctx: borrow WebContext,
+    request: borrow Request,
+    who: borrow Principal,
+    action: StringView,
+    resource: StringView,
+    resourceId: StringView,
+) {
+    await audit(ctx, request, who.id, who.username.view(), action, resource, resourceId, "", true);
+}
+
+fn bound(r: Result<void, postgres.PgError>) -> bool => match (r) {
+    Ok() => true,
+    Err(_) => false,
+};
+
+/// The admin API: authorizes and dispatches.
+async fn adminApi(ctx: borrow WebContext, request: borrow Request) -> Result<Response, AllocError> {
+    let path = request.path.view();
+    let area = segment(path, 1) ?? "";
+    if (area == "auth" && (segment(path, 2) ?? "") == "login" && segmentCount(path) == 3) {
+        if (!request.isMethod("POST")) {
+            return notAllowed("POST");
+        }
+        return await login(ctx, request);
+    }
+    if (area == "auth" && (segment(path, 2) ?? "") == "me" && segmentCount(path) == 3) {
+        return await me(ctx, request);
+    }
+    if (area == "profile") {
+        return await profile(ctx, request);
+    }
+    let caller = match (await authorize(ctx, request, true, false)?) {
+        Authorized.Caller(p) => p,
+        Authorized.Refused(r) => { return Ok(r); }
+    };
+    if (area == "stats") {
+        return await stats(ctx, request, caller);
+    }
+    if (area == "domains") {
+        return await domainsApi(ctx, request, caller);
+    }
+    if (area == "aliases") {
+        return await aliasesApi(ctx, request, caller);
+    }
+    if (area == "users") {
+        return await usersApi(ctx, request, caller);
+    }
+    if (area == "mailboxes") {
+        return await mailboxesApi(ctx, request, caller);
+    }
+    if (area == "sieve-scripts") {
+        return await sieveApi(ctx, request, caller);
+    }
+    if (area == "queue") {
+        return await queueApi(ctx, request, caller);
+    }
+    if (area == "audit-logs") {
+        return await auditLogs(ctx, request, caller);
+    }
+    return unsupported(request, area);
+}
+
+/// Features the C# server had and this one does not (greylisting, the IP blacklist UI, retention rules, webhooks,
+/// PGP keys, OAuth clients, the DNS tools): listing gives nothing, changing is 501, so their pages load and say so.
+fn unsupported(request: borrow Request, area: StringView) -> Result<Response, AllocError> {
+    let known = area == "greylist" || area == "ip-blacklist" || area == "retention-rules" || area == "webhooks" ||
+        area == "pgp-keys" || area == "oauth" || area == "tools" || area == "admin";
+    if (!known) {
+        return Response.error(404, "No such endpoint.");
+    }
+    if (request.isMethod("GET") && area != "tools") {
+        var body = Vector<u8>.create();
+        body.extend("[]".bytes())?;
+        return Response.json(200, body);
+    }
+    return Response.error(501, "This server does not have that feature.");
+}
+
+// ---- Login ----
+
+/// $1 username: an admin account.
+fn sqlAdminLogin() -> StringView =>
+    """
+    SELECT a.id, a.password_hash, a.active, a.role, coalesce(a.domain_id, 0), a.display_name, d.name
+    FROM admin_users a LEFT JOIN domains d ON d.id = a.domain_id WHERE a.username = $1
+    """;
+
+/// $1 user id: a mail user's role and domain after a good login.
+fn sqlUserLogin() -> StringView =>
+    """
+    SELECT u.role, u.domain_id, d.name FROM users u JOIN domains d ON d.id = u.domain_id WHERE u.id = $1
+    """;
+
+/// POST /api/auth/login: an admin account by username, else a mail user by address. The token's claims are the C#
+/// server's.
+async fn login(ctx: borrow WebContext, request: borrow Request) -> Result<Response, AllocError> {
+    let body = StringView.fromUtf8(request.body.view()) ?? "";
+    let doc = match (JsonDocument.parse(body.bytes())) {
+        Ok(d) => d,
+        Err(_) => { return Response.error(400, "Username/email and password are required."); }
+    };
+    var username = String.create();
+    var password = String.create();
+    match (doc.member(doc.root(), "username")) {
+        Some(v) => { doc.string(v, mut username)?; }
+        null => {}
+    }
+    match (doc.member(doc.root(), "password")) {
+        Some(v) => { doc.string(v, mut password)?; }
+        null => {}
+    }
+    if (username.view().trim().length == 0 || password.length == 0) {
+        return Response.error(400, "Username/email and password are required.");
+    }
+    if (ctx.admin.jwtSecret.length < JWT_MIN_SECRET) {
+        return Response.error(503, "JWT is not configured: set [admin] jwt_secret (at least 32 characters).");
+    }
+    let mail = ctx.mail.get();
+    let peer = peerAddress(request);
+    if (await loginBlocked(mail.login, mail.store, peer)) {
+        return Response.error(429, "Too many failed logins from your address; try again later.");
+    }
+    var params = PgParams.create();
+    match (params.text(username.view().trim())) {
+        Ok() => {}
+        Err(_) => { return Err(AllocError.OutOfMemory); }
+    }
+    var rows = PgRows.create();
+    if (!(await queryRows(ctx, sqlAdminLogin(), params, mut rows))) {
+        return Response.error(503, "The database is not available.");
+    }
+    let isAdmin = rows.rowCount() == 1;
+    let hash = if (isAdmin) rows.text(0, 1) ?? "" else "";
+    if (isAdmin && (await verifyPassword(mail.login, hash, password.bytes()))) {
+        if (!(rows.bool(0, 2) ?? false)) {
+            await audit(
+                ctx,
+                request,
+                rows.int64(0, 0) ?? 0,
+                username.view(),
+                "admin.login.disabled",
+                "admin_user",
+                "",
+                "",
+                false,
+            );
+            return Response.error(401, "Account is disabled.");
+        }
+        let id = rows.int64(0, 0) ?? 0;
+        let role = rows.text(0, 3) ?? "domain";
+        let domainId = rows.int64(0, 4) ?? 0;
+        var record = PgParams.create();
+        match (record.int64(id)) {
+            Ok() => {}
+            Err(_) => { return Err(AllocError.OutOfMemory); }
+        }
+        var ignored = PgRows.create();
+        let stamped = await queryRows(
+            ctx,
+            "UPDATE admin_users SET last_login = now() WHERE id = $1",
+            record,
+            mut ignored,
+        );
+        await audit(ctx, request, id, username.view(), "admin.login.success", "admin_user", "", "", true);
+        return loginAnswer(ctx, id, username.view(), rows.text(0, 5), role, domainId, rows.text(0, 6), false);
+    }
+    if (isAdmin) {
+        let blocked = await loginFailed(mail.login, mail.store, peer, username.bytes());
+        await audit(ctx, request, 0, username.view(), "admin.login.failed", "auth", "", "", false);
+        return Response.error(401, "Invalid username or password.");
+    }
+    // A mail user: the same check as SMTP and IMAP (the guard, the dummy hash, the disabled flag).
+    var email = Vector<u8>.create();
+    let userId = match (await checkLogin(mail.login, mail.store, peer, username.bytes(), password.bytes(), mut email)) {
+        Ok(id) => id,
+        Err(_) => {
+            await audit(ctx, request, 0, username.view(), "admin.login.failed", "auth", "", "", false);
+            return Response.error(401, "Invalid username or password.");
+        }
+    };
+    var userParams = PgParams.create();
+    match (userParams.int64(userId)) {
+        Ok() => {}
+        Err(_) => { return Err(AllocError.OutOfMemory); }
+    }
+    var user = PgRows.create();
+    if (!(await queryRows(ctx, sqlUserLogin(), userParams, mut user)) || user.rowCount() == 0) {
+        return Response.error(503, "The database is not available.");
+    }
+    let address = StringView.fromUtf8(email.view()) ?? "";
+    let role = if ((user.text(0, 0) ?? "") == "admin") "domain_admin" else "user";
+    await audit(ctx, request, userId, address, "user.login.success", "user", "", "", true);
+    return loginAnswer(ctx, userId, address, null, role, user.int64(0, 1) ?? 0, user.text(0, 2), true);
+}
+
+fn peerAddress(request: borrow Request) -> [u8; 16] {
+    // The admin listener is loopback (the UI's server): the address that counts is the one it forwards, when it
+    // forwards one; it blanks the field on its own calls.
+    let forwarded = match (request.header("X-Forwarded-For")) {
+        Some(v) => v.view(),
+        null => "",
+    };
+    let first = forwarded[0..forwarded.indexOf(",") ?? forwarded.length].trim();
+    return peerBytes(SocketAddresses.parseIp(first, 0));
+}
+
+fn loginAnswer(
+    ctx: borrow WebContext,
+    id: i64,
+    username: StringView,
+    displayName: StringView?,
+    role: StringView,
+    domainId: i64,
+    domainName: StringView?,
+    mailUser: bool,
+) -> Result<Response, AllocError> {
+    let now = Clock.unixMillis() / 1000;
+    let lifetime = ctx.admin.tokenHours * 3600;
+    var idText = String.create();
+    idText.appendNumber(id)?;
+    var domainText = String.create();
+    domainText.appendNumber(domainId)?;
+    var jti = [0u8; 16];
+    match (Random.fill(mut jti[..])) {
+        Ok() => {}
+        Err(_) => {}
+    }
+    var jtiText = Vector<u8>.create();
+    macme.appendBase64Url(mut jtiText, jti[..])?;
+    var claims = JsonWriter.create();
+    claims.beginObject();
+    claims.stringField("sub", idText.view());
+    claims.stringField("unique_name", username);
+    claims.stringField("role", role);
+    claims.stringField("admin_role", role);
+    claims.stringField("source", if (mailUser) "users" else "admin_users");
+    claims.key("jti");
+    claims.stringBytes(jtiText.view());
+    if (domainId != 0) {
+        claims.stringField("domain_id", domainText.view());
+    }
+    claims.stringField("iss", "CosmoMailAdmin");
+    claims.stringField("aud", "CosmoMailAdmin");
+    claims.integerField("exp", now + lifetime);
+    claims.endObject();
+    let payload = claims.finish()?;
+    var token = Vector<u8>.create();
+    signJwt(ctx.admin.jwtSecret.bytes(), payload.view(), mut token)?;
+    var w = JsonWriter.create();
+    w.beginObject();
+    w.key("token");
+    w.stringBytes(token.view());
+    w.integerField("expiresIn", lifetime);
+    w.key("user");
+    w.beginObject();
+    w.integerField("id", id);
+    w.stringField("username", username);
+    w.optionalField("displayName", displayName);
+    w.stringField("role", role);
+    if (domainId != 0) {
+        w.integerField("domainId", domainId);
+    } else {
+        w.nullField("domainId");
+    }
+    w.optionalField("domainName", domainName);
+    w.stringField("source", if (mailUser) "users" else "admin_users");
+    w.endObject();
+    w.endObject();
+    return Response.json(200, w.finish()?);
+}
+
+/// $1 id, $2 whether a mail user: GET /api/auth/me's object.
+fn sqlMe() -> StringView =>
+    """
+    SELECT 200, jsonb_build_object('id', u.id, 'username', u.email, 'displayName', NULL,
+        'role', CASE WHEN u.role = 'admin' THEN 'domain_admin' ELSE 'user' END, 'domainId', u.domain_id,
+        'domainName', d.name, 'source', 'users')::text
+    FROM users u JOIN domains d ON d.id = u.domain_id WHERE $2 AND u.id = $1
+    UNION ALL
+    SELECT 200, jsonb_build_object('id', a.id, 'username', a.username, 'displayName', a.display_name, 'role', a.role,
+        'domainId', a.domain_id, 'domainName', d.name, 'source', 'admin_users')::text
+    FROM admin_users a LEFT JOIN domains d ON d.id = a.domain_id WHERE NOT $2 AND a.id = $1
+    """;
+
+async fn me(ctx: borrow WebContext, request: borrow Request) -> Result<Response, AllocError> {
+    let caller = match (await authorize(ctx, request, false, false)?) {
+        Authorized.Caller(p) => p,
+        Authorized.Refused(r) => { return Ok(r); }
+    };
+    var params = PgParams.create();
+    if (!(bound(params.int64(caller.id))) || !(bound(params.bool(caller.mailUser)))) {
+        return Err(AllocError.OutOfMemory);
+    }
+    return await answer(ctx, sqlMe(), params, "User not found.");
+}
+
+// ---- Profile (mail users) ----
+
+/// $1 user id.
+fn sqlProfile() -> StringView =>
+    """
+    SELECT 200, jsonb_build_object('id', u.id, 'email', u.email, 'domainName', d.name, 'role', u.role,
+        'status', CASE WHEN u.active THEN 'active' ELSE 'disabled' END, 'quota', u.quota, 'usedQuota', u.used,
+        'language', u.language, 'totpEnabled', false, 'forwardTo', u.forward_to,
+        'autoReplyEnabled', u.auto_reply_enabled, 'autoReplySubject', u.auto_reply_subject,
+        'autoReplyBody', u.auto_reply_body, 'authMethod', 'password', 'lastLogin', u.last_login,
+        'createdAt', u.created_at)::text
+    FROM users u JOIN domains d ON d.id = u.domain_id WHERE u.id = $1
+    """;
+
+/// $1 user id, $2 the body: null keeps a value, except forwardTo, which is always set ("" clears it).
+fn sqlUpdateProfile() -> StringView =>
+    """
+    UPDATE users SET
+        language = coalesce($2::jsonb->>'language', language),
+        forward_to = nullif(btrim(coalesce($2::jsonb->>'forwardTo', '')), ''),
+        auto_reply_enabled = coalesce(($2::jsonb->>'autoReplyEnabled')::boolean, auto_reply_enabled),
+        auto_reply_subject = coalesce($2::jsonb->>'autoReplySubject', auto_reply_subject),
+        auto_reply_body = coalesce($2::jsonb->>'autoReplyBody', auto_reply_body),
+        updated_at = now()
+    WHERE id = $1
+    RETURNING 200, '{"success":true}'
+    """;
+
+async fn profile(ctx: borrow WebContext, request: borrow Request) -> Result<Response, AllocError> {
+    let caller = match (await authorize(ctx, request, false, false)?) {
+        Authorized.Caller(p) => p,
+        Authorized.Refused(r) => { return Ok(r); }
+    };
+    if (!caller.mailUser) {
+        return Response.error(403, "Only mail users have a profile.");
+    }
+    let path = request.path.view();
+    var params = PgParams.create();
+    if (!(bound(params.int64(caller.id)))) {
+        return Err(AllocError.OutOfMemory);
+    }
+    if (segmentCount(path) == 2) {
+        if (request.isMethod("GET")) {
+            return await answer(ctx, sqlProfile(), params, "User not found.");
+        }
+        if (request.isMethod("PUT")) {
+            let body = match (bodyObject(request)) {
+                Some(b) => b,
+                null => { return Response.error(400, "A JSON object is required."); }
+            };
+            if (!(bound(params.text(body)))) {
+                return Err(AllocError.OutOfMemory);
+            }
+            return await answer(ctx, sqlUpdateProfile(), params, "User not found.");
+        }
+        return notAllowed("GET, PUT");
+    }
+    if (segmentCount(path) == 3 && (segment(path, 2) ?? "") == "password") {
+        if (!request.isMethod("PUT")) {
+            return notAllowed("PUT");
+        }
+        return await changeOwnPassword(ctx, request, caller);
+    }
+    return Response.error(404, "No such endpoint.");
+}
+
+/// PUT /api/profile/password: the current password, then the new one. A wrong current password is 400, not the C#
+/// server's 401, which logged the user out.
+async fn changeOwnPassword(
+    ctx: borrow WebContext,
+    request: borrow Request,
+    caller: borrow Principal,
+) -> Result<Response, AllocError> {
+    let doc = match (JsonDocument.parse(request.body.view())) {
+        Ok(d) => d,
+        Err(_) => { return Response.error(400, "Current and new password required."); }
+    };
+    var current = String.create();
+    var next = String.create();
+    match (doc.member(doc.root(), "currentPassword")) {
+        Some(v) => { doc.string(v, mut current)?; }
+        null => {}
+    }
+    match (doc.member(doc.root(), "newPassword")) {
+        Some(v) => { doc.string(v, mut next)?; }
+        null => {}
+    }
+    if (current.length == 0 || next.length == 0) {
+        return Response.error(400, "Current and new password required.");
+    }
+    if (next.length < 8) {
+        return Response.error(400, "The new password needs at least 8 characters.");
+    }
+    var params = PgParams.create();
+    if (!(bound(params.int64(caller.id)))) {
+        return Err(AllocError.OutOfMemory);
+    }
+    var rows = PgRows.create();
+    if (!(await queryRows(ctx, "SELECT password_hash FROM users WHERE id = $1", params, mut rows))) {
+        return Response.error(503, "The database is not available.");
+    }
+    let hash = if (rows.rowCount() == 1) rows.text(0, 0) ?? "" else "";
+    let mail = ctx.mail.get();
+    if (!(await verifyPassword(mail.login, hash, current.bytes()))) {
+        return Response.error(400, "Current password is incorrect.");
+    }
+    return await setPassword(ctx, request, caller, caller.id, next.bytes(), "user.password-change");
+}
+
+/// Stores a new bcrypt hash for the user `userId`.
+async fn setPassword(
+    ctx: borrow WebContext,
+    request: borrow Request,
+    caller: borrow Principal,
+    userId: i64,
+    password: Slice<u8>,
+    action: StringView,
+) -> Result<Response, AllocError> {
+    let mail = ctx.mail.get();
+    let hash = match (await hashPassword(mail.login, password)) {
+        Some(h) => h,
+        null => { return Err(AllocError.OutOfMemory); }
+    };
+    var params = PgParams.create();
+    if (!(bound(params.int64(userId))) || !(bound(
+        params.text(hash.view()),
+    )) || !(bound(params.int64(caller.scope())))) {
+        return Err(AllocError.OutOfMemory);
+    }
+    let r = await answer(
+        ctx,
+        "UPDATE users SET password_hash = $2, updated_at = now() WHERE id = $1 AND ($3 = 0 OR domain_id = $3) RETURNING 200, '{\"success\":true}'",
+        params,
+        "User not found",
+    )?;
+    if (r.status == 200) {
+        var idText = String.create();
+        idText.appendNumber(userId)?;
+        await audited(ctx, request, caller, action, "user", idText.view());
+    }
+    return Ok(r);
+}
+
+// ---- Stats, queue, audit logs ----
+
+async fn stats(
+    ctx: borrow WebContext,
+    request: borrow Request,
+    caller: borrow Principal,
+) -> Result<Response, AllocError> {
+    var params = PgParams.create();
+    if (!(bound(params.int64(caller.scope())))) {
+        return Err(AllocError.OutOfMemory);
+    }
+    return await answer(
+        ctx,
+        """
+        SELECT 200, jsonb_build_object(
+            'domains', (SELECT count(*) FROM domains WHERE $1 = 0 OR id = $1),
+            'users', (SELECT count(*) FROM users WHERE $1 = 0 OR domain_id = $1),
+            'queue_size', (SELECT count(*) FROM queue WHERE $1 = 0))::text
+        """,
+        params,
+        "",
+    );
+}
+
+/// GET /api/queue (the newest 50, as the C# server's smtp_queue rows) and POST /api/queue/{id}/retry (due now).
+/// Server admins only: the queue is everyone's mail.
+async fn queueApi(
+    ctx: borrow WebContext,
+    request: borrow Request,
+    caller: borrow Principal,
+) -> Result<Response, AllocError> {
+    if (caller.role != ROLE_SERVER) {
+        return Response.error(403, "Server-level access required.");
+    }
+    let path = request.path.view();
+    if (segmentCount(path) == 2 && request.isMethod("GET")) {
+        let none = PgParams.create();
+        return await answer(
+            ctx,
+            """
+            SELECT 200, coalesce(jsonb_agg(q ORDER BY q.created_at DESC), '[]')::text FROM (
+                SELECT id, NULL::text AS message_id, sender, to_jsonb(recipients)::text AS recipients,
+                    NULL::text AS message_path,
+                    CASE WHEN attempts = 0 THEN 'pending' ELSE 'retrying' END AS status, attempts AS retry_count,
+                    NULL::int AS max_retries, next_attempt AS next_retry, last_error AS error_message,
+                    user_id AS auto_save_user_id, created_at, created_at AS updated_at
+                FROM queue ORDER BY created_at DESC LIMIT 50) q
+            """,
+            none,
+            "",
+        );
+    }
+    if (segmentCount(path) == 4 && (segment(path, 3) ?? "") == "retry" && request.isMethod("POST")) {
+        let id = (segment(path, 2) ?? "").parseInt<i64>() ?? 0;
+        var params = PgParams.create();
+        if (!(bound(params.int64(id)))) {
+            return Err(AllocError.OutOfMemory);
+        }
+        let r = await answer(
+            ctx,
+            "UPDATE queue SET next_attempt = now() WHERE id = $1 RETURNING 200, '{\"success\":true}'",
+            params,
+            "Queue item not found",
+        )?;
+        if (r.status == 200) {
+            await audited(ctx, request, caller, "queue.retry", "queue", segment(path, 2) ?? "");
+        }
+        return Ok(r);
+    }
+    return Response.error(404, "No such endpoint.");
+}
+
+/// GET /api/audit-logs?limit&offset&action&username: camelCase rows, newest first. Domain admins see their own
+/// actions only.
+async fn auditLogs(
+    ctx: borrow WebContext,
+    request: borrow Request,
+    caller: borrow Principal,
+) -> Result<Response, AllocError> {
+    if (!request.isMethod("GET")) {
+        return notAllowed("GET");
+    }
+    var text = String.create();
+    let limit = if (request.param("limit", mut text)?) text.view().parseInt<i64>() ?? 100 else 100;
+    let offset = if (request.param("offset", mut text)?) text.view().parseInt<i64>() ?? 0 else 0;
+    var action = String.create();
+    request.param("action", mut action)?;
+    var username = String.create();
+    request.param("username", mut username)?;
+    var params = PgParams.create();
+    let bounded = if (limit < 1) 1 else if (limit > 1000) 1000 else limit;
+    if (!(bound(params.int64(bounded))) || !(bound(params.int64(if (offset < 0) 0 else offset))) ||
+        !(bound(params.text(action.view()))) || !(bound(params.text(username.view()))) ||
+        !(bound(params.int64(if (caller.role == ROLE_SERVER) 0 else caller.id)))) {
+        return Err(AllocError.OutOfMemory);
+    }
+    return await answer(
+        ctx,
+        """
+        SELECT 200, coalesce(jsonb_agg(a ORDER BY a."timestamp" DESC), '[]')::text FROM (
+            SELECT id, "timestamp", user_id AS "userId", username, action, resource_type AS "resourceType",
+                resource_id AS "resourceId", details, ip_address AS "ipAddress", user_agent AS "userAgent", severity,
+                success
+            FROM audit_logs
+            WHERE ($3 = '' OR action LIKE $3 || '%') AND ($4 = '' OR username ILIKE '%' || $4 || '%')
+                AND ($5 = 0 OR user_id = $5)
+            ORDER BY "timestamp" DESC LIMIT $1 OFFSET $2) a
+        """,
+        params,
+        "",
+    );
+}

@@ -1,0 +1,12 @@
+size 6867
+envelope ("Fri, 27 Sep 1996 09:36:54 -0700" "RE: problem with relative urls and applets" (("Dr. Mark K. Joseph" NIL "izzy" "nugget.scr.atm.com")) ((NIL NIL "owner-mhtml" "segate.sunet.se")) (("Dr. Mark K. Joseph" NIL "izzy" "nugget.scr.atm.com")) ((NIL NIL "lewisg" "exchange.microsoft.com")) ((NIL NIL "mhtml" "segate.sunet.se")) NIL "<MHTML%96092703403599@SEGATE.SUNET.SE>" "<19960927163654.izzy@scr.atm.com>")
+bodystructure (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 881 18 NIL NIL NIL NIL) ("application" "vcard" NIL NIL "The Sender's Signature" "7bit" 3702 NIL ("inline" ("filename" "MJOSEPH.VCF")) NIL NIL) "mixed" ("boundary" "=_27tW56g.bO1996u.N16d000A.r09Y.36:0008d3") NIL NIL NIL)
+body (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 881 18) ("application" "vcard" NIL NIL "The Sender's Signature" "7bit" 3702) "mixed")
+section HEADER 1896 3097fedb895fb5bad33a4ad7544cae41bb5472a08dbf7694bea96d6ac7a8abc9
+section TEXT 4971 94609b6305c99312b06415ba20b73ef695338c05661f4f0c9de7f0dc17792fd0
+section HEADER.FIELDS 355 31ec9bb799ac09f02b09d0b079788f51f538d89e06d7266b4b1192f251845361
+section HEADER.FIELDS.NOT 1543 c185bd16f89ba2d919acfbf111f0505386776102d20bc25f7ffdb996997d4ee4
+section 1 881 65785f7792c6866ff6d0fd16e2d1b04c1cd5276b149a1008f10788b0b99f2470
+section 1.MIME 81 11e512bb335700048a2f81e229896d81e68a6c0460f1135f1c57ff19506dfbe5
+section 2 3702 72a831b5809b31868e13a95d880ed0116692518279adb3febf74fa5bb1c0fda5
+section 2.MIME 166 ba01d9462108af9aec96134774161a5890b3a7e561df481fcaed2b19ff7c3267

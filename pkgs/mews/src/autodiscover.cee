@@ -1,0 +1,47 @@
+// What Autodiscover says about EWS: in Outlook's POX response an EXPR protocol block with the EWS URL (only when
+// `[http] advertise_exchange` is on: its presence makes macOS Mail set the account up as Exchange), and in the v2
+// JSON answer for Protocol=ews a pointer to the URL, as the C# server gave them. ActiveSync's ASUrl belongs in the
+// same EXPR block.
+
+fn appendEscaped(out: borrow mut Vector<u8>, text: StringView) -> Result<void, AllocError> {
+    for (c in text.bytes()) {
+        if (c == 0x26) {
+            out.extend("&amp;".bytes())?;
+        } else if (c == 0x3c) {
+            out.extend("&lt;".bytes())?;
+        } else if (c == 0x3e) {
+            out.extend("&gt;".bytes())?;
+        } else {
+            out.push(c)?;
+        }
+    }
+    return Ok();
+}
+
+/// EWS's URL on `server`.
+public fn ewsUrl(server: StringView, into: borrow mut String) -> Result<void, AllocError> {
+    into.clear();
+    into.append("https://")?;
+    into.append(server)?;
+    return into.append("/EWS/Exchange.asmx");
+}
+
+/// The POX response's EXPR protocol block: the server, its login name (without it macOS Mail logs in with the bare
+/// local part), and the EWS URLs.
+public fn appendExchangeProtocol(
+    out: borrow mut Vector<u8>,
+    server: StringView,
+    email: StringView,
+) -> Result<void, AllocError> {
+    var url = String.create();
+    ewsUrl(server, mut url)?;
+    out.extend("      <Protocol>\n        <Type>EXPR</Type>\n        <Server>".bytes())?;
+    appendEscaped(out, server)?;
+    out.extend("</Server>\n        <SSL>on</SSL>\n        <LoginName>".bytes())?;
+    appendEscaped(out, email)?;
+    out.extend("</LoginName>\n        <EwsUrl>".bytes())?;
+    appendEscaped(out, url.view())?;
+    out.extend("</EwsUrl>\n        <EmwsUrl>".bytes())?;
+    appendEscaped(out, url.view())?;
+    return out.extend("</EmwsUrl>\n      </Protocol>\n".bytes());
+}

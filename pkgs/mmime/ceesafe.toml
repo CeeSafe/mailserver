@@ -1,0 +1,13 @@
+[package]
+name = "mmime"
+version = "0.1.0"
+kind = "library"
+c = ["c/charset_shim.c"]
+tests = ["tests"]
+
+# glibc has iconv built in; macOS keeps it in libiconv.
+[target.macos]
+links = ["iconv"]
+
+[dependencies]
+encoding = { path = "../../../../CeeSafeLibs/encoding" }

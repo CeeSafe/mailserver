@@ -1,0 +1,92 @@
+// Header decoding: RFC 2047 encoded words, charsets, RFC 2231 parameters.
+
+fn decoded(value: StringView) -> String {
+    var out = Vector<u8>.create();
+    decodeHeader(value.bytes(), mut out)!;
+    var s = String.create();
+    s.append(StringView.fromUtf8(out.view())!)!;
+    return s;
+}
+
+fn same(value: StringView, want: StringView) -> Result<void, TestFailure> {
+    let got = decoded(value);
+    if (got.view() != want) {
+        Console.writeErrorLine(got.view());
+    }
+    return Check.isTrue(got.view() == want, want);
+}
+
+@test
+fn decodesEncodedWords() -> Result<void, TestFailure> {
+    same(" plain text ", "plain text")?;
+    same("=?UTF-8?B?w6l0w6k=?=", "été")?;
+    same("=?utf-8?q?caf=C3=A9_au_lait?=", "café au lait")?;
+    same("=?ISO-8859-1?Q?Andr=E9?= Pirard", "André Pirard")?;
+    // The whitespace between two encoded words is dropped (RFC 2047 §6.2), not between a word and text.
+    same("=?UTF-8?Q?a?= =?UTF-8?Q?b?=", "ab")?;
+    same("=?UTF-8?Q?a?=\r\n =?UTF-8?Q?b?= c", "ab c")?;
+    same("x =?UTF-8?Q?a?=", "x a")?;
+    // Charsets through iconv, a stateful one included.
+    same("=?KOI8-R?B?79TL1cTB?=", "Откуда")?;
+    same("=?ISO-2022-JP?B?GyRCRnxLXDhsGyhC?=", "日本語")?;
+    same("=?windows-1252?Q?=93quoted=94?=", "\u{201c}quoted\u{201d}")?;
+    // Lenient: no padding, lower-case encoding letter, a word inside parentheses.
+    same("=?utf-8?b?w6k?=", "é")?;
+    same("(=?utf-8?q?x?=)", "(x)")?;
+    return Ok();
+}
+
+@test
+fn neverFails() -> Result<void, TestFailure> {
+    // Malformed words stay as text; unknown charsets read as UTF-8 or Latin-1; bad UTF-8 becomes U+FFFD.
+    same("=?UTF-8?X?abc?=", "=?UTF-8?X?abc?=")?;
+    same("=?UTF-8?Q?unterminated", "=?UTF-8?Q?unterminated")?;
+    same("=?x-unknown?Q?caf=C3=A9?=", "café")?;
+    same("=?x-unknown?Q?caf=E9?=", "café")?;
+    same("=?UTF-8?Q?bad=FF?=", "bad\u{fffd}")?;
+    same("=?UTF-8?B?!!!?=", "")?;
+    // Raw 8-bit text: UTF-8 if it is, else Latin-1.
+    let utf8 = [0xc3u8, 0xa9];
+    var out = Vector<u8>.create();
+    decodeHeader(utf8[..], mut out)!;
+    Check.isTrue(out.view().startsWith("é".bytes()) && out.length == 2, "raw UTF-8")?;
+    let latin = [0x41u8, 0xe9];
+    out.clear();
+    decodeHeader(latin[..], mut out)!;
+    return Check.isTrue(StringView.fromUtf8(out.view())! == "Aé", "raw Latin-1");
+}
+
+fn param(header: StringView, name: StringView) -> String {
+    var media = MediaType.create();
+    parseDisposition(header.bytes(), mut media)!;
+    var out = Vector<u8>.create();
+    var s = String.create();
+    if (decodeParam(media.params, name, mut out)!) {
+        s.append(StringView.fromUtf8(out.view())!)!;
+    } else {
+        s.append("<none>")!;
+    }
+    return s;
+}
+
+@test
+fn decodesParameters() -> Result<void, TestFailure> {
+    paramIs("attachment; filename=\"plain.txt\"", "plain.txt")?;
+    paramIs("attachment; filename*=UTF-8''%E2%82%AC%20rates.pdf", "€ rates.pdf")?;
+    paramIs("attachment; filename*=iso-8859-1'en'%A3%20rates", "£ rates")?;
+    // Continuations, out of order.
+    paramIs("attachment; filename*1*=%20two; filename*0*=utf-8''one%C3%A9; filename*2=\" three\"", "oneé two three")?;
+    // RFC 2047 in a parameter, which clients write though RFC 2047 forbids it.
+    paramIs("attachment; filename=\"=?UTF-8?B?w6l0w6kucGRm?=\"", "été.pdf")?;
+    // The RFC 2231 form wins over a plain one.
+    paramIs("attachment; FILENAME*=utf-8''x; filename=y", "x")?;
+    return paramIs("inline", "<none>");
+}
+
+fn paramIs(header: StringView, want: StringView) -> Result<void, TestFailure> {
+    let got = param(header, "filename");
+    if (got.view() != want) {
+        Console.writeErrorLine(got.view());
+    }
+    return Check.isTrue(got.view() == want, want);
+}

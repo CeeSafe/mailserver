@@ -1,0 +1,523 @@
+// The streaming MIME scanner (RFC 5322, RFC 2045/2046): fed a message in chunks of any size, it finds every part's
+// byte ranges and line counts in one pass, keeping only the header blocks. It never rejects input: malformed mail
+// is read as the major implementations read it, and the corpus differential (tools/differential.py) pins that.
+
+/// What a part is.
+public const PART_LEAF: u8 = 0;
+/// A multipart with a boundary: its children follow it in `MessageIndex.parts`.
+public const PART_MULTIPART: u8 = 1;
+/// A message/rfc822 (or message/global) part: its one child is the encapsulated message.
+public const PART_MESSAGE: u8 = 2;
+
+/// No part: the root's parent.
+public const NO_PART: usize = 0xffffffffffffffff;
+
+/// Nesting deeper than this is read as a leaf, so hostile input cannot make the index or a renderer recurse
+/// without bound.
+const MAX_DEPTH: u32 = 64;
+/// The longest line kept whole. Longer header lines are cut there; body lines only ever need their start, to look
+/// for a boundary.
+const MAX_LINE: usize = 16 * 1024;
+/// The most header bytes kept per part, and for the whole message.
+const MAX_PART_HEADER: usize = 256 * 1024;
+const MAX_HEADERS: usize = 4 * 1024 * 1024;
+
+const PHASE_HEADER: u8 = 0;
+const PHASE_BODY: u8 = 1;
+const PHASE_PREAMBLE: u8 = 2;
+const PHASE_EPILOGUE: u8 = 3;
+
+/// One part of a message, as offsets into it.
+public struct Part {
+    /// The enclosing part, or `NO_PART` for the message itself.
+    public parent: usize;
+    /// `PART_LEAF`, `PART_MULTIPART` or `PART_MESSAGE`.
+    public kind: u8;
+    /// Whether this part is a message's top level: the root, or the child of a `PART_MESSAGE`.
+    public isMessage: bool;
+    /// Whether its default type is message/rfc822 (a part of a multipart/digest).
+    public digestChild: bool;
+    public depth: u32;
+    /// The header block is `[headerStart, bodyStart)`, the blank line that ends it included.
+    public headerStart: u64;
+    public bodyStart: u64;
+    /// The body is `[bodyStart, bodyEnd)`: the line break before a boundary belongs to the boundary.
+    public bodyEnd: u64;
+    /// Lines starting in the body.
+    public lines: u64;
+    /// The header block's copy in `MessageIndex.headers`.
+    headersAt: usize;
+    headersLength: usize;
+    /// For a multipart, its boundary in `MessageIndex.headers`.
+    boundaryAt: usize;
+    boundaryLength: usize;
+    /// The line index at `bodyStart`.
+    firstLine: u64;
+    childCount: u32;
+}
+
+/// Every part of a message, in order (a part's children follow it), and their header blocks.
+@noncopy
+public struct MessageIndex {
+    public parts: Vector<Part>;
+    headers: Vector<u8>;
+    /// The message's length.
+    public size: u64;
+
+    public fn create() -> MessageIndex =>
+        MessageIndex { parts: Vector<Part>.create(), headers: Vector<u8>.create(), size: 0 };
+
+    /// A part's header block, as kept (each line CRLF-terminated; cut if it was huge).
+    public fn headerBlock(borrow this, part: usize) -> Slice<u8> {
+        let p = this.parts[part];
+        return this.headers[p.headersAt..p.headersAt + p.headersLength];
+    }
+
+    fn boundary(borrow this, part: usize) -> Slice<u8> {
+        let p = this.parts[part];
+        return this.headers[p.boundaryAt..p.boundaryAt + p.boundaryLength];
+    }
+
+    /// The children of `part`, in order: `into` gets their indices.
+    public fn children(borrow this, part: usize, into: borrow mut Vector<usize>) -> Result<void, AllocError> {
+        into.clear();
+        for (i in part + 1..this.parts.length) {
+            if (this.parts[i].parent == part) {
+                into.push(i)?;
+            }
+        }
+        return Ok();
+    }
+
+    fn clear(borrow mut this) {
+        this.parts.clear();
+        this.headers.clear();
+        this.size = 0;
+    }
+}
+
+/// The raw value of the first header field `name` (any case) of `part` of `index`, or `null`.
+public fn headerOf<region a>(index: borrow(a) MessageIndex, part: usize, name: StringView) -> Slice<a, u8>? =>
+    headerValue(index.headerBlock(part), name);
+
+/// Reads a message fed in chunks and builds its `MessageIndex`.
+@noncopy
+public struct MimeScanner {
+    index: MessageIndex;
+    /// The line being read: its start offset, the bytes kept of it, and its full length so far.
+    line: Vector<u8>;
+    lineStart: u64;
+    lineLength: u64;
+    /// The line's last two bytes, which tell its terminator even when the line was cut.
+    tail: [u8; 2];
+    /// Lines completed so far.
+    lineCount: u64;
+    /// The previous line's terminator length (0 to 2) and whether its content was empty.
+    previousTerminator: u64;
+    previousEmpty: bool;
+    /// Whether the previous line was a boundary: its line break is its own, so the next boundary takes none.
+    previousBoundary: bool;
+    /// The part receiving lines, and what it is reading.
+    current: usize;
+    phase: u8;
+    /// Multiparts whose boundary is active, outermost first.
+    open: Vector<usize>;
+    media: MediaType;
+    encoding: MediaType;
+
+    public fn create() -> MimeScanner => MimeScanner {
+        index: MessageIndex.create(),
+        line: Vector<u8>.create(),
+        lineStart: 0,
+        lineLength: 0,
+        tail: [0u8; 2],
+        lineCount: 0,
+        previousTerminator: 0,
+        previousEmpty: false,
+        previousBoundary: false,
+        current: NO_PART,
+        phase: PHASE_HEADER,
+        open: Vector<usize>.create(),
+        media: MediaType.create(),
+        encoding: MediaType.create(),
+    };
+
+    /// Reads the next bytes of the message.
+    public fn feed(borrow mut this, bytes: Slice<u8>) -> Result<void, AllocError> {
+        if (this.current == NO_PART && this.index.parts.length == 0) {
+            this.startPart(NO_PART, 0, true, false)?;
+        }
+        var at: usize = 0;
+        while (at < bytes.length) {
+            let rest = bytes[at..];
+            match (rest.indexOfByte(0x0a)) {
+                Some(lf) => {
+                    this.keep(rest[0..lf + 1])?;
+                    at += lf + 1;
+                    this.endLine()?;
+                }
+                null => {
+                    this.keep(rest)?;
+                    at = bytes.length;
+                }
+            }
+        }
+        return Ok();
+    }
+
+    /// Ends the message and gives its index. The scanner is empty again afterwards.
+    public fn finish(borrow mut this, into: borrow mut MessageIndex) -> Result<void, AllocError> {
+        if (this.index.parts.length == 0) {
+            this.startPart(NO_PART, 0, true, false)?;
+        }
+        if (this.lineLength > 0) {
+            this.endLine()?;
+        }
+        let end = this.lineStart;
+        // A header never ended: the whole part is header.
+        if (this.phase == PHASE_HEADER) {
+            this.endHeader(end)?;
+        }
+        var p = this.current;
+        while (p != NO_PART) {
+            let count = this.lineCount;
+            let noLf = this.previousTerminator == 0;
+            this.close(p, end, count, noLf);
+            p = this.index.parts[p].parent;
+        }
+        this.index.size = end;
+        into.clear();
+        into.parts.extend(this.index.parts.view())?;
+        into.headers.extend(this.index.headers.view())?;
+        into.size = this.index.size;
+        this.reset();
+        return Ok();
+    }
+
+    fn reset(borrow mut this) {
+        this.index.clear();
+        this.line.clear();
+        this.lineStart = 0;
+        this.lineLength = 0;
+        this.lineCount = 0;
+        this.previousTerminator = 0;
+        this.previousEmpty = false;
+        this.previousBoundary = false;
+        this.current = NO_PART;
+        this.phase = PHASE_HEADER;
+        this.open.clear();
+    }
+
+    /// Adds bytes of the current line, keeping at most `MAX_LINE` of them.
+    fn keep(borrow mut this, bytes: Slice<u8>) -> Result<void, AllocError> {
+        if (bytes.length >= 2) {
+            this.tail[0] = bytes[bytes.length - 2];
+            this.tail[1] = bytes[bytes.length - 1];
+        } else if (bytes.length == 1) {
+            this.tail[0] = this.tail[1];
+            this.tail[1] = bytes[0];
+        }
+        this.lineLength += bytes.length as u64;
+        let room = MAX_LINE - this.line.length;
+        if (room > 0) {
+            let n = if (bytes.length < room) bytes.length else room;
+            this.line.extend(bytes[0..n])?;
+        }
+        return Ok();
+    }
+
+    /// The current line is complete (or the message ended).
+    fn endLine(borrow mut this) -> Result<void, AllocError> {
+        let kept = this.line.length;
+        var content = kept;
+        var terminator: u64 = 0;
+        let whole = this.lineLength == kept as u64;
+        if (whole && content > 0 && this.line[content - 1] == 0x0a) {
+            content -= 1;
+            terminator = 1;
+            if (content > 0 && this.line[content - 1] == 0x0d) {
+                content -= 1;
+                terminator = 2;
+            }
+        } else if (!whole && this.tail[1] == 0x0a) {
+            // A cut line: its terminator is in the bytes not kept.
+            terminator = if (this.tail[0] == 0x0d) 2u64 else 1u64;
+        }
+        let boundary = this.lineDone(content, terminator)?;
+        this.previousBoundary = boundary;
+        this.lineStart += this.lineLength;
+        this.lineCount += 1;
+        this.lineLength = 0;
+        this.tail = [0u8; 2];
+        this.previousTerminator = terminator;
+        this.previousEmpty = content == 0 && whole;
+        this.line.clear();
+        return Ok();
+    }
+
+    /// Handles a complete line; true if it was a boundary.
+    fn lineDone(borrow mut this, content: usize, terminator: u64) -> Result<bool, AllocError> {
+        let at = this.lineStart;
+        let next = at + this.lineLength;
+        // A boundary of any open multipart, innermost first, ends whatever is inside it.
+        if (content >= 2 && this.line[0] == 0x2d && this.line[1] == 0x2d && this.open.length > 0) {
+            var k = this.open.length;
+            while (k > 0) {
+                k -= 1;
+                let multipart = this.open[k];
+                let found = this.boundaryMatch(multipart, content);
+                if (found == 1) {
+                    this.delimiter(k, at, next)?;
+                    return Ok(true);
+                }
+                if (found == 2) {
+                    this.closeDelimiter(k, at);
+                    return Ok(true);
+                }
+            }
+        }
+        if (this.phase != PHASE_HEADER) {
+            return Ok(false);
+        }
+        if (content == 0) {
+            this.endHeader(next)?;
+            return Ok(false);
+        }
+        // Every line up to the blank one is header, even one without a colon (as Dovecot reads it); such lines are
+        // kept, and field lookups skip them. Keep the line, CRLF-terminated, within the limits.
+        let p = this.current;
+        let partLength = this.index.parts[p].headersLength;
+        if (partLength + content + 2 <= MAX_PART_HEADER && this.index.headers.length + content + 2 <= MAX_HEADERS) {
+            this.index.headers.extend(this.line[0..content])?;
+            this.index.headers.extend("\r\n".bytes())?;
+            this.index.parts[p].headersLength = partLength + content + 2;
+        }
+        return Ok(false);
+    }
+
+    /// 1 if the line is a delimiter of `multipart`, 2 if it is its close delimiter, else 0.
+    fn boundaryMatch(borrow this, multipart: usize, content: usize) -> u8 {
+        let boundary = this.index.boundary(multipart);
+        let line = this.line[0..content];
+        if (content < 2 + boundary.length || !line[2..].startsWith(boundary)) {
+            return 0;
+        }
+        let rest = line[2 + boundary.length..];
+        if (rest.length >= 2 && rest[0] == 0x2d && rest[1] == 0x2d) {
+            return 2;
+        }
+        for (c in rest) {
+            if (!isWsp(c)) {
+                return 0;
+            }
+        }
+        return 1;
+    }
+
+    fn startPart(
+        borrow mut this,
+        parent: usize,
+        at: u64,
+        isMessage: bool,
+        digestChild: bool,
+    ) -> Result<void, AllocError> {
+        let depth = if (parent == NO_PART) 0u32 else this.index.parts[parent].depth + 1;
+        this.index.parts.push(Part {
+            parent: parent,
+            kind: PART_LEAF,
+            isMessage: isMessage,
+            digestChild: digestChild,
+            depth: depth,
+            headerStart: at,
+            bodyStart: at,
+            bodyEnd: at,
+            lines: 0,
+            headersAt: this.index.headers.length,
+            headersLength: 0,
+            boundaryAt: 0,
+            boundaryLength: 0,
+            firstLine: this.lineCount,
+            childCount: 0,
+        })?;
+        if (parent != NO_PART) {
+            this.index.parts[parent].childCount += 1;
+        }
+        this.current = this.index.parts.length - 1;
+        this.phase = PHASE_HEADER;
+        return Ok();
+    }
+
+    /// The current part's header ends; its body starts at `bodyStart`.
+    fn endHeader(borrow mut this, bodyStart: u64) -> Result<void, AllocError> {
+        let p = this.current;
+        this.index.parts[p].bodyStart = bodyStart;
+        // The line index at bodyStart: after the blank line, or this very line when it is body.
+        this.index.parts[p].firstLine = if (bodyStart == this.lineStart) this.lineCount else this.lineCount + 1;
+        let block = this.index.headerBlock(p);
+        let typed = match (headerValue(block, "Content-Type")) {
+            Some(v) => parseMediaType(v, mut this.media)?,
+            null => false,
+        };
+        let deep = this.index.parts[p].depth >= MAX_DEPTH;
+        if (typed && this.media.isType("multipart") && !deep) {
+            match (findParam(borrow this.media.params, "boundary")) {
+                Some(b) => {
+                    // An empty boundary is a boundary (its delimiter is `--`), as Dovecot reads it.
+                    let at = this.index.headers.length;
+                    this.index.headers.extend(b)?;
+                    this.index.parts[p].boundaryAt = at;
+                    this.index.parts[p].boundaryLength = b.length;
+                    this.index.parts[p].kind = PART_MULTIPART;
+                    this.open.push(p)?;
+                    this.phase = PHASE_PREAMBLE;
+                    return Ok();
+                }
+                null => {}
+            }
+            // No usable boundary: a multipart with no parts (rendered with one empty part, as Dovecot does).
+            this.index.parts[p].kind = PART_MULTIPART;
+            this.phase = PHASE_BODY;
+            return Ok();
+        }
+        var message = this.index.parts[p].digestChild;
+        if (typed) {
+            message = this.media.isType(
+                "message",
+            ) && (this.media.isSubtype("rfc822") || this.media.isSubtype("global"));
+        }
+        // An encapsulated message is read in place whatever its Content-Transfer-Encoding says (as Dovecot does): an
+        // encoded one reads as a message whose header never ends.
+        if (message && !deep) {
+            this.index.parts[p].kind = PART_MESSAGE;
+            this.startPart(p, bodyStart, true, false)?;
+            return Ok();
+        }
+        this.phase = PHASE_BODY;
+        return Ok();
+    }
+
+    /// Ends part `p` at `end`; `lineIndex` is the index of the line that ends it (the boundary), or the line count at
+    /// the end of the message.
+    /// Ends part `p` at `end`. `lineIndex` is the index of the line that ends it (a boundary), or the line count at the
+    /// end of the message; `dropLast` when the last line's LF is not the part's (it belongs to the boundary, or there
+    /// is none at the end of the message).
+    fn close(borrow mut this, p: usize, end: u64, lineIndex: u64, dropLast: bool) {
+        var part = this.index.parts[p];
+        if (part.bodyStart > end) {
+            part.bodyStart = end;
+        }
+        part.bodyEnd = end;
+        // Lines are the LFs in the body. At a boundary, the LF before it belongs to the boundary; at the end of the
+        // message, a last line without a LF does not count.
+        let first = part.firstLine;
+        var lines = if (lineIndex > first) lineIndex - first else 0;
+        if (lines > 0 && dropLast) {
+            lines -= 1;
+        }
+        part.lines = lines;
+        this.index.parts[p] = part;
+        // A multipart without parts gets one empty part.
+        if (part.kind == PART_MULTIPART && part.childCount == 0) {
+            match (this.emptyChild(p, end)) {
+                Ok() => {}
+                Err(_) => {}
+            }
+        }
+    }
+
+    /// Adds an empty, header-less part to the multipart `p` that has none, at `at`.
+    fn emptyChild(borrow mut this, p: usize, at: u64) -> Result<void, AllocError> {
+        let depth = this.index.parts[p].depth + 1;
+        this.index.parts.push(Part {
+            parent: p,
+            kind: PART_LEAF,
+            isMessage: false,
+            digestChild: false,
+            depth: depth,
+            headerStart: at,
+            bodyStart: at,
+            bodyEnd: at,
+            lines: 0,
+            headersAt: this.index.headers.length,
+            headersLength: 0,
+            boundaryAt: 0,
+            boundaryLength: 0,
+            firstLine: 0,
+            childCount: 0,
+        })?;
+        this.index.parts[p].childCount = 1;
+        return Ok();
+    }
+
+    /// Closes every part inside the multipart `open[k]` at the boundary line starting at `at`.
+    fn closeInside(borrow mut this, k: usize, at: u64) {
+        let multipart = this.open[k];
+        // The line break before a boundary is the boundary's (unless that line was itself a boundary): the parts end
+        // before it. When it was the blank line ending the innermost part's header, that part's header loses it but
+        // the parts around keep it, as Dovecot counts them.
+        let stripped = !this.previousBoundary && this.previousTerminator > 0;
+        let end = if (stripped) at - this.previousTerminator else at;
+        let count = this.lineCount;
+        let innermost = this.current;
+        let headerOnly = this.phase != PHASE_HEADER && end < this.index.parts[innermost].bodyStart;
+        let outer = if (headerOnly) at else end;
+        var p = innermost;
+        while (p != multipart && p != NO_PART) {
+            if (p == innermost) {
+                if (this.phase == PHASE_HEADER) {
+                    // Its header never ended: it is all header.
+                    this.index.parts[p].bodyStart = end;
+                    this.index.parts[p].firstLine = count;
+                }
+                let headerStart = this.index.parts[p].headerStart;
+                if (end < this.index.parts[p].bodyStart) {
+                    // The line break the boundary takes was the blank line ending the header: the header is what
+                    // came before it, and the body is empty.
+                    this.index.parts[p].bodyStart = if (end < headerStart) headerStart else end;
+                    this.index.parts[p].firstLine = count;
+                }
+                let stop = this.index.parts[p].bodyStart;
+                this.close(p, if (end < stop) stop else end, count, stripped);
+            } else {
+                this.close(p, outer, count, stripped && !headerOnly);
+            }
+            p = this.index.parts[p].parent;
+        }
+        this.open.truncate(k + 1);
+    }
+
+    fn delimiter(borrow mut this, k: usize, at: u64, next: u64) -> Result<void, AllocError> {
+        let multipart = this.open[k];
+        if (this.current != multipart) {
+            this.closeInside(k, at);
+        } else {
+            this.open.truncate(k + 1);
+        }
+        let digest = this.isDigest(multipart);
+        this.startPart(multipart, next, false, digest)?;
+        return Ok();
+    }
+
+    fn closeDelimiter(borrow mut this, k: usize, at: u64) {
+        let multipart = this.open[k];
+        if (this.current != multipart) {
+            this.closeInside(k, at);
+        }
+        this.open.truncate(k);
+        this.current = multipart;
+        this.phase = PHASE_EPILOGUE;
+    }
+
+    fn isDigest(borrow mut this, multipart: usize) -> bool {
+        let block = this.index.headerBlock(multipart);
+        match (headerValue(block, "Content-Type")) {
+            Some(v) => {
+                match (parseMediaType(v, mut this.media)) {
+                    Ok(true) => { return this.media.isSubtype("digest"); }
+                    _ => { return false; }
+                }
+            }
+            null => { return false; }
+        }
+    }
+}

@@ -1,0 +1,10 @@
+size 1987
+envelope ("25 Apr 1995 20:51:43 GMT" "I DID IT - I'm a New Entrepreneur -" (("Charles Halle" NIL "ross" "iclc.net")) (("Charles Halle" NIL "ross" "iclc.net")) (("Charles Halle" NIL "ross" "iclc.net")) NIL NIL NIL NIL "<3njncv$1kh@castle.iclc.net>")
+bodystructure ("Application" "octet-stream" NIL NIL NIL "7bit" 1464 NIL NIL NIL NIL)
+body ("Application" "octet-stream" NIL NIL NIL "7bit" 1464)
+section HEADER 523 925eaac0ea4ef8fef4acf62f282507c051b87e143127a3334ce7a69ad5799ed6
+section TEXT 1464 8a2384e4ecee4ee0156e05bf857fbd00c08d2c66a1b265a48f4b1476b84e5d99
+section HEADER.FIELDS 202 2e5f457c30a76383b506a9ff82069507887b28c35b32afd2a5965d1fb2307798
+section HEADER.FIELDS.NOT 323 a3ca6bc8e3caa057537b3f7db9f21288d8815da1756d1c315c6fbb278e5d11eb
+section 1 1464 8a2384e4ecee4ee0156e05bf857fbd00c08d2c66a1b265a48f4b1476b84e5d99
+section 1.MIME 523 925eaac0ea4ef8fef4acf62f282507c051b87e143127a3334ce7a69ad5799ed6

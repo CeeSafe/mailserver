@@ -1,0 +1,75 @@
+import postgres.PgConnection;
+import postgres.PgParams;
+
+/// The advisory lock that serialises migrations between servers starting at once ("mstore" in ASCII).
+const MIGRATION_LOCK: i64 = 0x6d73746f7265;
+
+/// Brings a database's schema up to date.
+public struct Migrations {
+    /// Applies every migration the database lacks, each in its own transaction, and gives the schema version.
+    /// Servers starting together take turns through an advisory lock. A database newer than this build is refused
+    /// with `Invalid`, rather than used with a schema it does not know.
+    public async fn apply(connection: borrow mut PgConnection) -> Result<i32, StoreError> {
+        var params = PgParams.create();
+        bound(params.int64(MIGRATION_LOCK))?;
+        await executeOn(connection, "SELECT pg_advisory_lock($1)", params)?;
+        let outcome = await Migrations.upgrade(connection);
+        // Released whatever happened; a failure to release ends with the session anyway.
+        match (await connection.execute("SELECT pg_advisory_unlock($1)", params)) {
+            Ok(_) => {}
+            Err(_) => {}
+        }
+        return outcome;
+    }
+
+    async fn upgrade(connection: borrow mut PgConnection) -> Result<i32, StoreError> {
+        let none = PgParams.create();
+        let ledger =
+            "CREATE TABLE IF NOT EXISTS mstore_schema (version INT PRIMARY KEY, name TEXT NOT NULL, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())";
+        await batchOn(connection, ledger)?;
+        let rows = match (await connection.query("SELECT coalesce(max(version), 0) FROM mstore_schema", none)) {
+            Ok(r) => r,
+            Err(e) => { return Err(dbError(e, connection)); }
+        };
+        let current = match (rows.int32(0, 0)) {
+            Some(v) => v,
+            null => 0,
+        };
+        if (current > SCHEMA_VERSION) {
+            return Err(StoreError.Invalid);
+        }
+        for (version in current + 1..SCHEMA_VERSION + 1) {
+            await batchOn(connection, "BEGIN")?;
+            match (await Migrations.step(connection, version)) {
+                Ok() => {}
+                Err(e) => {
+                    match (await connection.batch("ROLLBACK")) {
+                        Ok(_) => {}
+                        Err(_) => {}
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        return Ok(SCHEMA_VERSION);
+    }
+
+    /// Applies migration `version` and records it, inside the caller's transaction, then commits.
+    async fn step(connection: borrow mut PgConnection, version: i32) -> Result<void, StoreError> {
+        var part: usize = 0;
+        loop {
+            let sql = migrationPart(version, part);
+            if (sql.length == 0) {
+                break;
+            }
+            await batchOn(connection, sql)?;
+            part += 1;
+        }
+        var params = PgParams.create();
+        bound(params.int32(version))?;
+        bound(params.text(migrationName(version)))?;
+        await executeOn(connection, "INSERT INTO mstore_schema (version, name) VALUES ($1, $2)", params)?;
+        await batchOn(connection, "COMMIT")?;
+        return Ok();
+    }
+}

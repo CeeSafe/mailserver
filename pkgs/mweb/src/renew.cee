@@ -1,0 +1,392 @@
+// Certificate renewal with ACME: the certificate files are checked twice a day (by default), and when the
+// certificate is within `renewDays` of expiring, or does not name every host it should, a new one is ordered,
+// answered through this server's HTTP-01 challenges, and written over the files, which the certificate watcher then
+// installs. The hosts are the configured names and, for each domain publishing an MTA-STS policy, mta-sts.<domain>
+// (its policy must be served over HTTPS with a valid certificate).
+
+import diskio.Files;
+import diskio.RawFile;
+import macme.AccountKey;
+import macme.AcmeClient;
+import macme.AcmeError;
+import macme.CertificateInfo;
+import macme.appendPem;
+import macme.generateKey;
+import macme.keyFromPem;
+import macme.keyPem;
+import macme.pemBlocks;
+import macme.readCertificate;
+import macme.selfSignedCertificate;
+import pkey.PrivateKey;
+import postgres.PgParams;
+import postgres.PgRows;
+import tls.TlsConfig;
+
+/// What renewal needs.
+@noncopy
+public struct AcmeSettings {
+    /// The CA's directory URL.
+    public directory: String;
+    /// The account's contact address, or empty.
+    public email: String;
+    /// Where the account key is kept (made on first use).
+    public accountKeyPath: String;
+    /// The hosts the certificate must name, before the mta-sts ones.
+    public names: Vector<String>;
+    /// Add mta-sts.<domain> for each domain with an MTA-STS policy.
+    public mtaStsNames: bool;
+    public renewDays: i64;
+    public checkMs: u64;
+    public retryMs: u64;
+    /// PEM roots trusted for the CA besides the system's (for a test CA); empty for none.
+    public trustPem: Vector<u8>;
+    /// The certificate files the server uses.
+    public chainPath: String;
+    public keyPath: String;
+
+    public fn create() -> AcmeSettings => AcmeSettings {
+        directory: String.create(),
+        email: String.create(),
+        accountKeyPath: String.create(),
+        names: Vector<String>.create(),
+        mtaStsNames: true,
+        renewDays: 30,
+        checkMs: 43200000,
+        retryMs: 3600000,
+        trustPem: Vector<u8>.create(),
+        chainPath: String.create(),
+        keyPath: String.create(),
+    };
+}
+
+/// Writes a self-signed certificate for `names` (valid a week, so the first check renews it) and its key to the
+/// files, when the chain file does not exist yet: the server can then start TLS before its first ACME certificate.
+/// False when they could not be written.
+public fn writePlaceholder(chainPath: StringView, keyPath: StringView, names: borrow Vector<String>) -> bool {
+    let key = match (generateKey()) {
+        Ok(k) => k,
+        Err(_) => { return false; }
+    };
+    var der = Vector<u8>.create();
+    match (selfSignedCertificate(key, names, Clock.unixMillis() / 1000, 7, mut der)) {
+        Ok() => {}
+        Err(_) => { return false; }
+    }
+    var chain = Vector<u8>.create();
+    var keyText = Vector<u8>.create();
+    match (appendPem(mut chain, "CERTIFICATE", der.view())) {
+        Ok() => {}
+        Err(_) => { return false; }
+    }
+    match (keyPem(key, mut keyText)) {
+        Ok() => {}
+        Err(_) => { return false; }
+    }
+    return replaceFile(keyPath, keyText.view()) && replaceFile(chainPath, chain.view());
+}
+
+/// Writes `bytes` to `path` through a temporary file and a rename, so a reader never sees half of it.
+fn replaceFile(path: StringView, bytes: Slice<u8>) -> bool {
+    var temporary = String.create();
+    match (temporary.append(path)) {
+        Ok() => {}
+        Err(_) => { return false; }
+    }
+    match (temporary.append(".new")) {
+        Ok() => {}
+        Err(_) => { return false; }
+    }
+    var file = match (RawFile.create(temporary.view())) {
+        Ok(f) => f,
+        Err(_) => { return false; }
+    };
+    let written = match (file.write(bytes)) {
+        Ok() => match (file.sync()) {
+            Ok() => true,
+            Err(_) => false,
+        },
+        Err(_) => false,
+    };
+    if (!written) {
+        return false;
+    }
+    return match (Files.rename(temporary.view(), path)) {
+        Ok() => true,
+        Err(_) => false,
+    };
+}
+
+/// Whether the certificate in `chain` (PEM) must be renewed now: unreadable, expiring within `renewDays`, or not
+/// naming every host in `names`.
+public fn needsRenewal(chain: Slice<u8>, names: borrow Vector<String>, nowSeconds: i64, renewDays: i64) -> bool {
+    var blocks = Vector<Vector<u8>>.create();
+    match (pemBlocks(chain, "CERTIFICATE", mut blocks)) {
+        Ok() => {}
+        Err(_) => { return true; }
+    }
+    if (blocks.length == 0) {
+        return true;
+    }
+    var info = CertificateInfo.create();
+    let read = match (readCertificate(blocks[0].view(), mut info)) {
+        Ok(r) => r,
+        Err(_) => false,
+    };
+    if (!read || info.notAfter - nowSeconds < renewDays * 86400) {
+        return true;
+    }
+    for (n in names.view()) {
+        if (!info.covers(n.view())) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// $1 none: the mta-sts host of each domain publishing a policy.
+fn sqlMtaStsHosts() -> StringView =>
+    """
+    SELECT 'mta-sts.' || name FROM domains WHERE active AND mta_sts_mode <> 'none' ORDER BY name
+    """;
+
+/// The hosts the certificate should name now. False when the database could not say.
+async fn desiredNames(ctx: borrow WebContext, settings: borrow AcmeSettings, into: borrow mut Vector<String>) -> bool {
+    into.clear();
+    for (n in settings.names.view()) {
+        var copy = String.create();
+        match (copy.append(n.view())) {
+            Ok() => {}
+            Err(_) => { return false; }
+        }
+        match (into.push(copy)) {
+            Ok() => {}
+            Err(_) => { return false; }
+        }
+    }
+    if (!settings.mtaStsNames) {
+        return true;
+    }
+    let none = PgParams.create();
+    var rows = PgRows.create();
+    if (!(await queryRows(ctx, sqlMtaStsHosts(), none, mut rows))) {
+        return false;
+    }
+    for (r in 0..rows.rowCount()) {
+        let host = rows.text(r, 0) ?? "";
+        var known = false;
+        for (n in into.view()) {
+            if (n.view().equalsIgnoreAsciiCase(host)) {
+                known = true;
+            }
+        }
+        if (known || host.length == 0) {
+            continue;
+        }
+        var copy = String.create();
+        match (copy.append(host)) {
+            Ok() => {}
+            Err(_) => { return false; }
+        }
+        match (into.push(copy)) {
+            Ok() => {}
+            Err(_) => { return false; }
+        }
+    }
+    return true;
+}
+
+/// Checks and renews until cancelled.
+public async fn renewCertificates(ctx: borrow WebContext, settings: borrow AcmeSettings) {
+    var names = Vector<String>.create();
+    loop {
+        var wait = settings.checkMs;
+        if (await desiredNames(ctx, settings, mut names)) {
+            var chain = Vector<u8>.create();
+            let path = settings.chainPath.view();
+            let read: bool = await Async.blocking(() => readInto(path, mut chain));
+            let now = Clock.unixMillis() / 1000;
+            if (!read || needsRenewal(chain.view(), names, now, settings.renewDays)) {
+                if (!(await renewOnce(ctx, settings, names))) {
+                    wait = settings.retryMs;
+                }
+            }
+        } else {
+            wait = settings.retryMs;
+        }
+        match (await Timer.sleep(wait)) {
+            Ok() => {}
+            Err(_) => { return; }
+        }
+    }
+}
+
+/// The RSA key in the file at `path`, or null.
+fn existingKey(path: StringView) -> PrivateKey? {
+    var pem = Vector<u8>.create();
+    if (!readInto(path, mut pem)) {
+        return null;
+    }
+    return match (keyFromPem(pem.view())) {
+        Ok(k) => k,
+        Err(_) => null,
+    };
+}
+
+/// The account key from its file, or a new one written there.
+fn accountKey(path: StringView) -> PrivateKey? {
+    var pem = Vector<u8>.create();
+    if (readInto(path, mut pem)) {
+        return match (keyFromPem(pem.view())) {
+            Ok(k) => k,
+            Err(_) => null,
+        };
+    }
+    let key = match (generateKey()) {
+        Ok(k) => k,
+        Err(_) => { return null; }
+    };
+    var text = Vector<u8>.create();
+    match (keyPem(key, mut text)) {
+        Ok() => {}
+        Err(_) => { return null; }
+    }
+    if (!replaceFile(path, text.view())) {
+        return null;
+    }
+    return key;
+}
+
+/// One renewal: order, answer, finalize, write the files. Logs the outcome; true when the files were written.
+async fn renewOnce(ctx: borrow WebContext, settings: borrow AcmeSettings, names: borrow Vector<String>) -> bool {
+    var line = String.create();
+    match (line.append("mailserver: ACME: ordering a certificate for")) {
+        Ok() => {}
+        Err(_) => { return false; }
+    }
+    for (n in names.view()) {
+        match (line.append(" ")) {
+            Ok() => {}
+            Err(_) => { return false; }
+        }
+        match (line.append(n.view())) {
+            Ok() => {}
+            Err(_) => { return false; }
+        }
+    }
+    match (line.append("\n")) {
+        Ok() => {}
+        Err(_) => { return false; }
+    }
+    await logLine(line.view());
+    let keyPath = settings.accountKeyPath.view();
+    let loaded: PrivateKey? = await Async.blocking(() => accountKey(keyPath));
+    let privateKey = match (loaded) {
+        Some(k) => k,
+        null => {
+            await logLine("mailserver: ACME: the account key could not be read or made\n");
+            return false;
+        }
+    };
+    let account = match (AccountKey.create(privateKey)) {
+        Ok(a) => a,
+        Err(_) => {
+            await logLine("mailserver: ACME: the account key is not an RSA key\n");
+            return false;
+        }
+    };
+    var tls = match (TlsConfig.client()) {
+        Ok(t) => t,
+        Err(_) => { return false; }
+    };
+    if (settings.trustPem.length > 0) {
+        match (tls.trustPem(settings.trustPem.view())) {
+            Ok() => {}
+            Err(_) => {
+                await logLine("mailserver: ACME: [acme] trust_file holds no usable certificate\n");
+                return false;
+            }
+        }
+    }
+    var client = match (AcmeClient.create(tls, settings.directory.view(), account)) {
+        Ok(c) => c,
+        Err(_) => { return false; }
+    };
+    // The certificate's key is kept across renewals (made only when there is none), so a DANE TLSA record of the
+    // key (3 1 1) stays right.
+    let currentKeyPath = settings.keyPath.view();
+    let kept: PrivateKey? = await Async.blocking(() => existingKey(currentKeyPath));
+    let certificateKey = match (kept) {
+        Some(k) => k,
+        null => {
+            match (generateKey()) {
+                Ok(k) => k,
+                Err(_) => { return false; }
+            }
+        }
+    };
+    var chain = Vector<u8>.create();
+    let outcome = match (await client.register(settings.email.view())) {
+        Ok() => await client.obtain(names, certificateKey, ctx.challenges, mut chain),
+        Err(e) => Err(e),
+    };
+    match (outcome) {
+        Ok() => {}
+        Err(e) => {
+            await logFailure(client, e);
+            return false;
+        }
+    }
+    var keyText = Vector<u8>.create();
+    match (keyPem(certificateKey, mut keyText)) {
+        Ok() => {}
+        Err(_) => { return false; }
+    }
+    let chainPath = settings.chainPath.view();
+    let certificateKeyPath = settings.keyPath.view();
+    // The key first: a watcher that sees the new chain with the old key refuses the pair and tries again.
+    let written: bool = await Async.blocking(
+        () => replaceFile(certificateKeyPath, keyText.view()) && replaceFile(chainPath, chain.view()),
+    );
+    if (!written) {
+        await logLine("mailserver: ACME: the new certificate could not be written\n");
+        return false;
+    }
+    await logLine("mailserver: ACME: obtained a certificate; it is installed at the next check of the files\n");
+    return true;
+}
+
+async fn logFailure(client: borrow AcmeClient, e: AcmeError) {
+    var line = String.create();
+    let what = match (e) {
+        AcmeError.Network => "the CA could not be reached or answered unexpectedly",
+        AcmeError.Problem => "the CA refused a request",
+        AcmeError.Invalid => "an authorization failed",
+        AcmeError.TimedOut => "the CA took too long",
+        AcmeError.Key => "the key could not sign",
+        AcmeError.Cancelled => "cancelled",
+        AcmeError.OutOfMemory => "out of memory",
+    };
+    let built = match (line.append("mailserver: ACME: ")) {
+        Ok() => match (line.append(what)) {
+            Ok() => match (line.append(": ")) {
+                Ok() => match (line.append(client.problem())) {
+                    Ok() => match (line.append(" ")) {
+                        Ok() => match (line.append(client.detail())) {
+                            Ok() => line.append("\n"),
+                            Err(x) => Err(x),
+                        },
+                        Err(x) => Err(x),
+                    },
+                    Err(x) => Err(x),
+                },
+                Err(x) => Err(x),
+            },
+            Err(x) => Err(x),
+        },
+        Err(x) => Err(x),
+    };
+    match (built) {
+        Ok() => { await logLine(line.view()); }
+        Err(_) => {}
+    }
+}

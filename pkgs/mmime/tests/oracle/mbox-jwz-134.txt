@@ -1,0 +1,10 @@
+size 2048
+envelope ("Wed, 26 Apr 1995 15:02:16 EDT" "Federal EDI - 836 IC open for comments" (("Jean-Philippe Favreau" NIL "favreau" "apm2.ncsl.nist.gov")) (("Electronic Data Interchange Issues" NIL "EDI-L" "uccvma.ucop.edu")) (("Jean-Philippe Favreau" NIL "favreau" "apm2.ncsl.nist.gov")) NIL NIL NIL NIL "<9504261902.AA20642@apm2.ncsl.nist.gov>")
+bodystructure ("X-sun-attachment" "" NIL NIL NIL "7bit" 1440 NIL NIL NIL NIL)
+body ("X-sun-attachment" "" NIL NIL NIL "7bit" 1440)
+section HEADER 608 eff15cde0ca0d5173b8d6b15fa1b2d5272a45328040150799345f23a84a7758f
+section TEXT 1440 dc9a34e0fa14de92502f094c78dd66dbdb192f53e425c9bdb0549ec3b77909d7
+section HEADER.FIELDS 231 402ed00392e86449e6eef48718d54b1603314753948fdf3fef2a2c94d24bf943
+section HEADER.FIELDS.NOT 379 3806bc740fe06edf5ebe7761e2f9f483bc88f5a76191367895271dd0f4ea151f
+section 1 1440 dc9a34e0fa14de92502f094c78dd66dbdb192f53e425c9bdb0549ec3b77909d7
+section 1.MIME 608 eff15cde0ca0d5173b8d6b15fa1b2d5272a45328040150799345f23a84a7758f

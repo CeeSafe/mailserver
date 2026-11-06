@@ -1,0 +1,46 @@
+size 13428
+envelope ("Wed, 10 Jun 1992 14:20:39 -0400 (EDT)" "Re: icons" (("Michael J. McInerny" NIL "mcinerny+" "andrew.cmu.edu")) (("Michael J. McInerny" NIL "mcinerny+" "andrew.cmu.edu")) (("Michael J. McInerny" NIL "mcinerny+" "andrew.cmu.edu")) (("Fred Hansen" NIL "wjh+" "andrew.cmu.edu")) ((NIL NIL "dave" "expo.lcs.mit.edu")) NIL "<0eBXzMC00Vs4QNk9oL@andrew.cmu.edu>" "<MeBYTrq00hYx4uHkwL@andrew.cmu.edu>")
+bodystructure (("text" "plain" ("charset" "US-ASCII") NIL NIL "7bit" 1705 38 NIL NIL NIL NIL) (("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 571 14 NIL NIL NIL NIL) ("image" "x-xwd" NIL NIL NIL "base64" 884 NIL NIL NIL NIL) ("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 51 5 NIL NIL NIL NIL) ("image" "x-xwd" NIL NIL NIL "base64" 884 NIL NIL NIL NIL) ("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 51 5 NIL NIL NIL NIL) ("image" "x-xwd" NIL NIL NIL "base64" 884 NIL NIL NIL NIL) ("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 45 5 NIL NIL NIL NIL) ("image" "x-xwd" NIL NIL NIL "base64" 228 NIL NIL NIL NIL) ("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 69 5 NIL NIL NIL NIL) ("image" "x-xwd" NIL NIL NIL "base64" 228 NIL NIL NIL NIL) ("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 49 5 NIL NIL NIL NIL) ("image" "x-xwd" NIL NIL NIL "base64" 228 NIL NIL NIL NIL) ("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 303 11 NIL NIL NIL NIL) ("image" "x-xwd" NIL NIL NIL "base64" 884 NIL NIL NIL NIL) ("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 44 4 NIL NIL NIL NIL) ("image" "x-xwd" NIL NIL NIL "base64" 1942 NIL NIL NIL NIL) ("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 11 1 NIL NIL NIL NIL) "mixed" ("boundary" "Alternative.Boundary.8eBYTr200hYxIuHkkf") NIL NIL NIL) "alternative" ("boundary" "Interpart.Boundary.8eBYTr200hYx4uHkoz") NIL NIL NIL)
+body (("text" "plain" ("charset" "US-ASCII") NIL NIL "7bit" 1705 38) (("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 571 14) ("image" "x-xwd" NIL NIL NIL "base64" 884) ("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 51 5) ("image" "x-xwd" NIL NIL NIL "base64" 884) ("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 51 5) ("image" "x-xwd" NIL NIL NIL "base64" 884) ("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 45 5) ("image" "x-xwd" NIL NIL NIL "base64" 228) ("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 69 5) ("image" "x-xwd" NIL NIL NIL "base64" 228) ("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 49 5) ("image" "x-xwd" NIL NIL NIL "base64" 228) ("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 303 11) ("image" "x-xwd" NIL NIL NIL "base64" 884) ("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 44 4) ("image" "x-xwd" NIL NIL NIL "base64" 1942) ("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 11 1) "mixed") "alternative")
+section HEADER 1778 cc7d626e7eb05ba346df4bcb771316eefdfaf89ca7319bdeea7272218ca0a5db
+section TEXT 11650 8cb8ebf9ac1e990d323d8bd2b7ed3da91b4ad21d076b20eef50aef2ed24180c3
+section HEADER.FIELDS 328 13932517130e010f9712e788d309760eb61c713fb3395344325a80724c4733a0
+section HEADER.FIELDS.NOT 1452 f8f234ef9a5f89ba27de0124f07812258a839e8cd3f894121ee9d713fb917e19
+section 1 1705 8d5c49a4b7ebdf73f8e5161d2ee9fc331217fed84f14b7020efd7f3ce2a9465a
+section 1.MIME 46 b3532c649b28a23803c77a2acc4907f5048ea77b89e0c51dcf7f271f2db4bfa6
+section 2 9524 4d45596e795fb095b19ae4992fa211d6e08e8e9dfc3f53dbb6d44483403e7987
+section 2.MIME 88 33483f5a6c0b0bb66972e9fb34500b7ebab530619a0c30c0b1445f40bf1b9dc2
+section 2.1 571 d9729add3e5f1e77b18d40bde895031d8083c9c9d860b6e4a83394184ee0722b
+section 2.1.MIME 94 7d35d8c48d3869c4391f6ff71123bfb4c8466e5b04f02d64c3961f23d7d8bf61
+section 2.2 884 5d7ebf12dac185a334fcf1bd25e3ca6718b8532fa85ac0735c7dfedc24961a10
+section 2.2.MIME 64 08b4fee533f8ae60baf6a813124e7f68ec5b0af77306ceedaa44b33691f53825
+section 2.3 51 61b3a371c9b78b1f60cbbcb4e281ed9141fcb8749c5e83a48f7f2f0855075caf
+section 2.3.MIME 94 7d35d8c48d3869c4391f6ff71123bfb4c8466e5b04f02d64c3961f23d7d8bf61
+section 2.4 884 bd08709b98c67adba95f32cff03507ceb64a2b8da1d6bfdcf8aba3d43a6b9205
+section 2.4.MIME 64 08b4fee533f8ae60baf6a813124e7f68ec5b0af77306ceedaa44b33691f53825
+section 2.5 51 a084614edb4b0e3d393f1cc5aff8cb4d31f6d5d3e89891d52fd0c147505c9425
+section 2.5.MIME 94 7d35d8c48d3869c4391f6ff71123bfb4c8466e5b04f02d64c3961f23d7d8bf61
+section 2.6 884 68d4c3107924d668fb891f9a990b5b2e380cb48036de4b2ae26c43b07f7ab3f6
+section 2.6.MIME 64 08b4fee533f8ae60baf6a813124e7f68ec5b0af77306ceedaa44b33691f53825
+section 2.7 45 29f250406374883a085a6ec30fc78d6304dd5ffb383c127130a8dda98eaf9e84
+section 2.7.MIME 94 7d35d8c48d3869c4391f6ff71123bfb4c8466e5b04f02d64c3961f23d7d8bf61
+section 2.8 228 6254a542156955c27d2fa4c62f3ced44879cbe0bf26ee9d5fe4d8739fb4bb5dd
+section 2.8.MIME 64 08b4fee533f8ae60baf6a813124e7f68ec5b0af77306ceedaa44b33691f53825
+section 2.9 69 0cfb44a1fb1465182e46bf53d43f6fdae0ce0412108678e3fadc7123e7605b9c
+section 2.9.MIME 94 7d35d8c48d3869c4391f6ff71123bfb4c8466e5b04f02d64c3961f23d7d8bf61
+section 2.10 228 5a29d5d98e7128fea66c61acf4a81b829ef48b04e731360ebd224762a4cdcc08
+section 2.10.MIME 64 08b4fee533f8ae60baf6a813124e7f68ec5b0af77306ceedaa44b33691f53825
+section 2.11 49 e7a93e186b2bf5cfe5a25f093fbeea4e59a9df6a558c850c166e2552f51193d1
+section 2.11.MIME 94 7d35d8c48d3869c4391f6ff71123bfb4c8466e5b04f02d64c3961f23d7d8bf61
+section 2.12 228 984f89913edf2c97ff2d37370d76fbc6b3553ef89e54cda7e02f4ca4db0eb8d8
+section 2.12.MIME 64 08b4fee533f8ae60baf6a813124e7f68ec5b0af77306ceedaa44b33691f53825
+section 2.13 303 5f0e9eeb579ee726a5e83e6dadb782c0a60b9277ed530d909e1db5c6947e4278
+section 2.13.MIME 94 7d35d8c48d3869c4391f6ff71123bfb4c8466e5b04f02d64c3961f23d7d8bf61
+section 2.14 884 3bd302d9ba46baa1b544eacf4b707241b184077850258cf12a0eb1cbab13885b
+section 2.14.MIME 64 08b4fee533f8ae60baf6a813124e7f68ec5b0af77306ceedaa44b33691f53825
+section 2.15 44 0c18d7c90d4ed06191491b4746f62de307c6af240e92851fa078094b010eb252
+section 2.15.MIME 94 7d35d8c48d3869c4391f6ff71123bfb4c8466e5b04f02d64c3961f23d7d8bf61
+section 2.16 1942 35f69f7819dbe57d5fb94918fa3ccfe496e5d154d9f777748bf5df5346466b47
+section 2.16.MIME 64 08b4fee533f8ae60baf6a813124e7f68ec5b0af77306ceedaa44b33691f53825
+section 2.17 11 93b4cb1965b8f77dacd4d405e0fec5f4c5d8db3f6f9a01678d921b0713390171
+section 2.17.MIME 94 7d35d8c48d3869c4391f6ff71123bfb4c8466e5b04f02d64c3961f23d7d8bf61

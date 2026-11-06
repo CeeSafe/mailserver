@@ -1,0 +1,10 @@
+size 137687
+envelope ("Fri, 29 Nov 91 07:13:33 EST" "just testing..." (("Bob Kummerfeld" NIL "bob" "cs.su.oz.au")) (("Bob Kummerfeld" NIL "bob" "cs.su.oz.au")) (("Bob Kummerfeld" NIL "bob" "cs.su.oz.au")) ((NIL NIL "nsb" "thumper.bellcore.com")) NIL NIL NIL "<9111291211.AA11898@thumper.bellcore.com>")
+bodystructure ("audio" "basic" NIL NIL NIL "base64" 137124 NIL NIL NIL NIL)
+body ("audio" "basic" NIL NIL NIL "base64" 137124)
+section HEADER 563 7a3b984a091e84447aa3353f2ac3f788a2424a78c0d13391c6fd6ee12f205ee2
+section TEXT 137124 a0c69795fd1604d1c3a384415371d1518a6834546a83d4efdcc2e8eb4eb592da
+section HEADER.FIELDS 216 8f23926c6dc848ed140263487d4bf0b924d8c15866dd0716b5a3ebe4949224f9
+section HEADER.FIELDS.NOT 349 6ec0cf868fae63e1a6dbdce54005de094625dbc9ce8378cbadd5d8a0169372b2
+section 1 137124 a0c69795fd1604d1c3a384415371d1518a6834546a83d4efdcc2e8eb4eb592da
+section 1.MIME 563 7a3b984a091e84447aa3353f2ac3f788a2424a78c0d13391c6fd6ee12f205ee2

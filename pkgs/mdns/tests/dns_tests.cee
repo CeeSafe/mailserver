@@ -1,0 +1,180 @@
+// Addresses and messages offline; queries against tools/fakedns.py on 127.0.0.1:$DNS_TEST_PORT with tests/zone.yaml
+// (run by tests/run.sh). Without DNS_TEST_PORT the live tests pass without running.
+
+fn ipIs(ip: IpAddress, want: StringView) -> bool {
+    var out = Vector<u8>.create();
+    appendIp(mut out, ip)!;
+    return StringView.fromUtf8(out.view())! == want;
+}
+
+@test
+fn parsesAddresses() -> Result<void, TestFailure> {
+    let v4 = parseIp("192.0.2.33".bytes())!;
+    Check.isTrue(v4.isV4() && ipIs(v4, "192.0.2.33"), "IPv4")?;
+    let v6 = parseIp("2001:DB8::a:1".bytes())!;
+    Check.isTrue(!v6.isV4() && ipIs(v6, "2001:db8:0:0:0:0:a:1"), "IPv6")?;
+    let mapped = parseIp("::ffff:10.0.0.1".bytes())!;
+    Check.isTrue(mapped.isV4() && ipIs(mapped, "10.0.0.1"), "IPv4-mapped")?;
+    Check.isTrue(ipIs(parseIp("::".bytes())!, "0:0:0:0:0:0:0:0"), "::")?;
+    let bad = ["256.1.1.1", "1.2.3", "01.2.3.4", "1::2::3", "12345::", "1:2:3:4:5:6:7:8:9", "", "1.2.3.4.5", ":1::"];
+    for (b in bad) {
+        match (parseIp(b.bytes())) {
+            Some(_) => { return Check.fail(b); }
+            null => {}
+        }
+    }
+    let net = parseIp("192.0.2.0".bytes())!;
+    Check.isTrue(v4.inNetwork(net, 24) && !v4.inNetwork(net, 27) && v4.inNetwork(net, 26), "CIDR")?;
+    Check.isTrue(!v4.inNetwork(parseIp("2001:db8::".bytes())!, 0), "families differ")?;
+    var reverse = Vector<u8>.create();
+    appendReverseName(mut reverse, v4)!;
+    Check.isTrue(StringView.fromUtf8(reverse.view())! == "33.2.0.192.in-addr.arpa", "in-addr.arpa")?;
+    reverse.clear();
+    appendReverseName(mut reverse, parseIp("2001:db8::1".bytes())!)!;
+    let six = StringView.fromUtf8(reverse.view())!;
+    return Check.isTrue(six.startsWith("1.0.0.0.0.0.0.0") && six.endsWith("8.b.d.0.1.0.0.2.ip6.arpa"), "ip6.arpa");
+}
+
+@test
+fn refusesBadMessages() -> Result<void, TestFailure> {
+    var query = Vector<u8>.create();
+    Check.isTrue(buildQuery(mut query, 0x1234, "a.test", TYPE_A)!, "a query")?;
+    Check.isTrue(!buildQuery(mut query, 1, "bad..name", TYPE_A)!, "an empty label")?;
+    var long = String.create();
+    for (i in 0..64) {
+        long.append("x")!;
+    }
+    Check.isTrue(!buildQuery(mut query, 1, long.view(), TYPE_A)!, "a 64-byte label")?;
+    buildQuery(mut query, 0x1234, "a.test", TYPE_A)!;
+    // The query turned into a response: the question echoed, no answers (strip the OPT record).
+    var response = Vector<u8>.create();
+    response.extend(query[0..query.length - 11])!;
+    response[2] = 0x81;
+    response[3] = 0x80;
+    response[11] = 0; // ARCOUNT
+    var answer = DnsAnswer.create();
+    match (parseResponse(response.view(), 0x1234, "A.TEST.", TYPE_A, mut answer)) {
+        Ok() => {}
+        Err(_) => { return Check.fail("a valid empty response"); }
+    }
+    match (parseResponse(response.view(), 0x9999, "a.test", TYPE_A, mut answer)) {
+        Err(ParseError.Mismatch) => {}
+        _ => { return Check.fail("another id"); }
+    }
+    match (parseResponse(response.view(), 0x1234, "b.test", TYPE_A, mut answer)) {
+        Err(ParseError.Mismatch) => {}
+        _ => { return Check.fail("another name"); }
+    }
+    // Every truncation is refused, none crashes.
+    for (n in 0..response.length) {
+        match (parseResponse(response[0..n], 0x1234, "a.test", TYPE_A, mut answer)) {
+            Ok() => { return Check.fail("a truncated response"); }
+            Err(_) => {}
+        }
+    }
+    return Ok();
+}
+
+fn testPort() -> u16? {
+    let text = Environment.variable("DNS_TEST_PORT")?;
+    return text.parseInt<u16>();
+}
+
+fn resolver(port: u16) -> Resolver {
+    var servers = Vector<IpAddress>.create();
+    servers.push(IpAddress.v4(127, 0, 0, 1))!;
+    var r = Resolver.create(servers, port)!;
+    r.timeout(500);
+    return r;
+}
+
+async fn lookups(port: u16, checks: borrow mut Vector<bool>) -> Result<void, DnsError> {
+    let r = resolver(port);
+    var answer = DnsAnswer.create();
+    let first = [192u8, 0, 2, 1];
+    let seventh = [192u8, 0, 2, 7];
+    await r.query("a.test", TYPE_A, mut answer)?;
+    checks.push(answer.count() == 1 && answer.data(0).startsWith(first[..]) && answer.ttl(0) == 300)!;
+    await r.query("A.Test.", TYPE_AAAA, mut answer)?;
+    checks.push(answer.count() == 1 && answer.data(0).length == 16)!;
+    await r.query("mx.test", TYPE_MX, mut answer)?;
+    checks.push(answer.count() == 2 && answer.preference(0) == 20 && answer.dataText(0) == "backup.a.test")!;
+    await r.query("multi.test", TYPE_TXT, mut answer)?;
+    checks.push(answer.count() == 1 && answer.dataText(0) == "part one part two")!;
+    await r.query("alias.test", TYPE_A, mut answer)?;
+    checks.push(answer.count() == 1 && answer.data(0).startsWith(first[..]))!; // through the CNAME
+    await r.query("1.2.0.192.in-addr.arpa", TYPE_PTR, mut answer)?;
+    checks.push(answer.count() == 1 && answer.dataText(0) == "a.test")!;
+    await r.query("nothing.test", TYPE_A, mut answer)?;
+    checks.push(answer.isNxDomain() && answer.count() == 0)!;
+    await r.query("a.test", TYPE_MX, mut answer)?;
+    checks.push(!answer.isNxDomain() && answer.rcode == RCODE_NOERROR && answer.count() == 0)!; // NODATA
+    await r.query("servfail.test", TYPE_A, mut answer)?;
+    checks.push(answer.rcode == RCODE_SERVFAIL)!;
+    await r.query("big.test", TYPE_TXT, mut answer)?;
+    checks.push(answer.count() == 1 && answer.dataText(0) == "a record that only arrives over TCP")!;
+    await r.query("spoof.test", TYPE_A, mut answer)?;
+    checks.push(answer.count() == 1 && answer.data(0).startsWith(seventh[..]))!; // the wrong id ignored
+    let slow = await r.query("slow.test", TYPE_A, mut answer);
+    checks.push(match (slow) {
+        Err(DnsError.Timeout) => true,
+        _ => false,
+    })!;
+    let looped = await r.query("loop.test", TYPE_A, mut answer);
+    checks.push(match (looped) {
+        Err(_) => true,
+        Ok() => false,
+    })!;
+    // Cached: the same answer again, at once.
+    let start = Clock.unixMillis();
+    for (i in 0..1000) {
+        await r.query("mx.test", TYPE_MX, mut answer)?;
+    }
+    checks.push(answer.count() == 2 && Clock.unixMillis() - start < 500)!;
+    return Ok();
+}
+
+@test
+fn resolves() -> Result<void, TestFailure> {
+    let port = match (testPort()) {
+        Some(p) => p,
+        null => { return Ok(); }
+    };
+    var checks = Vector<bool>.create();
+    match (Async.run(lookups(port, mut checks))) {
+        Ok() => {}
+        Err(_) => { return Check.fail("a query failed"); }
+    }
+    Check.isTrue(checks.length == 14, "every check ran")?;
+    for (i in 0..checks.length) {
+        if (!checks[i]) {
+            var message = String.create();
+            message.append("check ")!;
+            let digit = [0x30u8 + truncate<u8>((i + 1) / 10), 0x30u8 + truncate<u8>((i + 1) % 10)];
+            message.append(StringView.fromUtf8(digit[..])!)!;
+            message.append(" failed")!;
+            return Check.fail(message.view());
+        }
+    }
+    return Ok();
+}
+
+fn canonicalIs(text: StringView, want: StringView) -> bool {
+    var out = Vector<u8>.create();
+    appendIpCanonical(mut out, parseIp(text.bytes())!)!;
+    return StringView.fromUtf8(out.view())! == want;
+}
+
+@test
+fn writesCanonicalAddresses() -> Result<void, TestFailure> {
+    // RFC 5952 §4's rules and examples.
+    Check.isTrue(canonicalIs("2001:0DB8:0:0:0:0:0:1", "2001:db8::1"), "longest run")?;
+    Check.isTrue(canonicalIs("2001:db8:0:0:1:0:0:1", "2001:db8::1:0:0:1"), "the first of equal runs")?;
+    Check.isTrue(canonicalIs("2001:db8:0:1:1:1:1:1", "2001:db8:0:1:1:1:1:1"), "one zero group is not shortened")?;
+    Check.isTrue(canonicalIs("2001:0:0:1:0:0:0:1", "2001:0:0:1::1"), "the longer run")?;
+    Check.isTrue(canonicalIs("::", "::"), "all zero")?;
+    Check.isTrue(canonicalIs("::1", "::1"), "loopback")?;
+    Check.isTrue(canonicalIs("1::", "1::"), "trailing")?;
+    Check.isTrue(canonicalIs("2001:db8:1:2::", "2001:db8:1:2::"), "a /64")?;
+    return Check.isTrue(canonicalIs("192.0.2.1", "192.0.2.1"), "IPv4");
+}

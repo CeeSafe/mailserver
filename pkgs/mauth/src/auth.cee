@@ -1,0 +1,177 @@
+// Inbound authentication in one call: SPF for the envelope, DKIM for the content, DMARC for the From domain, and the
+// Authentication-Results header (RFC 8601) that records them.
+
+import mdns.IpAddress;
+import mdns.Resolver;
+import mmime.AddressList;
+import mmime.parseAddressList;
+
+/// Everything `authenticate` found.
+@noncopy
+public struct AuthReport {
+    public spf: SpfOutcome;
+    public dkim: Vector<DkimResult>;
+    public dmarc: DmarcOutcome;
+
+    public fn create() -> AuthReport =>
+        AuthReport { spf: SpfOutcome.create(), dkim: Vector<DkimResult>.create(), dmarc: DmarcOutcome.create() };
+}
+
+/// The From field's value in a raw header block: `Ok(null)` if there is none, `Err` if there are several.
+fn fromField(block: Slice<u8>) -> Result<Slice<u8>?, bool> {
+    var found: Slice<u8>? = null;
+    var at: usize = 0;
+    while (at < block.length) {
+        let start = at;
+        var end = start;
+        loop {
+            match (block[end..].indexOfByte(0x0a)) {
+                Some(lf) => { end = end + lf + 1; }
+                null => {
+                    end = block.length;
+                    break;
+                }
+            }
+            if (end >= block.length || (block[end] != 0x20 && block[end] != 0x09)) {
+                break;
+            }
+        }
+        at = end;
+        let field = block[start..end];
+        if (field.length >= 5 && field[0..5].equalsIgnoreAsciiCase("from:".bytes())) {
+            if (found != null) {
+                return Err(true); // several From fields (RFC 7489 §6.6.1)
+            }
+            found = field[5..];
+        }
+    }
+    return Ok(found);
+}
+
+/// Checks a received message: SPF of `ip` for `mailFrom` (or `helo`), DKIM of what `verifier` was fed, and DMARC
+/// for its From domain. `now` is the Unix time in seconds.
+public async fn authenticate(
+    resolver: borrow Resolver,
+    ip: IpAddress,
+    mailFrom: StringView,
+    helo: StringView,
+    verifier: borrow mut DkimVerifier,
+    now: i64,
+    report: borrow mut AuthReport,
+) -> Result<void, AllocError> {
+    await checkSpf(resolver, ip, mailFrom, helo, mut report.spf)?;
+    await verifier.verify(resolver, now, mut report.dkim)?;
+    // The From domain: exactly one domain is needed.
+    var fromDomain = Vector<u8>.create();
+    var several = false;
+    match (fromField(verifier.headerBlock())) {
+        Ok(Some(value)) => {
+            var list = AddressList.create();
+            parseAddressList(value, mut list)?;
+            for (i in 0..list.count()) {
+                match (list.host(i)) {
+                    Some(host) => {
+                        if (fromDomain.length == 0) {
+                            fromDomain.extend(host)?;
+                        } else if (!fromDomain.view().equalsIgnoreAsciiCase(host)) {
+                            several = true;
+                        }
+                    }
+                    null => {}
+                }
+            }
+        }
+        Ok(null) => {}
+        Err(_) => { several = true; }
+    }
+    var spfDomain = Vector<u8>.create();
+    match (report.spf.result) {
+        SpfResult.Pass => { spfDomain.extend(report.spf.domain.view().bytes())?; }
+        _ => {}
+    }
+    var dkimDomains = Vector<Vector<u8>>.create();
+    for (i in 0..report.dkim.length) {
+        match (report.dkim[i].status) {
+            DkimStatus.Pass => {
+                var d = Vector<u8>.create();
+                d.extend(report.dkim[i].domain.view().bytes())?;
+                dkimDomains.push(d)?;
+            }
+            _ => {}
+        }
+    }
+    if (several) {
+        report.dmarc.status = DmarcStatus.PermError;
+        report.dmarc.disposition = DmarcPolicy.None;
+        return Ok();
+    }
+    return await checkDmarc(resolver, fromDomain.view(), spfDomain.view(), dkimDomains, mut report.dmarc);
+}
+
+/// Appends `text` keeping only characters safe in a header value: printable ASCII without `;` `(` `)` `"`.
+fn appendSafe(out: borrow mut Vector<u8>, text: Slice<u8>) -> Result<void, AllocError> {
+    for (c in text) {
+        let ok = c > 0x20 && c < 0x7f && c != 0x3b && c != 0x28 && c != 0x29 && c != 0x22;
+        out.push(if (ok) c else 0x5f)?;
+    }
+    return Ok();
+}
+
+/// The Authentication-Results field (RFC 8601), CRLF-terminated, for `hostname` (the authserv-id).
+public fn authenticationResults(
+    hostname: StringView,
+    report: borrow AuthReport,
+    out: borrow mut Vector<u8>,
+) -> Result<void, AllocError> {
+    out.extend("Authentication-Results: ".bytes())?;
+    appendSafe(out, hostname.bytes())?;
+    out.extend(";\r\n\tspf=".bytes())?;
+    out.extend(spfName(report.spf.result).bytes())?;
+    out.extend(" smtp.mailfrom=".bytes())?;
+    appendSafe(out, report.spf.domain.view().bytes())?;
+    if (report.dkim.length == 0) {
+        out.extend(";\r\n\tdkim=none".bytes())?;
+    }
+    for (i in 0..report.dkim.length) {
+        let d = borrow report.dkim[i];
+        out.extend(";\r\n\tdkim=".bytes())?;
+        out.extend(dkimName(d.status).bytes())?;
+        if (d.reason.length > 0) {
+            out.extend(" (".bytes())?;
+            appendSafe(out, d.reason.view().bytes())?;
+            out.extend(")".bytes())?;
+        }
+        out.extend(" header.d=".bytes())?;
+        appendSafe(out, d.domain.view().bytes())?;
+        out.extend(" header.s=".bytes())?;
+        appendSafe(out, d.selector.view().bytes())?;
+        out.extend(" header.a=".bytes())?;
+        appendSafe(out, d.algorithm.view().bytes())?;
+        if (d.signaturePrefix.length > 0) {
+            out.extend(" header.b=".bytes())?;
+            appendSafe(out, d.signaturePrefix.view().bytes())?;
+        }
+    }
+    out.extend(";\r\n\tdmarc=".bytes())?;
+    out.extend(dmarcName(report.dmarc.status).bytes())?;
+    match (report.dmarc.status) {
+        DmarcStatus.Pass => {
+            out.extend(" (p=".bytes())?;
+            out.extend(policyName(report.dmarc.policy).bytes())?;
+            out.extend(")".bytes())?;
+        }
+        DmarcStatus.Fail => {
+            out.extend(" (p=".bytes())?;
+            out.extend(policyName(report.dmarc.policy).bytes())?;
+            out.extend(" dis=".bytes())?;
+            out.extend(policyName(report.dmarc.disposition).bytes())?;
+            out.extend(")".bytes())?;
+        }
+        _ => {}
+    }
+    if (report.dmarc.fromDomain.length > 0) {
+        out.extend(" header.from=".bytes())?;
+        appendSafe(out, report.dmarc.fromDomain.view().bytes())?;
+    }
+    return out.extend("\r\n".bytes());
+}

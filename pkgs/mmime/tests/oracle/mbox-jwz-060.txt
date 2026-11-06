@@ -1,0 +1,14 @@
+size 2414
+envelope ("14 Aug 95 06:39:48 GMT" "Re: MIME Content-MD5 header" (("Keith Moore" NIL "moore" "cs.utk.edu")) (("Keith Moore" NIL "moore" "cs.utk.edu")) (("Keith Moore" NIL "moore" "cs.utk.edu")) NIL NIL NIL "Your message of \"Fri, 11 Aug 1995 09:34:10 BST.\"             <Q9+PDBACYxKwIAQs@turnpike.com>" "<199508140639.CAA17658@wilma.cs.utk.edu>")
+bodystructure (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 1193 21 NIL NIL NIL NIL) ("text" "plain" ("charset" "us-ascii") NIL NIL "quoted-printable" 148 2 "JBUsEwk6AEsrJxeDnYDj2g==" NIL NIL NIL) ("text" "plain" ("charset" "us-ascii") NIL NIL "base64" 196 2 "JBUsEwk6AEsrJxeDnYDj2g==" NIL NIL NIL) "mixed" ("boundary" "frotz") NIL NIL NIL)
+body (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 1193 21) ("text" "plain" ("charset" "us-ascii") NIL NIL "quoted-printable" 148 2) ("text" "plain" ("charset" "us-ascii") NIL NIL "base64" 196 2) "mixed")
+section HEADER 537 c630fd6275f22a2b5e6cf2c70bae7546600c2a51aced8bd09be14756124fe34c
+section TEXT 1877 68ab0b21736c8e9967eb5d1b73541e63322968530de804ae604067969a7b882a
+section HEADER.FIELDS 211 67631bf67b8e6911b5e6f0fc51a38d4ffdda69fa713c605d0696cebe8b8a5969
+section HEADER.FIELDS.NOT 328 23007ab4f81b4535bbaae356a358a5e65ee8938cf85cf277d2481ffd30b490be
+section 1 1193 dac49de257fed42cf96a2c2dcc2d1fa3d88a609a58322d66d1846ba61049470a
+section 1.MIME 46 b626ae45e90fb59356da100ea846d695ec64fbb6678e425044c5be1b836bb788
+section 2 148 e63bb8a094eac0a0ac9cb7e5891d7dadae5fe350732f26b40af5b7ffd8c5d7bb
+section 2.MIME 130 5a40a46cd3a4b28d4665b2c0e1ddeae98c8d184c198cc9dd8c43049b328490f4
+section 3 196 fcbe2bad8f828ddc1c5b0f75f37fb21d6e14d5c758cd6b1beaa58fb2b4e20401
+section 3.MIME 120 f54f868b2dde4eb3def9775a2b0719acefbe8c854921c1f01aa1d588152ac9b9

@@ -1,0 +1,576 @@
+// Properties (RFC 4918 §9.1, RFC 4791 §5.2 and §6, RFC 6352 §6, RFC 5397, RFC 6578) and PROPFIND. A response lists
+// the properties asked for that the resource has under 200, and the others under 404; `allprop` gives every
+// property but the object data, `propname` their names.
+
+import mhttp.Request;
+import mhttp.Response;
+import mpim.Collection;
+import mpim.KIND_ADDRESSBOOK;
+import mpim.KIND_CALENDAR;
+import mpim.PimError;
+import mpim.PimObject;
+import mpim.collections;
+import mpim.objectNamed;
+import mpim.objects;
+import msmtp.SmtpContext;
+import mxml.XmlDocument;
+import mxml.XmlWriter;
+import mxml.parseXml;
+
+const ASK_ALL: u8 = 0;
+const ASK_NAMES: u8 = 1;
+const ASK_PROPS: u8 = 2;
+
+struct PropName {
+    space: String;
+    local: String;
+}
+
+/// What a PROPFIND or REPORT asks for.
+struct PropRequest {
+    mode: u8;
+    names: Vector<PropName>;
+
+    fn create() -> PropRequest => PropRequest { mode: ASK_ALL, names: Vector<PropName>.create() };
+
+    fn add(borrow mut this, space: StringView, local: StringView) -> Result<void, AllocError> {
+        var n = PropName { space: String.create(), local: String.create() };
+        n.space.append(space)?;
+        n.local.append(local)?;
+        return this.names.push(n);
+    }
+
+    /// Whether the object data (calendar-data or address-data) is asked for.
+    fn wantsData(borrow this) -> bool {
+        for (n in this.names.view()) {
+            if ((n.space.view() == NS_CAL && n.local.view() == "calendar-data") ||
+                (n.space.view() == NS_CARD && n.local.view() == "address-data")) {
+                return true;
+            }
+        }
+        return false;
+    }
+}
+
+/// Reads the `DAV:prop`, `DAV:allprop` or `DAV:propname` child of `container`; with none, `fallback` decides
+/// (PROPFIND: all; a REPORT: the etag).
+fn readPropRequest(
+    doc: borrow XmlDocument,
+    container: usize,
+    into: borrow mut PropRequest,
+) -> Result<void, AllocError> {
+    match (doc.child(container, NS_DAV, "prop")) {
+        Some(prop) => {
+            into.mode = ASK_PROPS;
+            var kids = Vector<usize>.create();
+            doc.children(prop, mut kids)?;
+            for (k in kids.view()) {
+                into.add(StringView.fromUtf8(doc.spaceName(k)) ?? "", StringView.fromUtf8(doc.localName(k)) ?? "")?;
+            }
+            return Ok();
+        }
+        null => {}
+    }
+    if (doc.child(container, NS_DAV, "propname") != null) {
+        into.mode = ASK_NAMES;
+    } else {
+        into.mode = ASK_ALL;
+    }
+    return Ok();
+}
+
+/// The properties `allprop` and `propname` give for a kind of resource.
+fn defaultProps(kind: u8, into: borrow mut PropRequest) -> Result<void, AllocError> {
+    into.names.clear();
+    into.add(NS_DAV, "resourcetype")?;
+    if (kind == T_CAL_OBJECT || kind == T_CARD) {
+        into.add(NS_DAV, "getetag")?;
+        into.add(NS_DAV, "getcontenttype")?;
+        into.add(NS_DAV, "getcontentlength")?;
+        into.add(NS_DAV, "current-user-privilege-set")?;
+        return Ok();
+    }
+    into.add(NS_DAV, "displayname")?;
+    into.add(NS_DAV, "current-user-principal")?;
+    into.add(NS_DAV, "current-user-privilege-set")?;
+    into.add(NS_DAV, "owner")?;
+    if (kind == T_ROOT || kind == T_PRINCIPALS || kind == T_PRINCIPAL) {
+        into.add(NS_DAV, "principal-URL")?;
+        into.add(NS_CAL, "calendar-home-set")?;
+        into.add(NS_CARD, "addressbook-home-set")?;
+        into.add(NS_CAL, "calendar-user-address-set")?;
+        into.add(NS_DAV, "principal-collection-set")?;
+    }
+    if (kind == T_CALENDAR) {
+        into.add(NS_IC, "calendar-color")?;
+        into.add(NS_CAL, "calendar-description")?;
+        into.add(NS_CAL, "supported-calendar-component-set")?;
+        into.add(NS_CAL, "supported-calendar-data")?;
+    }
+    if (kind == T_BOOK) {
+        into.add(NS_CARD, "addressbook-description")?;
+        into.add(NS_CARD, "supported-address-data")?;
+    }
+    if (kind == T_CALENDAR || kind == T_BOOK) {
+        into.add(NS_CS, "getctag")?;
+        into.add(NS_DAV, "sync-token")?;
+        into.add(NS_DAV, "supported-report-set")?;
+    }
+    return Ok();
+}
+
+/// One resource, for writing its properties.
+struct Resource {
+    kind: u8;
+    href: String;
+}
+
+/// The account a response is for.
+struct Viewer {
+    email: String;
+    principal: String;
+}
+
+fn hrefElement(w: borrow mut XmlWriter, name: StringView, href: StringView) {
+    w.start(name);
+    w.element("D:href", href);
+    w.end();
+}
+
+/// Writes property `space`/`local` of `r`; false (nothing written) when it has no such property.
+fn writeProp(
+    w: borrow mut XmlWriter,
+    viewer: borrow Viewer,
+    r: borrow Resource,
+    c: borrow Collection,
+    o: borrow PimObject,
+    space: StringView,
+    local: StringView,
+) -> Result<bool, AllocError> {
+    let kind = r.kind;
+    let isObject = kind == T_CAL_OBJECT || kind == T_CARD;
+    let isPrincipal = kind == T_ROOT || kind == T_PRINCIPALS || kind == T_PRINCIPAL;
+    let isCollection = kind == T_CALENDAR || kind == T_BOOK;
+    if (space == NS_DAV) {
+        if (local == "resourcetype") {
+            w.start("D:resourcetype");
+            if (!isObject) {
+                w.empty("D:collection");
+            }
+            if (kind == T_PRINCIPAL) {
+                w.empty("D:principal");
+            }
+            if (kind == T_CALENDAR) {
+                w.empty("C:calendar");
+            }
+            if (kind == T_BOOK) {
+                w.empty("CARD:addressbook");
+            }
+            w.end();
+            return Ok(true);
+        }
+        if (local == "displayname" && !isObject) {
+            if (isCollection) {
+                w.element("D:displayname", c.displayName.view());
+            } else if (kind == T_CAL_HOME) {
+                w.element("D:displayname", "Calendars");
+            } else if (kind == T_CARD_HOME) {
+                w.element("D:displayname", "Contacts");
+            } else {
+                w.element("D:displayname", viewer.email.view());
+            }
+            return Ok(true);
+        }
+        if (local == "current-user-principal") {
+            hrefElement(w, "D:current-user-principal", viewer.principal.view());
+            return Ok(true);
+        }
+        if (local == "principal-URL" && isPrincipal) {
+            hrefElement(w, "D:principal-URL", viewer.principal.view());
+            return Ok(true);
+        }
+        if (local == "principal-collection-set" && isPrincipal) {
+            hrefElement(w, "D:principal-collection-set", "/dav/principals/");
+            return Ok(true);
+        }
+        if (local == "owner" && !isObject) {
+            hrefElement(w, "D:owner", viewer.principal.view());
+            return Ok(true);
+        }
+        if (local == "current-user-privilege-set") {
+            w.start("D:current-user-privilege-set");
+            for (p in [
+                "all", "read", "write", "write-properties", "write-content", "bind", "unbind",
+                "read-current-user-privilege-set",
+            ]) {
+                w.start("D:privilege");
+                var name = String.create();
+                name.append("D:")?;
+                name.append(p)?;
+                w.empty(name.view());
+                w.end();
+            }
+            w.end();
+            return Ok(true);
+        }
+        if (local == "sync-token" && isCollection) {
+            var token = String.create();
+            token.append(SYNC_PREFIX)?;
+            token.appendNumber(c.modseq)?;
+            w.element("D:sync-token", token.view());
+            return Ok(true);
+        }
+        if (local == "supported-report-set" && isCollection) {
+            w.start("D:supported-report-set");
+            let reports = if (kind == T_CALENDAR) [
+                "C:calendar-multiget",
+                "C:calendar-query",
+                "D:sync-collection",
+            ] else [
+                "CARD:addressbook-multiget", "CARD:addressbook-query", "D:sync-collection",
+            ];
+            for (name in reports) {
+                w.start("D:supported-report");
+                w.start("D:report");
+                w.empty(name);
+                w.end();
+                w.end();
+            }
+            w.end();
+            return Ok(true);
+        }
+        if (local == "getetag" && isObject) {
+            var etag = String.create();
+            etag.append("\"")?;
+            etag.append(o.etag.view())?;
+            etag.append("\"")?;
+            w.element("D:getetag", etag.view());
+            return Ok(true);
+        }
+        if (local == "getcontenttype" && isObject) {
+            w.element(
+                "D:getcontenttype",
+                if (kind == T_CAL_OBJECT) "text/calendar; charset=utf-8" else "text/vcard; charset=utf-8",
+            );
+            return Ok(true);
+        }
+        if (local == "getcontentlength" && isObject && o.data.length > 0) {
+            w.number("D:getcontentlength", truncate<i64>(o.data.length));
+            return Ok(true);
+        }
+        return Ok(false);
+    }
+    if (space == NS_CAL) {
+        if (local == "calendar-home-set" && isPrincipal) {
+            var home = String.create();
+            collectionHref(true, viewer.email.view(), "", mut home)?;
+            hrefElement(w, "C:calendar-home-set", home.view());
+            return Ok(true);
+        }
+        if (local == "calendar-user-address-set" && isPrincipal) {
+            var mailto = String.create();
+            mailto.append("mailto:")?;
+            mailto.append(viewer.email.view())?;
+            w.start("C:calendar-user-address-set");
+            w.element("D:href", mailto.view());
+            w.element("D:href", viewer.principal.view());
+            w.end();
+            return Ok(true);
+        }
+        if (local == "calendar-description" && kind == T_CALENDAR) {
+            w.element("C:calendar-description", c.description.view());
+            return Ok(true);
+        }
+        if (local == "supported-calendar-component-set" && kind == T_CALENDAR) {
+            w.start("C:supported-calendar-component-set");
+            for (comp in c.components.view().split(",")) {
+                let name = comp.trim();
+                if (name.length > 0) {
+                    w.start("C:comp");
+                    w.attribute("name", name);
+                    w.end();
+                }
+            }
+            w.end();
+            return Ok(true);
+        }
+        if (local == "supported-calendar-data" && kind == T_CALENDAR) {
+            w.start("C:supported-calendar-data");
+            w.start("C:calendar-data");
+            w.attribute("content-type", "text/calendar");
+            w.attribute("version", "2.0");
+            w.end();
+            w.end();
+            return Ok(true);
+        }
+        if (local == "calendar-data" && kind == T_CAL_OBJECT) {
+            w.element("C:calendar-data", o.data.view());
+            return Ok(true);
+        }
+        return Ok(false);
+    }
+    if (space == NS_CARD) {
+        if (local == "addressbook-home-set" && isPrincipal) {
+            var home = String.create();
+            collectionHref(false, viewer.email.view(), "", mut home)?;
+            hrefElement(w, "CARD:addressbook-home-set", home.view());
+            return Ok(true);
+        }
+        if (local == "addressbook-description" && kind == T_BOOK) {
+            w.element("CARD:addressbook-description", c.description.view());
+            return Ok(true);
+        }
+        if (local == "supported-address-data" && kind == T_BOOK) {
+            w.start("CARD:supported-address-data");
+            for (version in ["3.0", "4.0"]) {
+                w.start("CARD:address-data-type");
+                w.attribute("content-type", "text/vcard");
+                w.attribute("version", version);
+                w.end();
+            }
+            w.end();
+            return Ok(true);
+        }
+        if (local == "address-data" && kind == T_CARD) {
+            w.element("CARD:address-data", o.data.view());
+            return Ok(true);
+        }
+        return Ok(false);
+    }
+    if (space == NS_CS && local == "getctag" && isCollection) {
+        var tag = String.create();
+        tag.appendNumber(c.modseq)?;
+        w.element("CS:getctag", tag.view());
+        return Ok(true);
+    }
+    if (space == NS_IC && local == "calendar-color" && kind == T_CALENDAR) {
+        w.element("IC:calendar-color", if (c.color.length > 0) c.color.view() else "#0078D4");
+        return Ok(true);
+    }
+    return Ok(false);
+}
+
+/// An empty element named `space`/`local`, declaring its namespace when it has no prefix of ours.
+fn emptyNamed(w: borrow mut XmlWriter, space: StringView, local: StringView) -> Result<void, AllocError> {
+    var name = String.create();
+    let known = qualifiedName(space, local, mut name)?;
+    w.start(name.view());
+    if (!known) {
+        w.attribute("xmlns:X", space);
+    }
+    w.end();
+    return Ok();
+}
+
+fn statusElement(w: borrow mut XmlWriter, status: StringView) { w.element("D:status", status); }
+
+/// One `DAV:response` for `r`, with the properties `asked` asks for.
+fn writeResource(
+    w: borrow mut XmlWriter,
+    viewer: borrow Viewer,
+    r: borrow Resource,
+    c: borrow Collection,
+    o: borrow PimObject,
+    asked: borrow PropRequest,
+) -> Result<void, AllocError> {
+    if (asked.mode == ASK_PROPS) {
+        return writeNamed(w, viewer, r, c, o, asked.names, false);
+    }
+    var defaults = PropRequest.create();
+    defaultProps(r.kind, mut defaults)?;
+    return writeNamed(w, viewer, r, c, o, defaults.names, asked.mode == ASK_NAMES);
+}
+
+fn writeNamed(
+    w: borrow mut XmlWriter,
+    viewer: borrow Viewer,
+    r: borrow Resource,
+    c: borrow Collection,
+    o: borrow PimObject,
+    names: borrow Vector<PropName>,
+    namesOnly: bool,
+) -> Result<void, AllocError> {
+    w.start("D:response");
+    w.element("D:href", r.href.view());
+    if (namesOnly) {
+        w.start("D:propstat");
+        w.start("D:prop");
+        for (n in names.view()) {
+            emptyNamed(w, n.space.view(), n.local.view())?;
+        }
+        w.end();
+        statusElement(w, "HTTP/1.1 200 OK");
+        w.end();
+        w.end();
+        return Ok();
+    }
+    var found = XmlWriter.create();
+    var missing = Vector<usize>.create();
+    for (i in 0..names.length) {
+        if (!writeProp(mut found, viewer, r, c, o, names[i].space.view(), names[i].local.view())?) {
+            missing.push(i)?;
+        }
+    }
+    let foundBytes = found.finish()?;
+    if (foundBytes.length > 0 || missing.length == 0) {
+        w.start("D:propstat");
+        w.start("D:prop");
+        w.raw(foundBytes.view());
+        w.end();
+        statusElement(w, "HTTP/1.1 200 OK");
+        w.end();
+    }
+    if (missing.length > 0) {
+        w.start("D:propstat");
+        w.start("D:prop");
+        for (i in missing.view()) {
+            emptyNamed(w, names[i].space.view(), names[i].local.view())?;
+        }
+        w.end();
+        statusElement(w, "HTTP/1.1 404 Not Found");
+        w.end();
+    }
+    w.end();
+    return Ok();
+}
+
+/// A `DAV:response` for a resource that is not there.
+fn writeGone(w: borrow mut XmlWriter, href: StringView) {
+    w.start("D:response");
+    w.element("D:href", href);
+    statusElement(w, "HTTP/1.1 404 Not Found");
+    w.end();
+}
+
+fn multistatus() -> XmlWriter {
+    var w = XmlWriter.document();
+    w.start("D:multistatus");
+    declareSpaces(mut w);
+    return w;
+}
+
+fn finishMultistatus(w: XmlWriter) -> Result<Response, AllocError> {
+    var done = w;
+    done.end();
+    var r = Response.of(207, "application/xml; charset=utf-8", done.finish()?)?;
+    r.header("DAV", "1, 3, calendar-access, addressbook, extended-mkcol")?;
+    return Ok(r);
+}
+
+fn makeViewer(email: StringView) -> Result<Viewer, AllocError> {
+    var v = Viewer { email: String.create(), principal: String.create() };
+    v.email.append(email)?;
+    principalHref(email, mut v.principal)?;
+    return Ok(v);
+}
+
+/// The request body as XML; null when there is none. `Err(true)` when it is malformed.
+fn bodyXml(request: borrow Request) -> Result<XmlDocument?, bool> {
+    var blank = true;
+    for (b in request.body.view()) {
+        if (b != 0x20 && b != 0x09 && b != 0x0a && b != 0x0d) {
+            blank = false;
+            break;
+        }
+    }
+    if (blank) {
+        return Ok(null);
+    }
+    return match (parseXml(request.body.view())) {
+        Ok(d) => Ok(d),
+        Err(_) => Err(true),
+    };
+}
+
+/// PROPFIND (RFC 4918 §9.1): the target, and with Depth 1 or infinity its members (one level: homes list their
+/// collections, collections their objects).
+async fn propfind(
+    mail: borrow SmtpContext,
+    request: borrow Request,
+    target: borrow DavPath,
+    email: StringView,
+    userId: i64,
+) -> Result<Response, AllocError> {
+    var asked = PropRequest.create();
+    match (bodyXml(request)) {
+        Ok(Some(doc)) => {
+            if (!doc.is(doc.root(), NS_DAV, "propfind")) {
+                return Response.text(400, "Expected DAV:propfind.");
+            }
+            readPropRequest(doc, doc.root(), mut asked)?;
+        }
+        Ok(null) => {}
+        Err(_) => { return Response.text(400, "The body is not well-formed XML."); }
+    }
+    let depth = depthOf(request);
+    let viewer = makeViewer(email)?;
+    var w = multistatus();
+    let none = Collection.create();
+    let nothing = PimObject.create();
+    var r = Resource { kind: target.kind, href: String.create() };
+    r.href.append(request.path.view())?;
+    let kind = target.kind;
+    if (kind == T_ROOT || kind == T_PRINCIPALS || kind == T_PRINCIPAL) {
+        if (kind == T_PRINCIPAL) {
+            r.href.clear();
+            r.href.append(viewer.principal.view())?;
+        }
+        writeResource(mut w, viewer, r, none, nothing, asked)?;
+        if (kind == T_PRINCIPALS && depth > 0) {
+            var mine = Resource { kind: T_PRINCIPAL, href: String.create() };
+            mine.href.append(viewer.principal.view())?;
+            writeResource(mut w, viewer, mine, none, nothing, asked)?;
+        }
+        return finishMultistatus(w);
+    }
+    let calendar = target.isCalendarSide();
+    if (kind == T_CAL_HOME || kind == T_CARD_HOME) {
+        collectionHref(calendar, email, "", mut r.href)?;
+        writeResource(mut w, viewer, r, none, nothing, asked)?;
+        if (depth > 0) {
+            var list = Vector<Collection>.create();
+            match (await collections(mail.store, userId, target.kindName(), mut list)) {
+                Ok() => {}
+                Err(e) => { return pimAnswer(e); }
+            }
+            for (c in list.view()) {
+                var member = Resource { kind: if (calendar) T_CALENDAR else T_BOOK, href: String.create() };
+                collectionHref(calendar, email, c.name.view(), mut member.href)?;
+                writeResource(mut w, viewer, member, c, nothing, asked)?;
+            }
+        }
+        return finishMultistatus(w);
+    }
+    var c = Collection.create();
+    match (await targetCollection(mail, userId, target, mut c)) {
+        Ok(true) => {}
+        Ok(false) => { return Response.text(404, "No such collection."); }
+        Err(e) => { return pimAnswer(e); }
+    }
+    if (kind == T_CALENDAR || kind == T_BOOK) {
+        collectionHref(calendar, email, c.name.view(), mut r.href)?;
+        writeResource(mut w, viewer, r, c, nothing, asked)?;
+        if (depth > 0) {
+            var list = Vector<PimObject>.create();
+            match (await objects(mail.store, c.id, asked.wantsData() || asked.mode == ASK_ALL, mut list)) {
+                Ok() => {}
+                Err(e) => { return pimAnswer(e); }
+            }
+            for (o in list.view()) {
+                var member = Resource { kind: if (calendar) T_CAL_OBJECT else T_CARD, href: String.create() };
+                objectHref(calendar, email, c.name.view(), o.href.view(), mut member.href)?;
+                writeResource(mut w, viewer, member, c, o, asked)?;
+            }
+        }
+        return finishMultistatus(w);
+    }
+    var o = PimObject.create();
+    match (await objectNamed(mail.store, c.id, target.href.view(), mut o)) {
+        Ok(true) => {}
+        Ok(false) => { return Response.text(404, "Not found."); }
+        Err(e) => { return pimAnswer(e); }
+    }
+    objectHref(calendar, email, c.name.view(), o.href.view(), mut r.href)?;
+    writeResource(mut w, viewer, r, c, o, asked)?;
+    return finishMultistatus(w);
+}

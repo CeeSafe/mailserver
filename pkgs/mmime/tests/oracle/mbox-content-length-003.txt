@@ -1,0 +1,12 @@
+size 8223
+envelope ("Mon, 3 Jun 1996 09:42:32 -0700" "RE[4]: your generated HTML" ((NIL NIL "izzy" "nugget.scr.atm.com")) ((NIL NIL "izzy" "nugget.scr.atm.com")) ((NIL NIL "izzy" "nugget.scr.atm.com")) ((NIL NIL "jwz" "netscape.com")) NIL NIL "<31AEE9BD.59E2@netscape.com>" "<19960603164232.izzy@scr.atm.com>")
+bodystructure (("text" "html" ("charset" "ISO-8859-1") NIL NIL "quoted-printable" 5310 111 NIL NIL NIL NIL) ("image" "gif" NIL "<0.19960603164233.izzy@scr.atm.com>" "The Sender's Signature" "base64" 942 NIL ("inline" ("filename" "SIG.GIF")) NIL NIL) "related" ("boundary" "=_03tW34g.bO1996u.N16d000A.r06Y.42:0047e7" "type" "text/html" "start-info" "X-twg-cidlinking-V1.2") NIL NIL NIL)
+body (("text" "html" ("charset" "ISO-8859-1") NIL NIL "quoted-printable" 5310 111) ("image" "gif" NIL "<0.19960603164233.izzy@scr.atm.com>" "The Sender's Signature" "base64" 942) "related")
+section HEADER 1529 5f6702eb1808bcb32298edef87bae812d8bbf8605e6d16b3e754444ae68fdf0d
+section TEXT 6694 ee6248770c091cf730d541432b05beabbc0be1a459d569d2f869a2b4c19ea02d
+section HEADER.FIELDS 330 6f50574b2d6ef9387d0b4803800c4fade18fcfc6ff8cddcda8df4f1f5dc7fbcb
+section HEADER.FIELDS.NOT 1201 a415c5ab2ba539a816afbbd0e65d22a54bad7ef92145c4c4804d07f5b75a104d
+section 1 5310 8219fdf2a4f07c92fe5f18e628017d6ce9bccf40397ce6224f75d29265ce1658
+section 1.MIME 94 781d3f464b8f4931811a651b4cc292ae61df69bcc6466ce63cb21d580d575e6b
+section 2 942 341f3fb6356ccc5005a3eaf89b82b9e15eb93b721c9510433d4605248770d22d
+section 2.MIME 205 72b68b7054c46510855c6807f2d24c954bf2bb75d5d2f8fdae2247d92e100594

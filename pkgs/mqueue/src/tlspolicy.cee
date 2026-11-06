@@ -1,0 +1,299 @@
+// The TLS a recipient domain's MX hosts must give, under `[relay] tls_policy`:
+//   opportunistic  STARTTLS when offered, the certificate unchecked, plaintext when it fails (RFC 7435);
+//   published      what the domain publishes: DANE (RFC 7672) where the resolver validates its DNSSEC records, else
+//                  its MTA-STS policy in enforce mode (RFC 8461); without either, opportunistic;
+//   verified       as published, and every other domain also needs TLS with a certificate valid for the MX name.
+// DANE takes precedence over MTA-STS (RFC 8461 §2). A host that cannot give what its domain asks is skipped, never
+// used in the clear: the mail waits and is retried, and bounces only when it is too old.
+
+import mdns.DnsAnswer;
+import mdns.TYPE_TLSA;
+import mdns.TYPE_TXT;
+import msmtp.TLS_DANE;
+import msmtp.TLS_ENCRYPTED;
+import msmtp.TLS_NONE;
+import msmtp.TLS_OPPORTUNISTIC;
+import msmtp.TLS_VERIFIED;
+import mstore.MailStore;
+import tls.Tlsa;
+
+/// `[relay] tls_policy`.
+public const TLS_POLICY_OPPORTUNISTIC: u8 = 0;
+public const TLS_POLICY_PUBLISHED: u8 = 1;
+public const TLS_POLICY_VERIFIED: u8 = 2;
+
+/// What `hostTls` decided for one MX host.
+/// Connect, with the level and records it gave.
+const HOST_TLS_USE: u8 = 0;
+/// The domain's MTA-STS policy does not list the host: skip it (RFC 8461 §4.1).
+const HOST_TLS_SKIP: u8 = 1;
+/// The host's TLSA records could not be looked up: skip it this time (RFC 7672 §2.2).
+const HOST_TLS_DEFER: u8 = 2;
+
+/// How long a domain without a policy, or whose policy could not be fetched, is taken as it is before the database
+/// and the policy host are asked again, in seconds.
+const STS_RECHECK_SECONDS: i64 = 300;
+
+/// A policy file cached in memory, with its id and expiry (Unix seconds). An empty `text` is a domain known to have
+/// no usable policy for now.
+@noncopy
+struct CachedSts {
+    domain: String;
+    id: String;
+    text: String;
+    expires: i64;
+}
+
+/// The MTA-STS policies in memory, in front of the database's.
+@noncopy
+struct StsCache {
+    entries: AsyncMutex<Vector<CachedSts>>;
+
+    fn create() -> Result<StsCache, AllocError> =>
+        Ok(StsCache { entries: AsyncMutex<Vector<CachedSts>>.create(Vector<CachedSts>.create())? });
+
+    /// The unexpired entry of `domain`, into `id` and `text` (empty for a domain known to have no policy), and when
+    /// it expires; 0 when there is none.
+    async fn find(
+        borrow this,
+        domain: StringView,
+        now: i64,
+        id: borrow mut String,
+        text: borrow mut String,
+    ) -> Result<i64, AllocError> {
+        id.clear();
+        text.clear();
+        var guard = match (await this.entries.lock()) {
+            Ok(g) => g,
+            Err(_) => { return Ok(0); }
+        };
+        let list = guard.data();
+        for (e in list.view()) {
+            if (e.domain.view().equalsIgnoreAsciiCase(domain) && e.expires > now) {
+                id.append(e.id.view())?;
+                text.append(e.text.view())?;
+                return Ok(e.expires);
+            }
+        }
+        return Ok(0);
+    }
+
+    async fn put(
+        borrow this,
+        domain: StringView,
+        id: StringView,
+        text: StringView,
+        expires: i64,
+    ) -> Result<void, AllocError> {
+        var guard = match (await this.entries.lock()) {
+            Ok(g) => g,
+            Err(_) => { return Ok(); }
+        };
+        let list = guard.data();
+        var i = list.length;
+        while (i > 0) {
+            i -= 1;
+            if (list[i].domain.view().equalsIgnoreAsciiCase(domain)) {
+                let last = list.length - 1;
+                list.swap(i, last);
+                let _ = list.pop();
+            }
+        }
+        var d = String.create();
+        d.append(domain)?;
+        var k = String.create();
+        k.append(id)?;
+        var t = String.create();
+        t.append(text)?;
+        return list.push(CachedSts { domain: d, id: k, text: t, expires: expires });
+    }
+}
+
+/// What a domain asks of its MX hosts, found once per delivery attempt.
+@noncopy
+struct DomainTls {
+    /// Its MTA-STS policy; mode STS_NONE when it has none.
+    sts: StsPolicy;
+    /// The MX answer was validated with DNSSEC, so DANE may apply to its hosts.
+    mxSecure: bool;
+
+    fn create() -> DomainTls => DomainTls { sts: StsPolicy.create(), mxSecure: false };
+}
+
+/// What one host needs: a msmtp TLS_ level, and for TLS_DANE the host's usable TLSA records.
+@noncopy
+struct HostTls {
+    level: u8;
+    tlsa: Vector<Tlsa>;
+    /// When the host is skipped, why.
+    reason: String;
+
+    fn create() -> HostTls =>
+        HostTls { level: TLS_OPPORTUNISTIC, tlsa: Vector<Tlsa>.create(), reason: String.create() };
+}
+
+/// Finds `domain`'s MTA-STS policy into `into` (RFC 8461 §3): the `_mta-sts` record's id says whether the cached
+/// policy (in memory, else in the database) is current; a new one is fetched when it is not. A policy that cannot be
+/// fetched leaves the cached one in force until it expires (§3.3, §5.1), and so does a record that disappears. The
+/// memory cache also remembers, for STS_RECHECK_SECONDS, that a domain has no policy or that a fetch failed, so that a
+/// delivery does not ask the database or the policy host each time.
+async fn domainTls(
+    relay: borrow Relay,
+    store: borrow MailStore,
+    domain: StringView,
+    mxSecure: bool,
+    into: borrow mut DomainTls,
+) -> Result<void, AllocError> {
+    into.mxSecure = mxSecure;
+    into.sts.mode = STS_NONE;
+    into.sts.mx.clear();
+    if (relay.settings.tlsPolicy == TLS_POLICY_OPPORTUNISTIC) {
+        return Ok();
+    }
+    var recordId = String.create();
+    await stsRecordOf(relay, domain, mut recordId)?;
+    let now = Clock.unixMillis() / 1000;
+    var cachedId = String.create();
+    var cachedText = String.create();
+    var expires = await relay.stsCache.find(domain, now, mut cachedId, mut cachedText)?;
+    if (expires == 0) {
+        match (await store.stsPolicy(domain, mut cachedId, mut cachedText)) {
+            Ok(stored) => {
+                expires = if (stored > now) stored else now + STS_RECHECK_SECONDS;
+                await relay.stsCache.put(domain, cachedId.view(), cachedText.view(), expires)?;
+            }
+            Err(_) => {} // the database is away: no policy from it this time
+        }
+    }
+    if (recordId.length > 0 && cachedId.view() != recordId.view()) {
+        var fetched = String.create();
+        var parsed = StsPolicy.create();
+        if (await fetchStsPolicy(relay, domain, mut fetched)? && parseStsPolicy(fetched.view(), mut parsed)?) {
+            match (await store.saveStsPolicy(domain, recordId.view(), fetched.view(), parsed.maxAge)) {
+                Ok() => {}
+                Err(_) => { await logLine("relay: could not save the MTA-STS policy of", domain); }
+            }
+            await relay.stsCache.put(domain, recordId.view(), fetched.view(), now + parsed.maxAge)?;
+            into.sts = parsed;
+            return Ok();
+        }
+        await logLine("relay: no valid MTA-STS policy could be fetched for", domain);
+        // Not fetched again for a while; the policy cached before, if any, stays in force meanwhile.
+        let recheck = now + STS_RECHECK_SECONDS;
+        let until = if (cachedText.length > 0 && expires < recheck) expires else recheck;
+        await relay.stsCache.put(domain, recordId.view(), cachedText.view(), until)?;
+    }
+    if (cachedText.length > 0) {
+        let _ = parseStsPolicy(cachedText.view(), mut into.sts)?;
+    }
+    return Ok();
+}
+
+/// The id of `domain`'s `_mta-sts` TXT record into `id`, left empty when it has none, or more than one (§3.1), or
+/// the lookup failed.
+async fn stsRecordOf(relay: borrow Relay, domain: StringView, id: borrow mut String) -> Result<void, AllocError> {
+    id.clear();
+    var name = String.create();
+    name.append("_mta-sts.")?;
+    name.append(domain)?;
+    var answer = DnsAnswer.create();
+    match (await relay.resolver.query(name.view(), TYPE_TXT, mut answer)) {
+        Ok() => {}
+        Err(_) => { return Ok(); }
+    }
+    if (answer.rcode != 0) {
+        return Ok();
+    }
+    var found = 0;
+    for (i in 0..answer.count()) {
+        if (answer.kind(i) != TYPE_TXT) {
+            continue;
+        }
+        let text = answer.dataText(i);
+        if (!text.startsWith("v=STSv1")) {
+            continue; // other TXT records may share the name
+        }
+        found += 1;
+        match (stsRecordId(text)) {
+            Some(value) => {
+                id.clear();
+                id.append(value)?;
+            }
+            null => {}
+        }
+    }
+    if (found != 1) {
+        id.clear();
+    }
+    return Ok();
+}
+
+/// What the MX host `host` needs, into `into`; `addressSecure` says whether its addresses were validated with DNSSEC.
+async fn hostTls(
+    relay: borrow Relay,
+    domain: borrow DomainTls,
+    host: StringView,
+    addressSecure: bool,
+    into: borrow mut HostTls,
+) -> Result<u8, AllocError> {
+    into.tlsa.clear();
+    into.reason.clear();
+    let settings = borrow relay.settings;
+    let fallback = if (settings.startTls) TLS_OPPORTUNISTIC else TLS_NONE;
+    into.level = fallback;
+    if (settings.tlsPolicy == TLS_POLICY_OPPORTUNISTIC) {
+        return Ok(HOST_TLS_USE);
+    }
+    // DANE (RFC 7672 §2.2): only through validated MX and address answers, and a validated TLSA answer.
+    if (domain.mxSecure && addressSecure) {
+        var name = String.create();
+        name.append("_")?;
+        name.appendNumber(settings.port as u64)?;
+        name.append("._tcp.")?;
+        name.append(host)?;
+        var answer = DnsAnswer.create();
+        let looked = await relay.resolver.query(name.view(), TYPE_TLSA, mut answer);
+        let failed = match (looked) {
+            Ok() => answer.rcode != 0 && !answer.isNxDomain(),
+            Err(_) => true,
+        };
+        if (failed) {
+            into.reason.append("451 4.7.5 The receiving server's DANE TLSA records could not be looked up")?;
+            return Ok(HOST_TLS_DEFER);
+        }
+        if (answer.authenticated) {
+            var any = false;
+            for (i in 0..answer.count()) {
+                if (answer.kind(i) != TYPE_TLSA) {
+                    continue;
+                }
+                any = true;
+                match (Tlsa.parse(answer.data(i))?) {
+                    Some(record) => {
+                        if (record.usableForSmtp()) {
+                            into.tlsa.push(record)?;
+                        }
+                    }
+                    null => {}
+                }
+            }
+            if (any) {
+                // Records, but none usable: TLS is still required, unauthenticated (RFC 7672 §2.2).
+                into.level = if (into.tlsa.length > 0) TLS_DANE else TLS_ENCRYPTED;
+                return Ok(HOST_TLS_USE);
+            }
+        }
+    }
+    if (domain.sts.mode == STS_ENFORCE) {
+        if (!domain.sts.allows(host)) {
+            into.reason.append("451 4.7.0 The recipient domain's MTA-STS policy does not list this MX host")?;
+            return Ok(HOST_TLS_SKIP);
+        }
+        into.level = TLS_VERIFIED;
+        return Ok(HOST_TLS_USE);
+    }
+    if (settings.tlsPolicy == TLS_POLICY_VERIFIED) {
+        into.level = TLS_VERIFIED;
+    }
+    return Ok(HOST_TLS_USE);
+}

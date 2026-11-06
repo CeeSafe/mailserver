@@ -1,0 +1,309 @@
+// Vacation replies (RFC 5230), with the rules for automatic responses (RFC 3834): when one may go, and the reply
+// itself. Whether one already went to this sender within `:days` is the store's business (MailStore.vacationDue).
+
+import mmime.AddressList;
+import mmime.parseAddressList;
+
+/// Whether a vacation reply to `sender` (the envelope's MAIL FROM) may go, for a message to `user` with `header`
+/// (RFC 5230 §4.5, RFC 3834 §2). Never to the null sender, to mailing lists, to other automatic messages, to
+/// addresses that are known not to read replies, or to the user themselves; and only when the user, or one of the
+/// action's `:addresses`, is among the message's recipients, so Bcc'd list mail gets no reply.
+public fn vacationAllowed(
+    header: Slice<u8>,
+    sender: Slice<u8>,
+    user: Slice<u8>,
+    action: borrow SieveAction,
+) -> Result<bool, AllocError> {
+    if (sender.length == 0 || sender.indexOfByte(0x40) == null) {
+        return Ok(false);
+    }
+    if (sender.equalsIgnoreAsciiCase(user) || inAddresses(action.addresses.view().bytes(), sender)) {
+        return Ok(false);
+    }
+    let at = sender.lastIndexOf("@".bytes())!;
+    if (isRobot(sender[0..at])) {
+        return Ok(false);
+    }
+    var values = Vector<u8>.create();
+    // Auto-Submitted other than "no" (RFC 3834 §5).
+    if (headerValues(header, "Auto-Submitted".bytes(), false, mut values)? > 0) {
+        let v = trimSpace(values.view());
+        let end = match (v.indexOfByte(0x3b)) {
+            Some(i) => i,
+            null => v.length,
+        };
+        if (!trimSpace(v[0..end]).equalsIgnoreAsciiCase("no".bytes())) {
+            return Ok(false);
+        }
+    }
+    if (headerValues(header, "Precedence".bytes(), false, mut values)? > 0) {
+        let v = trimSpace(values.view());
+        if (v.equalsIgnoreAsciiCase("bulk".bytes()) || v.equalsIgnoreAsciiCase("list".bytes()) ||
+            v.equalsIgnoreAsciiCase("junk".bytes())) {
+            return Ok(false);
+        }
+    }
+    // Mailing lists (RFC 2369, RFC 2919), and Microsoft's own "do not auto-reply" header.
+    if (headerValues(header, "List-Id".bytes(), false, mut values)? > 0 ||
+        headerValues(header, "List-Unsubscribe".bytes(), false, mut values)? > 0 ||
+        headerValues(header, "List-Post".bytes(), false, mut values)? > 0) {
+        return Ok(false);
+    }
+    if (headerValues(header, "X-Auto-Response-Suppress".bytes(), false, mut values)? > 0) {
+        let v = values.view();
+        if (containsBytes(v, "all".bytes(), false) || containsBytes(v, "oof".bytes(), false)) {
+            return Ok(false);
+        }
+    }
+    // The user among the recipients (RFC 5230 §4.5).
+    var list = AddressList.create();
+    var address = Vector<u8>.create();
+    let names = ["To", "Cc", "Bcc", "Resent-To", "Resent-Cc"];
+    for (n in 0..5) {
+        let name = names[n];
+        let count = headerValues(header, name.bytes(), false, mut values)?;
+        if (count == 0) {
+            continue;
+        }
+        let all = values.view();
+        var start: usize = 0;
+        while (start <= all.length) {
+            var end = start;
+            while (end < all.length && all[end] != 0) {
+                end += 1;
+            }
+            parseAddressList(all[start..end], mut list)?;
+            var i: usize = 0;
+            while (i < list.count()) {
+                if (realAddress(list, i)) {
+                    addressPart(list.mailbox(i)!, list.host(i)!, PART_ALL, mut address)?;
+                    let a = address.view();
+                    if (a.equalsIgnoreAsciiCase(user) || inAddresses(action.addresses.view().bytes(), a)) {
+                        return Ok(true);
+                    }
+                }
+                i += 1;
+            }
+            start = end + 1;
+        }
+    }
+    return Ok(false);
+}
+
+/// Whether `address` is one of the space-separated `addresses`.
+fn inAddresses(addresses: Slice<u8>, address: Slice<u8>) -> bool {
+    var at: usize = 0;
+    while (at < addresses.length) {
+        var end = at;
+        while (end < addresses.length && addresses[end] != 0x20) {
+            end += 1;
+        }
+        if (end > at && addresses[at..end].equalsIgnoreAsciiCase(address)) {
+            return true;
+        }
+        at = end + 1;
+    }
+    return false;
+}
+
+/// Local parts that belong to software, not people (RFC 5230 §4.5, and common practice).
+fn isRobot(local: Slice<u8>) -> bool {
+    let exact = [
+        "mailer-daemon", "postmaster", "listserv", "majordomo", "noreply", "no-reply", "donotreply",
+        "do-not-reply", "bounce", "bounces",
+    ];
+    for (i in 0..10) {
+        let name = exact[i];
+        if (local.equalsIgnoreAsciiCase(name.bytes())) {
+            return true;
+        }
+    }
+    let owner = "owner-".bytes();
+    let request = "-request".bytes();
+    if (local.length > owner.length && local[0..owner.length].equalsIgnoreAsciiCase(owner)) {
+        return true;
+    }
+    return local.length > request.length && local[local.length - request.length..].equalsIgnoreAsciiCase(request);
+}
+
+/// Writes the vacation reply to `sender` for a message with `header` to `user`: the whole message, CRLF line ends,
+/// to go from the null sender. `date` is the Date header's value, `messageId` the new Message-ID (with brackets).
+public fn buildVacation(
+    action: borrow SieveAction,
+    header: Slice<u8>,
+    sender: Slice<u8>,
+    user: Slice<u8>,
+    date: Slice<u8>,
+    messageId: Slice<u8>,
+    out: borrow mut Vector<u8>,
+) -> Result<void, AllocError> {
+    out.clear();
+    out.extend("From: ".bytes())?;
+    let from = action.from.view().bytes();
+    if (from.length > 0) {
+        appendOneLine(from, out)?;
+    } else {
+        out.push(0x3c)?;
+        out.extend(user)?;
+        out.push(0x3e)?;
+    }
+    out.extend("\r\nTo: <".bytes())?;
+    out.extend(sender)?;
+    out.extend(">\r\nSubject: ".bytes())?;
+    var subject = Vector<u8>.create();
+    if (action.subject.length > 0) {
+        subject.extend(action.subject.view().bytes())?;
+    } else {
+        // "Auto: " and the original subject (RFC 5230 §4.6).
+        subject.extend("Auto: ".bytes())?;
+        var values = Vector<u8>.create();
+        if (headerValues(header, "Subject".bytes(), true, mut values)? > 0) {
+            let v = values.view();
+            let end = match (v.indexOfByte(0)) {
+                Some(i) => i,
+                null => v.length,
+            };
+            subject.extend(trimSpace(v[0..end]))?;
+        }
+    }
+    appendEncoded(subject.view(), out)?;
+    out.extend("\r\nDate: ".bytes())?;
+    out.extend(date)?;
+    out.extend("\r\nMessage-ID: ".bytes())?;
+    out.extend(messageId)?;
+    // Threading (RFC 5322 §3.6.4).
+    var values = Vector<u8>.create();
+    var original = Vector<u8>.create();
+    if (headerValues(header, "Message-ID".bytes(), false, mut values)? > 0) {
+        let v = values.view();
+        let end = match (v.indexOfByte(0)) {
+            Some(i) => i,
+            null => v.length,
+        };
+        original.extend(trimSpace(v[0..end]))?;
+    }
+    if (original.length > 0) {
+        out.extend("\r\nIn-Reply-To: ".bytes())?;
+        appendOneLine(original.view(), out)?;
+        out.extend("\r\nReferences: ".bytes())?;
+        if (headerValues(header, "References".bytes(), false, mut values)? > 0) {
+            let v = values.view();
+            let end = match (v.indexOfByte(0)) {
+                Some(i) => i,
+                null => v.length,
+            };
+            let refs = trimSpace(v[0..end]);
+            if (refs.length > 0 && refs.length < 900) {
+                appendOneLine(refs, out)?;
+                out.push(0x20)?;
+            }
+        }
+        appendOneLine(original.view(), out)?;
+    }
+    out.extend("\r\nAuto-Submitted: auto-replied (vacation)\r\nMIME-Version: 1.0\r\n".bytes())?;
+    let reason = action.reason.view().bytes();
+    if (action.mime) {
+        // The reason is a MIME entity: its own header, a blank line, its body.
+        appendCrlf(reason, out)?;
+        return Ok();
+    }
+    var ascii = true;
+    for (c in reason) {
+        if (c >= 0x80) {
+            ascii = false;
+        }
+    }
+    out.extend("Content-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: ".bytes())?;
+    out.extend(if (ascii) "7bit".bytes() else "8bit".bytes())?;
+    out.extend("\r\n\r\n".bytes())?;
+    return appendCrlf(reason, out);
+}
+
+/// `text` with every line end made CRLF, ending with one.
+fn appendCrlf(text: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    var i: usize = 0;
+    while (i < text.length) {
+        let c = text[i];
+        if (c == 0x0d) {
+            out.extend("\r\n".bytes())?;
+            if (i + 1 < text.length && text[i + 1] == 0x0a) {
+                i += 1;
+            }
+        } else if (c == 0x0a) {
+            out.extend("\r\n".bytes())?;
+        } else {
+            out.push(c)?;
+        }
+        i += 1;
+    }
+    if (out.length < 2 || out[out.length - 1] != 0x0a) {
+        out.extend("\r\n".bytes())?;
+    }
+    return Ok();
+}
+
+/// `text` on one line: line ends and other controls become spaces, so a value cannot add header fields.
+fn appendOneLine(text: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    for (c in text) {
+        out.push(if (c < 0x20 || c == 0x7f) 0x20 else c)?;
+    }
+    return Ok();
+}
+
+const BASE64: [u8; 64] = [
+    0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4a, 0x4b, 0x4c, 0x4d, 0x4e, 0x4f, 0x50,
+    0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5a, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66,
+    0x67, 0x68, 0x69, 0x6a, 0x6b, 0x6c, 0x6d, 0x6e, 0x6f, 0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 0x76,
+    0x77, 0x78, 0x79, 0x7a, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x2b, 0x2f,
+];
+
+fn appendBase64(bytes: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    var i: usize = 0;
+    while (i < bytes.length) {
+        let b0 = bytes[i] as u32;
+        let b1 = if (i + 1 < bytes.length) bytes[i + 1] as u32 else 0;
+        let b2 = if (i + 2 < bytes.length) bytes[i + 2] as u32 else 0;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(BASE64[((n >> 18) & 63) as usize])?;
+        out.push(BASE64[((n >> 12) & 63) as usize])?;
+        out.push(if (i + 1 < bytes.length) BASE64[((n >> 6) & 63) as usize] else 0x3d)?;
+        out.push(if (i + 2 < bytes.length) BASE64[(n & 63) as usize] else 0x3d)?;
+        i += 3;
+    }
+    return Ok();
+}
+
+/// A header value: as it is when it is printable ASCII, else as RFC 2047 encoded words (UTF-8, base64) of at most
+/// 45 bytes of text each, never splitting a character, folded between words.
+fn appendEncoded(text: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    var plain = true;
+    for (c in text) {
+        if (c >= 0x80 || c < 0x20 || c == 0x7f) {
+            plain = false;
+        }
+    }
+    if (plain && text.indexOf("=?".bytes()) == null) {
+        return out.extend(text);
+    }
+    var at: usize = 0;
+    var first = true;
+    while (at < text.length) {
+        var end = at;
+        while (end < text.length) {
+            let n = charLength(text, end);
+            if (end + n - at > 45) {
+                break;
+            }
+            end += n;
+        }
+        if (!first) {
+            out.extend("\r\n ".bytes())?;
+        }
+        first = false;
+        out.extend("=?utf-8?b?".bytes())?;
+        appendBase64(text[at..end], out)?;
+        out.extend("?=".bytes())?;
+        at = end;
+    }
+    return Ok();
+}

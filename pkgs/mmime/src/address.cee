@@ -1,0 +1,471 @@
+// RFC 5322 address lists, read as IMAP's ENVELOPE shows them (RFC 9051 §7.5.2): each mailbox as
+// (name adl mailbox host), a group as (NIL NIL name NIL) … (NIL NIL NIL NIL). Display names and local parts keep
+// their encoded words; quoting is removed. Malformed addresses are read leniently, never rejected.
+
+/// One address of an ENVELOPE, as byte ranges into `AddressList.bytes`; a group start has `host` absent and
+/// `mailbox` the group's name, a group end has everything absent.
+public struct EnvelopeAddress {
+    nameAt: usize;
+    nameLength: usize;
+    hasName: bool;
+    routeAt: usize;
+    routeLength: usize;
+    hasRoute: bool;
+    mailboxAt: usize;
+    mailboxLength: usize;
+    hasMailbox: bool;
+    hostAt: usize;
+    hostLength: usize;
+    hasHost: bool;
+}
+
+@noncopy
+public struct AddressList {
+    bytes: Vector<u8>;
+    addresses: Vector<EnvelopeAddress>;
+
+    public fn create() -> AddressList =>
+        AddressList { bytes: Vector<u8>.create(), addresses: Vector<EnvelopeAddress>.create() };
+
+    public fn count(borrow this) -> usize => this.addresses.length;
+
+    public fn clear(borrow mut this) {
+        this.bytes.clear();
+        this.addresses.clear();
+    }
+
+    fn field(borrow this, at: usize, length: usize, present: bool) -> Slice<u8>? {
+        if (!present) {
+            return null;
+        }
+        return this.bytes[at..at + length];
+    }
+
+    public fn name(borrow this, i: usize) -> Slice<u8>? {
+        let a = this.addresses[i];
+        return this.field(a.nameAt, a.nameLength, a.hasName);
+    }
+
+    public fn route(borrow this, i: usize) -> Slice<u8>? {
+        let a = this.addresses[i];
+        return this.field(a.routeAt, a.routeLength, a.hasRoute);
+    }
+
+    public fn mailbox(borrow this, i: usize) -> Slice<u8>? {
+        let a = this.addresses[i];
+        return this.field(a.mailboxAt, a.mailboxLength, a.hasMailbox);
+    }
+
+    public fn host(borrow this, i: usize) -> Slice<u8>? {
+        let a = this.addresses[i];
+        return this.field(a.hostAt, a.hostLength, a.hasHost);
+    }
+}
+
+/// Pieces of one address while it is read.
+@noncopy
+struct Pending {
+    name: Vector<u8>;
+    hasName: bool;
+    route: Vector<u8>;
+    local: Vector<u8>;
+    hasLocal: bool;
+    domain: Vector<u8>;
+    hasDomain: bool;
+    /// The address is complete; what follows up to the next `,` is ignored.
+    done: bool;
+    /// An angle address held something other than an address: its host reads SYNTAX_ERROR (as Dovecot's does).
+    syntaxError: bool;
+}
+
+fn pending() -> Pending => Pending {
+    name: Vector<u8>.create(),
+    hasName: false,
+    route: Vector<u8>.create(),
+    local: Vector<u8>.create(),
+    hasLocal: false,
+    domain: Vector<u8>.create(),
+    hasDomain: false,
+    done: false,
+    syntaxError: false,
+};
+
+fn clearPending(p: borrow mut Pending) {
+    p.name.clear();
+    p.hasName = false;
+    p.route.clear();
+    p.local.clear();
+    p.hasLocal = false;
+    p.domain.clear();
+    p.hasDomain = false;
+    p.done = false;
+    p.syntaxError = false;
+}
+
+fn push(
+    list: borrow mut AddressList,
+    name: Slice<u8>?,
+    route: Slice<u8>?,
+    mailbox: Slice<u8>?,
+    host: Slice<u8>?,
+) -> Result<void, AllocError> {
+    var a = EnvelopeAddress {
+        nameAt: 0,
+        nameLength: 0,
+        hasName: false,
+        routeAt: 0,
+        routeLength: 0,
+        hasRoute: false,
+        mailboxAt: 0,
+        mailboxLength: 0,
+        hasMailbox: false,
+        hostAt: 0,
+        hostLength: 0,
+        hasHost: false,
+    };
+    match (name) {
+        Some(v) => {
+            a.nameAt = list.bytes.length;
+            a.nameLength = v.length;
+            a.hasName = true;
+            list.bytes.extend(v)?;
+        }
+        null => {}
+    }
+    match (route) {
+        Some(v) => {
+            a.routeAt = list.bytes.length;
+            a.routeLength = v.length;
+            a.hasRoute = true;
+            list.bytes.extend(v)?;
+        }
+        null => {}
+    }
+    match (mailbox) {
+        Some(v) => {
+            a.mailboxAt = list.bytes.length;
+            a.mailboxLength = v.length;
+            a.hasMailbox = true;
+            list.bytes.extend(v)?;
+        }
+        null => {}
+    }
+    match (host) {
+        Some(v) => {
+            a.hostAt = list.bytes.length;
+            a.hostLength = v.length;
+            a.hasHost = true;
+            list.bytes.extend(v)?;
+        }
+        null => {}
+    }
+    return list.addresses.push(a);
+}
+
+fn optional(v: borrow Vector<u8>, present: bool) -> Slice<u8>? {
+    if (!present) {
+        return null;
+    }
+    return v.view();
+}
+
+/// Appends a word to a phrase, a single space between words.
+fn addWord(phrase: borrow mut Vector<u8>, word: Slice<u8>) -> Result<void, AllocError> {
+    if (phrase.length > 0) {
+        phrase.pushBE(0x20u8)?;
+    }
+    return phrase.extend(word);
+}
+
+fn isSpecial(c: u8) -> bool =>
+    c == 0x28 || c == 0x29 || c == 0x3c || c == 0x3e || c == 0x5b || c == 0x5d || c == 0x3a || c == 0x3b ||
+        c == 0x40 || c == 0x5c || c == 0x2c || c == 0x22;
+
+/// Skips an atom (`.` allowed, as in dot-atoms and obsolete phrases) and gives where it started: the atom is
+/// `text[start..at]`.
+fn atom<region r>(lexer: borrow mut Lexer<r>) -> usize {
+    let text = lexer.text;
+    let start = lexer.at;
+    while (lexer.at < text.length) {
+        let c = text[lexer.at];
+        if (c <= 0x20 || c == 0x7f || isSpecial(c)) {
+            break;
+        }
+        lexer.at += 1;
+    }
+    return start;
+}
+
+/// Reads an address list (a From, To, Cc… value) into `into`, as ENVELOPE shows it: display names and local parts
+/// keep their encoded words (`decodeHeader` reads them).
+public fn parseAddressList(value: Slice<u8>, into: borrow mut AddressList) -> Result<void, AllocError> {
+    into.clear();
+    var lexer = Lexer.of(value);
+    var p = pending();
+    var word = Vector<u8>.create();
+    var inGroup = false;
+    var comment = Vector<u8>.create();
+    var hasComment = false;
+    loop {
+        // Whitespace and comments; the first comment of an address names it when it has no display name.
+        loop {
+            lexer.skipBlanks();
+            if (lexer.atEnd() || lexer.peek() != 0x28) {
+                break;
+            }
+            if (!hasComment) {
+                comment.clear();
+                lexer.comment(mut comment)?;
+                hasComment = true;
+            } else {
+                lexer.skipSpace();
+            }
+        }
+        if (lexer.atEnd()) {
+            break;
+        }
+        let c = lexer.peek();
+        if (c == 0x2c || c == 0x3b) {
+            nameFromComment(mut p, comment.view(), hasComment)?;
+            hasComment = false;
+        } else if (p.done) {
+            // Junk after a complete address.
+            if (c == 0x22) {
+                word.clear();
+                lexer.quoted(mut word)?;
+            } else if (c == 0x3c) {
+                while (!lexer.atEnd() && lexer.peek() != 0x3e) {
+                    lexer.at += 1;
+                }
+            } else {
+                lexer.at += 1;
+            }
+            continue;
+        }
+        if (c == 0x2c) {
+            // The end of an address.
+            lexer.at += 1;
+            finishAddress(mut p, into)?;
+            continue;
+        }
+        if (c == 0x3b) {
+            lexer.at += 1;
+            finishAddress(mut p, into)?;
+            if (inGroup) {
+                push(into, null, null, null, null)?;
+                inGroup = false;
+            }
+            continue;
+        }
+        if (c == 0x3a && !p.hasLocal && !inGroup) {
+            // The phrase so far names a group.
+            lexer.at += 1;
+            push(into, null, null, p.name.view(), null)?;
+            clearPending(mut p);
+            inGroup = true;
+            continue;
+        }
+        if (c == 0x3c) {
+            lexer.at += 1;
+            angleAddress(mut lexer, mut p)?;
+            p.done = true;
+            continue;
+        }
+        if (c == 0x22) {
+            word.clear();
+            lexer.quoted(mut word)?;
+            if (p.hasLocal && !p.hasDomain) {
+                p.local.extend(word.view())?;
+            } else {
+                addWord(mut p.name, word.view())?;
+                p.hasName = true;
+            }
+            continue;
+        }
+        if (c == 0x40) {
+            // An addr-spec without angle brackets: what came before is its local part.
+            lexer.at += 1;
+            if (!p.hasLocal) {
+                p.local.clear();
+                p.local.extend(p.name.view())?;
+                p.name.clear();
+                p.hasName = false;
+                p.hasLocal = true;
+            }
+            lexer.skipSpace();
+            domain(mut lexer, mut p.domain)?;
+            p.hasDomain = true;
+            p.done = true;
+            continue;
+        }
+        let atomStart = atom(mut lexer);
+        let a = value[atomStart..lexer.at];
+        if (a.length == 0) {
+            lexer.at += 1; // a stray special
+            continue;
+        }
+        if (p.hasLocal && !p.hasDomain) {
+            p.local.extend(a)?;
+        } else {
+            // A word of the phrase; if no '@' or '<' follows, it is a bare local part (finishAddress decides).
+            if (p.hasName) {
+                addWord(mut p.name, a)?;
+            } else {
+                p.name.extend(a)?;
+                p.hasName = true;
+            }
+        }
+    }
+    nameFromComment(mut p, comment.view(), hasComment)?;
+    finishAddress(mut p, into)?;
+    if (inGroup) {
+        push(into, null, null, null, null)?;
+    }
+    return Ok();
+}
+
+/// An address without a display name takes its first comment as one: `jwz@netscape.com (Jamie Zawinski)`.
+fn nameFromComment(p: borrow mut Pending, comment: Slice<u8>, hasComment: bool) -> Result<void, AllocError> {
+    if (!hasComment) {
+        return Ok();
+    }
+    if (p.hasLocal && !p.hasName) {
+        p.name.extend(comment)?;
+        p.hasName = true;
+    } else if (!p.hasLocal && p.hasName) {
+        // Bare words then a comment (`nsb (Nathaniel Borenstein)`): the words are the mailbox.
+        p.local.extend(p.name.view())?;
+        p.hasLocal = true;
+        p.name.clear();
+        p.name.extend(comment)?;
+    }
+    return Ok();
+}
+
+/// `<[route:]local@domain>`, the cursor after the `<`.
+fn angleAddress<region r>(lexer: borrow mut Lexer<r>, p: borrow mut Pending) -> Result<void, AllocError> {
+    var word = Vector<u8>.create();
+    p.local.clear();
+    p.domain.clear();
+    p.hasLocal = true;
+    loop {
+        let before = lexer.at;
+        lexer.skipSpace();
+        let spaced = lexer.at != before;
+        if (lexer.atEnd()) {
+            return Ok();
+        }
+        let c = lexer.peek();
+        if (c == 0x3e) {
+            lexer.at += 1;
+            return Ok();
+        }
+        if (c == 0x40 && p.local.length == 0 && !p.hasDomain) {
+            // A source route: @a,@b:
+            let start = lexer.at;
+            while (!lexer.atEnd() && lexer.peek() != 0x3a && lexer.peek() != 0x3e) {
+                lexer.at += 1;
+            }
+            if (!lexer.atEnd() && lexer.peek() == 0x3a) {
+                p.route.extend(lexer.text[start..lexer.at])?;
+                lexer.at += 1;
+                continue;
+            }
+            lexer.at = start + 1;
+            domain(lexer, mut p.domain)?;
+            p.hasDomain = true;
+            continue;
+        }
+        if (c == 0x40) {
+            lexer.at += 1;
+            lexer.skipSpace();
+            domain(lexer, mut p.domain)?;
+            p.hasDomain = true;
+            continue;
+        }
+        // A second word of the local part after whitespace is not an address.
+        if (!p.hasDomain && p.local.length > 0 && spaced) {
+            p.syntaxError = true;
+            while (!lexer.atEnd() && lexer.peek() != 0x3e) {
+                lexer.at += 1;
+            }
+            continue;
+        }
+        if (c == 0x22) {
+            word.clear();
+            lexer.quoted(mut word)?;
+            p.local.extend(word.view())?;
+            continue;
+        }
+        let atomStart = atom(lexer);
+        let text = lexer.text;
+        let a = text[atomStart..lexer.at];
+        if (a.length == 0) {
+            lexer.at += 1;
+            continue;
+        }
+        if (p.hasDomain) {
+            p.domain.extend(a)?;
+        } else {
+            p.local.extend(a)?;
+        }
+    }
+}
+
+/// A domain: a dot-atom or a domain literal `[…]`.
+fn domain<region r>(lexer: borrow mut Lexer<r>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    loop {
+        lexer.skipBlanks(); // a comment after the domain may name the address: the caller reads it
+        if (lexer.atEnd()) {
+            return Ok();
+        }
+        let c = lexer.peek();
+        if (c == 0x5b) {
+            let start = lexer.at;
+            while (!lexer.atEnd() && lexer.peek() != 0x5d) {
+                lexer.at += 1;
+            }
+            if (!lexer.atEnd()) {
+                lexer.at += 1;
+            }
+            out.extend(lexer.text[start..lexer.at])?;
+            continue;
+        }
+        let atomStart = atom(lexer);
+        let text = lexer.text;
+        let a = text[atomStart..lexer.at];
+        if (a.length == 0) {
+            return Ok();
+        }
+        out.extend(a)?;
+    }
+}
+
+/// Adds the address read so far, if any, and starts the next.
+fn finishAddress(p: borrow mut Pending, into: borrow mut AddressList) -> Result<void, AllocError> {
+    if (!p.hasLocal && !p.hasName) {
+        return Ok();
+    }
+    // Hosts are lowercase; a missing mailbox or host is named, as Dovecot does, so the address is never read as a
+    // group marker.
+    for (i in 0..p.domain.length) {
+        let c = p.domain[i];
+        if (c >= 0x41 && c <= 0x5a) {
+            p.domain[i] = c + 0x20;
+        }
+    }
+    if (!p.hasLocal) {
+        // Only words: a local part without a domain.
+        let host = "MISSING_DOMAIN".bytes();
+        push(into, null, null, p.name.view(), host)?;
+    } else {
+        let missing = if (p.syntaxError) "SYNTAX_ERROR".bytes() else "MISSING_DOMAIN".bytes();
+        let host = if (p.domain.length > 0) p.domain.view() else missing;
+        let mailbox = if (p.local.length > 0) p.local.view() else "MISSING_MAILBOX".bytes();
+        let name: Slice<u8>? = if (p.hasName) p.name.view() else null;
+        let route: Slice<u8>? = if (p.route.length > 0) p.route.view() else null;
+        push(into, name, route, mailbox, host)?;
+    }
+    clearPending(p);
+    return Ok();
+}

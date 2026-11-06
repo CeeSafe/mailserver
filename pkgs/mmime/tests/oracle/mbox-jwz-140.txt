@@ -1,0 +1,10 @@
+size 3333
+envelope ("Thu, 13 Jun 1996 23:25:49 -0700" "uuencoded images" (("Jamie Zawinski" NIL "jwz" "netscape.com")) (("Jamie Zawinski" NIL "jwz" "netscape.com")) (("Jamie Zawinski" NIL "jwz" "netscape.com")) NIL NIL NIL NIL "<31C105ED.41C6adfas@netscape.com>")
+bodystructure ("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 3177 68 NIL NIL NIL NIL)
+body ("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 3177 68)
+section HEADER 156 3de2fde138857e0799158d4157de0be97ef1ec312a68b76cd2768acf59272711
+section TEXT 3177 aaf12a597e89d3d1e039984d543d54fdf99088e76621d6350657ee93410ebe83
+section HEADER.FIELDS 156 3de2fde138857e0799158d4157de0be97ef1ec312a68b76cd2768acf59272711
+section HEADER.FIELDS.NOT 2 7eb70257593da06f682a3ddda54a9d260d4fc514f645237f5ca74b08f8da61a6
+section 1 3177 aaf12a597e89d3d1e039984d543d54fdf99088e76621d6350657ee93410ebe83
+section 1.MIME 156 3de2fde138857e0799158d4157de0be97ef1ec312a68b76cd2768acf59272711

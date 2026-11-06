@@ -1,0 +1,733 @@
+// JSON (RFC 8259): a writer that builds a document in a buffer, and a reader that checks a whole document once and
+// keeps it as a tape of nodes, so lookups need no tree of allocations.
+//
+// The writer remembers a failed allocation instead of returning it from every call: `finish` reports it.
+
+/// The deepest nesting either side accepts; deeper input is malformed, which keeps the reader's stack small.
+const JSON_MAX_DEPTH: usize = 64;
+
+/// Builds one JSON value: `beginObject`, then `key` and a value for each member, then `endObject`; arrays alike.
+@noncopy
+public struct JsonWriter {
+    out: Vector<u8>;
+    /// Per open container: whether a value has been written in it (so the next needs a comma).
+    filled: Vector<bool>;
+    /// A key was just written, so the next value follows its colon without a comma.
+    afterKey: bool;
+    oom: bool;
+
+    public fn create() -> JsonWriter =>
+        JsonWriter { out: Vector<u8>.create(), filled: Vector<bool>.create(), afterKey: false, oom: false };
+
+    fn bytes(borrow mut this, b: Slice<u8>) {
+        match (this.out.extend(b)) {
+            Ok() => {}
+            Err(_) => { this.oom = true; }
+        }
+    }
+
+    fn byte(borrow mut this, b: u8) {
+        match (this.out.push(b)) {
+            Ok() => {}
+            Err(_) => { this.oom = true; }
+        }
+    }
+
+    /// The comma before a value, unless it is the first in its container or follows a key.
+    fn separate(borrow mut this) {
+        if (this.afterKey) {
+            this.afterKey = false;
+            return;
+        }
+        let depth = this.filled.length;
+        if (depth > 0) {
+            if (this.filled[depth - 1]) {
+                this.byte(0x2c);
+            }
+            this.filled[depth - 1] = true;
+        }
+    }
+
+    fn open(borrow mut this, b: u8) {
+        this.separate();
+        this.byte(b);
+        match (this.filled.push(false)) {
+            Ok() => {}
+            Err(_) => { this.oom = true; }
+        }
+    }
+
+    fn close(borrow mut this, b: u8) {
+        match (this.filled.pop()) {
+            Some(_) => {}
+            null => {}
+        }
+        this.byte(b);
+    }
+
+    public fn beginObject(borrow mut this) { this.open(0x7b); }
+
+    public fn endObject(borrow mut this) { this.close(0x7d); }
+
+    public fn beginArray(borrow mut this) { this.open(0x5b); }
+
+    public fn endArray(borrow mut this) { this.close(0x5d); }
+
+    /// A member's name; its value comes next.
+    public fn key(borrow mut this, name: StringView) {
+        this.separate();
+        this.quoted(name.bytes());
+        this.byte(0x3a);
+        this.afterKey = true;
+    }
+
+    public fn string(borrow mut this, value: StringView) {
+        this.separate();
+        this.quoted(value.bytes());
+    }
+
+    /// A string from bytes that should be UTF-8; bytes that are not come out as U+FFFD.
+    public fn stringBytes(borrow mut this, value: Slice<u8>) {
+        this.separate();
+        match (StringView.fromUtf8(value)) {
+            Some(_) => { this.quoted(value); }
+            null => {
+                // Each byte that is not ASCII becomes U+FFFD: lossy, but always valid JSON.
+                this.byte(0x22);
+                for (b in value) {
+                    if (b < 0x80) {
+                        this.escaped(b);
+                    } else {
+                        this.bytes("\u{FFFD}".bytes());
+                    }
+                }
+                this.byte(0x22);
+            }
+        }
+    }
+
+    public fn integer(borrow mut this, value: i64) {
+        this.separate();
+        var digits = [0u8; 24];
+        var at: usize = 24;
+        var negative = value < 0;
+        // Work in negative numbers so i64's minimum has no overflow.
+        var v = if (negative) value else 0 - value;
+        loop {
+            at -= 1;
+            digits[at] = truncate<u8>(0x30 - v % 10);
+            v = v / 10;
+            if (v == 0) {
+                break;
+            }
+        }
+        if (negative) {
+            at -= 1;
+            digits[at] = 0x2d;
+        }
+        this.bytes(digits[at..24]);
+    }
+
+    public fn boolean(borrow mut this, value: bool) {
+        this.separate();
+        this.bytes(if (value) "true".bytes() else "false".bytes());
+    }
+
+    public fn nothing(borrow mut this) {
+        this.separate();
+        this.bytes("null".bytes());
+    }
+
+    /// Text that is already one JSON value, such as a column the database returned as JSON.
+    public fn raw(borrow mut this, json: Slice<u8>) {
+        this.separate();
+        this.bytes(json);
+    }
+
+    public fn stringField(borrow mut this, name: StringView, value: StringView) {
+        this.key(name);
+        this.string(value);
+    }
+
+    public fn integerField(borrow mut this, name: StringView, value: i64) {
+        this.key(name);
+        this.integer(value);
+    }
+
+    public fn booleanField(borrow mut this, name: StringView, value: bool) {
+        this.key(name);
+        this.boolean(value);
+    }
+
+    public fn nullField(borrow mut this, name: StringView) {
+        this.key(name);
+        this.nothing();
+    }
+
+    /// A string member, or null when there is no value.
+    public fn optionalField(borrow mut this, name: StringView, value: StringView?) {
+        this.key(name);
+        match (value) {
+            Some(v) => { this.string(v); }
+            null => { this.nothing(); }
+        }
+    }
+
+    fn quoted(borrow mut this, value: Slice<u8>) {
+        this.byte(0x22);
+        var plain: usize = 0;
+        for (i in 0..value.length) {
+            let b = value[i];
+            if (b < 0x20 || b == 0x22 || b == 0x5c || b == 0x7f) {
+                this.bytes(value[plain..i]);
+                this.escaped(b);
+                plain = i + 1;
+            }
+        }
+        this.bytes(value[plain..value.length]);
+        this.byte(0x22);
+    }
+
+    /// One ASCII byte inside a string, escaped when JSON requires it (and DEL, and `<` `>` `&` are left alone).
+    fn escaped(borrow mut this, b: u8) {
+        if (b == 0x22) {
+            this.bytes("\\\"".bytes());
+        } else if (b == 0x5c) {
+            this.bytes("\\\\".bytes());
+        } else if (b == 0x0a) {
+            this.bytes("\\n".bytes());
+        } else if (b == 0x0d) {
+            this.bytes("\\r".bytes());
+        } else if (b == 0x09) {
+            this.bytes("\\t".bytes());
+        } else if (b < 0x20 || b == 0x7f) {
+            let hex = "0123456789abcdef".bytes();
+            this.bytes("\\u00".bytes());
+            this.byte(hex[truncate<usize>(b >> 4)]);
+            this.byte(hex[truncate<usize>(b & 0x0f)]);
+        } else {
+            this.byte(b);
+        }
+    }
+
+    /// The document, or `OutOfMemory` if any write failed.
+    public fn finish(this) -> Result<Vector<u8>, AllocError> {
+        if (this.oom) {
+            return Err(AllocError.OutOfMemory);
+        }
+        return Ok(this.out);
+    }
+}
+
+/// What a JSON value is.
+public enum JsonKind {
+    Null,
+    True,
+    False,
+    Number,
+    String,
+    Array,
+    Object,
+}
+
+struct JsonNode {
+    kind: JsonKind;
+    /// The value's bytes in the text; for a string, between the quotes, still escaped.
+    start: usize;
+    end: usize;
+    /// The index of the node after this value and everything inside it.
+    next: usize;
+    /// For a string: whether it has escapes, so it cannot be used as it is.
+    escaped: bool;
+}
+
+/// Why a document was refused.
+public enum JsonError {
+    Malformed,
+    TooDeep,
+    OutOfMemory,
+}
+
+/// A checked JSON document. Values are named by their index; the root is 0. An object's members are its key and
+/// value nodes in turn; `member` finds one by name and `items` lists an array's elements.
+@noncopy
+public struct JsonDocument {
+    text: Vector<u8>;
+    nodes: Vector<JsonNode>;
+
+    /// Parses `text`: one value, with only white space around it.
+    public fn parse(text: Slice<u8>) -> Result<JsonDocument, JsonError> {
+        var copy = Vector<u8>.create();
+        match (copy.extend(text)) {
+            Ok() => {}
+            Err(_) => { return Err(JsonError.OutOfMemory); }
+        }
+        var doc = JsonDocument { text: copy, nodes: Vector<JsonNode>.create() };
+        doc.scan()?;
+        return Ok(doc);
+    }
+
+    fn add(borrow mut this, kind: JsonKind, start: usize, end: usize, escaped: bool) -> Result<usize, JsonError> {
+        let index = this.nodes.length;
+        match (this.nodes.push(JsonNode { kind: kind, start: start, end: end, next: index + 1, escaped: escaped })) {
+            Ok() => {}
+            Err(_) => { return Err(JsonError.OutOfMemory); }
+        }
+        return Ok(index);
+    }
+
+    fn scan(borrow mut this) -> Result<void, JsonError> {
+        let n = this.text.length;
+        var at = skipSpace(this.text.view(), 0);
+        // The open containers, by node index, and whether each is an object.
+        var open = Vector<usize>.create();
+        // In an object: true when the next token must be a key.
+        var wantKey = false;
+        // After a value inside a container: a comma or the close must come next.
+        var wantSeparator = false;
+        var done = false;
+        while (!done) {
+            if (at >= n) {
+                return Err(JsonError.Malformed);
+            }
+            let c = this.text[at];
+            if (wantSeparator) {
+                let top = open[open.length - 1];
+                let isObject = this.isObjectNode(top);
+                if (c == 0x2c) {
+                    at = skipSpace(this.text.view(), at + 1);
+                    wantSeparator = false;
+                    wantKey = isObject;
+                    // A trailing comma: the close may not follow it.
+                    if (at < n && (this.text[at] == 0x7d || this.text[at] == 0x5d)) {
+                        return Err(JsonError.Malformed);
+                    }
+                    continue;
+                }
+                if ((c == 0x7d && isObject) || (c == 0x5d && !isObject)) {
+                    at = this.closeContainer(mut open, at)?;
+                    if (open.length == 0) {
+                        done = true;
+                    }
+                    continue;
+                }
+                return Err(JsonError.Malformed);
+            }
+            if (wantKey) {
+                if (c != 0x22) {
+                    return Err(JsonError.Malformed);
+                }
+                at = this.scanString(at)?;
+                at = skipSpace(this.text.view(), at);
+                if (at >= n || this.text[at] != 0x3a) {
+                    return Err(JsonError.Malformed);
+                }
+                at = skipSpace(this.text.view(), at + 1);
+                wantKey = false;
+                continue;
+            }
+            // A value.
+            if (c == 0x7b || c == 0x5b) {
+                if (open.length >= JSON_MAX_DEPTH) {
+                    return Err(JsonError.TooDeep);
+                }
+                let kind = if (c == 0x7b) JsonKind.Object else JsonKind.Array;
+                let index = this.add(kind, at, at, false)?;
+                match (open.push(index)) {
+                    Ok() => {}
+                    Err(_) => { return Err(JsonError.OutOfMemory); }
+                }
+                at = skipSpace(this.text.view(), at + 1);
+                if (at < n && ((c == 0x7b && this.text[at] == 0x7d) || (c == 0x5b && this.text[at] == 0x5d))) {
+                    at = this.closeContainer(mut open, at)?;
+                    if (open.length == 0) {
+                        done = true;
+                    } else {
+                        wantSeparator = true;
+                    }
+                    continue;
+                }
+                wantKey = c == 0x7b;
+                continue;
+            }
+            if (c == 0x22) {
+                at = this.scanString(at)?;
+            } else if (c == 0x74) {
+                at = this.scanWord(at, "true", JsonKind.True)?;
+            } else if (c == 0x66) {
+                at = this.scanWord(at, "false", JsonKind.False)?;
+            } else if (c == 0x6e) {
+                at = this.scanWord(at, "null", JsonKind.Null)?;
+            } else if (c == 0x2d || (c >= 0x30 && c <= 0x39)) {
+                at = this.scanNumber(at)?;
+            } else {
+                return Err(JsonError.Malformed);
+            }
+            at = skipSpace(this.text.view(), at);
+            if (open.length == 0) {
+                done = true;
+            } else {
+                wantSeparator = true;
+            }
+        }
+        if (skipSpace(this.text.view(), at) != n) {
+            return Err(JsonError.Malformed);
+        }
+        return Ok();
+    }
+
+    fn isObjectNode(borrow this, index: usize) -> bool => match (this.nodes[index].kind) {
+        JsonKind.Object => true,
+        _ => false,
+    };
+
+    /// Closes the innermost container at `at` (its `}` or `]`): its subtree ends here.
+    fn closeContainer(borrow mut this, open: borrow mut Vector<usize>, at: usize) -> Result<usize, JsonError> {
+        let index = match (open.pop()) {
+            Some(i) => i,
+            null => { return Err(JsonError.Malformed); }
+        };
+        this.nodes[index].next = this.nodes.length;
+        this.nodes[index].end = at + 1;
+        let after = skipSpace(this.text.view(), at + 1);
+        return Ok(after);
+    }
+
+    fn scanWord(borrow mut this, at: usize, word: StringView, kind: JsonKind) -> Result<usize, JsonError> {
+        let w = word.bytes();
+        if (at + w.length > this.text.length || this.text[at..at + w.length] != w) {
+            return Err(JsonError.Malformed);
+        }
+        this.add(kind, at, at + w.length, false)?;
+        return Ok(at + w.length);
+    }
+
+    /// `-? (0 | [1-9][0-9]*) (. [0-9]+)? ([eE] [+-]? [0-9]+)?`
+    fn scanNumber(borrow mut this, start: usize) -> Result<usize, JsonError> {
+        let n = this.text.length;
+        var at = start;
+        if (this.text[at] == 0x2d) {
+            at += 1;
+        }
+        if (at >= n || !isDigit(this.text[at])) {
+            return Err(JsonError.Malformed);
+        }
+        if (this.text[at] == 0x30) {
+            at += 1;
+        } else {
+            while (at < n && isDigit(this.text[at])) {
+                at += 1;
+            }
+        }
+        if (at < n && this.text[at] == 0x2e) {
+            at += 1;
+            if (at >= n || !isDigit(this.text[at])) {
+                return Err(JsonError.Malformed);
+            }
+            while (at < n && isDigit(this.text[at])) {
+                at += 1;
+            }
+        }
+        if (at < n && (this.text[at] == 0x65 || this.text[at] == 0x45)) {
+            at += 1;
+            if (at < n && (this.text[at] == 0x2b || this.text[at] == 0x2d)) {
+                at += 1;
+            }
+            if (at >= n || !isDigit(this.text[at])) {
+                return Err(JsonError.Malformed);
+            }
+            while (at < n && isDigit(this.text[at])) {
+                at += 1;
+            }
+        }
+        this.add(JsonKind.Number, start, at, false)?;
+        return Ok(at);
+    }
+
+    /// A string starting at its opening quote, checked: escapes are valid, `\u` surrogates pair up, no control
+    /// characters, and the text is UTF-8. Returns the index after the closing quote.
+    fn scanString(borrow mut this, quote: usize) -> Result<usize, JsonError> {
+        let n = this.text.length;
+        var at = quote + 1;
+        var escaped = false;
+        loop {
+            if (at >= n) {
+                return Err(JsonError.Malformed);
+            }
+            let c = this.text[at];
+            if (c == 0x22) {
+                break;
+            }
+            if (c < 0x20) {
+                return Err(JsonError.Malformed);
+            }
+            if (c != 0x5c) {
+                at += 1;
+                continue;
+            }
+            escaped = true;
+            if (at + 1 >= n) {
+                return Err(JsonError.Malformed);
+            }
+            let e = this.text[at + 1];
+            if (e == 0x75) {
+                let unit = hex4(this.text.view(), at + 2) ?? 0x110000;
+                if (unit == 0x110000) {
+                    return Err(JsonError.Malformed);
+                }
+                at += 6;
+                if (unit >= 0xd800 && unit <= 0xdbff) {
+                    // A high surrogate must be followed by `\u` and a low one.
+                    if (at + 1 >= n || this.text[at] != 0x5c || this.text[at + 1] != 0x75) {
+                        return Err(JsonError.Malformed);
+                    }
+                    let low = hex4(this.text.view(), at + 2) ?? 0;
+                    if (low < 0xdc00 || low > 0xdfff) {
+                        return Err(JsonError.Malformed);
+                    }
+                    at += 6;
+                } else if (unit >= 0xdc00 && unit <= 0xdfff) {
+                    return Err(JsonError.Malformed);
+                }
+                continue;
+            }
+            if (e != 0x22 && e != 0x5c && e != 0x2f && e != 0x62 && e != 0x66 && e != 0x6e && e != 0x72 && e != 0x74) {
+                return Err(JsonError.Malformed);
+            }
+            at += 2;
+        }
+        match (StringView.fromUtf8(this.text[quote + 1..at])) {
+            Some(_) => {}
+            null => { return Err(JsonError.Malformed); }
+        }
+        this.add(JsonKind.String, quote + 1, at, escaped)?;
+        return Ok(at + 1);
+    }
+
+    /// The root value.
+    public fn root(borrow this) -> usize => 0;
+
+    public fn kind(borrow this, value: usize) -> JsonKind => this.nodes[value].kind;
+
+    public fn isNull(borrow this, value: usize) -> bool => match (this.nodes[value].kind) {
+        JsonKind.Null => true,
+        _ => false,
+    };
+
+    /// The value of `object`'s member `name` (the last, if it repeats), or null when there is none or `object` is
+    /// not an object.
+    public fn member(borrow this, object: usize, name: StringView) -> usize? {
+        match (this.nodes[object].kind) {
+            JsonKind.Object => {}
+            _ => { return null; }
+        }
+        var found: usize? = null;
+        var at = object + 1;
+        let stop = this.nodes[object].next;
+        while (at < stop) {
+            let value = at + 1;
+            if (this.keyIs(at, name.bytes())) {
+                found = value;
+            }
+            at = this.nodes[value].next;
+        }
+        return found;
+    }
+
+    /// The names of `object`'s members, in order, as node indexes (read each with `string`).
+    public fn keys(borrow this, object: usize, into: borrow mut Vector<usize>) -> Result<void, AllocError> {
+        into.clear();
+        match (this.nodes[object].kind) {
+            JsonKind.Object => {}
+            _ => { return Ok(); }
+        }
+        var at = object + 1;
+        let stop = this.nodes[object].next;
+        while (at < stop) {
+            into.push(at)?;
+            at = this.nodes[at + 1].next;
+        }
+        return Ok();
+    }
+
+    /// The value after the key node `key` (from `keys`).
+    public fn valueOf(borrow this, key: usize) -> usize => key + 1;
+
+    /// An array's elements, in order.
+    public fn items(borrow this, array: usize, into: borrow mut Vector<usize>) -> Result<void, AllocError> {
+        into.clear();
+        match (this.nodes[array].kind) {
+            JsonKind.Array => {}
+            _ => { return Ok(); }
+        }
+        var at = array + 1;
+        let stop = this.nodes[array].next;
+        while (at < stop) {
+            into.push(at)?;
+            at = this.nodes[at].next;
+        }
+        return Ok();
+    }
+
+    fn keyIs(borrow this, key: usize, name: Slice<u8>) -> bool {
+        let node = this.nodes[key];
+        if (!node.escaped) {
+            return this.text[node.start..node.end] == name;
+        }
+        var decoded = Vector<u8>.create();
+        match (this.decodeInto(key, mut decoded)) {
+            Ok() => {}
+            Err(_) => { return false; }
+        }
+        return decoded.view() == name;
+    }
+
+    /// A string value's text, unescaped, into `into` (replacing it). False when `value` is not a string.
+    public fn string(borrow this, value: usize, into: borrow mut String) -> Result<bool, AllocError> {
+        into.clear();
+        match (this.nodes[value].kind) {
+            JsonKind.String => {}
+            _ => { return Ok(false); }
+        }
+        let node = this.nodes[value];
+        if (!node.escaped) {
+            // Checked as UTF-8 by the scan.
+            let text = StringView.fromUtf8(this.text[node.start..node.end]) ?? "";
+            into.append(text)?;
+            return Ok(true);
+        }
+        var decoded = Vector<u8>.create();
+        this.decodeInto(value, mut decoded)?;
+        into.append(StringView.fromUtf8(decoded.view()) ?? "")?;
+        return Ok(true);
+    }
+
+    /// A string value's text with no escapes, as it stands in the document: null when `value` is not a string or
+    /// has escapes (then use `string`).
+    public fn plainString(borrow this, value: usize) -> StringView? {
+        let node = this.nodes[value];
+        match (node.kind) {
+            JsonKind.String => {}
+            _ => { return null; }
+        }
+        if (node.escaped) {
+            return null;
+        }
+        return StringView.fromUtf8(this.text[node.start..node.end]);
+    }
+
+    /// The integer a number value is, when it has no fraction or exponent and fits; null otherwise.
+    public fn integer(borrow this, value: usize) -> i64? {
+        let node = this.nodes[value];
+        match (node.kind) {
+            JsonKind.Number => {}
+            _ => { return null; }
+        }
+        let text = StringView.fromUtf8(this.text[node.start..node.end]) ?? "";
+        return text.parseInt<i64>();
+    }
+
+    /// A number's text as it stands, for callers that need fractions.
+    public fn numberText(borrow this, value: usize) -> StringView? {
+        let node = this.nodes[value];
+        match (node.kind) {
+            JsonKind.Number => {}
+            _ => { return null; }
+        }
+        return StringView.fromUtf8(this.text[node.start..node.end]);
+    }
+
+    public fn boolean(borrow this, value: usize) -> bool? => match (this.nodes[value].kind) {
+        JsonKind.True => true,
+        JsonKind.False => false,
+        _ => null,
+    };
+
+    /// The bytes of any value as it stands in the document (a string's without its quotes).
+    public fn source(borrow this, value: usize) -> Slice<u8> {
+        let node = this.nodes[value];
+        return this.text[node.start..node.end];
+    }
+
+    /// Unescapes a string node checked by the scan.
+    fn decodeInto(borrow this, value: usize, into: borrow mut Vector<u8>) -> Result<void, AllocError> {
+        let node = this.nodes[value];
+        var at = node.start;
+        while (at < node.end) {
+            let c = this.text[at];
+            if (c != 0x5c) {
+                into.push(c)?;
+                at += 1;
+                continue;
+            }
+            let e = this.text[at + 1];
+            if (e == 0x75) {
+                var code = hex4(this.text.view(), at + 2) ?? 0xfffd;
+                at += 6;
+                if (code >= 0xd800 && code <= 0xdbff) {
+                    let low = hex4(this.text.view(), at + 2) ?? 0xdc00;
+                    code = 0x10000 + ((code - 0xd800) << 10) + (low - 0xdc00);
+                    at += 6;
+                }
+                appendUtf8(into, code)?;
+                continue;
+            }
+            let b: u8 =
+                if (e ==
+                    0x62) 0x08 else if (e ==
+                    0x66) 0x0c else if (e == 0x6e) 0x0a else if (e == 0x72) 0x0d else if (e == 0x74) 0x09 else e;
+            into.push(b)?;
+            at += 2;
+        }
+        return Ok();
+    }
+}
+
+fn isDigit(c: u8) -> bool => c >= 0x30 && c <= 0x39;
+
+fn skipSpace(text: Slice<u8>, from: usize) -> usize {
+    var at = from;
+    while (at < text.length && (text[at] == 0x20 || text[at] == 0x09 || text[at] == 0x0a || text[at] == 0x0d)) {
+        at += 1;
+    }
+    return at;
+}
+
+/// Four hex digits at `at`, or null.
+fn hex4(text: Slice<u8>, at: usize) -> u32? {
+    if (at + 4 > text.length) {
+        return null;
+    }
+    var v: u32 = 0;
+    for (i in 0..4) {
+        let c = text[at + i];
+        let d: u32 =
+            if (c >= 0x30 &&
+                c <= 0x39) (c - 0x30) as u32 else if (c >= 0x61 &&
+                c <= 0x66) (c - 0x57) as u32 else if (c >= 0x41 && c <= 0x46) (c - 0x37) as u32 else 16;
+        if (d == 16) {
+            return null;
+        }
+        v = v * 16 + d;
+    }
+    return v;
+}
+
+fn appendUtf8(into: borrow mut Vector<u8>, code: u32) -> Result<void, AllocError> {
+    if (code < 0x80) {
+        return into.push(truncate<u8>(code));
+    }
+    if (code < 0x800) {
+        into.push(truncate<u8>(0xc0 | (code >> 6)))?;
+        return into.push(truncate<u8>(0x80 | (code & 0x3f)));
+    }
+    if (code < 0x10000) {
+        into.push(truncate<u8>(0xe0 | (code >> 12)))?;
+        into.push(truncate<u8>(0x80 | ((code >> 6) & 0x3f)))?;
+        return into.push(truncate<u8>(0x80 | (code & 0x3f)));
+    }
+    into.push(truncate<u8>(0xf0 | (code >> 18)))?;
+    into.push(truncate<u8>(0x80 | ((code >> 12) & 0x3f)))?;
+    into.push(truncate<u8>(0x80 | ((code >> 6) & 0x3f)))?;
+    return into.push(truncate<u8>(0x80 | (code & 0x3f)));
+}

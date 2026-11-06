@@ -1,0 +1,420 @@
+// Notifications: Subscribe and GetEvents as the C# server answered them (an id, and a status event), and
+// GetStreamingEvents (MS-OXWSNTIF), which Apple's EWS client needs exactly: one chunked response that stays open for
+// the ConnectionTimeout and carries a sequence of whole SOAP envelopes, a keep-alive (`ConnectionStatus` OK) at once
+// and every 20 seconds, a notification part when a mailbox changes (NewMailEvent with the newest message, else
+// ModifiedEvent), and a last part with ConnectionStatus Closed.
+//
+// The web server hands such a request to `streamEvents` before routing (`isStreamingRequest`), since it writes
+// the response itself as it goes.
+
+import encoding.Base64;
+import mhttp.Request;
+import mhttp.Response;
+import mhttp.appendIsoTime;
+import mhttp.writeResponse;
+import mpim.Account;
+import mpim.basicLogin;
+import mpim.loginAnswer;
+import msmtp.SmtpContext;
+import msmtp.Wire;
+import mstore.MailboxList;
+import mxml.XmlDocument;
+import mxml.XmlWriter;
+import mxml.parseXml;
+
+const HEARTBEAT_MS: u64 = 20000;
+const DEFAULT_MINUTES: i64 = 2;
+const MAX_MINUTES: i64 = 10;
+
+fn watermark(seconds: i64, into: borrow mut String) -> Result<void, AllocError> {
+    var raw = Vector<u8>.create();
+    raw.extend("{\"ts\":".bytes())?;
+    decimal(mut raw, seconds)?;
+    raw.push(0x7d)?;
+    into.clear();
+    return base64Of(raw.view(), into);
+}
+
+fn subscriptionId(userId: i64, into: borrow mut String) -> Result<void, AllocError> {
+    var random = [0u8; 16];
+    match (Random.fill(mut random[..])) {
+        Ok() => {}
+        Err(_) => {}
+    }
+    let hex = "0123456789abcdef".bytes();
+    var raw = Vector<u8>.create();
+    raw.extend("sub-".bytes())?;
+    decimal(mut raw, userId)?;
+    raw.push(0x2d)?;
+    for (b in random) {
+        raw.push(hex[truncate<usize>(b >> 4)])?;
+        raw.push(hex[truncate<usize>(b & 0x0f)])?;
+    }
+    into.clear();
+    return into.append(StringView.fromUtf8(raw.view()[0..(if (raw.length < 32) raw.length else 32)]) ?? "");
+}
+
+fn subscribe(
+    account: borrow Account,
+    doc: borrow XmlDocument,
+    op: usize,
+    w: borrow mut XmlWriter,
+) -> Result<void, EwsError> {
+    let streaming = findLocal(doc, op, "StreamingSubscriptionRequest") != null;
+    var id = String.create();
+    mem(subscriptionId(account.userId, mut id))?;
+    beginEnvelope(w, "Subscribe");
+    beginSuccess(w, "Subscribe");
+    w.element("m:SubscriptionId", id.view());
+    if (!streaming) {
+        // Streaming subscriptions have no watermark; pull and push ones do.
+        var mark = String.create();
+        mem(watermark(Clock.unixMillis() / 1000, mut mark))?;
+        w.element("m:Watermark", mark.view());
+    }
+    w.end();
+    endEnvelope(w);
+    return Ok();
+}
+
+fn getEvents(doc: borrow XmlDocument, op: usize, w: borrow mut XmlWriter) -> Result<void, EwsError> {
+    var id = String.create();
+    mem(localText(doc, op, "SubscriptionId", mut id))?;
+    var mark = String.create();
+    mem(watermark(Clock.unixMillis() / 1000, mut mark))?;
+    beginEnvelope(w, "GetEvents");
+    beginSuccess(w, "GetEvents");
+    w.start("m:Notification");
+    w.element("t:SubscriptionId", id.view());
+    w.element("t:PreviousWatermark", mark.view());
+    w.element("t:MoreEvents", "false");
+    w.start("t:StatusEvent");
+    w.element("t:Watermark", mark.view());
+    w.end();
+    w.end();
+    w.end();
+    endEnvelope(w);
+    return Ok();
+}
+
+/// Whether `request` is a GetStreamingEvents call, which `streamEvents` must answer.
+public fn isStreamingRequest(request: borrow Request) -> bool {
+    if (!request.isMethod("POST") || !request.path.view().equalsIgnoreAsciiCase("/EWS/Exchange.asmx")) {
+        return false;
+    }
+    let body = request.body.view();
+    if (body.indexOf("GetStreamingEvents".bytes()) == null) {
+        return false;
+    }
+    let doc = match (parseXml(body)) {
+        Ok(d) => d,
+        Err(_) => { return false; }
+    };
+    return match (operationOf(doc)) {
+        Some(op) => doc.localName(op) == "GetStreamingEvents".bytes(),
+        null => false,
+    };
+}
+
+/// One part of the stream: a whole envelope without the XML declaration.
+fn part(
+    kind: u8,
+    subscriptions: borrow Vector<String>,
+    changed: borrow Vector<[i64; 2]>,
+    userId: i64,
+) -> Result<Vector<u8>, AllocError> {
+    var w = XmlWriter.create();
+    beginEnvelope(mut w, "GetStreamingEvents");
+    beginSuccess(mut w, "GetStreamingEvents");
+    if (kind == 0) {
+        w.element("m:ConnectionStatus", "OK");
+    } else if (kind == 2) {
+        w.element("m:ConnectionStatus", "Closed");
+    } else {
+        let now = Clock.unixMillis() / 1000;
+        var mark = String.create();
+        watermark(now, mut mark)?;
+        var stamp = Vector<u8>.create();
+        appendIsoTime(mut stamp, now)?;
+        let time = StringView.fromUtf8(stamp.view()) ?? "";
+        var folder = String.create();
+        var item = String.create();
+        w.start("m:Notifications");
+        for (s in subscriptions.view()) {
+            w.start("m:Notification");
+            w.element("t:SubscriptionId", s.view());
+            for (c in changed.view()) {
+                folderId(c[0], mut folder)?;
+                w.start(if (c[1] > 0) "t:NewMailEvent" else "t:ModifiedEvent");
+                w.element("t:Watermark", mark.view());
+                w.element("t:TimeStamp", time);
+                if (c[1] > 0) {
+                    itemId(c[0], c[1], mut item)?;
+                    w.start("t:ItemId");
+                    w.attribute("Id", item.view());
+                    w.attribute("ChangeKey", "AAAA");
+                    w.end();
+                } else {
+                    w.start("t:FolderId");
+                    w.attribute("Id", folder.view());
+                    w.attribute("ChangeKey", "AAAA");
+                    w.end();
+                }
+                w.start("t:ParentFolderId");
+                w.attribute("Id", folder.view());
+                w.attribute("ChangeKey", "AAAA");
+                w.end();
+                w.end();
+            }
+            w.end();
+        }
+        w.end();
+    }
+    w.end();
+    endEnvelope(mut w);
+    return w.finish();
+}
+
+/// Sends `bytes` as one chunk, at once.
+async fn chunk(wire: borrow mut Wire, bytes: Slice<u8>) -> bool {
+    var out = Vector<u8>.create();
+    let hex = "0123456789abcdef".bytes();
+    var digits = Vector<u8>.create();
+    var n = bytes.length;
+    loop {
+        match (digits.push(hex[n % 16])) {
+            Ok() => {}
+            Err(_) => { return false; }
+        }
+        n = n / 16;
+        if (n == 0) {
+            break;
+        }
+    }
+    var i = digits.length;
+    while (i > 0) {
+        i -= 1;
+        match (out.push(digits[i])) {
+            Ok() => {}
+            Err(_) => { return false; }
+        }
+    }
+    match (out.extend("\r\n".bytes())) {
+        Ok() => {}
+        Err(_) => { return false; }
+    }
+    match (out.extend(bytes)) {
+        Ok() => {}
+        Err(_) => { return false; }
+    }
+    match (out.extend("\r\n".bytes())) {
+        Ok() => {}
+        Err(_) => { return false; }
+    }
+    return match (await wire.sendNow(out.view())) {
+        Ok() => true,
+        Err(_) => false,
+    };
+}
+
+/// Each mailbox's [id, uidnext, highest modseq].
+async fn snapshot(mail: borrow SmtpContext, userId: i64, into: borrow mut Vector<[i64; 3]>) -> bool {
+    into.clear();
+    var list = MailboxList.create();
+    match (await mail.store.mailboxes(userId, mut list)) {
+        Ok() => {}
+        Err(_) => { return false; }
+    }
+    for (i in 0..list.count()) {
+        match (into.push([list.id(i), list.uidNext(i), list.highestModseq(i)])) {
+            Ok() => {}
+            Err(_) => { return false; }
+        }
+    }
+    return true;
+}
+
+enum Woken {
+    Changed,
+    Quiet,
+    Ended,
+}
+
+async fn waitChange(watch: borrow mstore.Watch) -> Result<Woken, Woken> {
+    return match (await watch.changed()) {
+        Ok() => Ok(Woken.Changed),
+        Err(_) => Err(Woken.Ended),
+    };
+}
+
+/// Answers a GetStreamingEvents request on `wire`, writing the response as it goes. True when the response was
+/// finished cleanly (so the connection can carry another request).
+public async fn streamEvents(mail: borrow SmtpContext, request: borrow Request, wire: borrow mut Wire) -> bool {
+    var account = Account.create();
+    match (await basicLogin(mail, request, mut account)) {
+        Ok() => {}
+        Err(f) => {
+            return match (loginAnswer(f, "CosmoMail")) {
+                Ok(r) => match (await writeResponse(wire, r, true, false)) {
+                    Ok() => true,
+                    Err(_) => false,
+                },
+                Err(_) => false,
+            };
+        }
+    }
+    let doc = match (parseXml(request.body.view())) {
+        Ok(d) => d,
+        Err(_) => { return false; }
+    };
+    let op = match (operationOf(doc)) {
+        Some(o) => o,
+        null => { return false; }
+    };
+    var subscriptions = Vector<String>.create();
+    var ids = Vector<usize>.create();
+    match (findAllLocal(doc, op, "SubscriptionId", mut ids)) {
+        Ok() => {}
+        Err(_) => { return false; }
+    }
+    for (e in ids.view()) {
+        var s = String.create();
+        match (s.append(doc.trimmed(e))) {
+            Ok() => {}
+            Err(_) => { return false; }
+        }
+        if (s.length > 0) {
+            match (subscriptions.push(s)) {
+                Ok() => {}
+                Err(_) => { return false; }
+            }
+        }
+    }
+    if (subscriptions.length == 0) {
+        match (subscriptions.push(String.create())) {
+            Ok() => {}
+            Err(_) => { return false; }
+        }
+    }
+    var minutes = DEFAULT_MINUTES;
+    match (findLocal(doc, op, "ConnectionTimeout")) {
+        Some(t) => { minutes = doc.trimmed(t).parseInt<i64>() ?? DEFAULT_MINUTES; }
+        null => {}
+    }
+    if (minutes < 1) {
+        minutes = 1;
+    }
+    if (minutes > MAX_MINUTES) {
+        minutes = MAX_MINUTES;
+    }
+    let deadline = Clock.unixMillis() + minutes * 60000;
+    var before = Vector<[i64; 3]>.create();
+    if (!(await snapshot(mail, account.userId, mut before))) {
+        return false;
+    }
+    let watch = match (await mail.store.notifications().watch(account.userId, 0)) {
+        Some(w) => w,
+        null => { return false; }
+    };
+    var head = Vector<u8>.create();
+    match (head.extend(
+        "HTTP/1.1 200 OK\r\nServer: mailserver\r\nContent-Type: text/xml; charset=utf-8\r\nTransfer-Encoding: chunked\r\nCache-Control: no-cache\r\n\r\n".bytes(),
+    )) {
+        Ok() => {}
+        Err(_) => { return false; }
+    }
+    match (await wire.sendNow(head.view())) {
+        Ok() => {}
+        Err(_) => { return false; }
+    }
+    let none = Vector<[i64; 2]>.create();
+    let first = match (part(0, subscriptions, none, account.userId)) {
+        Ok(p) => p,
+        Err(_) => { return false; }
+    };
+    if (!(await chunk(wire, first.view()))) {
+        return false;
+    }
+    var after = Vector<[i64; 3]>.create();
+    var changed = Vector<[i64; 2]>.create();
+    loop {
+        let now = Clock.unixMillis();
+        if (now >= deadline) {
+            break;
+        }
+        let left = truncate<u64>(deadline - now);
+        let wait = if (left < HEARTBEAT_MS) left else HEARTBEAT_MS;
+        let woken = match (await Async.timeout(wait, Woken.Quiet, async () => await waitChange(watch))) {
+            Ok(k) => k,
+            Err(k) => k,
+        };
+        var kind: u8 = 0;
+        match (woken) {
+            Woken.Ended => { return false; }
+            Woken.Quiet => {
+                if (Clock.unixMillis() >= deadline) {
+                    break;
+                }
+            }
+            Woken.Changed => {
+                if (!(await snapshot(mail, account.userId, mut after))) {
+                    return false;
+                }
+                changed.clear();
+                for (a in after.view()) {
+                    var was: [i64; 3]? = null;
+                    for (b in before.view()) {
+                        if (b[0] == a[0]) {
+                            was = b;
+                        }
+                    }
+                    match (was) {
+                        Some(b) => {
+                            if (a[1] > b[1]) {
+                                match (changed.push([a[0], a[1] - 1])) {
+                                    Ok() => {}
+                                    Err(_) => { return false; }
+                                }
+                            } else if (a[2] != b[2]) {
+                                match (changed.push([a[0], 0])) {
+                                    Ok() => {}
+                                    Err(_) => { return false; }
+                                }
+                            }
+                        }
+                        null => {}
+                    }
+                }
+                before.clear();
+                for (a in after.view()) {
+                    match (before.push(a)) {
+                        Ok() => {}
+                        Err(_) => { return false; }
+                    }
+                }
+                if (changed.length == 0) {
+                    continue; // a calendar or contact change, or none to report
+                }
+                kind = 1;
+            }
+        }
+        let bytes = match (part(kind, subscriptions, changed, account.userId)) {
+            Ok(p) => p,
+            Err(_) => { return false; }
+        };
+        if (!(await chunk(wire, bytes.view()))) {
+            return false;
+        }
+    }
+    let last = match (part(2, subscriptions, none, account.userId)) {
+        Ok(p) => p,
+        Err(_) => { return false; }
+    };
+    if (!(await chunk(wire, last.view()))) {
+        return false;
+    }
+    return match (await wire.sendNow("0\r\n\r\n".bytes())) {
+        Ok() => true,
+        Err(_) => false,
+    };
+}

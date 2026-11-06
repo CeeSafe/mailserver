@@ -1,0 +1,14 @@
+size 91057
+envelope ("Tue, 29 Sep 92 10:19:23 EDT" "Re: Happy New Year" (("Nathaniel Borenstein" NIL "nsb" "MISSING_DOMAIN")) (("Nathaniel Borenstein" NIL "nsb" "MISSING_DOMAIN")) (("Nathaniel Borenstein" NIL "nsb" "MISSING_DOMAIN")) ((NIL NIL "dnd" "MISSING_DOMAIN")) ((NIL NIL "nsb" "MISSING_DOMAIN")) NIL NIL "<9209291419.AA19468@greenbush.bellcore.com>")
+bodystructure (("text" "richtext" ("charset" "iso-8859-8") NIL NIL "quoted-printable" 212 9 NIL NIL NIL NIL) ("audio" "basic" NIL NIL NIL "base64" 89812 NIL NIL NIL NIL) ("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 31 1 NIL NIL NIL NIL) "mixed" ("boundary" "PART.BOUNDARY.4099.19398.greenbush.717776361.2") NIL NIL NIL)
+body (("text" "richtext" ("charset" "iso-8859-8") NIL NIL "quoted-printable" 212 9) ("audio" "basic" NIL NIL NIL "base64" 89812) ("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 31 1) "mixed")
+section HEADER 405 dd6cefa3cba21a88ebee1bac881bae091205666c5b26ea3272413a043c1139f1
+section TEXT 90652 44c17013a6f9fa51dd5cd6cbf39e6e325374ecc80005c66251eb733c28b7dd5d
+section HEADER.FIELDS 267 fd5a35fa603484b3efc47d547c8130f8d2d0b1a0288d3db73c4790adc9f980ae
+section HEADER.FIELDS.NOT 140 4eb7f695bd4c82b5ac8e542fb6c8f7b8ff0bf24ba67c1c426aa92ae73d67a5fb
+section 1 212 dfe0d0efc84f61b6c0dfa161a5908c6d60fa052a55804db245aaab64774ad55b
+section 1.MIME 98 8359d56ac571a391bdaaa5afb47db23b0a9c883f9f28138c44569c5f605418d9
+section 2 89812 a0e208765a7c5e041091f791e508eed18df555da52c5bbc827065598102af3c6
+section 2.MIME 64 2a5df9264c21eeb7f8e96c1da14d672046d13d976ab8e9ecdf41bab0c5e64c0e
+section 3 31 369aa4975b3169aa0b5ae084fce5434d567789414a7947bbce59bf65e2c000bd
+section 3.MIME 28 8647343b82154690e74d06e14d0df506d30752c4e45caf8c5e7766153d16d2e2

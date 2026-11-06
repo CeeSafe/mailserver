@@ -1,0 +1,311 @@
+import postgres.PgRows;
+
+/// An account as `MailStore.findLogin` finds it.
+@noncopy
+public struct LoginRecord {
+    public userId: i64;
+    public email: String;
+    public passwordHash: String;
+    public active: bool;
+
+    public fn create() -> LoginRecord =>
+        LoginRecord { userId: 0, email: String.create(), passwordHash: String.create(), active: false };
+
+    fn clear(borrow mut this) {
+        this.userId = 0;
+        this.email.clear();
+        this.passwordHash.clear();
+        this.active = false;
+    }
+}
+
+/// Where mail for an address goes.
+public enum RecipientKind {
+    /// A local user's INBOX: `userId`, with `address` the user's own address.
+    User,
+    /// An alias or catch-all pointing elsewhere: forward to `address`.
+    Remote,
+    /// The domain is local but has no such address: reject it (550 5.1.1).
+    UnknownUser,
+    /// Not a local domain: relay it only for an authenticated sender.
+    NotLocal,
+}
+
+@noncopy
+public struct Recipient {
+    public kind: RecipientKind;
+    public userId: i64;
+    public address: String;
+    /// For a local user: their INBOX, their quota in bytes (0 unlimited) and the bytes their mail takes.
+    public inboxId: i64;
+    public quota: i64;
+    public used: i64;
+    /// Their active Sieve script, or empty.
+    public script: String;
+
+    public fn create() -> Recipient => Recipient {
+        kind: RecipientKind.NotLocal,
+        userId: 0,
+        address: String.create(),
+        inboxId: 0,
+        quota: 0,
+        used: 0,
+        script: String.create(),
+    };
+
+    /// Whether a message of `size` bytes would take a local user over their quota.
+    public fn overQuota(borrow this, size: i64) -> bool => this.quota > 0 && this.used + size > this.quota;
+
+    public fn isUser(borrow this) -> bool => this.kind == RecipientKind.User;
+
+    public fn isRemote(borrow this) -> bool => this.kind == RecipientKind.Remote;
+
+    public fn isUnknownUser(borrow this) -> bool => this.kind == RecipientKind.UnknownUser;
+
+    public fn isNotLocal(borrow this) -> bool => this.kind == RecipientKind.NotLocal;
+
+    fn clear(borrow mut this) {
+        this.kind = RecipientKind.NotLocal;
+        this.userId = 0;
+        this.address.clear();
+        this.inboxId = 0;
+        this.quota = 0;
+        this.used = 0;
+        this.script.clear();
+    }
+}
+
+/// Mailboxes, a row each, as `MailStore.mailboxes` and `findMailbox` give them.
+@noncopy
+public struct MailboxList {
+    rows: PgRows;
+
+    public fn create() -> MailboxList => MailboxList { rows: PgRows.create() };
+
+    public fn count(borrow this) -> usize => this.rows.rowCount();
+    public fn id(borrow this, i: usize) -> i64 => orElse(this.rows.int64(i, 0), 0);
+    public fn name(borrow this, i: usize) -> StringView => textOr(this.rows.text(i, 1));
+    /// The RFC 6154 attribute (`\Sent`, …), or empty.
+    public fn specialUse(borrow this, i: usize) -> StringView => textOr(this.rows.text(i, 2));
+    public fn subscribed(borrow this, i: usize) -> bool => orElse(this.rows.bool(i, 3), false);
+    public fn uidValidity(borrow this, i: usize) -> i64 => orElse(this.rows.int64(i, 4), 0);
+    public fn uidNext(borrow this, i: usize) -> i64 => orElse(this.rows.int64(i, 5), 0);
+    public fn highestModseq(borrow this, i: usize) -> i64 => orElse(this.rows.int64(i, 6), 0);
+    public fn messages(borrow this, i: usize) -> i64 => orElse(this.rows.int64(i, 7), 0);
+    public fn unseen(borrow this, i: usize) -> i64 => orElse(this.rows.int64(i, 8), 0);
+    /// The bytes its messages take.
+    public fn size(borrow this, i: usize) -> i64 => orElse(this.rows.int64(i, 9), 0);
+}
+
+/// Messages, a row each by uid, as `MailStore.messages`, `fetchMessages` and `setFlags` give them. Reading allocates nothing: the
+/// getters view the result's buffer.
+@noncopy
+public struct MessageList {
+    rows: PgRows;
+
+    public fn create() -> MessageList => MessageList { rows: PgRows.create() };
+
+    public fn count(borrow this) -> usize => this.rows.rowCount();
+    public fn uid(borrow this, i: usize) -> i64 => orElse(this.rows.int64(i, 0), 0);
+    public fn modseq(borrow this, i: usize) -> i64 => orElse(this.rows.int64(i, 1), 0);
+    /// The system flags: `FLAG_SEEN` and the others.
+    public fn flags(borrow this, i: usize) -> u16 => truncate<u16>(orElse(this.rows.int32(i, 2), 0));
+    /// The keywords, space-separated and sorted.
+    public fn keywords(borrow this, i: usize) -> StringView => textOr(this.rows.text(i, 3));
+    /// Unix milliseconds. Only `messages` and `fetchMessages` give it.
+    public fn internalDate(borrow this, i: usize) -> i64 => orElse(this.rows.int64(i, 4), 0);
+    /// Only `messages` and `fetchMessages` give it.
+    public fn size(borrow this, i: usize) -> i64 => orElse(this.rows.int64(i, 5), 0);
+    /// The content's hash, for `BlobStore.open`, into `into`. Only `messages` and `fetchMessages` give it.
+    public fn blob(borrow this, i: usize, into: borrow mut Vector<u8>) -> Result<void, StoreError> {
+        into.clear();
+        match (this.rows.bytea(i, 6, into)) {
+            Ok(_) => { return Ok(); }
+            Err(e) => { return Err(StoreError.Db(e)); }
+        }
+    }
+
+    /// The stored part index (as `messageMeta`), into `into`; false when there is none. Only `fetchMessages` with
+    /// `withMeta` gives it.
+    public fn meta(borrow this, i: usize, into: borrow mut Vector<u8>) -> Result<bool, StoreError> {
+        into.clear();
+        if (this.rows.columnCount() < 8) {
+            return Ok(false);
+        }
+        match (this.rows.bytea(i, 7, into)) {
+            Ok(found) => { return Ok(found); }
+            Err(e) => { return Err(StoreError.Db(e)); }
+        }
+    }
+}
+
+/// One mailbox a delivered message goes into.
+@noncopy
+public struct Delivery {
+    public userId: i64;
+    public mailboxId: i64;
+    /// The system flags it starts with.
+    public flags: u16;
+    /// Keywords it starts with, space-separated.
+    public keywords: String;
+    /// Unix milliseconds.
+    public internalDate: i64;
+    /// The parsed-once part index, or empty.
+    public meta: Vector<u8>;
+    /// 0: the mailbox's next uid. Otherwise this uid, which must be above every uid in the mailbox (an import that
+    /// keeps the old server's uids, so clients need not fetch everything again); uid_next moves past it.
+    public uid: i64;
+
+    public fn to(userId: i64, mailboxId: i64, internalDate: i64) -> Delivery => Delivery {
+        userId: userId,
+        mailboxId: mailboxId,
+        flags: 0,
+        keywords: String.create(),
+        internalDate: internalDate,
+        meta: Vector<u8>.create(),
+        uid: 0,
+    };
+}
+
+/// A delivered message's place.
+public struct Delivered {
+    public uid: i64;
+    public modseq: i64;
+}
+
+/// A set of uids, built from ranges, in the order given.
+@noncopy
+public struct UidSet {
+    /// An int8multirange literal: `{[1,4),[7,8)}`.
+    private literal: Vector<u8>;
+
+    public fn create() -> UidSet => UidSet { literal: Vector<u8>.create() };
+
+    /// Adds `first` to `last`, both included.
+    public fn addRange(borrow mut this, first: i64, last: i64) -> Result<void, StoreError> {
+        if (first < 1 || last < first) {
+            return Err(StoreError.Invalid);
+        }
+        if (this.literal.length == 0) {
+            grown(this.literal.pushBE(0x7bu8))?; // '{'
+        } else {
+            this.literal.pop();                  // the closing '}'
+            grown(this.literal.pushBE(0x2cu8))?; // ','
+        }
+        grown(this.literal.pushBE(0x5bu8))?; // '['
+        appendInt(mut this.literal, first)?;
+        grown(this.literal.pushBE(0x2cu8))?;
+        appendInt(mut this.literal, last + 1)?;
+        grown(this.literal.pushBE(0x29u8))?;       // ')'
+        return grown(this.literal.pushBE(0x7du8)); // '}'
+    }
+
+    /// Adds one uid.
+    public fn add(borrow mut this, uid: i64) -> Result<void, StoreError> => this.addRange(uid, uid);
+
+    public fn isEmpty(borrow this) -> bool => this.literal.length == 0;
+
+    public fn clear(borrow mut this) {
+        this.literal.clear();
+    }
+
+    fn text(borrow this) -> StringView => StringView.fromUtf8(this.literal.view())!;
+}
+
+fn appendInt(out: borrow mut Vector<u8>, value: i64) -> Result<void, StoreError> {
+    var digits = [0u8; 20];
+    var n = value;
+    var at: usize = 20;
+    if (n == 0) {
+        at -= 1;
+        digits[at] = '0';
+    }
+    while (n > 0) {
+        at -= 1;
+        digits[at] = '0' + truncate<u8>(n % 10);
+        n = n / 10;
+    }
+    return grown(out.extend(digits[at..]));
+}
+
+/// A flag change for `MailStore.setFlags`.
+@noncopy
+public struct FlagChange {
+    /// System flags to add (with `replace`, the new flags).
+    public add: u16;
+    public remove: u16;
+    /// STORE FLAGS: the flags and keywords become `add` and `addKeywords`.
+    public replace: bool;
+    /// Space-separated keywords.
+    public addKeywords: String;
+    public removeKeywords: String;
+    /// UNCHANGEDSINCE (RFC 7162): change only messages whose modseq is at most this; 0 for no condition.
+    public unchangedSince: i64;
+
+    public fn create() -> FlagChange => FlagChange {
+        add: 0,
+        remove: 0,
+        replace: false,
+        addKeywords: String.create(),
+        removeKeywords: String.create(),
+        unchangedSince: 0,
+    };
+}
+
+/// Where a message goes besides local mailboxes: the outbound queue, for relaying (Phase 5's workers).
+@noncopy
+public struct Outbound {
+    /// The reverse-path (MAIL FROM); empty for a bounce.
+    public sender: String;
+    /// Remote recipients, one per element.
+    public recipients: Vector<String>;
+    /// The submitting user, or 0.
+    public userId: i64;
+
+    public fn create() -> Outbound =>
+        Outbound { sender: String.create(), recipients: Vector<String>.create(), userId: 0 };
+
+    public fn clear(borrow mut this) {
+        this.sender.clear();
+        this.recipients.clear();
+        this.userId = 0;
+    }
+}
+
+/// A queued message a relay worker has claimed (`MailStore.claim`).
+@noncopy
+public struct QueueItem {
+    public id: i64;
+    /// The content's hash, for `BlobStore.open`.
+    public blob: Vector<u8>;
+    public size: i64;
+    /// The reverse-path; empty for a bounce.
+    public sender: String;
+    /// The recipients not yet delivered.
+    public recipients: Vector<String>;
+    /// Attempts so far.
+    public attempts: i32;
+    /// Seconds since it was queued.
+    public age: i64;
+    /// The worker's claim, which settling it must show.
+    public claim: i64;
+    /// Whether the sender has been told it is delayed; set it before settling to note that a notice went.
+    public delayNotified: bool;
+}
+
+/// What `MailStore.copy` did: `source[i]` became `target[i]` in a mailbox of `uidValidity`.
+@noncopy
+public struct CopyResult {
+    public source: Vector<i64>;
+    public target: Vector<i64>;
+    public uidValidity: i64;
+
+    public fn create() -> CopyResult =>
+        CopyResult { source: Vector<i64>.create(), target: Vector<i64>.create(), uidValidity: 0 };
+
+    fn clear(borrow mut this) {
+        this.source.clear();
+        this.target.clear();
+        this.uidValidity = 0;
+    }
+}

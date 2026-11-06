@@ -1,0 +1,430 @@
+// The statements of `import-cosmomail` (import.cee). SRC_ statements read CosmoMailServer's database
+// (CosmoMail.Data/Schema/postgres.sql), each table as one JSON document; TGT_ statements write this server's store
+// from such a document ($1), giving the rows added and the rows given. Rows are matched by their natural keys
+// (domain names, addresses, a user's mailbox names), never by the source's ids.
+
+const SRC_DOMAINS: StringView =
+    """
+    SELECT coalesce(json_agg(json_build_object(
+        'name', lower(d.name),
+        'active', lower(d.status) = 'active',
+        'catchall', nullif(lower(d.catchall_email), ''),
+        'default_quota', d.default_quota,
+        'mta_sts_mode', CASE WHEN lower(d.mta_sts_mode) IN ('none', 'testing', 'enforce') THEN lower(d.mta_sts_mode)
+                             ELSE 'none' END,
+        'mta_sts_max_age', LEAST(GREATEST(d.mta_sts_max_age, 0), 31557600),
+        'mta_sts_mx', nullif(d.mta_sts_mx_patterns, ''),
+        'created_at', d.created_at,
+        'settings', to_jsonb(d) - ARRAY['id', 'name', 'status', 'catchall_email', 'default_quota', 'mta_sts_mode',
+                                        'mta_sts_max_age', 'mta_sts_mx_patterns', 'created_at', 'updated_at',
+                                        'dkim_private_key']
+    ) ORDER BY d.id), '[]')::text
+    FROM domains d
+    """;
+
+const TGT_DOMAINS: StringView =
+    """
+    WITH r AS (
+        SELECT * FROM jsonb_to_recordset($1::jsonb) AS r(name text, active bool, catchall text, default_quota int8,
+            mta_sts_mode text, mta_sts_max_age int4, mta_sts_mx text, created_at timestamptz, settings jsonb)
+    ),
+    added AS (
+        INSERT INTO domains (name, active, catchall, default_quota, mta_sts_mode, mta_sts_max_age, mta_sts_mx,
+            created_at, settings)
+        SELECT name, active, catchall, default_quota, mta_sts_mode, mta_sts_max_age, mta_sts_mx, created_at,
+            coalesce(settings, '{}')
+        FROM r
+        ON CONFLICT (name) DO NOTHING
+        RETURNING 1
+    )
+    SELECT (SELECT count(*) FROM added), (SELECT count(*) FROM r)
+    """;
+
+const SRC_DOMAIN_ALIASES: StringView =
+    """
+    SELECT coalesce(json_agg(json_build_object(
+        'alias', lower(a.alias_domain), 'domain', lower(d.name), 'active', a.active, 'created_at', a.created_at
+    )), '[]')::text
+    FROM domain_aliases a JOIN domains d ON d.id = a.target_domain_id
+    """;
+
+const TGT_DOMAIN_ALIASES: StringView =
+    """
+    WITH r AS (
+        SELECT * FROM jsonb_to_recordset($1::jsonb) AS r(alias text, domain text, active bool, created_at timestamptz)
+    ),
+    added AS (
+        INSERT INTO domain_aliases (alias, domain_id, active, created_at)
+        SELECT r.alias, d.id, r.active, r.created_at FROM r JOIN domains d ON d.name = r.domain
+        ON CONFLICT (alias) DO NOTHING
+        RETURNING 1
+    )
+    SELECT (SELECT count(*) FROM added), (SELECT count(*) FROM r)
+    """;
+
+const SRC_USERS: StringView =
+    """
+    SELECT coalesce(json_agg(json_build_object(
+        'email', lower(u.email), 'domain', lower(d.name), 'password_hash', u.password_hash,
+        'active', lower(u.status) = 'active', 'role', u.role, 'quota', u.quota, 'language', u.language,
+        'forward_to', nullif(u.forward_to, ''), 'auto_reply_enabled', u.auto_reply_enabled,
+        'auto_reply_subject', u.auto_reply_subject, 'auto_reply_body', u.auto_reply_body,
+        'last_login', u.last_login, 'created_at', u.created_at
+    ) ORDER BY u.id), '[]')::text
+    FROM users u JOIN domains d ON d.id = u.domain_id
+    """;
+
+const TGT_USERS: StringView =
+    """
+    WITH r AS (
+        SELECT * FROM jsonb_to_recordset($1::jsonb) AS r(email text, domain text, password_hash text, active bool,
+            role text, quota int8, language text, forward_to text, auto_reply_enabled bool, auto_reply_subject text,
+            auto_reply_body text, last_login timestamptz, created_at timestamptz)
+    ),
+    added AS (
+        INSERT INTO users (domain_id, email, password_hash, active, role, quota, language, forward_to,
+            auto_reply_enabled, auto_reply_subject, auto_reply_body, last_login, created_at)
+        SELECT d.id, r.email, r.password_hash, r.active, coalesce(r.role, 'user'), coalesce(r.quota, 0),
+            coalesce(r.language, 'en'), r.forward_to, coalesce(r.auto_reply_enabled, false), r.auto_reply_subject,
+            r.auto_reply_body, r.last_login, r.created_at
+        FROM r JOIN domains d ON d.name = r.domain
+        ON CONFLICT (email) DO NOTHING
+        RETURNING 1
+    )
+    SELECT (SELECT count(*) FROM added), (SELECT count(*) FROM r)
+    """;
+
+const SRC_ADMINS: StringView =
+    """
+    SELECT coalesce(json_agg(json_build_object(
+        'username', a.username, 'password_hash', a.password_hash, 'display_name', a.display_name,
+        'role', lower(a.role), 'domain', lower(d.name), 'active', lower(a.status) = 'active',
+        'last_login', a.last_login, 'created_at', a.created_at
+    )), '[]')::text
+    FROM admin_users a LEFT JOIN domains d ON d.id = a.domain_id
+    """;
+
+/// Only the two roles CosmoMail knows; anything else is left out rather than made a server admin.
+const TGT_ADMINS: StringView =
+    """
+    WITH r AS (
+        SELECT * FROM jsonb_to_recordset($1::jsonb) AS r(username text, password_hash text, display_name text,
+            role text, domain text, active bool, last_login timestamptz, created_at timestamptz)
+    ),
+    added AS (
+        INSERT INTO admin_users (username, password_hash, display_name, role, domain_id, active, last_login,
+            created_at)
+        SELECT r.username, r.password_hash, r.display_name, r.role, CASE WHEN r.role = 'domain' THEN d.id END,
+            r.active, r.last_login, r.created_at
+        FROM r LEFT JOIN domains d ON d.name = r.domain
+        WHERE r.role = 'server' OR (r.role = 'domain' AND d.id IS NOT NULL)
+        ON CONFLICT (username) DO NOTHING
+        RETURNING 1
+    )
+    SELECT (SELECT count(*) FROM added), (SELECT count(*) FROM r)
+    """;
+
+const SRC_ALIASES: StringView =
+    """
+    SELECT coalesce(json_agg(json_build_object(
+        'address', lower(a.email), 'domain', lower(d.name), 'destination', a.destination, 'active', a.active,
+        'created_at', a.created_at
+    ) ORDER BY a.id), '[]')::text
+    FROM aliases a JOIN domains d ON d.id = a.domain_id
+    """;
+
+const TGT_ALIASES: StringView =
+    """
+    WITH r AS (
+        SELECT * FROM jsonb_to_recordset($1::jsonb) AS r(address text, domain text, destination text, active bool,
+            created_at timestamptz)
+    ),
+    added AS (
+        INSERT INTO aliases (address, domain_id, destination, active, created_at)
+        SELECT r.address, d.id, r.destination, r.active, r.created_at FROM r JOIN domains d ON d.name = r.domain
+        ON CONFLICT (address) DO NOTHING
+        RETURNING 1
+    )
+    SELECT (SELECT count(*) FROM added), (SELECT count(*) FROM r)
+    """;
+
+/// Mailbox names the store accepts (no empty hierarchy level); INBOX in any case is INBOX.
+const SRC_MAILBOXES: StringView =
+    """
+    SELECT coalesce(json_agg(json_build_object(
+        'email', lower(u.email), 'name', CASE WHEN upper(m.name) = 'INBOX' THEN 'INBOX' ELSE m.name END,
+        'special_use', nullif(m.special_use, ''), 'subscribed', m.subscribed, 'uid_validity', m.uid_validity,
+        'uid_next', m.uid_next, 'max_size', m.max_size, 'retention_days', m.retention_days,
+        'description', m.description, 'created_at', m.created_at
+    ) ORDER BY m.id), '[]')::text
+    FROM mailboxes m JOIN users u ON u.id = m.user_id
+    WHERE m.name <> '' AND left(m.name, 1) <> '/' AND right(m.name, 1) <> '/' AND position('//' IN m.name) = 0
+    """;
+
+/// UIDVALIDITY is kept (CosmoMail's are Unix seconds); one out of IMAP's range gets a new one.
+const TGT_MAILBOXES: StringView =
+    """
+    WITH r AS (
+        SELECT * FROM jsonb_to_recordset($1::jsonb) AS r(email text, name text, special_use text, subscribed bool,
+            uid_validity int8, uid_next int8, max_size int8, retention_days int4, description text,
+            created_at timestamptz)
+    ),
+    added AS (
+        INSERT INTO mailboxes (user_id, name, special_use, subscribed, uid_validity, uid_next, max_size,
+            retention_days, description, created_at)
+        SELECT u.id, r.name, r.special_use, coalesce(r.subscribed, true),
+            CASE WHEN r.uid_validity BETWEEN 1 AND 4294967295 THEN r.uid_validity
+                 ELSE nextval('mstore_uid_validity') END,
+            GREATEST(coalesce(r.uid_next, 1), 1), coalesce(r.max_size, 0), coalesce(r.retention_days, 0),
+            r.description, r.created_at
+        FROM r JOIN users u ON u.email = r.email
+        ON CONFLICT (user_id, name) DO NOTHING
+        RETURNING 1
+    )
+    SELECT (SELECT count(*) FROM added), (SELECT count(*) FROM r)
+    """;
+
+/// New mailboxes' UIDVALIDITY above every copied one: a mailbox deleted and made again gets a new one.
+const TGT_UID_VALIDITY_SEQUENCE: StringView =
+    """
+    SELECT setval('mstore_uid_validity',
+        GREATEST((SELECT coalesce(max(uid_validity), 1) FROM mailboxes),
+                 (SELECT last_value FROM mstore_uid_validity)))
+    """;
+
+const SRC_DKIM: StringView =
+    """
+    SELECT lower(name), dkim_selector, dkim_private_key, dkim_signing_enabled FROM domains
+    WHERE coalesce(dkim_private_key, '') <> '' AND coalesce(dkim_selector, '') <> ''
+    """;
+
+/// $1 domain, $2 selector, $3 PKCS #8 DER, $4 active.
+const TGT_DKIM: StringView =
+    """
+    INSERT INTO dkim_keys (domain, selector, private_key, active) VALUES ($1, $2, $3, $4)
+    ON CONFLICT (domain, selector) DO NOTHING
+    """;
+
+const SRC_SIEVE: StringView =
+    """
+    SELECT lower(u.email), s.name, s.content, s.active FROM sieve_scripts s JOIN users u ON u.id = s.user_id
+    ORDER BY s.id
+    """;
+
+/// $1 email, $2 name, $3 content.
+const TGT_SIEVE: StringView =
+    """
+    INSERT INTO sieve_scripts (user_id, name, content) SELECT id, $2, $3 FROM users WHERE email = $1
+    ON CONFLICT (user_id, name) DO NOTHING
+    """;
+
+/// $1 email, $2 name: the user's active script, unless one is already (or this one is).
+const TGT_SIEVE_ACTIVE: StringView =
+    """
+    UPDATE users SET sieve_active = $2 WHERE email = $1 AND (sieve_active IS NULL OR sieve_active = $2)
+    """;
+
+const SRC_MAILBOX_LIST: StringView =
+    """
+    SELECT m.id, lower(u.email), CASE WHEN upper(m.name) = 'INBOX' THEN 'INBOX' ELSE m.name END
+    FROM mailboxes m JOIN users u ON u.id = m.user_id ORDER BY m.id
+    """;
+
+/// $1 email, $2 name: the copy's id, its user, and the highest uid copied so far.
+const TGT_MAILBOX_FIND: StringView =
+    """
+    SELECT b.id, b.user_id, coalesce((SELECT max(uid) FROM messages WHERE mailbox_id = b.id), 0)
+    FROM mailboxes b JOIN users u ON u.id = b.user_id WHERE u.email = $1 AND b.name = $2
+    """;
+
+// A source message's system flags as the store's bits (\Seen 1, \Answered 2, \Flagged 4, \Deleted 8, \Draft 16;
+// \Recent is not kept), from its JSON array and its is_seen and is_deleted columns, and its keywords: the other
+// entries that are IMAP atoms, space-separated.
+
+/// $1 mailbox, $2 above this uid, $3 at most this many: uid, internal date (ms), flags, keywords, storage type,
+/// locator, content (when in the database).
+const SRC_MESSAGES: StringView =
+    """
+    SELECT m.uid, (extract(epoch FROM m.internal_date) * 1000)::int8,
+        (SELECT coalesce(bit_or(CASE lower(e) WHEN '\seen' THEN 1 WHEN '\answered' THEN 2 WHEN '\flagged' THEN 4
+                                              WHEN '\deleted' THEN 8 WHEN '\draft' THEN 16 ELSE 0 END), 0)
+         FROM jsonb_array_elements_text(f.list) e)
+            | CASE WHEN m.is_seen THEN 1 ELSE 0 END | CASE WHEN m.is_deleted THEN 8 ELSE 0 END,
+        (SELECT coalesce(string_agg(DISTINCT e, ' '), '') FROM jsonb_array_elements_text(f.list) e
+         WHERE left(e, 1) <> '\' AND e ~ '^[!-~]+$' AND length(translate(e, '(){%*"\]', '')) = length(e)),
+        lower(coalesce(m.storage_type, '')), m.content_path,
+        CASE WHEN coalesce(m.storage_type, '') IN ('', 'database') THEN m.content END
+    FROM messages m
+    CROSS JOIN LATERAL (SELECT CASE WHEN m.flags ~ '^\s*\[' THEN m.flags::jsonb ELSE '[]'::jsonb END AS list) f
+    WHERE m.mailbox_id = $1 AND m.uid > $2
+    ORDER BY m.uid
+    LIMIT $3
+    """;
+
+/// $1 mailbox: every message's uid, flags and keywords, as SRC_MESSAGES gives them.
+const SRC_FLAGS: StringView =
+    """
+    SELECT coalesce(json_agg(json_build_object(
+        'uid', m.uid,
+        'flags', (SELECT coalesce(bit_or(CASE lower(e) WHEN '\seen' THEN 1 WHEN '\answered' THEN 2
+                                                       WHEN '\flagged' THEN 4 WHEN '\deleted' THEN 8
+                                                       WHEN '\draft' THEN 16 ELSE 0 END), 0)
+                  FROM jsonb_array_elements_text(f.list) e)
+                 | CASE WHEN m.is_seen THEN 1 ELSE 0 END | CASE WHEN m.is_deleted THEN 8 ELSE 0 END,
+        'keywords', (SELECT coalesce(string_agg(DISTINCT e, ' '), '') FROM jsonb_array_elements_text(f.list) e
+                     WHERE left(e, 1) <> '\' AND e ~ '^[!-~]+$'
+                       AND length(translate(e, '(){%*"\]', '')) = length(e))
+    )), '[]')::text
+    FROM messages m
+    CROSS JOIN LATERAL (SELECT CASE WHEN m.flags ~ '^\s*\[' THEN m.flags::jsonb ELSE '[]'::jsonb END AS list) f
+    WHERE m.mailbox_id = $1
+    """;
+
+/// $1 mailbox, $2 SRC_FLAGS's document: copies of messages the source no longer has.
+const TGT_EXPUNGE: StringView =
+    """
+    DELETE FROM messages m
+    WHERE m.mailbox_id = $1
+      AND NOT EXISTS (SELECT 1 FROM jsonb_to_recordset($2::jsonb) AS r(uid int8) WHERE r.uid = m.uid)
+    """;
+
+/// $1 mailbox, $2 SRC_FLAGS's document: flags and keywords that differ, each change with a new MODSEQ.
+const TGT_FLAGS: StringView =
+    """
+    WITH r AS (
+        SELECT uid, flags::int2 AS flags,
+            ARRAY(SELECT DISTINCT w FROM unnest(string_to_array(keywords, ' ')) w WHERE w <> '' ORDER BY w) AS keywords
+        FROM jsonb_to_recordset($2::jsonb) AS r(uid int8, flags int4, keywords text)
+    ),
+    changed AS (
+        SELECT m.uid FROM messages m JOIN r ON r.uid = m.uid
+        WHERE m.mailbox_id = $1 AND (m.flags <> r.flags OR m.keywords <> r.keywords)
+    ),
+    b AS (
+        UPDATE mailboxes SET highest_modseq = highest_modseq + 1
+        WHERE id = $1 AND EXISTS (SELECT 1 FROM changed)
+        RETURNING highest_modseq
+    )
+    UPDATE messages m SET flags = r.flags, keywords = r.keywords, modseq = b.highest_modseq
+    FROM r, b
+    WHERE m.mailbox_id = $1 AND m.uid = r.uid AND m.uid IN (SELECT uid FROM changed)
+    """;
+
+/// $1 mailbox: its counters, counted.
+const TGT_RECOUNT: StringView =
+    """
+    UPDATE mailboxes b SET messages = s.n, unseen = s.unseen, size = s.size
+    FROM (SELECT count(*)::int4 AS n, (count(*) FILTER (WHERE flags & 1 = 0))::int4 AS unseen,
+                 coalesce(sum(size), 0)::int8 AS size
+          FROM messages WHERE mailbox_id = $1) s
+    WHERE b.id = $1
+    """;
+
+/// Every user's quota use, counted.
+const TGT_USED: StringView =
+    """
+    UPDATE users u SET used = coalesce((SELECT sum(m.size) FROM mailboxes b JOIN messages m ON m.mailbox_id = b.id
+                                        WHERE b.user_id = u.id), 0)
+    """;
+
+// ---- Calendars and contacts (CalDAV/CardDAV, ActiveSync and EWS share them) ----
+
+/// Calendars and address books, as collections of their owners'. Names are the URL segments clients use.
+const SRC_COLLECTIONS: StringView =
+    """
+    SELECT coalesce(json_agg(c ORDER BY c.kind, c.id), '[]')::text FROM (
+        SELECT 'calendar' AS kind, k.id, lower(u.email) AS email, k.name, k.description, k.color, k.created_at
+        FROM calendars k JOIN users u ON u.id = k.user_id
+        UNION ALL
+        SELECT 'addressbook', a.id, lower(u.email), a.name, a.description, NULL, a.created_at
+        FROM address_books a JOIN users u ON u.id = a.user_id
+    ) c
+    """;
+
+const TGT_COLLECTIONS: StringView =
+    """
+    WITH r AS (
+        SELECT * FROM jsonb_to_recordset($1::jsonb) AS r(kind text, email text, name text, description text,
+            color text, created_at timestamptz)
+    ),
+    added AS (
+        INSERT INTO dav_collections (user_id, kind, name, display_name, description, color, created_at)
+        SELECT u.id, r.kind, r.name, r.name, r.description, r.color, r.created_at
+        FROM r JOIN users u ON u.email = r.email
+        ON CONFLICT (user_id, kind, name) DO NOTHING
+        RETURNING 1
+    )
+    SELECT (SELECT count(*) FROM added), (SELECT count(*) FROM r)
+    """;
+
+/// Events and contacts, tombstones too. The C# server named each by the UID in its URL; that is the href here.
+const SRC_OBJECTS: StringView =
+    """
+    SELECT coalesce(json_agg(o ORDER BY o.kind, o.id), '[]')::text FROM (
+        SELECT 'calendar' AS kind, e.id, lower(u.email) AS email, k.name AS collection, e.uid || '.ics' AS href,
+               e.uid, CASE WHEN e.deleted THEN '' ELSE e.ics_data END AS data, e.etag, e.deleted
+        FROM calendar_events e JOIN calendars k ON k.id = e.calendar_id JOIN users u ON u.id = k.user_id
+        UNION ALL
+        SELECT 'addressbook', c.id, lower(u.email), a.name, c.uid || '.vcf', c.uid,
+               CASE WHEN c.deleted THEN '' ELSE c.v_card_data END, c.etag, c.deleted
+        FROM contacts c JOIN address_books a ON a.id = c.address_book_id JOIN users u ON u.id = a.user_id
+    ) o
+    """;
+
+/// New and changed objects (by etag, and deletion), each stamped with its collection's next modseq. The
+/// component is a first guess; `reindexObjects` reads each new object's own facts afterwards.
+const TGT_OBJECTS: StringView =
+    """
+    WITH r AS (
+        SELECT * FROM jsonb_to_recordset($1::jsonb) AS r(kind text, email text, collection text, href text,
+            uid text, data text, etag text, deleted bool)
+    ),
+    j AS (
+        SELECT c.id AS cid, c.modseq AS base, r.* FROM r
+        JOIN users u ON u.email = r.email
+        JOIN dav_collections c ON c.user_id = u.id AND c.kind = r.kind AND c.name = r.collection
+    ),
+    changed AS (
+        SELECT j.*, j.base + row_number() OVER (PARTITION BY j.cid ORDER BY j.href) AS m
+        FROM j LEFT JOIN dav_objects o ON o.collection_id = j.cid AND o.href = j.href
+        WHERE (o.id IS NULL AND NOT j.deleted)
+           OR (o.id IS NOT NULL AND (o.etag <> j.etag OR o.deleted <> j.deleted))
+    ),
+    put AS (
+        INSERT INTO dav_objects (collection_id, href, uid, component, data, etag, created_modseq, modseq, deleted)
+        SELECT cid, href, uid,
+               CASE WHEN kind = 'addressbook' THEN 'VCARD'
+                    WHEN data ~* 'BEGIN:VTODO' AND data !~* 'BEGIN:VEVENT' THEN 'VTODO' ELSE 'VEVENT' END,
+               data, etag, m, m, deleted
+        FROM changed
+        ON CONFLICT (collection_id, href) DO UPDATE SET
+            data = EXCLUDED.data, etag = EXCLUDED.etag, modseq = EXCLUDED.modseq, deleted = EXCLUDED.deleted,
+            component = EXCLUDED.component, dtstart = NULL, dtend = NULL,
+            created_modseq = CASE WHEN dav_objects.deleted THEN EXCLUDED.created_modseq
+                                  ELSE dav_objects.created_modseq END,
+            updated_at = now()
+        RETURNING collection_id, modseq
+    ),
+    bump AS (
+        UPDATE dav_collections c SET modseq = GREATEST(c.modseq, m.top), updated_at = now()
+        FROM (SELECT collection_id, max(modseq) AS top FROM put GROUP BY collection_id) m
+        WHERE c.id = m.collection_id
+        RETURNING 1
+    )
+    SELECT (SELECT count(*) FROM put), (SELECT count(*) FROM r), (SELECT count(*) FROM bump)
+    """;
+
+/// Objects whose facts (UID, component, time span) have not been read yet, after `$1`, in id order.
+const TGT_UNINDEXED: StringView =
+    """
+    SELECT id, data FROM dav_objects
+    WHERE id > $1 AND NOT deleted AND data <> '' AND component <> 'VCARD' AND dtstart IS NULL
+    ORDER BY id LIMIT 200
+    """;
+
+const TGT_INDEX_OBJECT: StringView =
+    """
+    UPDATE dav_objects SET uid = CASE WHEN $2 = '' THEN uid ELSE $2 END, component = $3,
+        dtstart = to_timestamp($4::int8::float8), dtend = to_timestamp($5::int8::float8)
+    WHERE id = $1
+    """;

@@ -1,0 +1,18 @@
+size 62310
+envelope ("Mon, 28 Sep 1992 13:04:17 -0600 (MDT)" "Fwd: test of weather" (("Brad Huntting" NIL "huntting" "advtech.uswest.com")) (("Brad Huntting" NIL "huntting" "advtech.uswest.com")) (("Brad Huntting" NIL "huntting" "advtech.uswest.com")) (("Nathaniel Borenstein" NIL "nsb" "thumper.bellcore.com")) (("Brad Huntting" NIL "huntting" "advtech.uswest.com")) NIL NIL "<gelpQlq23F86McEkxs@futureworld>")
+bodystructure (("text" "plain" ("charset" "US-ASCII") NIL NIL "7bit" 756 26 NIL NIL NIL NIL) (("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 827 25 NIL NIL NIL NIL) ("image" "gif" NIL NIL "Weather map" "base64" 58626 NIL NIL NIL NIL) ("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 6 1 NIL NIL NIL NIL) "mixed" ("boundary" "Alternative.Boundary.4elpQlO23F86McEkkS") NIL NIL NIL) "alternative" ("boundary" "Interpart.Boundary.4elpQlO23F868cEkpa") NIL NIL NIL)
+body (("text" "plain" ("charset" "US-ASCII") NIL NIL "7bit" 756 26) (("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 827 25) ("image" "gif" NIL NIL "Weather map" "base64" 58626) ("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 6 1) "mixed") "alternative")
+section HEADER 1209 05dc70a9fe64e9b78ccb5b28d08730c2c558f64f77336991b94a3c7b9c3e18de
+section TEXT 61101 46d267ce41e2e6285492f4e1af09fd6e26ba65807dfc4d1bd81f4f2144de3be0
+section HEADER.FIELDS 367 1c91e7c7fdc5a6dbbe36743b81b31c368460a9a09249fbd518940c21bc536574
+section HEADER.FIELDS.NOT 844 d50f3bd70b40740650aee985339e62421c86cba2298cacc4d7077de940051edd
+section 1 756 d91f4064f60417659d114fd220682f9bf647c6a330491230540b70c909cd8df5
+section 1.MIME 46 b3532c649b28a23803c77a2acc4907f5048ea77b89e0c51dcf7f271f2db4bfa6
+section 2 59924 b359d640a24b8a2db5707d225e9703285b3e19e58972bb0867dc84c98ad97e59
+section 2.MIME 88 33b15bc8bb8f2d49bd9f3a29c74cdcdfcb3651ea359ea9bcd8dc5d39c6d9d1b5
+section 2.1 827 c528816508ff0b4958d0667214cb07eeb26aa4d2184b0d99b56e314c9036d7bd
+section 2.1.MIME 94 7d35d8c48d3869c4391f6ff71123bfb4c8466e5b04f02d64c3961f23d7d8bf61
+section 2.2 58626 3208c232c93da7f9872e8c1dfde3a4c430a6581f8664f42aee38cf4e8712247d
+section 2.2.MIME 97 d054d3edd69231f0bcf12ab6354f3699d96ae739242ad67d19fdfd8faf190e3e
+section 2.3 6 cbb0903045ca99c83a19e6c85fbc28d568f0a07d31b2315bccaaa49c1803b38f
+section 2.3.MIME 94 7d35d8c48d3869c4391f6ff71123bfb4c8466e5b04f02d64c3961f23d7d8bf61

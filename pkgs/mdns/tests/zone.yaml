@@ -1,0 +1,20 @@
+a.test:
+  - A: 192.0.2.1
+  - AAAA: "2001:db8::1"
+mx.test:
+  - MX: [20, backup.a.test]
+  - MX: [10, mail.a.test]
+txt.test:
+  - TXT: "v=spf1 -all"
+multi.test:
+  - TXT: ["part one ", "part two"]
+alias.test:
+  - CNAME: a.test
+big.test:
+  - TXT: "a record that only arrives over TCP"
+spoof.test:
+  - A: 192.0.2.7
+1.2.0.192.in-addr.arpa:
+  - PTR: a.test
+slow.test:
+  - TIMEOUT: true

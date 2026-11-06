@@ -1,0 +1,879 @@
+// `import-cosmomail`: copies a CosmoMailServer database (Postgres, with message content in it or in S3) into this
+// server's store, for the cutover.
+//
+// - Accounts: domains (their settings kept for the admin UI), domain aliases, users (with their bcrypt hashes, so
+//   passwords keep working), admin logins, aliases, DKIM keys (signing stays as it was: the keys are in DNS
+//   already), Sieve scripts and mailboxes. Each table is read from the source as one JSON document and written
+//   with one statement; rows that exist already (by name or address) are left alone, so a second run adds only
+//   what is new.
+// - Messages keep their mailbox's UIDVALIDITY and their uids, so IMAP clients see the same mailboxes and do not
+//   fetch everything again. A run copies the messages above the highest uid copied before, then brings every
+//   copied message's flags up to date and drops those the source expunged: run it once ahead of the cutover
+//   (the long copy), and again after stopping the old server (a short one). The target is meant to be a mirror
+//   of the source until the cutover: nothing should deliver to it in between.
+// - Content is stored as SMTP stores it (a blob, and its parsed part index); bare LF line ends become CRLF.
+
+import mhttp.ClientLimits;
+import mhttp.ClientResponse;
+import mhttp.Url;
+import mhttp.appendIsoTime;
+import mhttp.httpRequestWith;
+import mhttp.parseUrl;
+import mmime.MessageIndex;
+import mpim.ObjectFacts;
+import mpim.objectFacts;
+import mmime.MimeScanner;
+import mmime.Renderer;
+import mmime.encodeMeta;
+import msieve.Script;
+import msieve.parseScript;
+import mstore.BlobStore;
+import mstore.BlobWriter;
+import mstore.Delivered;
+import mstore.Delivery;
+import mstore.MailStore;
+import mstore.StoreError;
+import pkey.PrivateKey;
+import postgres.PgConfig;
+import postgres.PgConnection;
+import postgres.PgError;
+import postgres.PgParams;
+import postgres.PgRows;
+import sha256.HmacSha256;
+import sha256.Sha256;
+import tls.TlsConfig;
+
+/// Messages read from the source per query (content in the database comes with them).
+const MESSAGE_BATCH: i64 = 25;
+/// The largest message copied.
+const MAX_IMPORT_SIZE: usize = 128 * 1024 * 1024;
+
+/// Where the source's message content is, when not in its database: an S3 endpoint (CosmoS3, MinIO, AWS).
+@noncopy
+struct S3Source {
+    endpoint: Url;
+    bucket: String;
+    region: String;
+    accessKey: String;
+    secretKey: String;
+}
+
+/// What a run did, reported at its end.
+struct Tally {
+    messages: i64;
+    bytes: i64;
+    missing: i64;
+    failed: i64;
+    expunged: i64;
+    mailboxes: i64;
+}
+
+fn importError(e: PgError) -> StoreError => StoreError.Db(e);
+
+async fn say(text: StringView) {
+    match (await AsyncConsole.writeError(text)) {
+        Ok() => {}
+        Err(_) => {}
+    }
+}
+
+async fn sayNumber(label: StringView, n: i64) {
+    var line = String.create();
+    match (line.append(label)) {
+        Ok() => {}
+        Err(_) => { return; }
+    }
+    match (line.appendNumber(n)) {
+        Ok() => {}
+        Err(_) => { return; }
+    }
+    match (line.append("\n")) {
+        Ok() => {}
+        Err(_) => { return; }
+    }
+    await say(line.view());
+}
+
+/// The import: `config`'s [import] source into `store`.
+async fn importCosmoMail(config: borrow Config, store: borrow MailStore) -> Result<void, StoreError> {
+    if (config.importSource.length == 0) {
+        await say("mailserver: [import] source is not set (the CosmoMailServer database's postgres:// URL)\n");
+        return Err(StoreError.Invalid);
+    }
+    let pg = match (PgConfig.parse(config.importSource.view())) {
+        Ok(p) => p,
+        Err(e) => { return Err(StoreError.Db(e)); }
+    };
+    var source = match (await PgConnection.connect(pg)) {
+        Ok(c) => c,
+        Err(e) => { return Err(StoreError.Db(e)); }
+    };
+    var s3: S3Source? = null;
+    if (config.s3Endpoint.length > 0) {
+        let endpoint = match (parseUrl(config.s3Endpoint.view())) {
+            Some(u) => u,
+            null => {
+                await say("mailserver: [import] s3_endpoint is not an http(s) URL\n");
+                return Err(StoreError.Invalid);
+            }
+        };
+        var bucket = String.create();
+        var region = String.create();
+        var accessKey = String.create();
+        var secretKey = String.create();
+        memOk(bucket.append(if (config.s3Bucket.length > 0) config.s3Bucket.view() else "default"))?;
+        memOk(region.append(if (config.s3Region.length > 0) config.s3Region.view() else "us-east-1"))?;
+        memOk(accessKey.append(config.s3AccessKey.view()))?;
+        memOk(secretKey.append(config.s3SecretKey.view()))?;
+        s3 = S3Source {
+            endpoint: endpoint,
+            bucket: bucket,
+            region: region,
+            accessKey: accessKey,
+            secretKey: secretKey,
+        };
+    }
+    let tls = match (TlsConfig.client()) {
+        Ok(t) => t,
+        Err(_) => { return Err(StoreError.OutOfMemory); }
+    };
+    await copyTable(mut source, store, "domains", SRC_DOMAINS, TGT_DOMAINS)?;
+    await copyTable(mut source, store, "domain aliases", SRC_DOMAIN_ALIASES, TGT_DOMAIN_ALIASES)?;
+    await copyTable(mut source, store, "users", SRC_USERS, TGT_USERS)?;
+    await copyTable(mut source, store, "admin logins", SRC_ADMINS, TGT_ADMINS)?;
+    await copyTable(mut source, store, "aliases", SRC_ALIASES, TGT_ALIASES)?;
+    await copyTable(mut source, store, "mailboxes", SRC_MAILBOXES, TGT_MAILBOXES)?;
+    await targetBatch(store, TGT_UID_VALIDITY_SEQUENCE)?;
+    await copyDkim(mut source, store)?;
+    await copySieve(mut source, store)?;
+    await copyTable(mut source, store, "calendars and address books", SRC_COLLECTIONS, TGT_COLLECTIONS)?;
+    await copyTable(mut source, store, "events and contacts", SRC_OBJECTS, TGT_OBJECTS)?;
+    await reindexObjects(store)?;
+    var tally = Tally { messages: 0, bytes: 0, missing: 0, failed: 0, expunged: 0, mailboxes: 0 };
+    await copyMessages(mut source, store, s3, tls, mut tally)?;
+    await targetBatch(store, TGT_USED)?;
+    await sayNumber("mailboxes synced: ", tally.mailboxes);
+    await sayNumber("messages copied: ", tally.messages);
+    await sayNumber("bytes copied: ", tally.bytes);
+    await sayNumber("messages expunged since an earlier run: ", tally.expunged);
+    await sayNumber("messages whose content is missing at the source (skipped): ", tally.missing);
+    await sayNumber("messages that could not be copied (skipped; run again to retry): ", tally.failed);
+    match (await source.close()) {
+        Ok() => {}
+        Err(_) => {}
+    }
+    return Ok();
+}
+
+/// Reads the facts of the calendar objects just copied (their UID, component and time span), which the C# server
+/// did not keep; those without a DTSTART keep none.
+async fn reindexObjects(store: borrow MailStore) -> Result<void, StoreError> {
+    var after: i64 = 0;
+    var count: i64 = 0;
+    loop {
+        var params = PgParams.create();
+        pgOk(params.int64(after))?;
+        var lease = match (await store.connections().acquire()) {
+            Ok(l) => l,
+            Err(e) => { return Err(importError(e)); }
+        };
+        let rows = match (await lease.connection().query(TGT_UNINDEXED, params)) {
+            Ok(r) => r,
+            Err(e) => { return Err(importError(e)); }
+        };
+        if (rows.rowCount() == 0) {
+            break;
+        }
+        for (r in 0..rows.rowCount()) {
+            let id = rows.int64(r, 0) ?? 0;
+            after = id;
+            var facts = ObjectFacts.create();
+            let known = match (objectFacts((rows.text(r, 1) ?? "").bytes(), mut facts)) {
+                Ok(k) => k,
+                Err(_) => { return Err(StoreError.OutOfMemory); }
+            };
+            if (!known || facts.start == null) {
+                continue;
+            }
+            var update = PgParams.create();
+            pgOk(update.int64(id))?;
+            pgOk(update.text(facts.uid.view()))?;
+            pgOk(update.text(facts.component.view()))?;
+            pgOk(update.int64(facts.start ?? 0))?;
+            match (facts.end) {
+                Some(e) => { pgOk(update.int64(e))?; }
+                null => { pgOk(update.sqlNull())?; }
+            }
+            match (await lease.connection().execute(TGT_INDEX_OBJECT, update)) {
+                Ok(_) => { count += 1; }
+                Err(e) => { return Err(importError(e)); }
+            }
+        }
+    }
+    await sayNumber("calendar objects indexed: ", count);
+    return Ok();
+}
+
+fn memOk(r: Result<void, AllocError>) -> Result<void, StoreError> => match (r) {
+    Ok() => Ok(),
+    Err(_) => Err(StoreError.OutOfMemory),
+};
+
+/// One table: the source's rows as one JSON document, written by `write` (which gives the rows added and the rows
+/// given).
+async fn copyTable(
+    source: borrow mut PgConnection,
+    store: borrow MailStore,
+    what: StringView,
+    read: StringView,
+    write: StringView,
+) -> Result<void, StoreError> {
+    var none = PgParams.create();
+    let rows = match (await source.query(read, none)) {
+        Ok(r) => r,
+        Err(e) => {
+            await reportSource(source, what);
+            return Err(importError(e));
+        }
+    };
+    let document = rows.text(0, 0) ?? "[]";
+    var params = PgParams.create();
+    match (params.text(document)) {
+        Ok() => {}
+        Err(e) => { return Err(importError(e)); }
+    }
+    var lease = match (await store.connections().acquire()) {
+        Ok(l) => l,
+        Err(e) => { return Err(importError(e)); }
+    };
+    let written = match (await lease.connection().query(write, params)) {
+        Ok(r) => r,
+        Err(e) => {
+            await reportTarget(lease.connection(), what);
+            return Err(importError(e));
+        }
+    };
+    var line = String.create();
+    memOk(line.append(what))?;
+    memOk(line.append(": "))?;
+    memOk(line.appendNumber(written.int64(0, 0) ?? 0))?;
+    memOk(line.append(" added of "))?;
+    memOk(line.appendNumber(written.int64(0, 1) ?? 0))?;
+    memOk(line.append("\n"))?;
+    await say(line.view());
+    return Ok();
+}
+
+async fn reportSource(source: borrow PgConnection, what: StringView) {
+    await say("mailserver: reading ");
+    await say(what);
+    await say(" from the source failed: ");
+    await say(source.lastError().message());
+    await say("\n");
+}
+
+async fn reportTarget(target: borrow PgConnection, what: StringView) {
+    await say("mailserver: writing ");
+    await say(what);
+    await say(" failed: ");
+    await say(target.lastError().message());
+    await say("\n");
+}
+
+async fn targetBatch(store: borrow MailStore, sql: StringView) -> Result<void, StoreError> {
+    var lease = match (await store.connections().acquire()) {
+        Ok(l) => l,
+        Err(e) => { return Err(importError(e)); }
+    };
+    match (await lease.connection().batch(sql)) {
+        Ok(_) => { return Ok(); }
+        Err(e) => {
+            await reportTarget(lease.connection(), "counters");
+            return Err(importError(e));
+        }
+    }
+}
+
+/// DKIM keys: CosmoMail keeps a PKCS #1 PEM in the domain's row; the store keeps PKCS #8 DER. A key signs here when
+/// it signed there.
+async fn copyDkim(source: borrow mut PgConnection, store: borrow MailStore) -> Result<void, StoreError> {
+    var none = PgParams.create();
+    let rows = match (await source.query(SRC_DKIM, none)) {
+        Ok(r) => r,
+        Err(e) => {
+            await reportSource(source, "DKIM keys");
+            return Err(importError(e));
+        }
+    };
+    var lease = match (await store.connections().acquire()) {
+        Ok(l) => l,
+        Err(e) => { return Err(importError(e)); }
+    };
+    var added: i64 = 0;
+    for (i in 0..rows.rowCount()) {
+        let domain = rows.text(i, 0) ?? "";
+        let pem = rows.text(i, 2) ?? "";
+        let key = match (PrivateKey.fromPem(pem.bytes())) {
+            Ok(k) => k,
+            Err(_) => {
+                await say("DKIM: the key of ");
+                await say(domain);
+                await say(" could not be read; skipped\n");
+                continue;
+            }
+        };
+        var params = PgParams.create();
+        pgOk(params.text(domain))?;
+        pgOk(params.text(rows.text(i, 1) ?? ""))?;
+        pgOk(params.bytes(key.der()))?;
+        pgOk(params.bool(rows.bool(i, 3) ?? false))?;
+        match (await lease.connection().execute(TGT_DKIM, params)) {
+            Ok(n) => { added += truncate<i64>(n); }
+            Err(e) => {
+                await reportTarget(lease.connection(), "DKIM keys");
+                return Err(importError(e));
+            }
+        }
+    }
+    var line = String.create();
+    memOk(line.append("DKIM keys: "))?;
+    memOk(line.appendNumber(added))?;
+    memOk(line.append(" added of "))?;
+    memOk(line.appendNumber(truncate<i64>(rows.rowCount())))?;
+    memOk(line.append("\n"))?;
+    await say(line.view());
+    return Ok();
+}
+
+fn pgOk(r: Result<void, PgError>) -> Result<void, StoreError> => match (r) {
+    Ok() => Ok(),
+    Err(e) => Err(StoreError.Db(e)),
+};
+
+/// Sieve scripts. CosmoMail runs every active script (the first that decides wins); here a user runs one, so the
+/// first active one that compiles is made active, and the others are reported.
+async fn copySieve(source: borrow mut PgConnection, store: borrow MailStore) -> Result<void, StoreError> {
+    var none = PgParams.create();
+    let rows = match (await source.query(SRC_SIEVE, none)) {
+        Ok(r) => r,
+        Err(e) => {
+            await reportSource(source, "Sieve scripts");
+            return Err(importError(e));
+        }
+    };
+    var lease = match (await store.connections().acquire()) {
+        Ok(l) => l,
+        Err(e) => { return Err(importError(e)); }
+    };
+    var added: i64 = 0;
+    for (i in 0..rows.rowCount()) {
+        let email = rows.text(i, 0) ?? "";
+        let name = rows.text(i, 1) ?? "";
+        let content = rows.text(i, 2) ?? "";
+        let active = rows.bool(i, 3) ?? false;
+        var params = PgParams.create();
+        pgOk(params.text(email))?;
+        pgOk(params.text(name))?;
+        pgOk(params.text(content))?;
+        match (await lease.connection().execute(TGT_SIEVE, params)) {
+            Ok(n) => { added += truncate<i64>(n); }
+            Err(e) => {
+                await reportTarget(lease.connection(), "Sieve scripts");
+                return Err(importError(e));
+            }
+        }
+        if (!active) {
+            continue;
+        }
+        var compiled = Script.create();
+        let compiles = match (parseScript(content.bytes(), mut compiled)) {
+            Ok(ok) => ok,
+            Err(_) => false,
+        };
+        if (!compiles) {
+            await say("Sieve: ");
+            await say(email);
+            await say("'s active script \"");
+            await say(name);
+            await say("\" does not compile here; it is copied but not active\n");
+            continue;
+        }
+        var activate = PgParams.create();
+        pgOk(activate.text(email))?;
+        pgOk(activate.text(name))?;
+        match (await lease.connection().execute(TGT_SIEVE_ACTIVE, activate)) {
+            Ok(n) => {
+                if (n == 0) {
+                    await say("Sieve: ");
+                    await say(email);
+                    await say(" has another active script; \"");
+                    await say(name);
+                    await say("\" is copied but not active\n");
+                }
+            }
+            Err(e) => { return Err(importError(e)); }
+        }
+    }
+    var line = String.create();
+    memOk(line.append("Sieve scripts: "))?;
+    memOk(line.appendNumber(added))?;
+    memOk(line.append(" added of "))?;
+    memOk(line.appendNumber(truncate<i64>(rows.rowCount())))?;
+    memOk(line.append("\n"))?;
+    await say(line.view());
+    return Ok();
+}
+
+/// Every mailbox's messages: the new ones copied, then flags and expunges brought up to date.
+async fn copyMessages(
+    source: borrow mut PgConnection,
+    store: borrow MailStore,
+    s3: borrow S3Source?,
+    tls: borrow TlsConfig,
+    tally: borrow mut Tally,
+) -> Result<void, StoreError> {
+    var none = PgParams.create();
+    let boxes = match (await source.query(SRC_MAILBOX_LIST, none)) {
+        Ok(r) => r,
+        Err(e) => {
+            await reportSource(source, "mailboxes");
+            return Err(importError(e));
+        }
+    };
+    for (i in 0..boxes.rowCount()) {
+        let sourceId = boxes.int64(i, 0) ?? 0;
+        let email = boxes.text(i, 1) ?? "";
+        let name = boxes.text(i, 2) ?? "";
+        let found = await findCopy(store, email, name)?;
+        let copy = match (found) {
+            Some(c) => c,
+            null => { continue; } // a mailbox whose name the store refuses, or whose user was not copied
+        };
+        let mailboxId = copy[0];
+        let userId = copy[1];
+        var after = copy[2];
+        let before = tally.messages;
+        loop {
+            var params = PgParams.create();
+            pgOk(params.int64(sourceId))?;
+            pgOk(params.int64(after))?;
+            pgOk(params.int64(MESSAGE_BATCH))?;
+            let batch = match (await source.query(SRC_MESSAGES, params)) {
+                Ok(r) => r,
+                Err(e) => {
+                    await reportSource(source, "messages");
+                    return Err(importError(e));
+                }
+            };
+            if (batch.rowCount() == 0) {
+                break;
+            }
+            for (m in 0..batch.rowCount()) {
+                let uid = batch.int64(m, 0) ?? 0;
+                after = uid;
+                await copyMessage(store, s3, tls, userId, mailboxId, batch, m, tally)?;
+            }
+        }
+        await syncMailbox(source, store, sourceId, mailboxId, tally)?;
+        tally.mailboxes += 1;
+        if (tally.messages > before) {
+            var line = String.create();
+            memOk(line.append(email))?;
+            memOk(line.append(" "))?;
+            memOk(line.append(name))?;
+            memOk(line.append(": "))?;
+            memOk(line.appendNumber(tally.messages - before))?;
+            memOk(line.append(" messages\n"))?;
+            await say(line.view());
+        }
+    }
+    return Ok();
+}
+
+/// The copy of a source mailbox: its id, its user, and the highest uid copied so far.
+async fn findCopy(store: borrow MailStore, email: StringView, name: StringView) -> Result<[i64; 3]?, StoreError> {
+    var find = PgParams.create();
+    pgOk(find.text(email))?;
+    pgOk(find.text(name))?;
+    var lease = match (await store.connections().acquire()) {
+        Ok(l) => l,
+        Err(e) => { return Err(importError(e)); }
+    };
+    let target = match (await lease.connection().query(TGT_MAILBOX_FIND, find)) {
+        Ok(r) => r,
+        Err(e) => { return Err(importError(e)); }
+    };
+    if (target.rowCount() == 0) {
+        return Ok(null);
+    }
+    return Ok([target.int64(0, 0) ?? 0, target.int64(0, 1) ?? 0, target.int64(0, 2) ?? 0]);
+}
+
+/// Row `m` of a SRC_MESSAGES batch: uid, internal date (ms), flags, keywords, storage type, locator, content.
+async fn copyMessage(
+    store: borrow MailStore,
+    s3: borrow S3Source?,
+    tls: borrow TlsConfig,
+    userId: i64,
+    mailboxId: i64,
+    batch: borrow PgRows,
+    m: usize,
+    tally: borrow mut Tally,
+) -> Result<void, StoreError> {
+    let uid = batch.int64(m, 0) ?? 0;
+    var content = Vector<u8>.create();
+    let kind = batch.text(m, 4) ?? "";
+    if (kind == "" || kind == "database") {
+        match (batch.bytea(m, 6, mut content)) {
+            Ok(true) => {}
+            _ => {
+                tally.missing += 1;
+                return Ok();
+            }
+        }
+    } else {
+        let locator = batch.text(m, 5) ?? "";
+        match (s3) {
+            Some(bucket) => {
+                var response = ClientResponse.create();
+                match (await fetchS3(bucket, tls, locator, mut response)) {
+                    Ok() => {}
+                    Err(_) => {
+                        tally.failed += 1;
+                        await reportMessage(uid, "the S3 request failed");
+                        return Ok();
+                    }
+                }
+                if (response.status == 404) {
+                    tally.missing += 1;
+                    return Ok();
+                }
+                if (response.status != 200) {
+                    tally.failed += 1;
+                    await reportMessage(uid, "S3 refused the request (check [import] s3_* settings)");
+                    return Ok();
+                }
+                content = response.body;
+            }
+            null => {
+                await say("mailserver: messages are in S3; set [import] s3_endpoint and its keys\n");
+                return Err(StoreError.Invalid);
+            }
+        }
+    }
+    if (content.length == 0) {
+        tally.missing += 1;
+        return Ok();
+    }
+    var normal = Vector<u8>.create();
+    memOk(crlf(content.view(), mut normal))?;
+    let blobs = store.blobs();
+    let bytes = normal.view();
+    let written: Result<BlobWriter, StoreError> = await Async.blocking(() => writeBlob(blobs, bytes));
+    var writer = written?;
+    var d = Delivery.to(userId, mailboxId, batch.int64(m, 1) ?? Clock.unixMillis());
+    d.uid = uid;
+    d.flags = truncate<u16>(batch.int64(m, 2) ?? 0);
+    memOk(d.keywords.append(batch.text(m, 3) ?? ""))?;
+    memOk(indexMessage(normal.view(), mut d.meta))?;
+    var targets = Vector<Delivery>.create();
+    memOk(targets.push(d))?;
+    var done = Vector<Delivered>.create();
+    match (await store.deliver(mut writer, targets, mut done)) {
+        Ok() => {
+            tally.messages += 1;
+            tally.bytes += truncate<i64>(normal.length);
+        }
+        Err(_) => {
+            let w = borrow mut writer;
+            await Async.blocking(() => w.discard());
+            tally.failed += 1;
+            await reportMessage(uid, "the store refused it");
+        }
+    }
+    return Ok();
+}
+
+/// `content` as a finished blob, ready to deliver (its file is placed by the delivery).
+fn writeBlob(blobs: borrow BlobStore, content: Slice<u8>) -> Result<BlobWriter, StoreError> {
+    var writer = blobs.begin()?;
+    match (writer.write(content)) {
+        Ok() => {}
+        Err(e) => {
+            writer.discard();
+            return Err(e);
+        }
+    }
+    match (writer.finish()) {
+        Ok() => {}
+        Err(e) => {
+            writer.discard();
+            return Err(e);
+        }
+    }
+    return Ok(writer);
+}
+
+async fn reportMessage(uid: i64, why: StringView) {
+    var line = String.create();
+    match (line.append("message uid ")) {
+        Ok() => {}
+        Err(_) => { return; }
+    }
+    match (line.appendNumber(uid)) {
+        Ok() => {}
+        Err(_) => { return; }
+    }
+    match (line.append(": ")) {
+        Ok() => {}
+        Err(_) => { return; }
+    }
+    match (line.append(why)) {
+        Ok() => {}
+        Err(_) => { return; }
+    }
+    match (line.append("\n")) {
+        Ok() => {}
+        Err(_) => { return; }
+    }
+    await say(line.view());
+}
+
+/// `text` with every bare LF made CRLF (IMAP and SMTP lines end in CRLF).
+fn crlf(text: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    for (i in 0..text.length) {
+        if (text[i] == 0x0a && (i == 0 || text[i - 1] != 0x0d)) {
+            out.push(0x0d)?;
+        }
+        out.push(text[i])?;
+    }
+    return Ok();
+}
+
+/// mmime's stored meta for `message`, into `out`.
+fn indexMessage(message: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    var scanner = MimeScanner.create();
+    scanner.feed(message)?;
+    var index = MessageIndex.create();
+    scanner.finish(mut index)?;
+    var renderer = Renderer.create();
+    return encodeMeta(index, mut renderer, out);
+}
+
+/// The source mailbox's flags and keywords onto the copies, and the copies the source no longer has dropped, in one
+/// transaction; then the mailbox's counters, counted afresh.
+async fn syncMailbox(
+    source: borrow mut PgConnection,
+    store: borrow MailStore,
+    sourceId: i64,
+    mailboxId: i64,
+    tally: borrow mut Tally,
+) -> Result<void, StoreError> {
+    var params = PgParams.create();
+    pgOk(params.int64(sourceId))?;
+    let rows = match (await source.query(SRC_FLAGS, params)) {
+        Ok(r) => r,
+        Err(e) => {
+            await reportSource(source, "flags");
+            return Err(importError(e));
+        }
+    };
+    let document = rows.text(0, 0) ?? "[]";
+    var sync = PgParams.create();
+    pgOk(sync.int64(mailboxId))?;
+    pgOk(sync.text(document))?;
+    var lease = match (await store.connections().acquire()) {
+        Ok(l) => l,
+        Err(e) => { return Err(importError(e)); }
+    };
+    let c = lease.connection();
+    match (await c.batch("BEGIN")) {
+        Ok(_) => {}
+        Err(e) => { return Err(importError(e)); }
+    }
+    let gone = match (await c.execute(TGT_EXPUNGE, sync)) {
+        Ok(n) => n,
+        Err(e) => {
+            await reportTarget(c, "expunges");
+            await abort(c);
+            return Err(importError(e));
+        }
+    };
+    tally.expunged += truncate<i64>(gone);
+    match (await c.execute(TGT_FLAGS, sync)) {
+        Ok(_) => {}
+        Err(e) => {
+            await reportTarget(c, "flags");
+            await abort(c);
+            return Err(importError(e));
+        }
+    }
+    var only = PgParams.create();
+    pgOk(only.int64(mailboxId))?;
+    match (await c.execute(TGT_RECOUNT, only)) {
+        Ok(_) => {}
+        Err(e) => {
+            await abort(c);
+            return Err(importError(e));
+        }
+    }
+    match (await c.batch("COMMIT")) {
+        Ok(_) => {}
+        Err(e) => { return Err(importError(e)); }
+    }
+    return Ok();
+}
+
+async fn abort(c: borrow mut PgConnection) {
+    match (await c.batch("ROLLBACK")) {
+        Ok(_) => {}
+        Err(_) => {}
+    }
+}
+
+/// GET of a CosmoMail locator: `bucket/key`, or (CosmoKvD's) a key starting with the user's id, in the configured
+/// bucket. Signed with AWS Signature Version 4.
+async fn fetchS3(
+    s3: borrow S3Source,
+    tls: borrow TlsConfig,
+    locator: StringView,
+    response: borrow mut ClientResponse,
+) -> Result<void, StoreError> {
+    let bytes = locator.bytes();
+    var path = Vector<u8>.create();
+    let slash = bytes.indexOfByte(0x2f);
+    let numericHead = match (slash) {
+        Some(at) => at > 0 && allDigits(bytes[..at]),
+        null => true,
+    };
+    var key = Vector<u8>.create();
+    if (numericHead) {
+        memOk(key.extend(bytes))?;
+        memOk(path.push(0x2f))?;
+        memOk(uriEncode(s3.bucket.view().bytes(), mut path))?;
+    } else {
+        let at = slash ?? 0;
+        memOk(key.extend(bytes[at + 1..]))?;
+        memOk(path.push(0x2f))?;
+        memOk(uriEncode(bytes[..at], mut path))?;
+    }
+    memOk(path.push(0x2f))?;
+    memOk(uriEncode(key.view(), mut path))?;
+    var stamp = Vector<u8>.create();
+    memOk(amzDate(Clock.unixMillis() / 1000, mut stamp))?;
+    var fields = Vector<u8>.create();
+    memOk(signS3(s3, StringView.fromUtf8(path.view())!, stamp.view(), mut fields))?;
+    var url = String.create();
+    memOk(url.append(if (s3.endpoint.secure) "https://" else "http://"))?;
+    memOk(url.append(s3.endpoint.authority.view()))?;
+    memOk(url.append(StringView.fromUtf8(path.view())!))?;
+    let limits = ClientLimits { timeoutMs: 120000, maxBody: MAX_IMPORT_SIZE };
+    match (await httpRequestWith(tls, "GET", url.view(), "", fields.view(), "".bytes(), response, limits)) {
+        Ok() => { return Ok(); }
+        Err(_) => { return Err(StoreError.NotFound); }
+    }
+}
+
+fn allDigits(text: Slice<u8>) -> bool {
+    for (c in text) {
+        if (c < 0x30 || c > 0x39) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// SigV4's URI encoding of a path: unreserved bytes as they are, `/` kept, the rest %XX.
+fn uriEncode(text: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    let hex = "0123456789ABCDEF".bytes();
+    for (c in text) {
+        let plain = (c >= 0x41 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a) || (c >= 0x30 && c <= 0x39) ||
+            c == 0x2d || c == 0x2e || c == 0x5f || c == 0x7e || c == 0x2f;
+        if (plain) {
+            out.push(c)?;
+        } else {
+            out.push(0x25)?;
+            out.push(hex[(c >> 4) as usize])?;
+            out.push(hex[(c & 0x0f) as usize])?;
+        }
+    }
+    return Ok();
+}
+
+/// `20261106T084937Z`.
+fn amzDate(unixSeconds: i64, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    var iso = Vector<u8>.create();
+    appendIsoTime(mut iso, unixSeconds)?;
+    for (c in iso) {
+        if (c != 0x2d && c != 0x3a) {
+            out.push(c)?;
+        }
+    }
+    return Ok();
+}
+
+/// The hex SHA-256 of an empty payload, which a GET signs.
+const EMPTY_SHA256: StringView = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+/// The header fields of a signed GET of `path` at `stamp`: Host comes from the client; these are x-amz-date,
+/// x-amz-content-sha256 and Authorization.
+fn signS3(
+    s3: borrow S3Source,
+    path: StringView,
+    stamp: Slice<u8>,
+    out: borrow mut Vector<u8>,
+) -> Result<void, AllocError> {
+    let day = stamp[..8];
+    var canonical = Vector<u8>.create();
+    canonical.extend("GET\n".bytes())?;
+    canonical.extend(path.bytes())?;
+    canonical.extend("\n\nhost:".bytes())?;
+    canonical.extend(s3.endpoint.authority.view().bytes())?;
+    canonical.extend("\nx-amz-content-sha256:".bytes())?;
+    canonical.extend(EMPTY_SHA256.bytes())?;
+    canonical.extend("\nx-amz-date:".bytes())?;
+    canonical.extend(stamp)?;
+    canonical.extend("\n\nhost;x-amz-content-sha256;x-amz-date\n".bytes())?;
+    canonical.extend(EMPTY_SHA256.bytes())?;
+    var scope = Vector<u8>.create();
+    scope.extend(day)?;
+    scope.push(0x2f)?;
+    scope.extend(s3.region.view().bytes())?;
+    scope.extend("/s3/aws4_request".bytes())?;
+    var toSign = Vector<u8>.create();
+    toSign.extend("AWS4-HMAC-SHA256\n".bytes())?;
+    toSign.extend(stamp)?;
+    toSign.push(0x0a)?;
+    toSign.extend(scope.view())?;
+    toSign.push(0x0a)?;
+    let digest = Sha256.hash(canonical.view());
+    hexInto(digest[..], mut toSign)?;
+    var secret = Vector<u8>.create();
+    secret.extend("AWS4".bytes())?;
+    secret.extend(s3.secretKey.view().bytes())?;
+    let kDate = HmacSha256.mac(secret.view(), day);
+    let kRegion = HmacSha256.mac(kDate[..], s3.region.view().bytes());
+    let kService = HmacSha256.mac(kRegion[..], "s3".bytes());
+    let kSigning = HmacSha256.mac(kService[..], "aws4_request".bytes());
+    let signature = HmacSha256.mac(kSigning[..], toSign.view());
+    out.extend("x-amz-date: ".bytes())?;
+    out.extend(stamp)?;
+    out.extend("\r\nx-amz-content-sha256: ".bytes())?;
+    out.extend(EMPTY_SHA256.bytes())?;
+    out.extend("\r\nAuthorization: AWS4-HMAC-SHA256 Credential=".bytes())?;
+    out.extend(s3.accessKey.view().bytes())?;
+    out.push(0x2f)?;
+    out.extend(scope.view())?;
+    out.extend(", SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=".bytes())?;
+    hexInto(signature[..], out)?;
+    return out.extend("\r\n".bytes());
+}
+
+fn hexInto(bytes: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    let hex = "0123456789abcdef".bytes();
+    for (b in bytes) {
+        out.push(hex[(b >> 4) as usize])?;
+        out.push(hex[(b & 0x0f) as usize])?;
+    }
+    return Ok();
+}

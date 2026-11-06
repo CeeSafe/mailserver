@@ -1,0 +1,90 @@
+# DNS for the conformance tests (served by pkgs/mdns/tools/fakedns.py), with pkgs/mauth/tests/dkim/zone.yaml's keys.
+remote.test:
+  - TXT: "v=spf1 ip4:127.0.0.1 -all"
+  - MX: [10, mx.remote.test]
+mx.remote.test:
+  - A: 127.0.0.1
+# The relay's routes: a dead first MX, an implicit MX, a null MX (RFC 7505); nodomain.test does not exist.
+twomx.test:
+  - MX: [5, dead.twomx.test]
+  - MX: [10, mx.twomx.test]
+dead.twomx.test:
+  - A: 192.0.2.1
+mx.twomx.test:
+  - A: 127.0.0.1
+implicit.test:
+  - A: 127.0.0.1
+deadonly.test:
+  - MX: [10, dead.twomx.test]
+nullmx.test:
+  - MX: [0, "."]
+spoofed.test:
+  - TXT: "v=spf1 -all"
+_dmarc.spoofed.test:
+  - TXT: "v=DMARC1; p=reject"
+quarantine.test:
+  - TXT: "v=spf1 -all"
+_dmarc.quarantine.test:
+  - TXT: "v=DMARC1; p=quarantine"
+example.org:
+  - TXT: "v=spf1 ip4:192.0.2.1 -all"
+_dmarc.example.org:
+  - TXT: "v=DMARC1; p=reject"
+
+# Strict TLS (pkgs/mqueue/src/tlspolicy.cee). SECURE marks a name fakedns answers with AD, as a validating resolver
+# would: DANE applies only through validated MX, address and TLSA answers. fakemx's certificate is the CeeSafeLibs
+# fixture localhost.pem; its SPKI's SHA-256 is d03a…af29 (tls's tests have the openssl commands).
+dane.test:
+  - MX: [10, mx.dane.test]
+  - SECURE: true
+mx.dane.test:
+  - A: 127.0.0.1
+  - SECURE: true
+_52700._tcp.mx.dane.test:
+  - TLSA: [3, 1, 1, "d03a94b2dc22beb9f94f9b0db6d7ecc9631f875c0db547d508250f4d948faf29"]
+  - SECURE: true
+danebad.test:
+  - MX: [10, mx.danebad.test]
+  - SECURE: true
+mx.danebad.test:
+  - A: 127.0.0.1
+  - SECURE: true
+_52700._tcp.mx.danebad.test:
+  - TLSA: [3, 1, 1, "0000000000000000000000000000000000000000000000000000000000000000"]
+  - SECURE: true
+daneinsecure.test:
+  - MX: [10, mx.daneinsecure.test]
+mx.daneinsecure.test:
+  - A: 127.0.0.1
+_52700._tcp.mx.daneinsecure.test:
+  - TLSA: [3, 1, 1, "0000000000000000000000000000000000000000000000000000000000000000"]
+# MTA-STS: the policies are in sts.yaml, served by pkgs/mqueue/tools/fakests.py. An MX named localhost has a
+# certificate valid for its name (localhost.pem, under the fixtures' ca.pem, which tls_trust_file trusts).
+localhost:
+  - A: 127.0.0.1
+sts.test:
+  - MX: [10, localhost]
+_mta-sts.sts.test:
+  - TXT: "v=STSv1; id=20261105"
+mta-sts.sts.test:
+  - A: 127.0.0.1
+stsbad.test:
+  - MX: [10, localhost]
+_mta-sts.stsbad.test:
+  - TXT: "v=STSv1; id=1"
+mta-sts.stsbad.test:
+  - A: 127.0.0.1
+stscert.test:
+  - MX: [10, mx.stscert.test]
+mx.stscert.test:
+  - A: 127.0.0.1
+_mta-sts.stscert.test:
+  - TXT: "v=STSv1; id=1"
+mta-sts.stscert.test:
+  - A: 127.0.0.1
+ststesting.test:
+  - MX: [10, localhost]
+_mta-sts.ststesting.test:
+  - TXT: "v=STSv1; id=1"
+mta-sts.ststesting.test:
+  - A: 127.0.0.1

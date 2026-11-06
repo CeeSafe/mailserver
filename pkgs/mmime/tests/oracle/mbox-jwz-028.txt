@@ -1,0 +1,10 @@
+size 109859
+envelope ("Mon,  8 Jun 1992 14:51:02 -0500 (CDT)" "/usr/sbin/sfplay" (("Bob Oesterlin" NIL "oester+" "rchland.ibm.com")) (("Bob Oesterlin" NIL "oester+" "rchland.ibm.com")) (("Bob Oesterlin" NIL "oester" "vnet.ibm.com")) ((NIL NIL "nsb" "thumper.bellcore.com")) NIL NIL NIL "<seAvcao91JbyQwDlE=@rchland.ibm.com>")
+bodystructure ("" "" NIL NIL NIL "7bit" 108383 NIL NIL NIL NIL)
+body ("" "" NIL NIL NIL "7bit" 108383)
+section HEADER 1476 ed4a799c0d238568b4c9d020cf07364ea7182e5c6f2d296a966d83eb0e0941f1
+section TEXT 108383 2ecefa81ab570cf2a1fadee0f416e4edd7145091d3d11de6ae44000cda7a425a
+section HEADER.FIELDS 226 233bfae16b4b70b65d9a9f282ea4c7854b1275d0f98dfe89107eac3abb06e16a
+section HEADER.FIELDS.NOT 1252 d1e34bc1865c5a3d098dabe873f8812ef7558da8931df94d4d27af8dfab5086b
+section 1 108383 2ecefa81ab570cf2a1fadee0f416e4edd7145091d3d11de6ae44000cda7a425a
+section 1.MIME 1476 ed4a799c0d238568b4c9d020cf07364ea7182e5c6f2d296a966d83eb0e0941f1

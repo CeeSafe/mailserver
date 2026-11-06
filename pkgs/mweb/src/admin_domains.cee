@@ -1,0 +1,713 @@
+// The admin API's domains and aliases.
+//
+// A domain is the C# server's snake_case Domain object, which the UI's settings cards PUT back whole. What this
+// server acts on is kept in columns: status (active), default_quota, catchall_email, the MTA-STS policy, and DKIM
+// signing (dkim_keys). Every other setting the UI shows (SPF, DMARC, spam, greylisting, rate limits, ...) is kept in
+// domains.settings and returned as saved, so the cards keep their values, but nothing enforces them yet. The private
+// DKIM key is never returned.
+
+import macme.appendPem;
+import macme.generateKey;
+import mhttp.JsonWriter;
+import mhttp.Request;
+import mhttp.Response;
+import mhttp.segment;
+import mhttp.segmentCount;
+import mstore.StoreError;
+import postgres.PgParams;
+import postgres.PgRows;
+
+/// The defaults of the settings kept in domains.settings, as the C# Domain record has them.
+const DOMAIN_DEFAULTS: StringView =
+    """
+    '{"max_users": 100, "max_mailbox_size": 1073741824, "backup_mx": false, "mail_only": false,
+      "dkim_verify_enabled": true, "dkim_key_size": 2048, "dkim_key_type": "rsa",
+      "dkim_headers_to_sign": "From,To,Subject,Date,Message-ID", "dkim_public_key": null,
+      "spf_record": null, "spf_enabled": false, "spf_dns_server": "8.8.8.8", "spf_dns_timeout": 5,
+      "spf_max_lookups": 10, "spf_fail_action": "reject", "spf_softfail_action": "quarantine",
+      "dmarc_policy": null, "dmarc_enabled": false, "dmarc_dns_server": "8.8.8.8", "dmarc_dns_timeout": 5,
+      "dmarc_report_enabled": false, "dmarc_report_email": null,
+      "clam_av_enabled": false, "clam_av_max_scan_size": 26214400, "clam_av_virus_action": "reject",
+      "clam_av_fail_action": "allow", "spam_enabled": false, "spam_reject_score": 10.0,
+      "spam_quarantine_score": 5.0, "spam_learning_enabled": false,
+      "greylist_enabled": false, "greylist_delay_minutes": 15, "greylist_expiry_days": 30,
+      "greylist_cleanup_interval": 24, "greylist_whitelist_after": 5,
+      "rate_limit_enabled": false, "rate_limit_smtp_per_ip": "100/1h", "rate_limit_smtp_per_user": "500/1h",
+      "rate_limit_smtp_per_domain": "1000/1h", "rate_limit_auth_per_ip": "20/15m",
+      "rate_limit_imap_per_user": "1000/1h", "rate_limit_cleanup_interval": 1,
+      "auth_totp_enforced": false, "auth_brute_force_enabled": true, "auth_brute_force_threshold": 5,
+      "auth_brute_force_window_minutes": 30, "auth_brute_force_block_minutes": 60,
+      "auth_ip_blacklist_enabled": false, "auth_cleanup_interval": 24, "cloudflare_zone_id": null}'::jsonb
+    """;
+
+/// The keys that live in columns (or are derived), so they are not copied into settings from a PUT.
+const DOMAIN_COLUMN_KEYS: StringView =
+    """
+    ARRAY['id', 'name', 'status', 'default_quota', 'catchall_email', 'mta_sts_mode', 'mta_sts_max_age',
+          'mta_sts_mx_patterns', 'dkim_selector', 'dkim_private_key', 'dkim_public_key', 'dkim_signing_enabled',
+          'created_at', 'updated_at']
+    """;
+
+/// The Domain object of the row `d`, with `k` its newest DKIM key (or the active one).
+const DOMAIN_JSON: StringView =
+    """
+    (DOMAIN_DEFAULTS || (d.settings - DOMAIN_COLUMN_KEYS) || jsonb_build_object(
+        'id', d.id, 'name', d.name, 'status', CASE WHEN d.active THEN 'active' ELSE 'suspended' END,
+        'default_quota', d.default_quota, 'catchall_email', d.catchall,
+        'mta_sts_mode', d.mta_sts_mode, 'mta_sts_max_age', d.mta_sts_max_age, 'mta_sts_mx_patterns', d.mta_sts_mx,
+        'dkim_selector', k.selector, 'dkim_signing_enabled', coalesce(k.active, false),
+        'dkim_public_key', CASE WHEN k.selector IS NOT NULL THEN d.settings->'dkim_public_key' END,
+        'created_at', d.created_at, 'updated_at', d.updated_at))
+    """;
+
+const DOMAIN_FROM: StringView =
+    """
+    FROM domains d LEFT JOIN LATERAL (
+        SELECT selector, active FROM dkim_keys WHERE domain = d.name ORDER BY active DESC, created_at DESC LIMIT 1
+    ) k ON true
+    """;
+
+/// SQL with DOMAIN_JSON, DOMAIN_FROM and the constants put in.
+fn domainSql(template: StringView, into: borrow mut String) -> Result<void, AllocError> {
+    into.clear();
+    return expandInto(template, into);
+}
+
+fn expandInto(template: StringView, into: borrow mut String) -> Result<void, AllocError> {
+    var at: usize = 0;
+    while (at < template.length) {
+        let next = template[at..].indexOf("DOMAIN_") ?? (template.length - at);
+        into.append(template[at..at + next])?;
+        at += next;
+        if (at == template.length) {
+            break;
+        }
+        let tail = template[at..];
+        if (tail.startsWith("DOMAIN_JSON")) {
+            expandInto(DOMAIN_JSON, into)?;
+            at += 11;
+        } else if (tail.startsWith("DOMAIN_FROM")) {
+            into.append(DOMAIN_FROM)?;
+            at += 11;
+        } else if (tail.startsWith("DOMAIN_DEFAULTS")) {
+            into.append(DOMAIN_DEFAULTS)?;
+            at += 15;
+        } else if (tail.startsWith("DOMAIN_COLUMN_KEYS")) {
+            into.append(DOMAIN_COLUMN_KEYS)?;
+            at += 18;
+        } else {
+            into.append("DOMAIN_")?;
+            at += 7;
+        }
+    }
+    return Ok();
+}
+
+/// $1 scope (0: all), $2 one domain's id (0: all).
+const SQL_DOMAINS: StringView =
+    """
+    SELECT 200, coalesce(jsonb_agg(DOMAIN_JSON ORDER BY d.name), '[]')::text DOMAIN_FROM
+    WHERE ($1 = 0 OR d.id = $1)
+    """;
+
+const SQL_DOMAIN: StringView =
+    """
+    SELECT 200, DOMAIN_JSON::text DOMAIN_FROM WHERE d.id = $2 AND ($1 = 0 OR d.id = $1)
+    """;
+
+/// $1 scope, $2 id, $3 the body. The name is not changed (addresses carry it). A changed MTA-STS policy gets a new
+/// id, for the domain's _mta-sts TXT record. dkim_signing_enabled turns the newest key on or off.
+const SQL_UPDATE_DOMAIN: StringView =
+    """
+    WITH b AS (SELECT $3::jsonb AS j),
+    upd AS (
+        UPDATE domains d SET
+            active = CASE WHEN b.j ? 'status' THEN b.j->>'status' = 'active' ELSE d.active END,
+            default_quota = coalesce((b.j->>'default_quota')::int8, d.default_quota),
+            catchall = CASE WHEN b.j ? 'catchall_email' THEN nullif(btrim(b.j->>'catchall_email'), '') ELSE d.catchall END,
+            mta_sts_mode = coalesce(b.j->>'mta_sts_mode', d.mta_sts_mode),
+            mta_sts_max_age = coalesce((b.j->>'mta_sts_max_age')::int4, d.mta_sts_max_age),
+            mta_sts_mx = CASE WHEN b.j ? 'mta_sts_mx_patterns' THEN nullif(btrim(b.j->>'mta_sts_mx_patterns'), '')
+                ELSE d.mta_sts_mx END,
+            mta_sts_id = CASE WHEN (coalesce(b.j->>'mta_sts_mode', d.mta_sts_mode),
+                    coalesce((b.j->>'mta_sts_max_age')::int4, d.mta_sts_max_age),
+                    CASE WHEN b.j ? 'mta_sts_mx_patterns' THEN nullif(btrim(b.j->>'mta_sts_mx_patterns'), '')
+                        ELSE d.mta_sts_mx END)
+                IS DISTINCT FROM (d.mta_sts_mode, d.mta_sts_max_age, d.mta_sts_mx)
+                THEN to_char(clock_timestamp() AT TIME ZONE 'UTC', 'YYYYMMDDHH24MISSUS') ELSE d.mta_sts_id END,
+            settings = d.settings || (b.j - DOMAIN_COLUMN_KEYS),
+            updated_at = now()
+        FROM b WHERE d.id = $2 AND ($1 = 0 OR d.id = $1)
+        RETURNING d.id, d.name
+    ),
+    dk AS (
+        UPDATE dkim_keys k SET active = (b.j->>'dkim_signing_enabled')::boolean
+        FROM upd, b
+        WHERE b.j ? 'dkim_signing_enabled' AND k.domain = upd.name AND k.selector = (
+            SELECT selector FROM dkim_keys WHERE domain = upd.name ORDER BY active DESC, created_at DESC LIMIT 1)
+    )
+    SELECT 200, '{"success":true}' FROM upd
+    """;
+
+fn bindAll(params: borrow mut PgParams, a: i64, b: i64) -> bool => bound(params.int64(a)) && bound(params.int64(b));
+
+fn idOf(text: StringView?) -> i64 => (text ?? "").parseInt<i64>() ?? 0;
+
+async fn domainsApi(
+    ctx: borrow WebContext,
+    request: borrow Request,
+    caller: borrow Principal,
+) -> Result<Response, AllocError> {
+    let path = request.path.view();
+    let n = segmentCount(path);
+    var sql = String.create();
+    var params = PgParams.create();
+    if (n == 2) {
+        if (!request.isMethod("GET")) {
+            return Response.error(501, "Domains are added with /api/domains/setup.");
+        }
+        if (!bindAll(mut params, caller.scope(), 0)) {
+            return Err(AllocError.OutOfMemory);
+        }
+        domainSql(SQL_DOMAINS, mut sql)?;
+        return await answer(ctx, sql.view(), params, "");
+    }
+    if (n == 3 && (segment(path, 2) ?? "") == "setup") {
+        if (!request.isMethod("POST")) {
+            return notAllowed("POST");
+        }
+        if (caller.role != ROLE_SERVER) {
+            return Response.error(403, "Server-level access required.");
+        }
+        return await setupDomain(ctx, request, caller);
+    }
+    let id = idOf(segment(path, 2));
+    if (n == 3) {
+        if (request.isMethod("GET")) {
+            if (!bindAll(mut params, caller.scope(), id)) {
+                return Err(AllocError.OutOfMemory);
+            }
+            domainSql(SQL_DOMAIN, mut sql)?;
+            return await answer(ctx, sql.view(), params, "Domain not found");
+        }
+        if (request.isMethod("PUT")) {
+            let body = match (bodyObject(request)) {
+                Some(b) => b,
+                null => { return Response.error(400, "A JSON object is required."); }
+            };
+            if (!bindAll(mut params, caller.scope(), id) || !bound(params.text(body))) {
+                return Err(AllocError.OutOfMemory);
+            }
+            domainSql(SQL_UPDATE_DOMAIN, mut sql)?;
+            let r = await answer(ctx, sql.view(), params, "Domain not found")?;
+            if (r.status == 200) {
+                await audited(ctx, request, caller, "domain.update", "domain", segment(path, 2) ?? "");
+            }
+            return Ok(r);
+        }
+        return notAllowed("GET, PUT");
+    }
+    let action = segment(path, 3) ?? "";
+    if (n == 4 && action == "aliases") {
+        return await domainAliases(ctx, request, caller, id);
+    }
+    if (n == 4 && action == "regenerate-dkim" && request.isMethod("POST")) {
+        return await regenerateDkim(ctx, request, caller, id);
+    }
+    if (n == 4 && (action == "sync-dns" || action == "sync-proxy")) {
+        return Response.error(501, "This server does not manage DNS or a proxy: publish the records yourself.");
+    }
+    if (n == 4 && action == "renew-cert") {
+        return Response.error(501, "Certificates are renewed by the server's own ACME client ([acme]).");
+    }
+    return Response.error(404, "No such endpoint.");
+}
+
+/// The domain's name when the caller may reach it; null otherwise.
+async fn domainName(ctx: borrow WebContext, caller: borrow Principal, id: i64, into: borrow mut String) -> bool {
+    into.clear();
+    var params = PgParams.create();
+    if (!bindAll(mut params, caller.scope(), id)) {
+        return false;
+    }
+    var rows = PgRows.create();
+    if (!(await queryRows(ctx, "SELECT name FROM domains WHERE id = $2 AND ($1 = 0 OR id = $1)", params, mut rows)) ||
+        rows.rowCount() == 0) {
+        return false;
+    }
+    return match (into.append(rows.text(0, 0) ?? "")) {
+        Ok() => true,
+        Err(_) => false,
+    };
+}
+
+/// A new RSA 2048 DKIM key for `domain` at `selector`: stored inactive (its public half must be in DNS before it
+/// signs), with the public key's PEM kept for the UI. The DNS `p=` value goes to `dns`.
+async fn newDkimKey(
+    ctx: borrow WebContext,
+    domain: StringView,
+    selector: StringView,
+    dns: borrow mut Vector<u8>,
+) -> Result<bool, AllocError> {
+    let generated: Result<pkey.PrivateKey, macme.KeyProblem> = await Async.blocking(() => generateKey());
+    let key = match (generated) {
+        Ok(k) => k,
+        Err(_) => { return Ok(false); }
+    };
+    var spki = Vector<u8>.create();
+    match (key.publicKey(mut spki)) {
+        Ok() => {}
+        Err(_) => { return Ok(false); }
+    }
+    dns.clear();
+    encoding.Base64.encode(spki.view(), dns)?;
+    var pem = Vector<u8>.create();
+    appendPem(mut pem, "PUBLIC KEY", spki.view())?;
+    var params = PgParams.create();
+    let ok = bound(params.text(domain)) && bound(params.text(selector)) && bound(params.bytes(key.der())) &&
+        bound(params.text(StringView.fromUtf8(pem.view()) ?? ""));
+    if (!ok) {
+        return Err(AllocError.OutOfMemory);
+    }
+    var rows = PgRows.create();
+    return Ok(await queryRows(
+        ctx,
+        """
+        WITH k AS (
+            INSERT INTO dkim_keys (domain, selector, private_key, active) VALUES ($1, $2, $3, false)
+            ON CONFLICT (domain, selector) DO UPDATE SET private_key = excluded.private_key, active = false,
+                created_at = now()
+        )
+        UPDATE domains SET settings = settings || jsonb_build_object('dkim_public_key', $4::text), updated_at = now()
+        WHERE name = $1
+        """,
+        params,
+        mut rows,
+    ));
+}
+
+/// POST /api/domains/{id}/regenerate-dkim: a new key at the current selector ("mail" when none). It is left off
+/// until its DNS record is published and signing is turned on again: a key that signs before its record is out
+/// makes every message fail DKIM.
+async fn regenerateDkim(
+    ctx: borrow WebContext,
+    request: borrow Request,
+    caller: borrow Principal,
+    id: i64,
+) -> Result<Response, AllocError> {
+    var name = String.create();
+    if (!(await domainName(ctx, caller, id, mut name))) {
+        return Response.error(404, "Domain not found");
+    }
+    var params = PgParams.create();
+    if (!bound(params.text(name.view()))) {
+        return Err(AllocError.OutOfMemory);
+    }
+    var rows = PgRows.create();
+    let found = await queryRows(
+        ctx,
+        "SELECT selector FROM dkim_keys WHERE domain = $1 ORDER BY active DESC, created_at DESC LIMIT 1",
+        params,
+        mut rows,
+    );
+    var selector = String.create();
+    selector.append(if (found && rows.rowCount() == 1) rows.text(0, 0) ?? "mail" else "mail")?;
+    var dns = Vector<u8>.create();
+    if (!(await newDkimKey(ctx, name.view(), selector.view(), mut dns))?) {
+        return Response.error(500, "The key could not be made.");
+    }
+    await audit(
+        ctx,
+        request,
+        caller.id,
+        caller.username.view(),
+        "domain.regenerate-dkim",
+        "domain",
+        segment(request.path.view(), 2) ?? "",
+        name.view(),
+        true,
+    );
+    var w = JsonWriter.create();
+    w.beginObject();
+    w.booleanField("success", true);
+    w.stringField("domain", name.view());
+    w.stringField("selector", selector.view());
+    w.key("publicKeyDns");
+    w.stringBytes(dns.view());
+    w.stringField("message", "A new key was made. Publish it in DNS, then turn signing on again.");
+    w.endObject();
+    return Response.json(200, w.finish()?);
+}
+
+fn appendRecord(
+    w: borrow mut JsonWriter,
+    kind: StringView,
+    name: StringView,
+    value: StringView,
+    description: StringView,
+) {
+    w.beginObject();
+    w.stringField("type", kind);
+    w.stringField("name", name);
+    w.stringField("value", value);
+    if (description.length > 0) {
+        w.stringField("description", description);
+    }
+    w.endObject();
+}
+
+/// POST /api/domains/setup: adds the domain (or keeps it), its settings from the wizard, a DKIM key at selector
+/// "mail" if it has none, and a first user with the standard mailboxes; answers the DNS records to publish.
+async fn setupDomain(
+    ctx: borrow WebContext,
+    request: borrow Request,
+    caller: borrow Principal,
+) -> Result<Response, AllocError> {
+    let body = match (bodyObject(request)) {
+        Some(b) => b,
+        null => { return Response.error(400, "Domain name is required"); }
+    };
+    let doc = match (mhttp.JsonDocument.parse(body.bytes())) {
+        Ok(d) => d,
+        Err(_) => { return Response.error(400, "Domain name is required"); }
+    };
+    var given = String.create();
+    match (doc.member(doc.root(), "name")) {
+        Some(v) => { doc.string(v, mut given)?; }
+        null => {}
+    }
+    var name = String.create();
+    lowerInto(given.view().trim(), mut name)?;
+    if (name.length == 0 || name.view().indexOf(".") == null || name.view().indexOf("@") != null ||
+        name.view().indexOf(" ") != null) {
+        return Response.error(400, "Domain name is required");
+    }
+    var params = PgParams.create();
+    if (!bound(params.text(name.view())) || !bound(params.text(body))) {
+        return Err(AllocError.OutOfMemory);
+    }
+    var rows = PgRows.create();
+    if (!(await queryRows(
+        ctx,
+        """
+        WITH b AS (SELECT $2::jsonb AS j)
+        INSERT INTO domains (name, settings)
+        SELECT $1, jsonb_strip_nulls(jsonb_build_object(
+            'mail_only', coalesce((j->>'mailOnly')::boolean, true),
+            'spf_enabled', coalesce((j->>'spfEnabled')::boolean, true),
+            'dmarc_enabled', coalesce((j->>'dmarcEnabled')::boolean, false),
+            'dmarc_policy', coalesce(j->>'dmarcPolicy', 'quarantine'),
+            'dmarc_report_email', coalesce(nullif(j->>'dmarcReportEmail', ''), 'postmaster@' || $1),
+            'dmarc_report_enabled', true,
+            'spam_enabled', coalesce((j->>'spamEnabled')::boolean, false),
+            'greylist_enabled', coalesce((j->>'greylistEnabled')::boolean, false),
+            'rate_limit_enabled', coalesce((j->>'rateLimitEnabled')::boolean, false),
+            'cloudflare_zone_id', nullif(j->>'cloudflareZoneId', ''))) FROM b
+        ON CONFLICT (name) DO UPDATE SET updated_at = now()
+        RETURNING id
+        """,
+        params,
+        mut rows,
+    )) || rows.rowCount() == 0) {
+        return Response.error(500, "The domain could not be added.");
+    }
+    let domainId = rows.int64(0, 0) ?? 0;
+    // A key only when there is none: setup run again must not replace a key already in DNS.
+    var check = PgParams.create();
+    if (!bound(check.text(name.view()))) {
+        return Err(AllocError.OutOfMemory);
+    }
+    var keys = PgRows.create();
+    let looked = await queryRows(
+        ctx,
+        "SELECT 1 FROM dkim_keys WHERE domain = $1 AND selector = 'mail'",
+        check,
+        mut keys,
+    );
+    var dns = Vector<u8>.create();
+    if (looked && keys.rowCount() == 0) {
+        let made = await newDkimKey(ctx, name.view(), "mail", mut dns)?;
+    } else {
+        // The existing key's public half, from what was kept.
+        var pem = PgRows.create();
+        if (await queryRows(ctx, "SELECT settings->>'dkim_public_key' FROM domains WHERE name = $1", check, mut pem) &&
+            pem.rowCount() == 1) {
+            let text = pem.text(0, 0) ?? "";
+            var blocks = Vector<Vector<u8>>.create();
+            macme.pemBlocks(text.bytes(), "PUBLIC KEY", mut blocks)?;
+            if (blocks.length > 0) {
+                encoding.Base64.encode(blocks[0].view(), mut dns)?;
+            }
+        }
+    }
+    // The first user, when asked for.
+    var userId: i64 = 0;
+    var email = String.create();
+    var password = String.create();
+    match (doc.member(doc.root(), "firstUserEmail")) {
+        Some(v) => { doc.string(v, mut email)?; }
+        null => {}
+    }
+    match (doc.member(doc.root(), "firstUserPassword")) {
+        Some(v) => { doc.string(v, mut password)?; }
+        null => {}
+    }
+    if (email.length > 0 && password.length > 0) {
+        match (await createMailUser(ctx, email.view(), password.bytes(), null)) {
+            Ok(u) => { userId = u; }
+            Err(StoreError.Exists) => {}
+            Err(_) => { return Response.error(400, "The first user could not be created."); }
+        }
+    }
+    var idText = String.create();
+    idText.appendNumber(domainId)?;
+    await audit(
+        ctx,
+        request,
+        caller.id,
+        caller.username.view(),
+        "domain.setup",
+        "domain",
+        idText.view(),
+        name.view(),
+        true,
+    );
+    var serverIp = String.create();
+    match (doc.member(doc.root(), "serverIp")) {
+        Some(v) => { doc.string(v, mut serverIp)?; }
+        null => {}
+    }
+    var dmarcPolicy = String.create();
+    match (doc.member(doc.root(), "dmarcPolicy")) {
+        Some(v) => { doc.string(v, mut dmarcPolicy)?; }
+        null => {}
+    }
+    if (dmarcPolicy.length == 0) {
+        dmarcPolicy.append("quarantine")?;
+    }
+    var report = String.create();
+    match (doc.member(doc.root(), "dmarcReportEmail")) {
+        Some(v) => { doc.string(v, mut report)?; }
+        null => {}
+    }
+    if (report.length == 0) {
+        report.append("postmaster@")?;
+        report.append(name.view())?;
+    }
+    let d = name.view();
+    var mailHost = String.create();
+    mailHost.append("mail.")?;
+    mailHost.append(d)?;
+    var text = String.create();
+    var w = JsonWriter.create();
+    w.beginObject();
+    w.booleanField("success", true);
+    w.integerField("domainId", domainId);
+    if (userId != 0) {
+        w.integerField("userId", userId);
+    } else {
+        w.nullField("userId");
+    }
+    w.key("dkim");
+    w.beginObject();
+    w.stringField("selector", "mail");
+    w.integerField("keySize", 2048);
+    w.endObject();
+    w.nullField("proxySync");
+    w.nullField("dnsSync");
+    w.key("dns");
+    w.beginArray();
+    appendRecord(mut w, "A", mailHost.view(), if (serverIp.length > 0) serverIp.view() else "<YOUR-SERVER-IP>", "");
+    text.clear();
+    text.append(mailHost.view())?;
+    text.append(" (priority 10)")?;
+    appendRecord(mut w, "MX", d, text.view(), "");
+    text.clear();
+    text.append("v=spf1 mx a:")?;
+    text.append(mailHost.view())?;
+    text.append(" -all")?;
+    appendRecord(mut w, "TXT", d, text.view(), "");
+    var dmarcName = String.create();
+    dmarcName.append("_dmarc.")?;
+    dmarcName.append(d)?;
+    text.clear();
+    text.append("v=DMARC1; p=")?;
+    text.append(dmarcPolicy.view())?;
+    text.append("; rua=mailto:")?;
+    text.append(report.view())?;
+    appendRecord(mut w, "TXT", dmarcName.view(), text.view(), "");
+    var dkimName = String.create();
+    dkimName.append("mail._domainkey.")?;
+    dkimName.append(d)?;
+    text.clear();
+    text.append("v=DKIM1; k=rsa; p=")?;
+    text.append(StringView.fromUtf8(dns.view()) ?? "")?;
+    appendRecord(mut w, "TXT", dkimName.view(), text.view(), "");
+    let kind = if (serverIp.length > 0) "A" else "CNAME";
+    let target = if (serverIp.length > 0) serverIp.view() else mailHost.view();
+    var host = String.create();
+    host.append("autodiscover.")?;
+    host.append(d)?;
+    appendRecord(mut w, kind, host.view(), target, "Exchange/Outlook/macOS Mail");
+    host.clear();
+    host.append("autoconfig.")?;
+    host.append(d)?;
+    appendRecord(mut w, kind, host.view(), target, "Thunderbird");
+    w.endArray();
+    w.endObject();
+    return Response.json(200, w.finish()?);
+}
+
+/// Adds a mail user with the standard mailboxes. `quota` null: the domain's default.
+async fn createMailUser(
+    ctx: borrow WebContext,
+    email: StringView,
+    password: Slice<u8>,
+    quota: i64?,
+) -> Result<i64, StoreError> {
+    let mail = ctx.mail.get();
+    let hash = match (await msmtp.hashPassword(mail.login, password)) {
+        Some(h) => h,
+        null => { return Err(StoreError.OutOfMemory); }
+    };
+    var lowered = String.create();
+    match (lowerInto(email.trim(), mut lowered)) {
+        Ok() => {}
+        Err(_) => { return Err(StoreError.OutOfMemory); }
+    }
+    return await mail.store.createUser(lowered.view(), hash.view(), quota);
+}
+
+// ---- Aliases (camelCase) ----
+
+const ALIAS_JSON: StringView =
+    """
+    jsonb_build_object('id', a.id, 'domainId', a.domain_id, 'domain', NULL, 'email', a.address,
+        'destination', a.destination, 'active', a.active, 'createdAt', a.created_at)
+    """;
+
+/// GET and POST /api/domains/{id}/aliases.
+async fn domainAliases(
+    ctx: borrow WebContext,
+    request: borrow Request,
+    caller: borrow Principal,
+    id: i64,
+) -> Result<Response, AllocError> {
+    var params = PgParams.create();
+    if (!bindAll(mut params, caller.scope(), id)) {
+        return Err(AllocError.OutOfMemory);
+    }
+    if (request.isMethod("GET")) {
+        return await answer(
+            ctx,
+            """
+            SELECT 200, coalesce((SELECT jsonb_agg(jsonb_build_object('id', a.id, 'domainId', a.domain_id,
+                'domain', NULL, 'email', a.address, 'destination', a.destination, 'active', a.active,
+                'createdAt', a.created_at) ORDER BY a.address)
+                FROM aliases a WHERE a.domain_id = $2 AND ($1 = 0 OR a.domain_id = $1)), '[]')::text
+            """,
+            params,
+            "",
+        );
+    }
+    if (!request.isMethod("POST")) {
+        return notAllowed("GET, POST");
+    }
+    let body = match (bodyObject(request)) {
+        Some(b) => b,
+        null => { return Response.error(400, "email and destination are required"); }
+    };
+    if (!bound(params.text(body))) {
+        return Err(AllocError.OutOfMemory);
+    }
+    // The address must be of this domain: an alias elsewhere would take another domain's mail.
+    let r = await answer(
+        ctx,
+        """
+        WITH b AS (SELECT $3::jsonb AS j), d AS (SELECT id, name FROM domains WHERE id = $2 AND ($1 = 0 OR id = $1)),
+        v AS (SELECT lower(btrim(coalesce(j->>'email', ''))) AS email, btrim(coalesce(j->>'destination', '')) AS dest,
+            coalesce((j->>'active')::boolean, true) AS active FROM b),
+        ins AS (
+            INSERT INTO aliases (address, domain_id, destination, active)
+            SELECT v.email, d.id, v.dest, v.active FROM v, d
+            WHERE v.email <> '' AND v.dest <> '' AND split_part(v.email, '@', 2) = d.name
+            RETURNING id
+        )
+        SELECT CASE WHEN EXISTS (SELECT 1 FROM ins) THEN 200 ELSE 400 END,
+            CASE WHEN EXISTS (SELECT 1 FROM ins) THEN '{"success":true}'
+                WHEN (SELECT email FROM v) = '' OR (SELECT dest FROM v) = '' THEN '{"error":"email and destination are required"}'
+                ELSE '{"error":"The alias must be an address of this domain."}' END
+        FROM d
+        """,
+        params,
+        "Domain not found",
+    )?;
+    if (r.status == 200) {
+        await audited(ctx, request, caller, "alias.create", "alias", "");
+    }
+    return Ok(r);
+}
+
+/// PUT and DELETE /api/aliases/{id}.
+async fn aliasesApi(
+    ctx: borrow WebContext,
+    request: borrow Request,
+    caller: borrow Principal,
+) -> Result<Response, AllocError> {
+    let path = request.path.view();
+    if (segmentCount(path) != 3) {
+        return Response.error(404, "No such endpoint.");
+    }
+    let id = idOf(segment(path, 2));
+    var params = PgParams.create();
+    if (!bindAll(mut params, caller.scope(), id)) {
+        return Err(AllocError.OutOfMemory);
+    }
+    let deleting = request.isMethod("DELETE");
+    var r = Response.create(500);
+    if (deleting) {
+        r = await answer(
+            ctx,
+            "DELETE FROM aliases WHERE id = $2 AND ($1 = 0 OR domain_id = $1) RETURNING 200, '{\"success\":true}'",
+            params,
+            "Alias not found",
+        )?;
+    } else if (request.isMethod("PUT")) {
+        let body = match (bodyObject(request)) {
+            Some(b) => b,
+            null => { return Response.error(400, "A JSON object is required."); }
+        };
+        if (!bound(params.text(body))) {
+            return Err(AllocError.OutOfMemory);
+        }
+        r = await answer(
+            ctx,
+            """
+            WITH b AS (SELECT $3::jsonb AS j)
+            UPDATE aliases a SET
+                address = coalesce(lower(btrim(nullif(j->>'email', ''))), a.address),
+                destination = coalesce(btrim(nullif(j->>'destination', '')), a.destination),
+                active = coalesce((j->>'active')::boolean, a.active)
+            FROM b, domains d
+            WHERE a.id = $2 AND ($1 = 0 OR a.domain_id = $1) AND d.id = a.domain_id
+                AND split_part(coalesce(lower(btrim(nullif(j->>'email', ''))), a.address), '@', 2) = d.name
+            RETURNING 200, '{"success":true}'
+            """,
+            params,
+            "Alias not found",
+        )?;
+    } else {
+        return notAllowed("PUT, DELETE");
+    }
+    if (r.status == 200) {
+        await audited(
+            ctx,
+            request,
+            caller,
+            if (deleting) "alias.delete" else "alias.update",
+            "alias",
+            segment(path, 2) ?? "",
+        );
+    }
+    return Ok(r);
+}

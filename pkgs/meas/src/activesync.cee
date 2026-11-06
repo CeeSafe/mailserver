@@ -1,0 +1,680 @@
+// Exchange ActiveSync (MS-ASHTTP, MS-ASCMD) at /Microsoft-Server-ActiveSync: the request (plain or base64-encoded
+// query, MS-ASHTTP §2.2.1.1.1), the login (HTTP Basic, through mpim), the device's record, and the command.
+
+import encoding.Base64;
+import mhttp.Request;
+import mhttp.Response;
+import mhttp.percentDecode;
+import mpim.Account;
+import mpim.basicLogin;
+import mpim.loginAnswer;
+import msmtp.SmtpContext;
+import mxml.XmlDocument;
+import postgres.PgParams;
+
+const WBXML_TYPE: StringView = "application/vnd.ms-sync.wbxml";
+const VERSIONS: StringView = "12.1,14.0,14.1,16.0,16.1";
+const COMMANDS: StringView =
+    "Sync,SendMail,SmartForward,SmartReply,GetAttachment,FolderSync,FolderCreate,FolderDelete,FolderUpdate,MoveItems,GetItemEstimate,MeetingResponse,Search,Find,Settings,Ping,ItemOperations,Provision,ResolveRecipients";
+
+/// Everything a command needs to know about its request.
+@noncopy
+struct Session {
+    userId: i64;
+    email: String;
+    /// eas_devices.id.
+    device: i64;
+    deviceId: String;
+    deviceType: String;
+    deviceStatus: String;
+    policyKey: i64;
+    hierarchyKey: i64;
+    /// 121, 140, 141, 160 or 161.
+    version: i32;
+    command: String;
+    collectionId: String;
+    itemId: String;
+    longId: String;
+    attachmentName: String;
+    occurrence: String;
+    saveInSent: bool;
+    /// The X-MS-PolicyKey sent, or 0.
+    sentPolicyKey: i64;
+
+    fn create() -> Session => Session {
+        userId: 0,
+        email: String.create(),
+        device: 0,
+        deviceId: String.create(),
+        deviceType: String.create(),
+        deviceStatus: String.create(),
+        policyKey: 0,
+        hierarchyKey: 0,
+        version: 141,
+        command: String.create(),
+        collectionId: String.create(),
+        itemId: String.create(),
+        longId: String.create(),
+        attachmentName: String.create(),
+        occurrence: String.create(),
+        saveInSent: false,
+        sentPolicyKey: 0,
+    };
+}
+
+/// A decoded request body: `present` is false when there was none.
+@noncopy
+struct Body {
+    doc: XmlDocument;
+    present: bool;
+}
+
+fn lowerInto(text: StringView, into: borrow mut String) -> Result<void, AllocError> {
+    into.clear();
+    var bytes = Vector<u8>.create();
+    for (b in text.bytes()) {
+        bytes.push(if (b >= 0x41 && b <= 0x5a) b + 0x20 else b)?;
+    }
+    return into.append(StringView.fromUtf8(bytes.view()) ?? "");
+}
+
+/// The command codes of the base64-encoded query (MS-ASHTTP §2.2.1.1.1.1.2).
+fn commandOfCode(code: u8) -> StringView {
+    if (code == 0) { return "sync"; }
+    if (code == 1) { return "sendmail"; }
+    if (code == 2) { return "smartforward"; }
+    if (code == 3) { return "smartreply"; }
+    if (code == 4) { return "getattachment"; }
+    if (code == 9) { return "foldersync"; }
+    if (code == 10) { return "foldercreate"; }
+    if (code == 11) { return "folderdelete"; }
+    if (code == 12) { return "folderupdate"; }
+    if (code == 13) { return "moveitems"; }
+    if (code == 14) { return "getitemestimate"; }
+    if (code == 15) { return "meetingresponse"; }
+    if (code == 16) { return "search"; }
+    if (code == 17) { return "settings"; }
+    if (code == 18) { return "ping"; }
+    if (code == 19) { return "itemoperations"; }
+    if (code == 20) { return "provision"; }
+    if (code == 21) { return "resolverecipients"; }
+    if (code == 22) { return "validatecert"; }
+    if (code == 23) { return "find"; }
+    return "";
+}
+
+fn appendHex(into: borrow mut String, bytes: Slice<u8>) -> Result<void, AllocError> {
+    let hex = "0123456789ABCDEF".bytes();
+    var out = Vector<u8>.create();
+    for (b in bytes) {
+        out.push(hex[truncate<usize>(b >> 4)])?;
+        out.push(hex[truncate<usize>(b & 0x0f)])?;
+    }
+    return into.append(StringView.fromUtf8(out.view()) ?? "");
+}
+
+fn appendUtf8(into: borrow mut String, bytes: Slice<u8>) -> Result<void, AllocError> =>
+    into.append(StringView.fromUtf8(bytes) ?? "");
+
+/// Reads the base64-encoded query form; false when `query` is not one.
+fn readEncodedQuery(query: StringView, s: borrow mut Session) -> Result<bool, AllocError> {
+    var raw = Vector<u8>.create();
+    var text = String.create();
+    percentDecode(query, false, mut text)?;
+    match (Base64.decode(text.view().bytes(), mut raw)) {
+        Ok() => {}
+        Err(_) => { return Ok(false); }
+    }
+    let b = raw.view();
+    if (b.length < 5) {
+        return Ok(false);
+    }
+    s.version = b[0] as i32;
+    lowerInto(commandOfCode(b[1]), mut s.command)?;
+    var at: usize = 4; // the version, the command, the locale (2 bytes)
+    let idLength = b[at] as usize;
+    at += 1;
+    if (at + idLength > b.length) {
+        return Ok(false);
+    }
+    // The device id is binary here; as hex it is what the plain form would carry.
+    appendHex(mut s.deviceId, b[at..(at + idLength)])?;
+    at += idLength;
+    if (at >= b.length) {
+        return Ok(false);
+    }
+    let keyLength = b[at] as usize;
+    at += 1;
+    if (keyLength == 4 && at + 4 <= b.length) {
+        let key = (b[at] as u32) | ((b[at + 1] as u32) << 8) | ((b[at + 2] as u32) << 16) | ((b[at + 3] as u32) << 24);
+        s.sentPolicyKey = key as i64;
+    }
+    at += keyLength;
+    if (at >= b.length) {
+        return Ok(false);
+    }
+    let typeLength = b[at] as usize;
+    at += 1;
+    if (at + typeLength > b.length) {
+        return Ok(false);
+    }
+    appendUtf8(mut s.deviceType, b[at..(at + typeLength)])?;
+    at += typeLength;
+    while (at + 2 <= b.length) {
+        let tag = b[at];
+        let length = b[at + 1] as usize;
+        at += 2;
+        if (at + length > b.length) {
+            break;
+        }
+        let value = b[at..(at + length)];
+        at += length;
+        if (tag == 0) {
+            appendUtf8(mut s.attachmentName, value)?;
+        } else if (tag == 1) {
+            appendUtf8(mut s.collectionId, value)?;
+        } else if (tag == 3) {
+            appendUtf8(mut s.itemId, value)?;
+        } else if (tag == 4) {
+            appendUtf8(mut s.longId, value)?;
+        } else if (tag == 6) {
+            appendUtf8(mut s.occurrence, value)?;
+        } else if (tag == 7) {
+            s.saveInSent = value.length > 0 && (value[0] & 0x01) != 0;
+        }
+    }
+    return Ok(true);
+}
+
+fn readPlainQuery(request: borrow Request, s: borrow mut Session) -> Result<void, AllocError> {
+    var value = String.create();
+    request.param("Cmd", mut value)?;
+    lowerInto(value.view(), mut s.command)?;
+    request.param("DeviceId", mut s.deviceId)?;
+    request.param("DeviceType", mut s.deviceType)?;
+    request.param("CollectionId", mut s.collectionId)?;
+    request.param("ItemId", mut s.itemId)?;
+    request.param("LongId", mut s.longId)?;
+    request.param("AttachmentName", mut s.attachmentName)?;
+    request.param("Occurrence", mut s.occurrence)?;
+    request.param("SaveInSent", mut value)?;
+    s.saveInSent = value.view() == "T" || value.view() == "t";
+    match (request.header("MS-ASProtocolVersion")) {
+        Some(v) => { s.version = versionNumber(v.view()); }
+        null => {}
+    }
+    match (request.header("X-MS-PolicyKey")) {
+        Some(v) => { s.sentPolicyKey = v.view().parseInt<i64>() ?? 0; }
+        null => {}
+    }
+    return Ok();
+}
+
+/// "14.1" as 141.
+fn versionNumber(text: StringView) -> i32 {
+    let dot = text.indexOf(".") ?? text.length;
+    let major = text[0..dot].parseInt<i32>() ?? 14;
+    let minor = if (dot + 1 < text.length) text[(dot + 1)..].parseInt<i32>() ?? 0 else 0;
+    return major * 10 + minor;
+}
+
+/// The response to a command: WBXML, with the server's version.
+fn wbxml(body: Vector<u8>) -> Result<Response, EasFail> {
+    var r = match (Response.of(200, WBXML_TYPE, body)) {
+        Ok(r) => r,
+        Err(_) => { return Err(EasFail.Memory); }
+    };
+    mem(r.header("MS-Server-ActiveSync", "16.1"))?;
+    return Ok(r);
+}
+
+fn written(w: WbxmlWriter) -> Result<Response, EasFail> => match (w.finish()) {
+    Ok(b) => wbxml(b),
+    Err(_) => Err(EasFail.Memory),
+};
+
+/// An empty 200 (a Sync with nothing to say, SendMail done).
+fn emptyOk() -> Result<Response, EasFail> {
+    var r = Response.create(200);
+    mem(r.header("MS-Server-ActiveSync", "16.1"))?;
+    return Ok(r);
+}
+
+fn plain(code: u16, text: StringView) -> Result<Response, EasFail> => match (Response.text(code, text)) {
+    Ok(r) => Ok(r),
+    Err(_) => Err(EasFail.Memory),
+};
+
+fn options() -> Result<Response, AllocError> {
+    var r = Response.create(200);
+    r.header("MS-ASProtocolVersions", VERSIONS)?;
+    r.header("MS-ASProtocolCommands", COMMANDS)?;
+    r.header("MS-Server-ActiveSync", "16.1")?;
+    r.header("Allow", "OPTIONS,POST")?;
+    r.header("Public", "OPTIONS,POST")?;
+    r.header("Cache-Control", "private")?;
+    return Ok(r);
+}
+
+/// Answers a request to `/Microsoft-Server-ActiveSync`.
+public async fn serveActiveSync(mail: borrow SmtpContext, request: borrow Request) -> Result<Response, AllocError> {
+    let isOptions = request.isMethod("OPTIONS");
+    if (!isOptions && !request.isMethod("POST")) {
+        var r = Response.text(405, "Use POST.")?;
+        r.header("Allow", "OPTIONS,POST")?;
+        return Ok(r);
+    }
+    // OPTIONS is version discovery and needs no login (MS-ASHTTP §3.2.5.1); credentials that are sent are checked,
+    // so a setup screen with a wrong password hears so.
+    if (isOptions && request.header("Authorization") == null) {
+        return options();
+    }
+    var account = Account.create();
+    match (await basicLogin(mail, request, mut account)) {
+        Ok() => {}
+        Err(f) => { return loginAnswer(f, "ActiveSync"); }
+    }
+    if (isOptions) {
+        return options();
+    }
+    var s = Session.create();
+    s.userId = account.userId;
+    s.email.append(account.email.view())?;
+    let query = request.query.view();
+    let encoded = query.length > 0 && query.indexOf("=") == null && readEncodedQuery(query, mut s)?;
+    if (!encoded) {
+        readPlainQuery(request, mut s)?;
+    }
+    if (s.deviceId.length == 0) {
+        s.deviceId.append("unknown")?;
+    }
+    if (s.deviceType.length == 0) {
+        s.deviceType.append("unknown")?;
+    }
+    let outcome = await handle(mail, request, mut s);
+    return match (outcome) {
+        Ok(r) => Ok(r),
+        Err(EasFail.Unavailable) => {
+            var r = Response.text(503, "The server is busy; try again later.")?;
+            r.header("Retry-After", "30")?;
+            Ok(r)
+        }
+        Err(EasFail.Memory) => Response.text(500, "The server could not answer."),
+    };
+}
+
+fn sqlDevice() -> StringView =>
+    """
+    INSERT INTO eas_devices (user_id, device_id, device_type, user_agent, protocol_version, last_sync_at)
+    VALUES ($1, $2, $3, nullif($4, ''), $5, now())
+    ON CONFLICT (user_id, device_id) DO UPDATE SET
+        device_type = EXCLUDED.device_type, user_agent = coalesce(EXCLUDED.user_agent, eas_devices.user_agent),
+        protocol_version = EXCLUDED.protocol_version, last_sync_at = now(), updated_at = now()
+    RETURNING id, status, policy_key, hierarchy_key
+    """;
+
+async fn handle(mail: borrow SmtpContext, request: borrow Request, s: borrow mut Session) -> Result<Response, EasFail> {
+    let store = borrow mail.store;
+    var params = PgParams.create();
+    pg(params.int64(s.userId))?;
+    pg(params.text(s.deviceId.view()))?;
+    pg(params.text(s.deviceType.view()))?;
+    let agent = match (request.header("User-Agent")) {
+        Some(a) => a.view(),
+        null => "",
+    };
+    pg(params.text(agent))?;
+    var version = String.create();
+    mem(version.appendNumber((s.version / 10) as i64))?;
+    mem(version.append("."))?;
+    mem(version.appendNumber((s.version % 10) as i64))?;
+    pg(params.text(version.view()))?;
+    let rows = await query(store, sqlDevice(), params)?;
+    s.device = rows.int64(0, 0) ?? 0;
+    copyText(rows, 0, 1, mut s.deviceStatus)?;
+    s.policyKey = rows.int64(0, 2) ?? 0;
+    s.hierarchyKey = rows.int64(0, 3) ?? 0;
+    if (s.deviceStatus.view() == "blocked") {
+        return plain(403, "This device is blocked.");
+    }
+    let cmd = s.command.view();
+    if (s.deviceStatus.view() == "wipe" && cmd != "provision") {
+        // The device must provision to receive the wipe (MS-ASPROV §3.2.5.1.2).
+        return plain(449, "Provision first.");
+    }
+    if (cmd == "sendmail" || cmd == "smartreply" || cmd == "smartforward") {
+        return await composeMail(mail, request, s);
+    }
+    if (cmd == "getattachment") {
+        return await getAttachment(mail, s);
+    }
+    var body = Body { doc: emptyDocument()?, present: false };
+    if (request.body.length > 0) {
+        match (decodeWbxml(request.body.view())) {
+            Ok(d) => {
+                body.doc = d;
+                body.present = true;
+            }
+            Err(_) => { return plain(400, "The request body is not WBXML."); }
+        }
+    }
+    if (cmd == "provision") {
+        return await provision(mail, s, body);
+    }
+    if (cmd == "foldersync") {
+        return await folderSync(mail, s, body);
+    }
+    if (cmd == "foldercreate") {
+        return await folderCreate(mail, s, body);
+    }
+    if (cmd == "folderdelete") {
+        return await folderDelete(mail, s, body);
+    }
+    if (cmd == "folderupdate") {
+        return await folderUpdate(mail, s, body);
+    }
+    if (cmd == "sync") {
+        return await sync(mail, s, body);
+    }
+    if (cmd == "getitemestimate") {
+        return await getItemEstimate(mail, s, body);
+    }
+    if (cmd == "ping") {
+        return await ping(mail, s, body);
+    }
+    if (cmd == "moveitems") {
+        return await moveItems(mail, s, body);
+    }
+    if (cmd == "itemoperations") {
+        return await itemOperations(mail, s, body);
+    }
+    if (cmd == "search") {
+        return await search(mail, s, body);
+    }
+    if (cmd == "find") {
+        return await find(mail, s, body);
+    }
+    if (cmd == "settings") {
+        return await settings(mail, s, body);
+    }
+    if (cmd == "meetingresponse") {
+        return await meetingResponse(mail, s, body);
+    }
+    if (cmd == "resolverecipients") {
+        return await resolveRecipients(mail, s, body);
+    }
+    return plain(501, "This command is not supported.");
+}
+
+fn emptyDocument() -> Result<XmlDocument, EasFail> => match (XmlDocument.create()) {
+    Ok(d) => Ok(d),
+    Err(_) => Err(EasFail.Memory),
+};
+
+// ---- Provision (MS-ASPROV) ----
+
+fn newPolicyKey() -> i64 {
+    var random = [0u8; 4];
+    match (Random.fill(mut random[..])) {
+        Ok() => {}
+        Err(_) => {}
+    }
+    let bits =
+        ((random[0] as u32) | ((random[1] as u32) << 8) | ((random[2] as u32) << 16) | ((random[3] as u32) << 24)) &
+            0x7fffffff;
+    let k = bits as i64;
+    return if (k == 0) 1 else k;
+}
+
+/// The policy this server sets: none that restricts the device (as the C# server's).
+fn writePolicy(w: borrow mut WbxmlWriter) {
+    w.start(PAGE_PROVISION, "EASProvisionDoc");
+    w.element(PAGE_PROVISION, "DevicePasswordEnabled", "0");
+    w.element(PAGE_PROVISION, "AlphanumericDevicePasswordRequired", "0");
+    w.element(PAGE_PROVISION, "PasswordRecoveryEnabled", "0");
+    w.element(PAGE_PROVISION, "RequireDeviceEncryption", "0");
+    w.element(PAGE_PROVISION, "AttachmentsEnabled", "1");
+    w.element(PAGE_PROVISION, "MinDevicePasswordLength", "1");
+    w.element(PAGE_PROVISION, "MaxInactivityTimeDeviceLock", "9999");
+    w.element(PAGE_PROVISION, "MaxDevicePasswordFailedAttempts", "16");
+    w.element(PAGE_PROVISION, "AllowSimpleDevicePassword", "1");
+    w.element(PAGE_PROVISION, "AllowStorageCard", "1");
+    w.element(PAGE_PROVISION, "AllowCamera", "1");
+    w.element(PAGE_PROVISION, "AllowUnsignedApplications", "1");
+    w.element(PAGE_PROVISION, "AllowUnsignedInstallationPackages", "1");
+    w.element(PAGE_PROVISION, "AllowWiFi", "1");
+    w.element(PAGE_PROVISION, "AllowTextMessaging", "1");
+    w.element(PAGE_PROVISION, "AllowPOPIMAPEmail", "1");
+    w.element(PAGE_PROVISION, "AllowBluetooth", "2");
+    w.element(PAGE_PROVISION, "AllowIrDA", "1");
+    w.element(PAGE_PROVISION, "RequireManualSyncWhenRoaming", "0");
+    w.element(PAGE_PROVISION, "AllowDesktopSync", "1");
+    w.element(PAGE_PROVISION, "MaxCalendarAgeFilter", "0");
+    w.element(PAGE_PROVISION, "AllowHTMLEmail", "1");
+    w.element(PAGE_PROVISION, "MaxEmailAgeFilter", "0");
+    w.element(PAGE_PROVISION, "AllowBrowser", "1");
+    w.element(PAGE_PROVISION, "AllowConsumerEmail", "1");
+    w.element(PAGE_PROVISION, "AllowInternetSharing", "1");
+    w.end();
+}
+
+async fn provision(mail: borrow SmtpContext, s: borrow Session, body: borrow Body) -> Result<Response, EasFail> {
+    let doc = borrow body.doc;
+    var w = WbxmlWriter.create();
+    w.start(PAGE_PROVISION, "Provision");
+    if (!body.present) {
+        w.element(PAGE_PROVISION, "Status", "2");
+        w.end();
+        return written(w);
+    }
+    let root = doc.root();
+    // Provisioning carries the device's information too (14.1).
+    match (doc.find(root, NS_SETTINGS, "DeviceInformation")) {
+        Some(info) => {
+            await saveDeviceInformation(mail, s, doc, info)?;
+            w.start(PAGE_SETTINGS, "DeviceInformation");
+            w.element(PAGE_SETTINGS, "Status", "1");
+            w.end();
+        }
+        null => {}
+    }
+    w.element(PAGE_PROVISION, "Status", "1");
+    let wipeAck = match (doc.child(root, NS_PROVISION, "RemoteWipe")) {
+        Some(r) => doc.child(r, NS_PROVISION, "Status") != null,
+        null => false,
+    };
+    if (wipeAck) {
+        await setDevice(mail, s, "status = 'wiped'")?;
+        w.end();
+        return written(w);
+    }
+    if (s.deviceStatus.view() == "wipe") {
+        w.empty(PAGE_PROVISION, "RemoteWipe");
+        w.end();
+        return written(w);
+    }
+    let policy = doc.find(root, NS_PROVISION, "Policy");
+    var policyType = String.create();
+    match (policy) {
+        Some(p) => { mem(policyType.append(childValue(doc, p, NS_PROVISION, "PolicyType")))?; }
+        null => {}
+    }
+    if (policyType.length == 0) {
+        mem(policyType.append("MS-EAS-Provisioning-WBXML"))?;
+    }
+    // The acknowledgement (a PolicyKey and a Status) gets the final key; the first request a temporary one, with
+    // the policy.
+    let acknowledging = match (policy) {
+        Some(p) => doc.child(p, NS_PROVISION, "PolicyKey") != null,
+        null => false,
+    };
+    let key = newPolicyKey();
+    var update = String.create();
+    mem(update.append("policy_key = "))?;
+    mem(update.appendNumber(key))?;
+    await setDevice(mail, s, update.view())?;
+    w.start(PAGE_PROVISION, "Policies");
+    w.start(PAGE_PROVISION, "Policy");
+    w.element(PAGE_PROVISION, "PolicyType", policyType.view());
+    w.element(PAGE_PROVISION, "Status", "1");
+    w.number(PAGE_PROVISION, "PolicyKey", key);
+    if (!acknowledging) {
+        w.start(PAGE_PROVISION, "Data");
+        writePolicy(mut w);
+        w.end();
+    }
+    w.end();
+    w.end();
+    w.end();
+    return written(w);
+}
+
+/// Sets columns of the device's row (`assignments` is fixed SQL from this package).
+async fn setDevice(mail: borrow SmtpContext, s: borrow Session, assignments: StringView) -> Result<void, EasFail> {
+    var sql = String.create();
+    mem(sql.append("UPDATE eas_devices SET "))?;
+    mem(sql.append(assignments))?;
+    mem(sql.append(", updated_at = now() WHERE id = $1"))?;
+    var params = PgParams.create();
+    pg(params.int64(s.device))?;
+    await query(borrow mail.store, sql.view(), params)?;
+    return Ok();
+}
+
+async fn saveDeviceInformation(
+    mail: borrow SmtpContext,
+    s: borrow Session,
+    doc: borrow XmlDocument,
+    info: usize,
+) -> Result<void, EasFail> {
+    let set = doc.child(info, NS_SETTINGS, "Set") ?? info;
+    var params = PgParams.create();
+    pg(params.int64(s.device))?;
+    pg(params.text(childValue(doc, set, NS_SETTINGS, "Model")))?;
+    pg(params.text(childValue(doc, set, NS_SETTINGS, "FriendlyName")))?;
+    pg(params.text(childValue(doc, set, NS_SETTINGS, "OS")))?;
+    pg(params.text(childValue(doc, set, NS_SETTINGS, "UserAgent")))?;
+    await query(
+        borrow mail.store,
+        "UPDATE eas_devices SET model = coalesce(nullif($2, ''), model), friendly_name = coalesce(nullif($3, ''), friendly_name), os = coalesce(nullif($4, ''), os), user_agent = coalesce(nullif($5, ''), user_agent), updated_at = now() WHERE id = $1",
+        params,
+    )?;
+    return Ok();
+}
+
+// ---- Settings (MS-ASCMD §2.2.1.18) ----
+
+async fn settings(mail: borrow SmtpContext, s: borrow Session, body: borrow Body) -> Result<Response, EasFail> {
+    let doc = borrow body.doc;
+    var w = WbxmlWriter.create();
+    w.start(PAGE_SETTINGS, "Settings");
+    if (!body.present) {
+        w.element(PAGE_SETTINGS, "Status", "2");
+        w.end();
+        return written(w);
+    }
+    w.element(PAGE_SETTINGS, "Status", "1");
+    var kids = Vector<usize>.create();
+    mem(doc.children(doc.root(), mut kids))?;
+    for (k in kids.view()) {
+        if (doc.is(k, NS_SETTINGS, "DeviceInformation")) {
+            await saveDeviceInformation(mail, s, doc, k)?;
+            w.start(PAGE_SETTINGS, "DeviceInformation");
+            w.element(PAGE_SETTINGS, "Status", "1");
+            w.end();
+        } else if (doc.is(k, NS_SETTINGS, "UserInformation")) {
+            w.start(PAGE_SETTINGS, "UserInformation");
+            w.element(PAGE_SETTINGS, "Status", "1");
+            w.start(PAGE_SETTINGS, "Get");
+            if (s.version >= 141) {
+                w.start(PAGE_SETTINGS, "Accounts");
+                w.start(PAGE_SETTINGS, "Account");
+                w.element(PAGE_SETTINGS, "UserDisplayName", s.email.view());
+                w.start(PAGE_SETTINGS, "EmailAddresses");
+                w.element(PAGE_SETTINGS, "SMTPAddress", s.email.view());
+                w.element(PAGE_SETTINGS, "PrimarySmtpAddress", s.email.view());
+                w.end();
+                w.end();
+                w.end();
+            } else {
+                w.start(PAGE_SETTINGS, "EmailAddresses");
+                w.element(PAGE_SETTINGS, "SMTPAddress", s.email.view());
+                w.end();
+            }
+            w.end();
+            w.end();
+        } else if (doc.is(k, NS_SETTINGS, "Oof")) {
+            await oof(mail, s, doc, k, mut w)?;
+        } else if (doc.is(k, NS_SETTINGS, "DevicePassword")) {
+            w.start(PAGE_SETTINGS, "DevicePassword");
+            w.element(PAGE_SETTINGS, "Status", "1");
+            w.end();
+        } else if (doc.is(k, NS_SETTINGS, "RightsManagementInformation")) {
+            w.start(PAGE_SETTINGS, "RightsManagementInformation");
+            w.element(PAGE_SETTINGS, "Status", "1");
+            w.end();
+        }
+    }
+    w.end();
+    return written(w);
+}
+
+/// Out of office: the account's auto-reply (users.auto_reply_*), as the admin UI shows it.
+async fn oof(
+    mail: borrow SmtpContext,
+    s: borrow Session,
+    doc: borrow XmlDocument,
+    element: usize,
+    w: borrow mut WbxmlWriter,
+) -> Result<void, EasFail> {
+    let store = borrow mail.store;
+    w.start(PAGE_SETTINGS, "Oof");
+    match (doc.child(element, NS_SETTINGS, "Set")) {
+        Some(set) => {
+            let state = childValue(doc, set, NS_SETTINGS, "OofState");
+            var message = String.create();
+            match (doc.find(set, NS_SETTINGS, "ReplyMessage")) {
+                Some(m) => { mem(message.append(doc.textView(m)))?; }
+                null => {}
+            }
+            var params = PgParams.create();
+            pg(params.int64(s.userId))?;
+            pg(params.bool(state == "1" || state == "2"))?;
+            pg(params.text(message.view()))?;
+            await query(
+                store,
+                "UPDATE users SET auto_reply_enabled = $2, auto_reply_body = CASE WHEN $3 = '' THEN auto_reply_body ELSE $3 END, updated_at = now() WHERE id = $1",
+                params,
+            )?;
+            w.element(PAGE_SETTINGS, "Status", "1");
+        }
+        null => {
+            var params = PgParams.create();
+            pg(params.int64(s.userId))?;
+            let rows = await query(
+                store,
+                "SELECT auto_reply_enabled, coalesce(auto_reply_body, '') FROM users WHERE id = $1",
+                params,
+            )?;
+            let on = rows.bool(0, 0) ?? false;
+            w.element(PAGE_SETTINGS, "Status", "1");
+            w.start(PAGE_SETTINGS, "Get");
+            w.element(PAGE_SETTINGS, "OofState", if (on) "1" else "0");
+            writeOofMessage(w, "AppliesToInternal", on, rows.text(0, 1) ?? "");
+            writeOofMessage(w, "AppliesToExternalKnown", on, rows.text(0, 1) ?? "");
+            writeOofMessage(w, "AppliesToExternalUnknown", on, rows.text(0, 1) ?? "");
+            w.end();
+        }
+    }
+    w.end();
+    return Ok();
+}
+
+fn writeOofMessage(w: borrow mut WbxmlWriter, audience: StringView, on: bool, message: StringView) {
+    w.start(PAGE_SETTINGS, "OofMessage");
+    w.empty(PAGE_SETTINGS, audience);
+    w.element(PAGE_SETTINGS, "Enabled", if (on) "1" else "0");
+    w.element(PAGE_SETTINGS, "ReplyMessage", message);
+    w.element(PAGE_SETTINGS, "BodyType", "Text");
+    w.end();
+}

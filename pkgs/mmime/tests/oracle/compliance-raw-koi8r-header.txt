@@ -1,0 +1,10 @@
+size 359
+envelope ("Tue, 12 Nov 2013 09:12:42 -0500" "\\xef\\xd4\\xcb\\xd5\\xc4\\xc1 \\xcf\\xce \\xd0\\xcf\\xd1\\xd7\\xc9\\xcc\\xd3\\xd1?" ((NIL NIL "mimekit" "example.com")) ((NIL NIL "mimekit" "example.com")) ((NIL NIL "mimekit" "example.com")) ((NIL NIL "mimekit" "example.com")) NIL NIL NIL "<54AD68C9E3B0184CAC6041320424FD1B5B81E74D@localhost.localdomain>")
+bodystructure ("text" "plain" ("charset" "koi8-r") NIL NIL "8bit" 21 1 NIL NIL NIL NIL)
+body ("text" "plain" ("charset" "koi8-r") NIL NIL "8bit" 21 1)
+section HEADER 338 fb5839e9048cd4878dc1fd0eaa6246a9fad114f90fda52d74e6b324a734c4594
+section TEXT 21 db4e151febc676040fc6f6dec5a0b0ebe2c2cf80d73b80ebd0c76027eb2e9cbb
+section HEADER.FIELDS 245 7ebd8a5d968053523d67d7bac2b3d43b7fefdf3e6c713690d7f408f978048409
+section HEADER.FIELDS.NOT 95 d72bc3a0b464307a488285184e84d703a1237f5ff4e32751d379e338b6a1c48f
+section 1 21 db4e151febc676040fc6f6dec5a0b0ebe2c2cf80d73b80ebd0c76027eb2e9cbb
+section 1.MIME 338 fb5839e9048cd4878dc1fd0eaa6246a9fad114f90fda52d74e6b324a734c4594

@@ -1,0 +1,16 @@
+size 2041
+envelope ("Wed, 26 Apr 1995 18:22:47 +0001" "work space" (("Stefano Gazziano" NIL "GAZZIANO_S" "casaccia.enea.it")) (("SAS(r) Discussion" NIL "SAS-L%VTVM1.BITNET" "vtbit.cc.vt.edu")) ((NIL NIL "GAZZIANO_S" "casaccia.enea.it")) NIL NIL NIL NIL "<01HPSYRPA1IAERWENE@ECA401.CASACCIA.ENEA.IT>")
+bodystructure ("message" "rfc822" NIL NIL NIL "7bit" 1397 ("Wed, 26 Apr 1995 17:25:38 +0001" "work file space" ((NIL NIL "GAZZIANO_S" "casaccia.enea.it")) ((NIL NIL "GAZZIANO_S" "casaccia.enea.it")) ((NIL NIL "GAZZIANO_S" "casaccia.enea.it")) ((NIL NIL "sas-l" "uga.ucc.uga.edu")) ((NIL NIL "gazziano_s" "casaccia.enea.it")) NIL NIL "<01HPSWRQOS4IERWELB@ECA401.CASACCIA.ENEA.IT>") ("TEXT" "PLAIN" ("CHARSET" "US-ASCII") NIL NIL "7bit" 901 25 NIL NIL NIL NIL) 38 NIL NIL NIL NIL)
+body ("message" "rfc822" NIL NIL NIL "7bit" 1397 ("Wed, 26 Apr 1995 17:25:38 +0001" "work file space" ((NIL NIL "GAZZIANO_S" "casaccia.enea.it")) ((NIL NIL "GAZZIANO_S" "casaccia.enea.it")) ((NIL NIL "GAZZIANO_S" "casaccia.enea.it")) ((NIL NIL "sas-l" "uga.ucc.uga.edu")) ((NIL NIL "gazziano_s" "casaccia.enea.it")) NIL NIL "<01HPSWRQOS4IERWELB@ECA401.CASACCIA.ENEA.IT>") ("TEXT" "PLAIN" ("CHARSET" "US-ASCII") NIL NIL "7bit" 901 25) 38)
+section HEADER 644 7897e908d4d0a5dde4de66c79ebd504fa3d6979e65f57d13e1443144dde2a3a1
+section TEXT 1397 eba9a4c550d2cfac46260f543fbfb26647d8a5ca227fbc0851e9532de8c80f0b
+section HEADER.FIELDS 204 9d74e311f2bbe818275b855bf39a3a15523156400f803edb5e9b76033fa53577
+section HEADER.FIELDS.NOT 442 abb0e84f85dd4a0cdd18baffb556f032157e34ecd4ac0f55f7c1823e7e0e0236
+section 1 1397 eba9a4c550d2cfac46260f543fbfb26647d8a5ca227fbc0851e9532de8c80f0b
+section 1.MIME 644 7897e908d4d0a5dde4de66c79ebd504fa3d6979e65f57d13e1443144dde2a3a1
+section 1.HEADER 496 d65320e1c98d132e7a6ddbf6306a0f9440c0d3c9a89b82110583c0878e04e881
+section 1.TEXT 901 63978cff84da4c8e0804c6d7f8e34b604a7eebc4c75dc4fcb5e81b0e232a1271
+section 1.HEADER.FIELDS 264 df6651166a48d8b3e7296fb08fbbfa2caa21d5d69b2214bc6e07dca9cf8b85e3
+section 1.HEADER.FIELDS.NOT 234 8630bfcccdfd7dffc4382f7feccec0d44f79003d36c31ce376decb7bd389950e
+section 1.1 901 63978cff84da4c8e0804c6d7f8e34b604a7eebc4c75dc4fcb5e81b0e232a1271
+section 1.1.MIME 496 d65320e1c98d132e7a6ddbf6306a0f9440c0d3c9a89b82110583c0878e04e881

@@ -1,0 +1,12 @@
+size 603
+envelope (NIL NIL NIL NIL NIL NIL NIL NIL NIL NIL)
+bodystructure (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 58 1 NIL NIL NIL NIL) ("message" "delivery-status" NIL NIL NIL "7bit" 157 NIL NIL NIL NIL) "report" ("report-type" "delivery-status" "boundary" "==unit.test.boundary") NIL NIL NIL)
+body (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 58 1) ("message" "delivery-status" NIL NIL NIL "7bit" 157) "report")
+section HEADER 269 257b75ae5e36a3c4acd4fc4513c6535709f4fd7dac0fc7b89584bd2e3c3447c5
+section TEXT 334 e21a2a48a10279bf8455740459ad6873db5af2c6483163c46fe15acd92ba4698
+section HEADER.FIELDS 96 459e4f112054aee1e554b751be62223bd5de8321516e42015746e79111d88154
+section HEADER.FIELDS.NOT 175 9a8167ba6f416b9f14f40cc2e9174028b2807f51a667bf1d4bc7df865dcef3f7
+section 1 58 e790f0e5c311b4bef400f17d7522217aa9023e839c7d306cb12da83bac31c7ba
+section 1.MIME 28 c3204dd99ab0f23ec6029433de09a5ae168a2daab5b5352645a32379e329b040
+section 2 157 79bdeb609872e3d9c8481335c0152768602bf28d794dad7cbfb512dae68b0b0e
+section 2.MIME 41 ac3f707be26d1ced18b7c61c482c6de1e9efb866c0804cfab299612eae1d0c0b

@@ -1,0 +1,106 @@
+// Header blocks as kept by the scanner: each field's lines, CRLF-terminated. Nothing here allocates.
+
+/// Whether `c` is a space or a horizontal tab.
+fn isWsp(c: u8) -> bool => c == 0x20 || c == 0x09;
+
+/// A field of a header block, as offsets into it: the name is `[nameStart, nameEnd)`, the raw value (from after the
+/// colon, continuation lines included) `[valueStart, valueEnd)`.
+public struct HeaderField {
+    public nameStart: usize;
+    public nameEnd: usize;
+    public valueStart: usize;
+    public valueEnd: usize;
+}
+
+/// Walks the fields of a header block in order.
+public struct HeaderCursor {
+    at: usize;
+
+    public fn start() -> HeaderCursor => HeaderCursor { at: 0 };
+
+    /// The next field of `block`, or `null` at the end. A line without a colon is skipped.
+    public fn next(borrow mut this, block: Slice<u8>) -> HeaderField? {
+        while (this.at < block.length) {
+            let start = this.at;
+            // The field runs to the first line end not followed by a space or a tab.
+            var end = start;
+            loop {
+                let lf = match (block[end..].indexOfByte(0x0a)) {
+                    Some(i) => i,
+                    null => {
+                        end = block.length;
+                        break;
+                    }
+                };
+                end = end + lf + 1;
+                if (end >= block.length || !isWsp(block[end])) {
+                    break;
+                }
+            }
+            this.at = end;
+            let colon = match (block[start..end].indexOfByte(0x3a)) {
+                Some(c) => start + c,
+                null => { continue; }
+            };
+            var nameEnd = colon;
+            while (nameEnd > start && isWsp(block[nameEnd - 1])) {
+                nameEnd -= 1;
+            }
+            if (nameEnd == start) {
+                continue;
+            }
+            return HeaderField { nameStart: start, nameEnd: nameEnd, valueStart: colon + 1, valueEnd: end };
+        }
+        return null;
+    }
+}
+
+/// The value of the first field called `name` (any case) in `block`, or `null`.
+fn headerValue<region r>(block: Slice<r, u8>, name: StringView) -> Slice<r, u8>? {
+    var cursor = HeaderCursor.start();
+    loop {
+        let field = cursor.next(block)?;
+        if (block[field.nameStart..field.nameEnd].equalsIgnoreAsciiCase(name.bytes())) {
+            return block[field.valueStart..field.valueEnd];
+        }
+    }
+}
+
+fn isSpace(c: u8) -> bool => c == 0x20 || c == 0x09 || c == 0x0d || c == 0x0a;
+
+/// Appends `value` unfolded as an IMAP ENVELOPE shows most fields (Dovecot's reading): line breaks removed, and the
+/// whitespace before the first other byte; the rest as it is.
+fn appendUnfolded(value: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    var started = false;
+    for (c in value) {
+        if (c == 0x0d || c == 0x0a) {
+            continue;
+        }
+        if (!started && isWsp(c)) {
+            continue;
+        }
+        started = true;
+        out.pushBE(c)?;
+    }
+    return Ok();
+}
+
+/// Appends `value` with each run of whitespace (line breaks included) one space and none at either end, as an
+/// ENVELOPE shows a subject or a display name.
+fn appendCollapsed(value: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    var space = false;
+    var any = false;
+    for (c in value) {
+        if (isSpace(c)) {
+            space = any;
+            continue;
+        }
+        if (space) {
+            out.pushBE(0x20u8)?;
+            space = false;
+        }
+        out.pushBE(c)?;
+        any = true;
+    }
+    return Ok();
+}

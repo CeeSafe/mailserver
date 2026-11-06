@@ -1,0 +1,7 @@
+[package]
+name = "mxml"
+version = "0.1.0"
+kind = "library"
+tests = ["tests"]
+
+[dependencies]

@@ -1,0 +1,10 @@
+size 528
+envelope ("Tue, 12 Nov 2013 09:12:42 -0500" "This is a test message" ((NIL NIL "unit-tests" "mimekit.net")) ((NIL NIL "unit-tests" "mimekit.net")) ((NIL NIL "unit-tests" "mimekit.net")) ((NIL NIL "unit-tests" "mimekit.net")) NIL NIL NIL "<123@example.org>")
+bodystructure (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 0 0 NIL NIL NIL NIL) "mixed" ("boundary" "----=_NextPart_000_003F_01CE98CE.6E826F90") NIL NIL NIL)
+body (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 0 0) "mixed")
+section HEADER 267 1aea3c8decec13da9ccaf803ce42f0570a6800971d7e2b385b56237c6d26084b
+section TEXT 261 d85d3aa0c4830d86903faf51b538572ff4ebaf43ed824650b43dada9550e5590
+section HEADER.FIELDS 248 3301e3549acc0d12b89c31c7a190319bce1b99ae693c379bed07239c6d9f47f8
+section HEADER.FIELDS.NOT 21 07a26ab8981ff3b1de28da29cf47f47e315b9c25685121dc5ebb60391005b2de
+section 1 0 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+section 1.MIME 0 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855

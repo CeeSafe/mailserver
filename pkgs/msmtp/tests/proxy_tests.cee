@@ -1,0 +1,148 @@
+// PROXY headers: version 1 text, version 2 binary over a loopback connection with the client's first line right
+// behind it (which must not be consumed), and the networks headers are taken from.
+
+import mdns.IpAddress;
+
+const PROXY_TEST_TIMEOUT: u64 = 5000;
+
+fn addressIs(got: SocketAddress?, a: u8, b: u8, c: u8, d: u8, port: u16) -> bool => match (got) {
+    Some(SocketAddress.V4(x, p)) => x[0] == a && x[1] == b && x[2] == c && x[3] == d && p == port,
+    _ => false,
+};
+
+@test
+fn parsesVersionOne() -> Result<void, TestFailure> {
+    need(addressIs(ok(parseV1("PROXY TCP4 192.0.2.7 198.51.100.1 51234 25\r\n".bytes())), 192, 0, 2, 7, 51234), "check 1")?;
+    match (parseV1("PROXY TCP6 2001:db8::5 2001:db8::1 4000 993\r\n".bytes())) {
+        Ok(Some(SocketAddress.V6(a, p, _))) => { need(a[0] == 0x20 && a[1] == 0x01 && a[15] == 5 && p == 4000, "check 2")?; }
+        _ => { need(false, "check 3")?; }
+    }
+    match (parseV1("PROXY UNKNOWN\r\n".bytes())) {
+        Ok(null) => {}
+        _ => { need(false, "check 4")?; }
+    }
+    // A family that does not match the address, a port out of range, missing fields, no CRLF.
+    need(!bound(parseV1("PROXY TCP6 192.0.2.7 198.51.100.1 1 2\r\n".bytes())), "check 5")?;
+    need(!bound(parseV1("PROXY TCP4 192.0.2.7 198.51.100.1 65536 25\r\n".bytes())), "check 6")?;
+    need(!bound(parseV1("PROXY TCP4 192.0.2.7 198.51.100.1 1\r\n".bytes())), "check 7")?;
+    need(!bound(parseV1("PROXY TCP4 192.0.2.7  198.51.100.1 1 2\r\n".bytes())), "check 8")?;
+    need(!bound(parseV1("PROXY TCP4 192.0.2.7 198.51.100.1 1 2\n".bytes())), "check 9")?;
+    return Ok();
+}
+
+fn ok(r: Result<SocketAddress?, ProxyError>) -> SocketAddress? => match (r) {
+    Ok(a) => a,
+    Err(_) => null,
+};
+
+fn bound(r: Result<SocketAddress?, ProxyError>) -> bool => match (r) {
+    Ok(_) => true,
+    Err(_) => false,
+};
+
+@test
+fn matchesProxyNetworks() -> Result<void, TestFailure> {
+    var networks = Vector<ProxyNetwork>.create();
+    networks.push(parseProxyNetwork("172.16.0.0/12".bytes())!)!;
+    networks.push(parseProxyNetwork("127.0.0.1".bytes())!)!;
+    networks.push(parseProxyNetwork("fd00::/8".bytes())!)!;
+    need(fromProxy(networks, SocketAddress.V4([172u8, 19, 0, 1], 1)), "check 13")?;
+    need(!fromProxy(networks, SocketAddress.V4([172u8, 32, 0, 1], 1)), "check 14")?;
+    need(fromProxy(networks, SocketAddress.V4([127u8, 0, 0, 1], 1)), "check 15")?;
+    need(!fromProxy(networks, SocketAddress.V4([127u8, 0, 0, 2], 1)), "check 16")?;
+    need(fromProxy(networks, IpAddress { bytes: [0xfdu8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1] }.socket(1)), "check 17")?;
+    need(parseProxyNetwork("10.0.0.0/33".bytes()) == null, "check 18")?;
+    need(parseProxyNetwork("10.0.0.0/".bytes()) == null, "check 19")?;
+    need(parseProxyNetwork("example".bytes()) == null, "check 20")?;
+    return Ok();
+}
+
+fn need(ok: bool, what: StringView) -> Result<void, TestFailure> {
+    if (!ok) {
+        return Err(TestFailure.create(what));
+    }
+    return Ok();
+}
+
+async fn check(ok: bool, what: StringView) -> Result<void, AsyncError> {
+    if (!ok) {
+        match (await AsyncConsole.writeError(what)) {
+            Ok() => {}
+            Err(_) => {}
+        }
+        return Err(AsyncError.Io(IoError.BrokenPipe));
+    }
+    return Ok();
+}
+
+async fn proxiedServer(listener: borrow AsyncTcpListener) -> Result<void, AsyncError> {
+    let fail = AsyncError.Io(IoError.BrokenPipe);
+    // Version 2, then version 1, each on its own connection, each followed at once by a command line.
+    for (round in 0..2) {
+        let stream = await listener.accept()?;
+        let got = match (await readProxyHeader(stream, PROXY_TEST_TIMEOUT)) {
+            Ok(a) => a,
+            Err(_) => { return Err(fail); }
+        };
+        let port: u16 = if (round == 0) 40000 else 40001;
+        await check(addressIs(got, 203, 0, 113, 9, port), "the client's address")?;
+        var wire = match (Wire.plain(stream)) {
+            Ok(w) => w,
+            Err(_) => { return Err(fail); }
+        };
+        wire.setProxied(got);
+        await check(addressIs(wire.peer(), 203, 0, 113, 9, port), "the wire's peer is the client")?;
+        var line = Vector<u8>.create();
+        match (await wire.readLine(mut line, PROXY_TEST_TIMEOUT)) {
+            Ok() => {}
+            Err(_) => { return Err(fail); }
+        }
+        await check(line.view() == "EHLO client.example".bytes(), "the line after the header is intact")?;
+        await wire.close();
+    }
+    return Ok();
+}
+
+async fn proxiedClient(port: u16) -> Result<void, AsyncError> {
+    // \r\n\r\n\0\r\nQUIT\n, PROXY over TCP4, 12 address bytes plus a 3-byte TLV (which is skipped).
+    let header: [u8; 31] = [
+        0x0d, 0x0a, 0x0d, 0x0a, 0x00, 0x0d, 0x0a, 0x51, 0x55, 0x49, 0x54, 0x0a,
+        0x21, 0x11, 0x00, 0x0f,
+        203, 0, 113, 9, 198, 51, 100, 1, 0x9c, 0x40, 0x00, 0x19,
+        0x04, 0x00, 0x00,
+    ];
+    let first = await AsyncTcpStream.connect("127.0.0.1", port)?;
+    var both = Vector<u8>.create();
+    match (both.extend(header[..])) {
+        Ok() => {}
+        Err(_) => { return Err(AsyncError.Io(IoError.BrokenPipe)); }
+    }
+    match (both.extend("EHLO client.example\r\n".bytes())) {
+        Ok() => {}
+        Err(_) => { return Err(AsyncError.Io(IoError.BrokenPipe)); }
+    }
+    await first.write(both.view())?;
+    var rest = [0u8; 16];
+    let _ = await first.read(mut rest[..]);
+    let second = await AsyncTcpStream.connect("127.0.0.1", port)?;
+    await second.write("PROXY TCP4 203.0.113.9 198.51.100.1 40001 25\r\nEHLO client.example\r\n".bytes())?;
+    let _ = await second.read(mut rest[..]);
+    return Ok();
+}
+
+@test
+async fn readsHeadersWithoutReadingPast() -> Result<void, AsyncError> {
+    let listener = match (AsyncTcpListener.bind("127.0.0.1", 0)) {
+        Ok(l) => l,
+        Err(e) => { return Err(AsyncError.Io(e)); }
+    };
+    let port = match (listener.port()) {
+        Ok(p) => p,
+        Err(e) => { return Err(AsyncError.Io(e)); }
+    };
+    await Async.scope(AsyncError.Cancelled, (s) => {
+        s.spawn(async () => await proxiedServer(borrow listener));
+        s.spawn(async () => await proxiedClient(port));
+    })?;
+    return Ok();
+}

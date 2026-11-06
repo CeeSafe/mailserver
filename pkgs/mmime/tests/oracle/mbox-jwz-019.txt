@@ -1,0 +1,12 @@
+size 2175
+envelope ("Sun, 7 May 95 16:21:03 GMT" "Re: The Once and Future OS" (("Peter Urka" NIL "pcu" "umich.edu")) ((NIL NIL "preston" "urkabox.chem.lsa.umich.edu")) ((NIL NIL "pcu" "umich.edu")) NIL NIL NIL NIL "<07May1621030321@urkabox.chem.lsa.umich.edu>")
+bodystructure (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 186 6 NIL NIL NIL NIL) ("application" "postscript" NIL NIL NIL "base64" 904 NIL NIL NIL NIL) "mixed" ("boundary" "NutNews,-a-nntpmtsonsguinrcfas,-boundary") NIL NIL NIL)
+body (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 186 6) ("application" "postscript" NIL NIL NIL "base64" 904) "mixed")
+section HEADER 731 f324a6971326d8220840bdce8c5cc22169af1f534ed97a64180c84087d5c12fc
+section TEXT 1444 5a4d8fc1aff7d73e9d2b7bd7a5dc3356da2d2346457f13ac491a3cd64202db36
+section HEADER.FIELDS 251 2bc0a8b4cb25f54ba9c4a2f9bea182ea550eeb458ae045ef663adb60496a815e
+section HEADER.FIELDS.NOT 482 9d882d15f3557f43b053d388e179e03870f003d958a262b5bf03defc77e29acf
+section 1 186 590413dabfea952688bb5c2e74fee4ebace3ee7f89dc3cfea2b23aa7626b31b1
+section 1.MIME 28 c3204dd99ab0f23ec6029433de09a5ae168a2daab5b5352645a32379e329b040
+section 2 904 7c5f9467bdf1c6beee62270105fcfdb1b49b0cfa5992b6199cd648b91bdda34a
+section 2.MIME 75 467295c01ec1139e37a4b3d5893f1beb296f032b979371d2f84587306435eead

@@ -1,0 +1,18 @@
+size 852
+envelope ("Tue, 12 Nov 2013 09:12:42 -0500" "xxxx xx xxxxxx xxxxxxxx xxxxxxxxxxxxxx xxxx" ((NIL NIL "xxxxxxx" "xxxxxxx.xxx")) ((NIL NIL "xxxxxxx" "xxxxxxx.xxx")) ((NIL NIL "xxxxxxx" "xxxxxxx.xxx")) ((NIL NIL "xxxxxxx" "xxxxxxx.xxx")) NIL NIL NIL "<xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx@xxxxxxxxx.xxxxxxxxxxx>")
+bodystructure (("text" "plain" ("charset" "utf-8") NIL NIL "7bit" 27 1 NIL NIL NIL NIL) ("message" "rfc822" NIL NIL NIL "7bit" 216 ("Tue, 12 Nov 2013 09:12:42 -0500" "xxxxxxxx xxxxxxx" ((NIL NIL "xxxxxxx" "xxxxxxx.xxx")) ((NIL NIL "xxxxxxx" "xxxxxxx.xxx")) ((NIL NIL "xxxxxxx" "xxxxxxx.xxx")) ((NIL NIL "xxxxxxx" "xxxxxxx.xxx")) NIL NIL NIL NIL) ("text" "plain" ("charset" "utf-8") NIL NIL "7bit" 36 1 NIL NIL NIL NIL) 8 NIL NIL NIL NIL) "mixed" ("boundary" "----=_NextPart_000_003F_01CE98CE.6E826F90") NIL NIL NIL)
+body (("text" "plain" ("charset" "utf-8") NIL NIL "7bit" 27 1) ("message" "rfc822" NIL NIL NIL "7bit" 216 ("Tue, 12 Nov 2013 09:12:42 -0500" "xxxxxxxx xxxxxxx" ((NIL NIL "xxxxxxx" "xxxxxxx.xxx")) ((NIL NIL "xxxxxxx" "xxxxxxx.xxx")) ((NIL NIL "xxxxxxx" "xxxxxxx.xxx")) ((NIL NIL "xxxxxxx" "xxxxxxx.xxx")) NIL NIL NIL NIL) ("text" "plain" ("charset" "utf-8") NIL NIL "7bit" 36 1) 8) "mixed")
+section HEADER 393 8d8c4450888085b42c435d20d6bd6716fded006dd974947cefd3e240bbe9f975
+section TEXT 459 029ec170707ff21f2a0b21e37b3bbb660156c3b9f46fa26339bea2ddd0281393
+section HEADER.FIELDS 312 76ede497fb29389de3a79ae0e453372b51b0fccf7520f694bc564235ca1565d2
+section HEADER.FIELDS.NOT 83 1177185119e8b4ed2dce916d489efa64b2347df369a82206457145233bf98f75
+section 1 27 75c6547fcd7c7e4c9d9c6116c85fd212ce668179c960dc5473783a07c32c39b8
+section 1.MIME 43 898726ecfd03d1be63b954310c21c8a7603e00979b91fb78949c88de26d728fb
+section 2 216 c3263c0c74835914d2f237b7fb9f677808c6c08a76813ffe560c79e7fd7bb48a
+section 2.MIME 32 94984f8e29692f32be6724e812f5568ad06604428ccd4509df6c3a1c966800a0
+section 2.HEADER 180 85ff063b12ddff5c8cb0a190bf5edccab97b23ab65c57de1a1bfb2f25ac790cc
+section 2.TEXT 36 d32e7f830697b4021933f601a5b86a110b549b34b4b1c376858e66c879b93141
+section 2.HEADER.FIELDS 161 e4138e31fb5d9e710c61201d1990d4f61d57574f6b59dfb97b7ef0d71c902517
+section 2.HEADER.FIELDS.NOT 21 07a26ab8981ff3b1de28da29cf47f47e315b9c25685121dc5ebb60391005b2de
+section 2.1 36 d32e7f830697b4021933f601a5b86a110b549b34b4b1c376858e66c879b93141
+section 2.1.MIME 180 85ff063b12ddff5c8cb0a190bf5edccab97b23ab65c57de1a1bfb2f25ac790cc

@@ -1,0 +1,5 @@
+# MTA-STS policies served by pkgs/mqueue/tools/fakests.py, by host name (see zone.yaml).
+mta-sts.sts.test: "version: STSv1\nmode: enforce\nmx: localhost\nmax_age: 86400\n"
+mta-sts.stsbad.test: "version: STSv1\nmode: enforce\nmx: elsewhere.stsbad.test\nmax_age: 86400\n"
+mta-sts.stscert.test: "version: STSv1\nmode: enforce\nmx: mx.stscert.test\nmax_age: 86400\n"
+mta-sts.ststesting.test: "version: STSv1\nmode: testing\nmx: elsewhere.ststesting.test\nmax_age: 86400\n"

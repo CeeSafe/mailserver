@@ -1,0 +1,19 @@
+[package]
+name = "msmtp"
+version = "0.1.0"
+kind = "library"
+tests = ["tests"]
+
+[dependencies]
+mstore = { path = "../mstore" }
+mmime = { path = "../mmime" }
+mauth = { path = "../mauth" }
+mdns = { path = "../mdns" }
+mscan = { path = "../mscan" }
+msieve = { path = "../msieve" }
+postgres = { path = "../../../PostgresClient" }
+tls = { path = "../../../../CeeSafeLibs/tls" }
+bcrypt = { path = "../../../../CeeSafeLibs/bcrypt" }
+encoding = { path = "../../../../CeeSafeLibs/encoding" }
+sha256 = { path = "../../../../CeeSafeLibs/sha256" }
+diskio = { path = "../../../../CeeSafeLibs/diskio" }

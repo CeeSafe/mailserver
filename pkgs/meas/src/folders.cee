@@ -1,0 +1,547 @@
+// The folder hierarchy (MS-ASCMD FolderSync, FolderCreate, FolderUpdate, FolderDelete). A device is given every
+// mailbox (`m<id>`), calendar (`c<id>`) and address book (`a<id>`) of the user's, as the C# server named them; what
+// it was given is in eas_folders, so a FolderSync sends what changed since.
+
+import mpim.Collection;
+import mpim.DEFAULT_COLLECTION;
+import mpim.KIND_ADDRESSBOOK;
+import mpim.KIND_CALENDAR;
+import mpim.PimError;
+import mpim.allCollections;
+import mpim.collectionById;
+import mpim.createCollection;
+import mpim.deleteCollection;
+import mpim.updateCollection;
+import mstore.MailboxList;
+import mstore.StoreError;
+import mhttp.Response;
+import msmtp.SmtpContext;
+import mxml.XmlDocument;
+import postgres.PgParams;
+
+public const KIND_MAILBOX: u8 = 0;
+public const KIND_EVENTS: u8 = 1;
+public const KIND_CONTACTS: u8 = 2;
+
+/// EAS folder types (MS-ASCMD §2.2.3.186.3).
+const TYPE_MAIL: i32 = 12;
+const TYPE_INBOX: i32 = 2;
+const TYPE_DRAFTS: i32 = 3;
+const TYPE_TRASH: i32 = 4;
+const TYPE_SENT: i32 = 5;
+const TYPE_CALENDAR: i32 = 8;
+const TYPE_CONTACTS: i32 = 9;
+const TYPE_USER_CALENDAR: i32 = 13;
+const TYPE_USER_CONTACTS: i32 = 14;
+
+/// A folder as a device sees it.
+struct Folder {
+    collectionId: String;
+    parentId: String;
+    name: String;
+    kind: u8;
+    folderType: i32;
+    sourceId: i64;
+}
+
+fn kindName(kind: u8) -> StringView =>
+    if (kind == KIND_MAILBOX) "mailbox" else if (kind == KIND_EVENTS) "calendar" else "addressbook";
+
+fn kindOf(name: StringView) -> u8 =>
+    if (name == "mailbox") KIND_MAILBOX else if (name == "calendar") KIND_EVENTS else KIND_CONTACTS;
+
+/// The class a Sync names a folder's items by.
+fn classOf(kind: u8) -> StringView =>
+    if (kind == KIND_MAILBOX) "Email" else if (kind == KIND_EVENTS) "Calendar" else "Contacts";
+
+fn mailboxType(name: StringView, specialUse: StringView) -> i32 {
+    if (name.equalsIgnoreAsciiCase("INBOX")) {
+        return TYPE_INBOX;
+    }
+    if (specialUse == "\\Drafts") {
+        return TYPE_DRAFTS;
+    }
+    if (specialUse == "\\Trash") {
+        return TYPE_TRASH;
+    }
+    if (specialUse == "\\Sent") {
+        return TYPE_SENT;
+    }
+    return TYPE_MAIL;
+}
+
+fn idText(prefix: StringView, id: i64, into: borrow mut String) -> Result<void, EasFail> {
+    into.clear();
+    mem(into.append(prefix))?;
+    return mem(into.appendNumber(id));
+}
+
+/// The user's folders now, mailboxes first.
+async fn currentFolders(
+    mail: borrow SmtpContext,
+    userId: i64,
+    into: borrow mut Vector<Folder>,
+) -> Result<void, EasFail> {
+    into.clear();
+    var boxes = MailboxList.create();
+    match (await mail.store.mailboxes(userId, mut boxes)) {
+        Ok() => {}
+        Err(_) => { return Err(EasFail.Unavailable); }
+    }
+    for (i in 0..boxes.count()) {
+        let name = boxes.name(i);
+        var f = Folder {
+            collectionId: String.create(),
+            parentId: String.create(),
+            name: String.create(),
+            kind: KIND_MAILBOX,
+            folderType: mailboxType(name, boxes.specialUse(i)),
+            sourceId: boxes.id(i),
+        };
+        idText("m", boxes.id(i), mut f.collectionId)?;
+        // "Work/Projects" is "Projects" inside "Work", when "Work" exists.
+        let slash = name.lastIndexOf("/");
+        match (slash) {
+            Some(cut) => {
+                mem(f.name.append(name[(cut + 1)..]))?;
+                let parent = name[0..cut];
+                for (j in 0..boxes.count()) {
+                    if (boxes.name(j) == parent) {
+                        idText("m", boxes.id(j), mut f.parentId)?;
+                    }
+                }
+            }
+            null => { mem(f.name.append(name))?; }
+        }
+        if (f.parentId.length == 0) {
+            mem(f.parentId.append("0"))?;
+        }
+        mem(into.push(f))?;
+    }
+    var collections = Vector<Collection>.create();
+    match (await allCollections(borrow mail.store, userId, mut collections)) {
+        Ok() => {}
+        Err(_) => { return Err(EasFail.Unavailable); }
+    }
+    for (c in collections.view()) {
+        let calendar = c.isCalendar();
+        let isDefault = c.name.view() == DEFAULT_COLLECTION;
+        var f = Folder {
+            collectionId: String.create(),
+            parentId: String.create(),
+            name: String.create(),
+            kind: if (calendar) KIND_EVENTS else KIND_CONTACTS,
+            folderType: if (calendar) (if (isDefault) TYPE_CALENDAR else TYPE_USER_CALENDAR) else (if (isDefault) TYPE_CONTACTS else TYPE_USER_CONTACTS),
+            sourceId: c.id,
+        };
+        idText(if (calendar) "c" else "a", c.id, mut f.collectionId)?;
+        mem(f.parentId.append("0"))?;
+        mem(f.name.append(if (c.displayName.length > 0) c.displayName.view() else c.name.view()))?;
+        mem(into.push(f))?;
+    }
+    return Ok();
+}
+
+fn writeFolder(w: borrow mut WbxmlWriter, f: borrow Folder) {
+    w.element(PAGE_FOLDERS, "ServerId", f.collectionId.view());
+    w.element(PAGE_FOLDERS, "ParentId", f.parentId.view());
+    w.element(PAGE_FOLDERS, "DisplayName", f.name.view());
+    w.number(PAGE_FOLDERS, "Type", f.folderType as i64);
+}
+
+fn sqlSaveFolder() -> StringView =>
+    """
+    INSERT INTO eas_folders (device_id, collection_id, kind, source_id, parent_id, display_name, folder_type)
+    VALUES ($1, $2, $3, $4, $5, $6, $7)
+    ON CONFLICT (device_id, collection_id) DO UPDATE SET kind = EXCLUDED.kind, source_id = EXCLUDED.source_id,
+        parent_id = EXCLUDED.parent_id, display_name = EXCLUDED.display_name, folder_type = EXCLUDED.folder_type,
+        updated_at = now()
+    """;
+
+async fn saveFolder(mail: borrow SmtpContext, device: i64, f: borrow Folder) -> Result<void, EasFail> {
+    var params = PgParams.create();
+    pg(params.int64(device))?;
+    pg(params.text(f.collectionId.view()))?;
+    pg(params.text(kindName(f.kind)))?;
+    pg(params.int64(f.sourceId))?;
+    pg(params.text(f.parentId.view()))?;
+    pg(params.text(f.name.view()))?;
+    pg(params.int32(f.folderType))?;
+    await query(borrow mail.store, sqlSaveFolder(), params)?;
+    return Ok();
+}
+
+async fn forgetFolder(mail: borrow SmtpContext, device: i64, collectionId: StringView) -> Result<void, EasFail> {
+    var params = PgParams.create();
+    pg(params.int64(device))?;
+    pg(params.text(collectionId))?;
+    await query(borrow mail.store, "DELETE FROM eas_folders WHERE device_id = $1 AND collection_id = $2", params)?;
+    return Ok();
+}
+
+/// Sets the device's hierarchy sync key.
+async fn setHierarchyKey(mail: borrow SmtpContext, device: i64, key: i64) -> Result<void, EasFail> {
+    var params = PgParams.create();
+    pg(params.int64(device))?;
+    pg(params.int64(key))?;
+    await query(
+        borrow mail.store,
+        "UPDATE eas_devices SET hierarchy_key = $2, updated_at = now() WHERE id = $1",
+        params,
+    )?;
+    return Ok();
+}
+
+fn folderStatus(command: StringView, code: StringView) -> Result<Response, EasFail> {
+    var w = WbxmlWriter.create();
+    w.start(PAGE_FOLDERS, command);
+    w.element(PAGE_FOLDERS, "Status", code);
+    w.end();
+    return written(w);
+}
+
+async fn folderSync(mail: borrow SmtpContext, s: borrow Session, body: borrow Body) -> Result<Response, EasFail> {
+    let doc = borrow body.doc;
+    let keyText = if (body.present) childValue(doc, doc.root(), NS_FOLDERS, "SyncKey") else "0";
+    let key = keyText.parseInt<i64>() ?? -1;
+    if (key < 0 || (key != 0 && key != s.hierarchyKey)) {
+        return folderStatus("FolderSync", "9");
+    }
+    var current = Vector<Folder>.create();
+    await currentFolders(mail, s.userId, mut current)?;
+    var params = PgParams.create();
+    pg(params.int64(s.device))?;
+    if (key == 0) {
+        // A new start: the device forgets everything, and so does its record here.
+        await query(borrow mail.store, "DELETE FROM eas_folders WHERE device_id = $1", params)?;
+    }
+    let known = await query(
+        borrow mail.store,
+        "SELECT collection_id, parent_id, display_name, folder_type FROM eas_folders WHERE device_id = $1",
+        params,
+    )?;
+    // Changes: what is new or changed, then what went.
+    var adds = Vector<usize>.create();
+    var updates = Vector<usize>.create();
+    for (i in 0..current.length) {
+        var found = false;
+        for (r in 0..known.rowCount()) {
+            if ((known.text(r, 0) ?? "") == current[i].collectionId.view()) {
+                found = true;
+                let same = (known.text(
+                    r,
+                    1,
+                ) ?? "") == current[i].parentId.view() && (known.text(
+                    r,
+                    2,
+                ) ?? "") == current[i].name.view() && (known.int32(r, 3) ?? 0) == current[i].folderType;
+                if (!same) {
+                    mem(updates.push(i))?;
+                }
+            }
+        }
+        if (!found) {
+            mem(adds.push(i))?;
+        }
+    }
+    var deletes = Vector<usize>.create();
+    for (r in 0..known.rowCount()) {
+        var still = false;
+        for (f in current.view()) {
+            if ((known.text(r, 0) ?? "") == f.collectionId.view()) {
+                still = true;
+            }
+        }
+        if (!still) {
+            mem(deletes.push(r))?;
+        }
+    }
+    let changed = adds.length + updates.length + deletes.length > 0;
+    let next = if (key == 0) 1 else if (changed) s.hierarchyKey + 1 else s.hierarchyKey;
+    for (i in adds.view()) {
+        await saveFolder(mail, s.device, current[i])?;
+    }
+    for (i in updates.view()) {
+        await saveFolder(mail, s.device, current[i])?;
+    }
+    for (r in deletes.view()) {
+        await forgetFolder(mail, s.device, known.text(r, 0) ?? "")?;
+    }
+    if (next != s.hierarchyKey) {
+        await setHierarchyKey(mail, s.device, next)?;
+    }
+    var w = WbxmlWriter.create();
+    w.start(PAGE_FOLDERS, "FolderSync");
+    w.element(PAGE_FOLDERS, "Status", "1");
+    w.number(PAGE_FOLDERS, "SyncKey", next);
+    w.start(PAGE_FOLDERS, "Changes");
+    w.number(PAGE_FOLDERS, "Count", truncate<i64>(adds.length + updates.length + deletes.length));
+    for (i in adds.view()) {
+        w.start(PAGE_FOLDERS, "Add");
+        writeFolder(mut w, current[i]);
+        w.end();
+    }
+    for (i in updates.view()) {
+        w.start(PAGE_FOLDERS, "Update");
+        writeFolder(mut w, current[i]);
+        w.end();
+    }
+    for (r in deletes.view()) {
+        w.start(PAGE_FOLDERS, "Delete");
+        w.element(PAGE_FOLDERS, "ServerId", known.text(r, 0) ?? "");
+        w.end();
+    }
+    w.end();
+    w.end();
+    return written(w);
+}
+
+/// The sync key a folder command must carry; null (status 9 sent) when it does not.
+fn hierarchyKeyOk(doc: borrow XmlDocument, s: borrow Session) -> bool =>
+    (childValue(doc, doc.root(), NS_FOLDERS, "SyncKey").parseInt<i64>() ?? -1) == s.hierarchyKey;
+
+/// The mailbox name of mailbox `id` of the user's, into `into`; false when there is none.
+async fn mailboxName(mail: borrow SmtpContext, userId: i64, id: i64, into: borrow mut String) -> Result<bool, EasFail> {
+    var list = MailboxList.create();
+    let found = match (await mail.store.mailboxById(userId, id, mut list)) {
+        Ok(f) => f,
+        Err(_) => { return Err(EasFail.Unavailable); }
+    };
+    into.clear();
+    if (found) {
+        mem(into.append(list.name(0)))?;
+        if (list.specialUse(0).length > 0) {
+            // Special folders are refused by the callers through `specialMailbox`.
+        }
+    }
+    return Ok(found);
+}
+
+async fn specialOrInbox(mail: borrow SmtpContext, userId: i64, id: i64) -> Result<bool, EasFail> {
+    var list = MailboxList.create();
+    match (await mail.store.mailboxById(userId, id, mut list)) {
+        Ok(true) => { return Ok(list.name(0).equalsIgnoreAsciiCase("INBOX") || list.specialUse(0).length > 0); }
+        Ok(false) => { return Ok(false); }
+        Err(_) => { return Err(EasFail.Unavailable); }
+    }
+}
+
+/// A folder ServerId's kind and id: `m12` → (mailbox, 12).
+fn parseFolderId(id: StringView) -> [i64; 2]? {
+    if (id.length < 2) {
+        return null;
+    }
+    let kind = id[0..1];
+    let number = id[1..].parseInt<i64>()?;
+    if (kind == "m") {
+        return [KIND_MAILBOX as i64, number];
+    }
+    if (kind == "c") {
+        return [KIND_EVENTS as i64, number];
+    }
+    if (kind == "a") {
+        return [KIND_CONTACTS as i64, number];
+    }
+    return null;
+}
+
+async fn folderCreate(mail: borrow SmtpContext, s: borrow Session, body: borrow Body) -> Result<Response, EasFail> {
+    let doc = borrow body.doc;
+    if (!body.present) {
+        return folderStatus("FolderCreate", "10");
+    }
+    if (!hierarchyKeyOk(doc, s)) {
+        return folderStatus("FolderCreate", "9");
+    }
+    let root = doc.root();
+    let name = childValue(doc, root, NS_FOLDERS, "DisplayName");
+    let parent = childValue(doc, root, NS_FOLDERS, "ParentId");
+    let folderType = childNumber(doc, root, NS_FOLDERS, "Type", 0);
+    if (name.length == 0 || name.indexOf("/") != null) {
+        return folderStatus("FolderCreate", "10");
+    }
+    var f = Folder {
+        collectionId: String.create(),
+        parentId: String.create(),
+        name: String.create(),
+        kind: KIND_MAILBOX,
+        folderType: truncate<i32>(folderType),
+        sourceId: 0,
+    };
+    mem(f.name.append(name))?;
+    mem(f.parentId.append(if (parent.length > 0) parent else "0"))?;
+    if (folderType == 1 || folderType == 12) {
+        f.folderType = TYPE_MAIL;
+        var full = String.create();
+        if (parent.length > 0 && parent != "0") {
+            match (parseFolderId(parent)) {
+                Some(p) => {
+                    if (p[0] != KIND_MAILBOX as i64 || !(await mailboxName(mail, s.userId, p[1], mut full)?)) {
+                        return folderStatus("FolderCreate", "5");
+                    }
+                    mem(full.append("/"))?;
+                }
+                null => { return folderStatus("FolderCreate", "5"); }
+            }
+        }
+        mem(full.append(name))?;
+        match (await mail.store.createMailbox(s.userId, full.view(), "")) {
+            Ok(id) => { f.sourceId = id; }
+            Err(StoreError.Exists) => { return folderStatus("FolderCreate", "2"); }
+            Err(StoreError.Invalid) => { return folderStatus("FolderCreate", "10"); }
+            Err(_) => { return folderStatus("FolderCreate", "6"); }
+        }
+        idText("m", f.sourceId, mut f.collectionId)?;
+    } else if (folderType == 13 || folderType == 14) {
+        let calendar = folderType == 13;
+        f.kind = if (calendar) KIND_EVENTS else KIND_CONTACTS;
+        mem(f.parentId.append(""))?;
+        f.parentId.clear();
+        mem(f.parentId.append("0"))?;
+        match (await createCollection(
+            borrow mail.store,
+            s.userId,
+            if (calendar) KIND_CALENDAR else KIND_ADDRESSBOOK,
+            name,
+            name,
+            null,
+            null,
+        )) {
+            Ok(id) => { f.sourceId = id; }
+            Err(PimError.Exists) => { return folderStatus("FolderCreate", "2"); }
+            Err(_) => { return folderStatus("FolderCreate", "6"); }
+        }
+        idText(if (calendar) "c" else "a", f.sourceId, mut f.collectionId)?;
+    } else {
+        return folderStatus("FolderCreate", "10");
+    }
+    await saveFolder(mail, s.device, f)?;
+    let next = s.hierarchyKey + 1;
+    await setHierarchyKey(mail, s.device, next)?;
+    var w = WbxmlWriter.create();
+    w.start(PAGE_FOLDERS, "FolderCreate");
+    w.element(PAGE_FOLDERS, "Status", "1");
+    w.number(PAGE_FOLDERS, "SyncKey", next);
+    w.element(PAGE_FOLDERS, "ServerId", f.collectionId.view());
+    w.end();
+    return written(w);
+}
+
+async fn folderDelete(mail: borrow SmtpContext, s: borrow Session, body: borrow Body) -> Result<Response, EasFail> {
+    let doc = borrow body.doc;
+    if (!body.present) {
+        return folderStatus("FolderDelete", "10");
+    }
+    if (!hierarchyKeyOk(doc, s)) {
+        return folderStatus("FolderDelete", "9");
+    }
+    let serverId = childValue(doc, doc.root(), NS_FOLDERS, "ServerId");
+    let parsed = match (parseFolderId(serverId)) {
+        Some(p) => p,
+        null => { return folderStatus("FolderDelete", "4"); }
+    };
+    if (parsed[0] == KIND_MAILBOX as i64) {
+        if (await specialOrInbox(mail, s.userId, parsed[1])?) {
+            return folderStatus("FolderDelete", "3");
+        }
+        match (await mail.store.deleteMailbox(s.userId, parsed[1])) {
+            Ok() => {}
+            Err(StoreError.NotFound) => { return folderStatus("FolderDelete", "4"); }
+            Err(_) => { return folderStatus("FolderDelete", "6"); }
+        }
+    } else {
+        var c = Collection.create();
+        match (await collectionById(borrow mail.store, s.userId, parsed[1], mut c)) {
+            Ok(true) => {}
+            Ok(false) => { return folderStatus("FolderDelete", "4"); }
+            Err(_) => { return folderStatus("FolderDelete", "6"); }
+        }
+        if (c.name.view() == DEFAULT_COLLECTION) {
+            return folderStatus("FolderDelete", "3");
+        }
+        match (await deleteCollection(borrow mail.store, s.userId, parsed[1])) {
+            Ok() => {}
+            Err(_) => { return folderStatus("FolderDelete", "6"); }
+        }
+    }
+    await forgetFolder(mail, s.device, serverId)?;
+    let next = s.hierarchyKey + 1;
+    await setHierarchyKey(mail, s.device, next)?;
+    var w = WbxmlWriter.create();
+    w.start(PAGE_FOLDERS, "FolderDelete");
+    w.element(PAGE_FOLDERS, "Status", "1");
+    w.number(PAGE_FOLDERS, "SyncKey", next);
+    w.end();
+    return written(w);
+}
+
+async fn folderUpdate(mail: borrow SmtpContext, s: borrow Session, body: borrow Body) -> Result<Response, EasFail> {
+    let doc = borrow body.doc;
+    if (!body.present) {
+        return folderStatus("FolderUpdate", "10");
+    }
+    if (!hierarchyKeyOk(doc, s)) {
+        return folderStatus("FolderUpdate", "9");
+    }
+    let root = doc.root();
+    let serverId = childValue(doc, root, NS_FOLDERS, "ServerId");
+    let name = childValue(doc, root, NS_FOLDERS, "DisplayName");
+    let parent = childValue(doc, root, NS_FOLDERS, "ParentId");
+    if (name.length == 0 || name.indexOf("/") != null) {
+        return folderStatus("FolderUpdate", "10");
+    }
+    let parsed = match (parseFolderId(serverId)) {
+        Some(p) => p,
+        null => { return folderStatus("FolderUpdate", "4"); }
+    };
+    if (parsed[0] == KIND_MAILBOX as i64) {
+        if (await specialOrInbox(mail, s.userId, parsed[1])?) {
+            return folderStatus("FolderUpdate", "2");
+        }
+        var from = String.create();
+        if (!(await mailboxName(mail, s.userId, parsed[1], mut from)?)) {
+            return folderStatus("FolderUpdate", "4");
+        }
+        var to = String.create();
+        if (parent.length > 0 && parent != "0") {
+            match (parseFolderId(parent)) {
+                Some(p) => {
+                    if (p[0] != KIND_MAILBOX as i64 || !(await mailboxName(mail, s.userId, p[1], mut to)?)) {
+                        return folderStatus("FolderUpdate", "5");
+                    }
+                    mem(to.append("/"))?;
+                }
+                null => { return folderStatus("FolderUpdate", "5"); }
+            }
+        }
+        mem(to.append(name))?;
+        match (await mail.store.renameMailbox(s.userId, from.view(), to.view())) {
+            Ok() => {}
+            Err(StoreError.Exists) => { return folderStatus("FolderUpdate", "2"); }
+            Err(StoreError.NotFound) => { return folderStatus("FolderUpdate", "4"); }
+            Err(_) => { return folderStatus("FolderUpdate", "6"); }
+        }
+    } else {
+        match (await updateCollection(borrow mail.store, s.userId, parsed[1], name, null, null)) {
+            Ok() => {}
+            Err(PimError.NotFound) => { return folderStatus("FolderUpdate", "4"); }
+            Err(_) => { return folderStatus("FolderUpdate", "6"); }
+        }
+    }
+    // The device has the new name already: record it, so the next FolderSync does not send it back.
+    var current = Vector<Folder>.create();
+    await currentFolders(mail, s.userId, mut current)?;
+    for (f in current.view()) {
+        if (f.collectionId.view() == serverId) {
+            await saveFolder(mail, s.device, f)?;
+        }
+    }
+    let next = s.hierarchyKey + 1;
+    await setHierarchyKey(mail, s.device, next)?;
+    var w = WbxmlWriter.create();
+    w.start(PAGE_FOLDERS, "FolderUpdate");
+    w.element(PAGE_FOLDERS, "Status", "1");
+    w.number(PAGE_FOLDERS, "SyncKey", next);
+    w.end();
+    return written(w);
+}

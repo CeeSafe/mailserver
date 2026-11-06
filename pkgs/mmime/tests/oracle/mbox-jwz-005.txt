@@ -1,0 +1,30 @@
+size 1788437
+envelope ("Sat,  6 Jun 1992 10:42:04 -0400 (EDT)" "Re: MIME example in VIN" (("Nathaniel Borenstein" NIL "nsb" "MISSING_DOMAIN")) (("Nathaniel Borenstein" NIL "nsb" "MISSING_DOMAIN")) (("Nathaniel Borenstein" NIL "nsb" "MISSING_DOMAIN")) (("Yutaka Sato =?ISO-2022-JP?B?GyRAOjRGI0stGyhK?=" NIL "ysato" "etl.go.jp")) NIL NIL "<9206052121.AA02633@etlibs.etl.go.jp>" "<MeAAuwe0M2YtEfF9xR@thumper.bellcore.com>")
+bodystructure (("text" "plain" ("charset" "US-ASCII") NIL NIL "7bit" 778 18 NIL NIL NIL NIL) (("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 229 4 NIL NIL NIL NIL) ("image" "x-xwd" NIL NIL "Your mail to me" "quoted-printable" 684046 NIL NIL NIL NIL) ("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 121 5 NIL NIL NIL NIL) ("image" "x-xwd" NIL NIL "The way that message looked to ME" "quoted-printable" 690196 NIL NIL NIL NIL) ("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 12 2 NIL NIL NIL NIL) ("audio" "basic" NIL NIL "Note the use of the audio button.." "base64" 69112 NIL NIL NIL NIL) ("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 143 5 NIL NIL NIL NIL) ("image" "x-xwd" NIL NIL "Reply-in-progress picture" "quoted-printable" 341234 NIL NIL NIL NIL) ("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 6 1 NIL NIL NIL NIL) "mixed" ("boundary" "Alternative.Boundary.4eAAtte0M2YtIfF9lv") NIL NIL NIL) "alternative" ("boundary" "Interpart.Boundary.4eAAtte0M2Yt8fF9oM") NIL NIL NIL)
+body (("text" "plain" ("charset" "US-ASCII") NIL NIL "7bit" 778 18) (("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 229 4) ("image" "x-xwd" NIL NIL "Your mail to me" "quoted-printable" 684046) ("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 121 5) ("image" "x-xwd" NIL NIL "The way that message looked to ME" "quoted-printable" 690196) ("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 12 2) ("audio" "basic" NIL NIL "Note the use of the audio button.." "base64" 69112) ("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 143 5) ("image" "x-xwd" NIL NIL "Reply-in-progress picture" "quoted-printable" 341234) ("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 6 1) "mixed") "alternative")
+section HEADER 734 f272a1540af406c2b586532f41776939b9ae807d323a368928ceb5cc77f99b81
+section TEXT 1787703 447a2788b2f33230d727dfb9f04cc450ff325d95bca0c7900a68405bb64b2f22
+section HEADER.FIELDS 330 841804b22622f7046ef3f68ba0274b05e2f2cdc256b4c8b631490a66abc3ea57
+section HEADER.FIELDS.NOT 406 319ed92fa7591fe9029964bde790bf0b6809a06ddfab26d6b9e5e43cd50aa7af
+section 1 778 7824ec62d1ea0f1a684ffc20627ccf05698f7208deaf6ad6c948629a8f705ba1
+section 1.MIME 46 b3532c649b28a23803c77a2acc4907f5048ea77b89e0c51dcf7f271f2db4bfa6
+section 2 1786504 60bf6d6d799b7e3d00bce65304b293d4a3a6b8f2bb9de30194ab2b1378f434e0
+section 2.MIME 88 f9f532e83e9b6ad280d1bc55eeb88ede21702948bd7ff0d8e303d400e3a39314
+section 2.1 229 127b6ca66f003ac02410af0628bede82677a7e38b23d7665729d7b258a9f2ebc
+section 2.1.MIME 94 7d35d8c48d3869c4391f6ff71123bfb4c8466e5b04f02d64c3961f23d7d8bf61
+section 2.2 684046 dbf405235eb21cb7a545733f1ed9ba338742f4067ce09a9c162e9b42539ee3cb
+section 2.2.MIME 112 2e4cb860d118c2cf7135f4794f289e0ef55b8ab0d21c9d6ca5e471c5a1177d0e
+section 2.3 121 80067dfee8b7ef6d85d7d4ea0fea6e1db319ae1768308560b2888a07d88ceafd
+section 2.3.MIME 94 7d35d8c48d3869c4391f6ff71123bfb4c8466e5b04f02d64c3961f23d7d8bf61
+section 2.4 690196 c5566b56e1933ed24c20a891fb199bd73bf5744735f5d2b026101ab784421043
+section 2.4.MIME 130 dbf89369b26bc64dac2befe4766199c3abf856497430e57b6681a57c0c871641
+section 2.5 12 c5b3f440dc8277c4959d27796d6aadb33a153bd2919367db52086c7cbf90f539
+section 2.5.MIME 94 7d35d8c48d3869c4391f6ff71123bfb4c8466e5b04f02d64c3961f23d7d8bf61
+section 2.6 69112 2b8499092cad0e1594f1f79d2e1a10fb92b1db853607fdde9ca1053610035c54
+section 2.6.MIME 121 7a005a8894c4ba1c882564b2cefc39a990235b5fd83fa93c3ff653ca0fd819ed
+section 2.7 143 05aa0fd4dfc56a4fb6dd9e684953a0e2250b3a4701118e5c20e2436740a52b26
+section 2.7.MIME 94 7d35d8c48d3869c4391f6ff71123bfb4c8466e5b04f02d64c3961f23d7d8bf61
+section 2.8 341234 66bf69a035e5460e008e1d01a81835ecc5c5ed47ac815f5d9988b1e02beb1254
+section 2.8.MIME 122 f5616e8f3acc3a18173fd1b8805b46a5bfdb9135ae361212987e3d9b24dd09b8
+section 2.9 6 cbb0903045ca99c83a19e6c85fbc28d568f0a07d31b2315bccaaa49c1803b38f
+section 2.9.MIME 94 7d35d8c48d3869c4391f6ff71123bfb4c8466e5b04f02d64c3961f23d7d8bf61

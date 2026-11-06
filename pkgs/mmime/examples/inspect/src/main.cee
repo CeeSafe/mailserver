@@ -1,0 +1,258 @@
+// inspect <file.eml> [chunk]: what mmime makes of a message, for tools/differential.py. The message is fed in
+// chunks of `chunk` bytes (default 4096) to exercise the streaming scanner.
+//
+//   size N
+//   envelope|bodystructure|body LENGTH, a newline, then that many bytes
+//   section NAME START END     (a byte range of the message; NIL when the section has no content)
+//   fields NAME LENGTH, a newline, then that many bytes (HEADER.FIELDS and HEADER.FIELDS.NOT of `FIELDS`)
+//   parts N                    (the number of parts, embedded messages and multiparts included)
+//   bodytext I LENGTH, a newline, then that many bytes: the decoded text of leaf part I (in `MessageMeta.parts`
+//                              order) when it is text/*, HTML not stripped (for tools/body-differential.py)
+
+import mmime.MessageIndex;
+import mmime.MimeScanner;
+import mmime.NO_PART;
+import mmime.PART_MESSAGE;
+import mmime.PART_MULTIPART;
+import mmime.AddressList;
+import mmime.appendHeaderFields;
+import mmime.MessageMeta;
+import mmime.decodeHeader;
+import mmime.headerOf;
+import mmime.parseAddressList;
+import mmime.Renderer;
+import mmime.encodeMeta;
+import mmime.metaBody;
+import mmime.metaBodyStructure;
+import mmime.metaEnvelope;
+import mmime.appendPartText;
+import mmime.PartText;
+import mmime.PART_LEAF;
+
+/// The names of the HEADER.FIELDS sections, as tools/dovecot-oracle.py asks Dovecot for them.
+const FIELDS: StringView = "FROM TO CC SUBJECT DATE MESSAGE-ID CONTENT-TYPE";
+
+fn main() {
+    let path = match (Process.argument(1)) {
+        Some(p) => p,
+        null => {
+            Console.writeLine("usage: inspect <file.eml> [chunk]");
+            Process.exit(2);
+        }
+    };
+    var chunk: usize = 4096;
+    match (Process.argument(2)) {
+        Some(c) => { chunk = c.parseInt<usize>()!; }
+        null => {}
+    }
+    var file = File.open(path)!;
+    var scanner = MimeScanner.create();
+    var buffer = Vector<u8>.create();
+    buffer.resize(chunk, 0)!;
+    var data = Vector<u8>.create();
+    loop {
+        let n = file.read(mut buffer[..])!;
+        if (n == 0) {
+            break;
+        }
+        scanner.feed(buffer[0..n])!;
+        data.extend(buffer[0..n])!;
+    }
+    var index = MessageIndex.create();
+    scanner.finish(mut index)!;
+    // Decoded header text, for the comparison with Python's email package.
+    var subject = Vector<u8>.create();
+    var hasSubject = false;
+    match (headerOf(index, 0, "Subject")) {
+        Some(v) => {
+            decodeHeader(v, mut subject)!;
+            hasSubject = true;
+        }
+        null => {}
+    }
+    var names = Vector<u8>.create();
+    match (headerOf(index, 0, "From")) {
+        Some(v) => {
+            var list = AddressList.create();
+            parseAddressList(v, mut list)!;
+            for (i in 0..list.count()) {
+                match (list.name(i)) {
+                    Some(n) => {
+                        decodeHeader(n, mut names)!;
+                    }
+                    null => {}
+                }
+                names.push('\n')!;
+            }
+        }
+        null => {}
+    }
+    // Everything below comes from the stored form, so the differential checks its round trip too.
+    var renderer = Renderer.create();
+    var stored = Vector<u8>.create();
+    encodeMeta(index, mut renderer, mut stored)!;
+    var meta = MessageMeta.create();
+    if (!meta.read(stored.view())!) {
+        Console.writeErrorLine("inspect: the meta value did not read back");
+        Process.exit(1);
+    }
+    var out = Vector<u8>.create();
+    put(mut out, "size ");
+    number(mut out, meta.size);
+    put(mut out, "\n");
+    block(mut out, "envelope", metaEnvelope(meta, stored.view()));
+    block(mut out, "bodystructure", metaBodyStructure(meta, stored.view()));
+    block(mut out, "body", metaBody(meta, stored.view()));
+    if (hasSubject) {
+        block(mut out, "subject", subject.view());
+    }
+    block(mut out, "from-names", names.view());
+    let root = meta.parts[0];
+    section(mut out, "HEADER", root.headerStart, root.bodyStart);
+    section(mut out, "TEXT", root.bodyStart, root.bodyEnd);
+    var fieldNames = Vector<Vector<u8>>.create();
+    let list = FIELDS;
+    for (word in list.split(" ")) {
+        var n = Vector<u8>.create();
+        n.extend(word.bytes())!;
+        fieldNames.push(n)!;
+    }
+    fields(mut out, "HEADER.FIELDS", data.view(), root.headerStart, root.bodyStart, fieldNames);
+    var name = Vector<u8>.create();
+    sections(meta, data.view(), fieldNames, NO_PART, mut name, mut out);
+    put(mut out, "parts ");
+    number(mut out, meta.parts.length as u64);
+    put(mut out, "\n");
+    var label = Vector<u8>.create();
+    for (i in 0..meta.parts.length) {
+        let p = meta.parts[i];
+        if (p.kind != PART_LEAF) {
+            continue;
+        }
+        let bytes = data.view();
+        let header = bytes[truncate<usize>(p.headerStart)..truncate<usize>(p.bodyStart)];
+        let body = bytes[truncate<usize>(p.bodyStart)..truncate<usize>(p.bodyEnd)];
+        var text = Vector<u8>.create();
+        let r = appendPartText(header, body, false, 64 * 1024 * 1024, mut text)!;
+        let skipped = match (r) {
+            PartText.Skipped => true,
+            _ => false,
+        };
+        if (skipped) {
+            continue;
+        }
+        label.clear();
+        label.extend("bodytext ".bytes())!;
+        appendNumber(mut label, i as u64);
+        block(mut out, StringView.fromUtf8(label.view())!, text.view());
+    }
+    Console.writeBytes(out.view());
+}
+
+fn sections(
+    meta: borrow MessageMeta,
+    data: Slice<u8>,
+    names: borrow Vector<Vector<u8>>,
+    part: usize,
+    name: borrow mut Vector<u8>,
+    out: borrow mut Vector<u8>,
+) {
+    var kids = Vector<usize>.create();
+    meta.numbered(part, mut kids)!;
+    let base = name.length;
+    for (i in 0..kids.length) {
+        name.truncate(base);
+        if (base > 0) {
+            name.push('.')!;
+        }
+        appendNumber(name, (i + 1) as u64);
+        let k = kids[i];
+        let p = meta.parts[k];
+        let label = StringView.fromUtf8(name.view())!;
+        section(out, label, p.bodyStart, p.bodyEnd);
+        var mime = Vector<u8>.create();
+        mime.extend(name.view())!;
+        mime.extend(".MIME".bytes())!;
+        section(out, StringView.fromUtf8(mime.view())!, p.headerStart, p.bodyStart);
+        if (p.kind == PART_MESSAGE) {
+            let inner = meta.parts[k + 1];
+            mime.truncate(name.length);
+            mime.extend(".HEADER".bytes())!;
+            section(out, StringView.fromUtf8(mime.view())!, inner.headerStart, inner.bodyStart);
+            mime.truncate(name.length);
+            mime.extend(".TEXT".bytes())!;
+            section(out, StringView.fromUtf8(mime.view())!, inner.bodyStart, inner.bodyEnd);
+            mime.truncate(name.length);
+            mime.extend(".HEADER.FIELDS".bytes())!;
+            fields(out, StringView.fromUtf8(mime.view())!, data, inner.headerStart, inner.bodyStart, names);
+        }
+        if (p.kind == PART_MESSAGE || p.kind == PART_MULTIPART) {
+            sections(meta, data, names, k, name, out);
+        }
+    }
+    name.truncate(base);
+}
+
+fn section(out: borrow mut Vector<u8>, name: StringView, start: u64, end: u64) {
+    put(out, "section ");
+    put(out, name);
+    put(out, " ");
+    number(out, start);
+    put(out, " ");
+    number(out, end);
+    put(out, "\n");
+}
+
+/// HEADER.FIELDS (`name`) and HEADER.FIELDS.NOT (`name.NOT`) of the header block `[start, end)` of `data`.
+fn fields(
+    out: borrow mut Vector<u8>,
+    name: StringView,
+    data: Slice<u8>,
+    start: u64,
+    end: u64,
+    names: borrow Vector<Vector<u8>>,
+) {
+    let header = data[truncate<usize>(start)..truncate<usize>(end)];
+    for (not in [false, true]) {
+        var selected = Vector<u8>.create();
+        appendHeaderFields(header, names, not, mut selected)!;
+        put(out, "fields ");
+        put(out, name);
+        if (not) {
+            put(out, ".NOT");
+        }
+        block(out, "", selected.view());
+    }
+}
+
+fn block(out: borrow mut Vector<u8>, name: StringView, bytes: Slice<u8>) {
+    put(out, name);
+    put(out, " ");
+    number(out, bytes.length as u64);
+    put(out, "\n");
+    out.extend(bytes)!;
+    put(out, "\n");
+}
+
+fn put(out: borrow mut Vector<u8>, text: StringView) {
+    out.extend(text.bytes())!;
+}
+
+fn number(out: borrow mut Vector<u8>, n: u64) {
+    appendNumber(out, n);
+}
+
+fn appendNumber(out: borrow mut Vector<u8>, value: u64) {
+    var digits = [0u8; 20];
+    var n = value;
+    var at: usize = 20;
+    loop {
+        at -= 1;
+        digits[at] = 0x30u8 + truncate<u8>(n % 10);
+        n = n / 10;
+        if (n == 0) {
+            break;
+        }
+    }
+    out.extend(digits[at..])!;
+}

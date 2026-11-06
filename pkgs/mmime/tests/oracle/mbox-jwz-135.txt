@@ -1,0 +1,12 @@
+size 247053
+envelope ("Sun, 6 Oct 1991 22:24:19 -0700 (PDT)" "re: audio mail" (("Mark Crispin" NIL "MRC" "cac.washington.edu")) (("Mark Crispin" NIL "mrc" "tomobiki-cho.cac.washington.edu")) (("Mark Crispin" NIL "MRC" "cac.washington.edu")) (("Nathaniel Borenstein" NIL "nsb" "thumper.bellcore.com")) NIL NIL "<9110032002.AA08943@greenbush.bellcore.com>" "<MailManager.686813059.25434.mrc@Tomobiki-Cho.CAC.Washington.EDU>")
+bodystructure (("TEXT" "plain" ("charset" "us-ascii") NIL NIL "7bit" 355 10 NIL NIL NIL NIL) ("AUDIO" "basic" NIL NIL "voice mail" "BASE64" 245530 NIL NIL NIL NIL) "mixed" ("boundary" "16819560-1953210302-686813225:#25434") NIL NIL NIL)
+body (("TEXT" "plain" ("charset" "us-ascii") NIL NIL "7bit" 355 10) ("AUDIO" "basic" NIL NIL "voice mail" "BASE64" 245530) "mixed")
+section HEADER 917 1c317c9f9a3ba3a6774187d975886ce31fedab242512f5e80e6a43f5496c0950
+section TEXT 246136 ab5f29ab06f4d4bbf2430cd43cde6b2513991a71052f7a73f2644fc22063c50a
+section HEADER.FIELDS 327 1a660d6f9ab1e29f2623ad5a0c888114c3320df6b31b42fd5e7d0a231bf756fb
+section HEADER.FIELDS.NOT 592 6cbc7d95c1eb0dfecdba5c87569d7e059623a1a9703e8e42fe54d476d435a0a8
+section 1 355 fa8d4bb8edf7699d06a9b774d443bffedf61c560bf20066e2255278e768f39b8
+section 1.MIME 28 f57d6159d9f2cdf8d35b05852b129e2b8b4bd169922bdc61f33db186aa91bb04
+section 2 245530 7c593618db1d3027e1e6e33ec210b3be865e9bce0210f4bd0cca55403dc13394
+section 2.MIME 97 83c6cd1152b75a035831a037bf93eb1ee2aee72f9ee4eb048fbe61e35fc2bf2e

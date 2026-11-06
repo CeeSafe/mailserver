@@ -1,0 +1,194 @@
+// SOAP 1.1 framing, as the C# server answered (SoapHelper): every response is an envelope with the server version
+// in its header and `m:<Operation>Response` / `m:ResponseMessages` in its body, written without indentation (Apple's
+// SOAP parser drops items that have white space between their elements). Request elements are found by local name
+// in any namespace, as the C# server looked them up.
+
+import mhttp.Response;
+import mxml.XmlDocument;
+import mxml.XmlWriter;
+
+public const SOAP_NS: StringView = "http://schemas.xmlsoap.org/soap/envelope/";
+public const SOAP12_NS: StringView = "http://www.w3.org/2003/05/soap-envelope";
+public const TYPES_NS: StringView = "http://schemas.microsoft.com/exchange/services/2006/types";
+public const MESSAGES_NS: StringView = "http://schemas.microsoft.com/exchange/services/2006/messages";
+
+/// Exchange 2016 SP2's numbers, as the C# server claimed.
+const MAJOR_VERSION: StringView = "15";
+const MINOR_VERSION: StringView = "1";
+const MAJOR_BUILD: StringView = "2507";
+const MINOR_BUILD: StringView = "0";
+const SCHEMA_VERSION: StringView = "V2018_01_08";
+
+/// Opens the response envelope for `operation`, through `m:ResponseMessages`; `endEnvelope` closes it.
+public fn beginEnvelope(w: borrow mut XmlWriter, operation: StringView) {
+    w.start("soap:Envelope");
+    w.attribute("xmlns:soap", SOAP_NS);
+    w.attribute("xmlns:t", TYPES_NS);
+    w.attribute("xmlns:m", MESSAGES_NS);
+    w.start("soap:Header");
+    w.start("t:ServerVersionInfo");
+    w.attribute("MajorVersion", MAJOR_VERSION);
+    w.attribute("MinorVersion", MINOR_VERSION);
+    w.attribute("MajorBuildNumber", MAJOR_BUILD);
+    w.attribute("MinorBuildNumber", MINOR_BUILD);
+    w.attribute("Version", SCHEMA_VERSION);
+    w.end();
+    w.end();
+    w.start("soap:Body");
+    var name = String.create();
+    prefixed(mut name, "m:", operation, "Response");
+    w.start(name.view());
+    w.start("m:ResponseMessages");
+}
+
+/// Closes what `beginEnvelope` opened.
+public fn endEnvelope(w: borrow mut XmlWriter) {
+    w.end(); // ResponseMessages
+    w.end(); // <Operation>Response
+    w.end(); // Body
+    w.end(); // Envelope
+}
+
+fn prefixed(into: borrow mut String, prefix: StringView, operation: StringView, suffix: StringView) {
+    // Failure here shows as an unbalanced or empty name, which XmlWriter.finish reports.
+    match (into.append(prefix)) {
+        Ok() => {}
+        Err(_) => {}
+    }
+    match (into.append(operation)) {
+        Ok() => {}
+        Err(_) => {}
+    }
+    match (into.append(suffix)) {
+        Ok() => {}
+        Err(_) => {}
+    }
+}
+
+/// Opens a successful `m:<Operation>ResponseMessage` (with its ResponseCode); the caller writes the rest and `end`s it.
+public fn beginSuccess(w: borrow mut XmlWriter, operation: StringView) {
+    var name = String.create();
+    prefixed(mut name, "m:", operation, "ResponseMessage");
+    w.start(name.view());
+    w.attribute("ResponseClass", "Success");
+    w.element("m:ResponseCode", "NoError");
+}
+
+/// A whole successful response message with nothing else in it.
+public fn success(w: borrow mut XmlWriter, operation: StringView) {
+    beginSuccess(w, operation);
+    w.end();
+}
+
+/// A whole error response message.
+public fn failure(w: borrow mut XmlWriter, operation: StringView, code: StringView, text: StringView) {
+    var name = String.create();
+    prefixed(mut name, "m:", operation, "ResponseMessage");
+    w.start(name.view());
+    w.attribute("ResponseClass", "Error");
+    w.element("m:MessageText", text);
+    w.element("m:ResponseCode", code);
+    w.element("m:DescriptiveLinkKey", "0");
+    w.end();
+}
+
+/// The response for a finished writer.
+public fn xmlResponse(w: XmlWriter) -> Result<Response, AllocError> =>
+    Response.of(200, "text/xml; charset=utf-8", w.finish()?);
+
+/// A SOAP fault (`Client` or `Server`), with HTTP status 500 as SOAP 1.1 has it.
+public fn faultResponse(code: StringView, text: StringView) -> Result<Response, AllocError> {
+    var w = XmlWriter.document();
+    w.start("soap:Envelope");
+    w.attribute("xmlns:soap", SOAP_NS);
+    w.start("soap:Body");
+    w.start("soap:Fault");
+    var c = String.create();
+    prefixed(mut c, "soap:", code, "");
+    w.element("faultcode", c.view());
+    w.element("faultstring", text);
+    w.end();
+    w.end();
+    w.end();
+    return Response.of(500, "text/xml; charset=utf-8", w.finish()?);
+}
+
+// ---- Reading requests ----
+
+/// The first element inside `element` (at any depth) whose local name is `local`, in any namespace.
+public fn findLocal(doc: borrow XmlDocument, element: usize, local: StringView) -> usize? {
+    let stop = doc.end(element);
+    for (at in (element + 1)..stop) {
+        if (doc.isElement(at) && doc.localName(at) == local.bytes()) {
+            return at;
+        }
+    }
+    return null;
+}
+
+/// Every element inside `element` whose local name is `local`, in document order.
+public fn findAllLocal(
+    doc: borrow XmlDocument,
+    element: usize,
+    local: StringView,
+    into: borrow mut Vector<usize>,
+) -> Result<void, AllocError> {
+    into.clear();
+    let stop = doc.end(element);
+    for (at in (element + 1)..stop) {
+        if (doc.isElement(at) && doc.localName(at) == local.bytes()) {
+            into.push(at)?;
+        }
+    }
+    return Ok();
+}
+
+/// The trimmed text of the first element named `local` inside `element`; empty when there is none.
+public fn localText(
+    doc: borrow XmlDocument,
+    element: usize,
+    local: StringView,
+    into: borrow mut String,
+) -> Result<void, AllocError> {
+    into.clear();
+    match (findLocal(doc, element, local)) {
+        Some(e) => { into.append(doc.trimmed(e))?; }
+        null => {}
+    }
+    return Ok();
+}
+
+/// Attribute `name` of `element` as a string; empty when absent.
+public fn attributeOf(
+    doc: borrow XmlDocument,
+    element: usize,
+    name: StringView,
+    into: borrow mut String,
+) -> Result<void, AllocError> {
+    into.clear();
+    match (doc.attribute(element, name)) {
+        Some(a) => { into.append(doc.valueText(a))?; }
+        null => {}
+    }
+    return Ok();
+}
+
+/// The operation element of a request: the first child of the SOAP 1.1 or 1.2 Body.
+public fn operationOf(doc: borrow XmlDocument) -> usize? {
+    let root = doc.root();
+    if (!doc.is(root, SOAP_NS, "Envelope") && !doc.is(root, SOAP12_NS, "Envelope")) {
+        return null;
+    }
+    let body = match (doc.child(root, SOAP_NS, "Body") ?? doc.child(root, SOAP12_NS, "Body")) {
+        Some(b) => b,
+        null => { return null; }
+    };
+    return doc.firstChild(body);
+}
+
+/// `<name>text</name>` from bytes that should be UTF-8.
+public fn textElement(w: borrow mut XmlWriter, name: StringView, text: Slice<u8>) {
+    w.start(name);
+    w.textBytes(text);
+    w.end();
+}

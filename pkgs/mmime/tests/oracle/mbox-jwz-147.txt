@@ -1,0 +1,22 @@
+size 222904
+envelope ("Thu, 24 Oct 91 11:44:49 EDT" "Re: your multipart stuff" (("Stephen A Uhler" NIL "sau" "sleepy.bellcore.com")) (("Stephen A Uhler" NIL "sau" "sleepy.bellcore.com")) (("Stephen A Uhler" NIL "sau" "sleepy.bellcore.com")) ((NIL NIL "nsb" "thumper.bellcore.com")) NIL NIL NIL "<9110241544.AA08398@sleepy.bellcore.com>")
+bodystructure (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 66 0 NIL NIL NIL NIL) ("audio" "basic" NIL NIL NIL "base64" 32332 NIL NIL NIL NIL) ("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 18 1 NIL NIL NIL NIL) ("image" "pbm" NIL NIL NIL "base64" 1090 NIL NIL NIL NIL) ("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 32 2 NIL NIL NIL NIL) ("application" "x-annotate-2" NIL NIL NIL "7bit" 188027 NIL NIL NIL NIL) ("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 8 0 NIL NIL NIL NIL) "mixed" ("boundary" "mail.sleepy.sau.297.8299") NIL NIL NIL)
+body (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 66 0) ("audio" "basic" NIL NIL NIL "base64" 32332) ("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 18 1) ("image" "pbm" NIL NIL NIL "base64" 1090) ("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 32 2) ("application" "x-annotate-2" NIL NIL NIL "7bit" 188027) ("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 8 0) "mixed")
+section HEADER 682 f356fb99a761de18056ff15961ce366c39cb6f70f12de624d514cad70e4dbf27
+section TEXT 222222 8ad25f4447c9b97fda922b793d197947189f0da329d60aa3e0049f468bdba09b
+section HEADER.FIELDS 274 58f9ce11917a2a118942a2931c927e625c927e9d7304925da66e76c4b9736577
+section HEADER.FIELDS.NOT 410 21d88483c3c83c9be1aa856fc340410eb3112895fea9fa1b34e8bc19fc41209e
+section 1 66 bbadbdf4b4de2e324d5be1b410f5fa73d12e4f870dbe071f7b90bf87c737f132
+section 1.MIME 2 7eb70257593da06f682a3ddda54a9d260d4fc514f645237f5ca74b08f8da61a6
+section 2 32332 f1f176679f48bc7780b92df6b8af24c98f930634a9e78f8709e333cfca59f260
+section 2.MIME 166 f2df3bc2e3b2fc9c2adf7aff2e6f0e157d29c6cf6b49b6994b2d9f5de4aeff99
+section 3 18 974fc003065f577e2373223d92521e64a4997bb1256af72b2d34141587c5c014
+section 3.MIME 2 7eb70257593da06f682a3ddda54a9d260d4fc514f645237f5ca74b08f8da61a6
+section 4 1090 aedc737a713671dfa44def6224389dbdd0246b72bea1081bd8f3d869652cb19b
+section 4.MIME 164 4ff5d7e5ffc04663826bd5db7393f562d4f2542ec1e3d6d68430a02759506056
+section 5 32 2b54a4bab658b7dc253d190f5421ac60a7e7b95647b88b63420dd9ff4dacfc73
+section 5.MIME 2 7eb70257593da06f682a3ddda54a9d260d4fc514f645237f5ca74b08f8da61a6
+section 6 188027 b22cfa046adcf2d6844f6893a22832ef65beb5e60076a56e268b48d4288c6ab4
+section 6.MIME 71 4237af43f372ba5e6df21e6cb5fa7d71dca80eaaedd14a11cb8ccea8477c0c3b
+section 7 8 0cc19f90b851742a064b3a19f7183bbfe2bc4312ac6f2630a6c60fdd315fe4b8
+section 7.MIME 2 7eb70257593da06f682a3ddda54a9d260d4fc514f645237f5ca74b08f8da61a6

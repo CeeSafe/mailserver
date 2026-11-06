@@ -1,0 +1,18 @@
+size 852
+envelope ("Tue, 12 Nov 2013 09:12:42 -0500" "test of simple embedded message/rfc822 part" ((NIL NIL "mimekit" "example.com")) ((NIL NIL "mimekit" "example.com")) ((NIL NIL "mimekit" "example.com")) ((NIL NIL "mimekit" "example.com")) NIL NIL NIL "<54AD68C9E3B0184CAC6041320424FD1B5B81E74D@localhost.localdomain>")
+bodystructure (("text" "plain" ("charset" "utf-8") NIL NIL "7bit" 27 1 NIL NIL NIL NIL) ("message" "rfc822" NIL NIL NIL "7bit" 216 ("Tue, 12 Nov 2013 09:12:42 -0500" "embedded message" ((NIL NIL "mimekit" "example.com")) ((NIL NIL "mimekit" "example.com")) ((NIL NIL "mimekit" "example.com")) ((NIL NIL "mimekit" "example.com")) NIL NIL NIL NIL) ("text" "plain" ("charset" "utf-8") NIL NIL "7bit" 36 1 NIL NIL NIL NIL) 8 NIL NIL NIL NIL) "mixed" ("boundary" "----=_NextPart_000_003F_01CE98CE.6E826F90") NIL NIL NIL)
+body (("text" "plain" ("charset" "utf-8") NIL NIL "7bit" 27 1) ("message" "rfc822" NIL NIL NIL "7bit" 216 ("Tue, 12 Nov 2013 09:12:42 -0500" "embedded message" ((NIL NIL "mimekit" "example.com")) ((NIL NIL "mimekit" "example.com")) ((NIL NIL "mimekit" "example.com")) ((NIL NIL "mimekit" "example.com")) NIL NIL NIL NIL) ("text" "plain" ("charset" "utf-8") NIL NIL "7bit" 36 1) 8) "mixed")
+section HEADER 393 170c4daa11a74cd54a12682aefa5c8e50a7094d926016f20d9cdbeb43fb59e1e
+section TEXT 459 24e1f2c36414f4311254faab9550c97f814f43740f78723b472be8e3eda69363
+section HEADER.FIELDS 312 21f35d3bf55b45fbcd161a1094d3c21e885d35277f9a4b8a8b6e1506615d09d6
+section HEADER.FIELDS.NOT 83 a6fba0664ed5051ba3e344a0cad9e4ab1ca7d9606b946c35bd2bb51ba32f875e
+section 1 27 271e157fddc5d111cdedc381414a4f7934aee1e5ccf1ebb131840efe3425754a
+section 1.MIME 43 898726ecfd03d1be63b954310c21c8a7603e00979b91fb78949c88de26d728fb
+section 2 216 359bff79c0b0039aec9ac1b114acc0cd0ade8acf5cbede8d080ea83038ea16ee
+section 2.MIME 32 94984f8e29692f32be6724e812f5568ad06604428ccd4509df6c3a1c966800a0
+section 2.HEADER 180 831bae00d6e6985ed46ce9bee20b8a7a79505c5083b80b123f889fcb90834f02
+section 2.TEXT 36 6f9f8db61f350d3172493c58adfc7609e732fd01a9da763b54f47ab9ae57455b
+section 2.HEADER.FIELDS 161 78839790451fd0eb46f60c543f3fc3bf2f372819b2e06a9df0c3ddba266e7fa5
+section 2.HEADER.FIELDS.NOT 21 07a26ab8981ff3b1de28da29cf47f47e315b9c25685121dc5ebb60391005b2de
+section 2.1 36 6f9f8db61f350d3172493c58adfc7609e732fd01a9da763b54f47ab9ae57455b
+section 2.1.MIME 180 831bae00d6e6985ed46ce9bee20b8a7a79505c5083b80b123f889fcb90834f02

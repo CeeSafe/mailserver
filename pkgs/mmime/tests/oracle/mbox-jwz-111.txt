@@ -1,0 +1,12 @@
+size 5838
+envelope ("Fri, 13 Dec 1996 15:10:21 -0800" "Encrypted message" (("Blake Ramsdell" NIL "blaker" "craswell.com")) (("Blake Ramsdell" NIL "blaker" "craswell.com")) (("Blake Ramsdell" NIL "blaker" "craswell.com")) ((NIL NIL "jwz" "netscape.com")) NIL NIL NIL "<3.0.32.19961213151017.0091ed80@mail.craswell.com>")
+bodystructure (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 110 3 NIL NIL NIL NIL) ("application" "x-pkcs7-signature" ("name" "smime.p7s") NIL NIL "base64" 3986 NIL ("attachment" ("filename" "smime.p7s")) NIL NIL) "signed" ("boundary" "---=_=_ 659214770-385040-15143392 _=_=---" "micalg" "rsa-sha1" "protocol" "application/x-pkcs7-signature") NIL NIL NIL)
+body (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 110 3) ("application" "x-pkcs7-signature" ("name" "smime.p7s") NIL NIL "base64" 3986) "signed")
+section HEADER 1377 56217e8e943bfdfb67c292c19b91033f964a5876366e938996e4fd7e875504e4
+section TEXT 4461 98b1561cf98d2dee23e37efa46b742a2afdbfaac60467365b9b402094e58e89f
+section HEADER.FIELDS 352 a046f36146e3aabf66d3b7c5031b4daccb130c7c3c13058f009e98cd53e062d6
+section HEADER.FIELDS.NOT 1027 c83f4a0b3650ed77bbf906d9d13228c29f65fca7cb04072bdfb620b0a7392e41
+section 1 110 eb8716919daf7a9506b49e2becde2aceec86eb38d24bb795bf2aab686a1613b2
+section 1.MIME 67 4b33f090cf8929ce73b000a40600cd45cef03b36e7cb2e75b1fc19201d832063
+section 2 3986 d0f7093fcabfed9601c6e958bf40a62398049c5f9f8a866ab9de2f27afa8aec4
+section 2.MIME 155 3f494fd607c17db262e344f14322972ba00d06304621f71328434bf52fff5389

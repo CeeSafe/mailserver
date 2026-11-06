@@ -1,0 +1,10 @@
+size 274
+envelope ("Tue, 12 Nov 2013 09:12:42 -0500" "Fwd: éèê folded" ((NIL NIL "mimekit" "example.com")) ((NIL NIL "mimekit" "example.com")) ((NIL NIL "mimekit" "example.com")) ((NIL NIL "mimekit" "example.com")) NIL NIL NIL "<54AD68C9E3B0184CAC6041320424FD1B5B81E74D@localhost.localdomain>")
+bodystructure ("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 27 1 NIL NIL NIL NIL)
+body ("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 27 1)
+section HEADER 247 7487a202e287dd960cb874693beb73f008678af01a8dbde6efb86c779977cc51
+section TEXT 27 271e157fddc5d111cdedc381414a4f7934aee1e5ccf1ebb131840efe3425754a
+section HEADER.FIELDS 228 70683a7ca16c5f91394368d79f8c039339759066fe33a1fb508d56a0b47dd82a
+section HEADER.FIELDS.NOT 21 07a26ab8981ff3b1de28da29cf47f47e315b9c25685121dc5ebb60391005b2de
+section 1 27 271e157fddc5d111cdedc381414a4f7934aee1e5ccf1ebb131840efe3425754a
+section 1.MIME 247 7487a202e287dd960cb874693beb73f008678af01a8dbde6efb86c779977cc51

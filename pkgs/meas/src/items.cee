@@ -1,0 +1,1065 @@
+// The item commands: MoveItems, ItemOperations (Fetch of items and attachments, EmptyFolderContents),
+// GetAttachment (12.1), Search (the mailbox and the global address list), Find (16.1), ResolveRecipients and
+// MeetingResponse.
+
+import encoding.Base64;
+import mhttp.Response;
+import mmime.MediaType;
+import mmime.MessageMeta;
+import mmime.PART_LEAF;
+import mmime.containsFolded;
+import mmime.decodeHeader;
+import mmime.headerOf;
+import mmime.metaEnvelope;
+import mmime.parseMediaType;
+import mpim.Collection;
+import mpim.ContentLines;
+import mpim.DEFAULT_COLLECTION;
+import mpim.KIND_CALENDAR;
+import mpim.ObjectFacts;
+import mpim.PimObject;
+import mpim.PutOutcome;
+import mpim.appendLine;
+import mpim.collectionNamed;
+import mpim.objectById;
+import mpim.objectFacts;
+import mpim.putObject;
+import mstore.CopyResult;
+import mstore.FLAG_DELETED;
+import mstore.FlagChange;
+import mstore.MessageList;
+import mstore.UidSet;
+import msmtp.SmtpContext;
+import mxml.XmlDocument;
+import postgres.PgParams;
+
+// ---- MoveItems ----
+
+async fn moveItems(mail: borrow SmtpContext, s: borrow Session, body: borrow Body) -> Result<Response, EasFail> {
+    let doc = borrow body.doc;
+    var w = WbxmlWriter.create();
+    w.start(PAGE_MOVE, "MoveItems");
+    if (body.present) {
+        var moves = Vector<usize>.create();
+        mem(doc.findAll(doc.root(), NS_MOVE, "Move", mut moves))?;
+        for (m in moves.view()) {
+            let src = childValue(doc, m, NS_MOVE, "SrcMsgId");
+            let srcFolder = childValue(doc, m, NS_MOVE, "SrcFldId");
+            let dstFolder = childValue(doc, m, NS_MOVE, "DstFldId");
+            w.start(PAGE_MOVE, "Response");
+            w.element(PAGE_MOVE, "SrcMsgId", src);
+            let from = parseFolderId(srcFolder);
+            let to = parseFolderId(dstFolder);
+            let uid = longIdOf(src);
+            match (from) {
+                null => { w.element(PAGE_MOVE, "Status", "1"); }
+                Some(f) => {
+                    match (to) {
+                        null => { w.element(PAGE_MOVE, "Status", "2"); }
+                        Some(t) => {
+                            if (f[0] != KIND_MAILBOX as i64 || t[0] != KIND_MAILBOX as i64 || uid == null) {
+                                w.element(PAGE_MOVE, "Status", "5");
+                            } else if (f[1] == t[1]) {
+                                w.element(PAGE_MOVE, "Status", "4");
+                            } else {
+                                let item = (uid ?? [0, 0])[1];
+                                let moved = await moveMessage(mail, s, srcFolder, dstFolder, f[1], t[1], item)?;
+                                if (moved > 0) {
+                                    w.element(PAGE_MOVE, "Status", "3");
+                                    var id = String.create();
+                                    itemServerId(dstFolder, moved, mut id)?;
+                                    w.element(PAGE_MOVE, "DstMsgId", id.view());
+                                } else {
+                                    w.element(PAGE_MOVE, "Status", "1");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            w.end();
+        }
+    }
+    w.end();
+    return written(w);
+}
+
+/// Moves message `uid` between two of the user's mailboxes; its new uid, or 0. The device has made the move
+/// itself: its records follow, so the next Syncs do not send it back.
+async fn moveMessage(
+    mail: borrow SmtpContext,
+    s: borrow Session,
+    srcFolder: StringView,
+    dstFolder: StringView,
+    from: i64,
+    to: i64,
+    uid: i64,
+) -> Result<i64, EasFail> {
+    var uids = UidSet.create();
+    match (uids.add(uid)) {
+        Ok() => {}
+        Err(_) => { return Err(EasFail.Memory); }
+    }
+    var moved = CopyResult.create();
+    match (await mail.store.copy(s.userId, from, to, uids, true, mut moved)) {
+        Ok() => {}
+        Err(_) => { return Err(EasFail.Unavailable); }
+    }
+    if (moved.target.length == 0) {
+        return Ok(0);
+    }
+    let target = moved.target[0];
+    var params = PgParams.create();
+    pg(params.int64(s.device))?;
+    pg(params.text(srcFolder))?;
+    pg(params.int64(uid))?;
+    await query(
+        borrow mail.store,
+        "DELETE FROM eas_items WHERE item = $3 AND folder_id = (SELECT id FROM eas_folders WHERE device_id = $1 AND collection_id = $2)",
+        params,
+    )?;
+    var now = MessageList.create();
+    var targets = UidSet.create();
+    match (targets.add(target)) {
+        Ok() => {}
+        Err(_) => { return Err(EasFail.Memory); }
+    }
+    match (await mail.store.fetchMessages(s.userId, to, targets, false, mut now)) {
+        Ok() => {}
+        Err(_) => { return Err(EasFail.Unavailable); }
+    }
+    if (now.count() > 0) {
+        var add = PgParams.create();
+        pg(add.int64(s.device))?;
+        pg(add.text(dstFolder))?;
+        pg(add.int64(target))?;
+        pg(add.int64(now.modseq(0)))?;
+        await query(
+            borrow mail.store,
+            "INSERT INTO eas_items (folder_id, item, version, sync_key) SELECT id, $3, $4, sync_key FROM eas_folders WHERE device_id = $1 AND collection_id = $2 AND sync_key > 0 ON CONFLICT DO NOTHING",
+            add,
+        )?;
+    }
+    return Ok(target);
+}
+
+// ---- ItemOperations ----
+
+/// A FileReference: `<folder>:<uid>:<part>`; [mailbox, uid, part].
+fn attachmentOf(reference: StringView) -> [i64; 3]? {
+    let last = reference.lastIndexOf(":")?;
+    let ids = longIdOf(reference[0..last])?;
+    let part = reference[(last + 1)..].parseInt<i64>()?;
+    return [ids[0], ids[1], part];
+}
+
+/// The bytes and type of an attachment; false when there is none.
+async fn loadAttachment(
+    mail: borrow SmtpContext,
+    s: borrow Session,
+    reference: StringView,
+    into: borrow mut Vector<u8>,
+    kind: borrow mut String,
+) -> Result<bool, EasFail> {
+    let ids = match (attachmentOf(reference)) {
+        Some(i) => i,
+        null => { return Ok(false); }
+    };
+    var m = emptyMessage();
+    if (!(await originalMessage(mail, s, ids[0], ids[1], mut m)?)) {
+        return Ok(false);
+    }
+    if (ids[2] < 0) {
+        return Ok(false);
+    }
+    return attachmentContent(m, truncate<usize>(ids[2]), into, kind);
+}
+
+/// `0-999`: [first, last].
+fn rangeOf(text: StringView) -> [i64; 2]? {
+    let dash = text.indexOf("-")?;
+    let first = text[0..dash].trim().parseInt<i64>()?;
+    let last = text[(dash + 1)..].trim().parseInt<i64>()?;
+    if (first < 0 || last < first) {
+        return null;
+    }
+    return [first, last];
+}
+
+fn bodyOptionsOf(doc: borrow XmlDocument, element: usize, fallback: i32) -> BodyOptions {
+    var opts = BodyOptions { bodyType: fallback, truncation: -1 };
+    match (doc.find(element, NS_BASE, "BodyPreference")) {
+        Some(p) => {
+            let t = truncate<i32>(childNumber(doc, p, NS_BASE, "Type", fallback as i64));
+            opts.bodyType = if (t == 1 || t == 2 || t == 4) t else fallback;
+            opts.truncation = childNumber(doc, p, NS_BASE, "TruncationSize", -1);
+        }
+        null => {}
+    }
+    if (childValue(doc, element, NS_AIRSYNC, "MIMESupport") == "2") {
+        opts.bodyType = 4;
+    }
+    return opts;
+}
+
+async fn itemOperations(mail: borrow SmtpContext, s: borrow Session, body: borrow Body) -> Result<Response, EasFail> {
+    let doc = borrow body.doc;
+    var w = WbxmlWriter.create();
+    w.start(PAGE_ITEMOPS, "ItemOperations");
+    if (!body.present) {
+        w.element(PAGE_ITEMOPS, "Status", "2");
+        w.end();
+        return written(w);
+    }
+    w.element(PAGE_ITEMOPS, "Status", "1");
+    w.start(PAGE_ITEMOPS, "Response");
+    var ops = Vector<usize>.create();
+    mem(doc.children(doc.root(), mut ops))?;
+    for (op in ops.view()) {
+        if (doc.is(op, NS_ITEMOPS, "Fetch")) {
+            await fetchOne(mail, s, doc, op, mut w)?;
+        } else if (doc.is(op, NS_ITEMOPS, "EmptyFolderContents")) {
+            let id = childValue(doc, op, NS_AIRSYNC, "CollectionId");
+            w.start(PAGE_ITEMOPS, "EmptyFolderContents");
+            match (parseFolderId(id)) {
+                Some(f) => {
+                    if (f[0] == KIND_MAILBOX as i64 && await emptyMailbox(mail, s, f[1])?) {
+                        w.element(PAGE_ITEMOPS, "Status", "1");
+                    } else {
+                        w.element(PAGE_ITEMOPS, "Status", "6");
+                    }
+                }
+                null => { w.element(PAGE_ITEMOPS, "Status", "6"); }
+            }
+            w.element(PAGE_AIRSYNC, "CollectionId", id);
+            w.end();
+        } else if (doc.is(op, NS_ITEMOPS, "Move")) {
+            w.start(PAGE_ITEMOPS, "Move");
+            w.element(PAGE_ITEMOPS, "Status", "2"); // conversations are not kept
+            w.end();
+        }
+    }
+    w.end();
+    w.end();
+    return written(w);
+}
+
+async fn emptyMailbox(mail: borrow SmtpContext, s: borrow Session, mailbox: i64) -> Result<bool, EasFail> {
+    var uids = UidSet.create();
+    match (uids.addRange(1, 9223372036854775806)) {
+        Ok() => {}
+        Err(_) => { return Err(EasFail.Memory); }
+    }
+    var change = FlagChange.create();
+    change.add = FLAG_DELETED;
+    var changed = MessageList.create();
+    match (await mail.store.setFlags(s.userId, mailbox, uids, change, mut changed)) {
+        Ok() => {}
+        Err(_) => { return Ok(false); }
+    }
+    var gone = Vector<i64>.create();
+    match (await mail.store.expunge(s.userId, mailbox, mut gone)) {
+        Ok() => { return Ok(true); }
+        Err(_) => { return Ok(false); }
+    }
+}
+
+async fn fetchOne(
+    mail: borrow SmtpContext,
+    s: borrow Session,
+    doc: borrow XmlDocument,
+    op: usize,
+    w: borrow mut WbxmlWriter,
+) -> Result<void, EasFail> {
+    w.start(PAGE_ITEMOPS, "Fetch");
+    let options = doc.child(op, NS_ITEMOPS, "Options");
+    let reference = childValue(doc, op, NS_BASE, "FileReference");
+    if (reference.length > 0) {
+        var data = Vector<u8>.create();
+        var kind = String.create();
+        if (!(await loadAttachment(mail, s, reference, mut data, mut kind)?)) {
+            w.element(PAGE_ITEMOPS, "Status", "15");
+            w.element(PAGE_BASE, "FileReference", reference);
+            w.end();
+            return Ok();
+        }
+        var first: i64 = 0;
+        var last: i64 = truncate<i64>(data.length) - 1;
+        var ranged = false;
+        match (options) {
+            Some(o) => {
+                match (rangeOf(childValue(doc, o, NS_ITEMOPS, "Range"))) {
+                    Some(r) => {
+                        first = r[0];
+                        if (r[1] < last) {
+                            last = r[1];
+                        }
+                        ranged = true;
+                    }
+                    null => {}
+                }
+            }
+            null => {}
+        }
+        w.element(PAGE_ITEMOPS, "Status", "1");
+        w.element(PAGE_BASE, "FileReference", reference);
+        w.start(PAGE_ITEMOPS, "Properties");
+        w.element(PAGE_BASE, "ContentType", kind.view());
+        if (ranged) {
+            var r = String.create();
+            mem(r.appendNumber(first))?;
+            mem(r.append("-"))?;
+            mem(r.appendNumber(if (last >= first) last else first))?;
+            w.element(PAGE_ITEMOPS, "Range", r.view());
+            w.number(PAGE_ITEMOPS, "Total", truncate<i64>(data.length));
+        }
+        var encoded = Vector<u8>.create();
+        if (first < truncate<i64>(data.length) && last >= first) {
+            mem(Base64.encode(data.view()[truncate<usize>(first)..truncate<usize>(last + 1)], mut encoded))?;
+        }
+        w.elementBytes(PAGE_ITEMOPS, "Data", encoded.view());
+        w.end();
+        w.end();
+        return Ok();
+    }
+    let givenId = childValue(doc, op, NS_AIRSYNC, "ServerId");
+    let givenCollection = childValue(doc, op, NS_AIRSYNC, "CollectionId");
+    let longId = childValue(doc, op, NS_SEARCH, "LongId");
+    let serverId = if (givenId.length > 0) givenId else longId;
+    let collectionId = if (givenCollection.length > 0) givenCollection else serverId[0..(serverId.indexOf(":") ?? 0)];
+    let folder = parseFolderId(collectionId);
+    let item = itemOf(collectionId, serverId);
+    match (folder) {
+        Some(f) => {
+            match (item) {
+                Some(i) => {
+                    let opts = match (options) {
+                        Some(o) => bodyOptionsOf(doc, o, 2),
+                        null => BodyOptions { bodyType: 2, truncation: -1 },
+                    };
+                    let state = FolderState {
+                        id: 0,
+                        kind: truncate<u8>(f[0]),
+                        sourceId: f[1],
+                        syncKey: 0,
+                        filterType: 0,
+                        bodyType: opts.bodyType,
+                        truncation: opts.truncation,
+                        mimeSupport: if (opts.bodyType == 4) 2 else 0,
+                    };
+                    if (!(await itemExists(mail, s, state, i)?)) {
+                        w.element(PAGE_ITEMOPS, "Status", "6");
+                    } else {
+                        w.element(PAGE_ITEMOPS, "Status", "1");
+                        w.element(PAGE_AIRSYNC, "CollectionId", collectionId);
+                        w.element(PAGE_AIRSYNC, "ServerId", serverId);
+                        w.element(PAGE_AIRSYNC, "Class", classOf(state.kind));
+                        w.start(PAGE_ITEMOPS, "Properties");
+                        // The whole body unless the device asked for less.
+                        var full = state;
+                        full.truncation = opts.truncation;
+                        await writeItemWith(mail, s, full, collectionId, i, w)?;
+                        w.end();
+                    }
+                }
+                null => { w.element(PAGE_ITEMOPS, "Status", "6"); }
+            }
+        }
+        null => { w.element(PAGE_ITEMOPS, "Status", "6"); }
+    }
+    w.end();
+    return Ok();
+}
+
+async fn itemExists(
+    mail: borrow SmtpContext,
+    s: borrow Session,
+    f: borrow FolderState,
+    item: i64,
+) -> Result<bool, EasFail> {
+    if (f.kind == KIND_MAILBOX) {
+        var uids = UidSet.create();
+        match (uids.add(item)) {
+            Ok() => {}
+            Err(_) => { return Err(EasFail.Memory); }
+        }
+        var list = MessageList.create();
+        match (await mail.store.fetchMessages(s.userId, f.sourceId, uids, false, mut list)) {
+            Ok() => { return Ok(list.count() > 0); }
+            Err(_) => { return Err(EasFail.Unavailable); }
+        }
+    }
+    var object = PimObject.create();
+    return match (await objectById(borrow mail.store, s.userId, item, mut object)) {
+        Ok(found) => Ok(found && object.collectionId == f.sourceId),
+        Err(_) => Err(EasFail.Unavailable),
+    };
+}
+
+/// `writeItem` with the folder's own truncation (Sync's options are not those of ItemOperations).
+async fn writeItemWith(
+    mail: borrow SmtpContext,
+    s: borrow Session,
+    f: borrow FolderState,
+    collectionId: StringView,
+    item: i64,
+    w: borrow mut WbxmlWriter,
+) -> Result<void, EasFail> =>
+    await writeItem(mail, s, f, collectionId, item, false, false, w);
+
+async fn getAttachment(mail: borrow SmtpContext, s: borrow Session) -> Result<Response, EasFail> {
+    var data = Vector<u8>.create();
+    var kind = String.create();
+    if (!(await loadAttachment(mail, s, s.attachmentName.view(), mut data, mut kind)?)) {
+        return plain(404, "No such attachment.");
+    }
+    return match (Response.of(200, kind.view(), data)) {
+        Ok(r) => Ok(r),
+        Err(_) => Err(EasFail.Memory),
+    };
+}
+
+// ---- Search and Find ----
+
+/// A message that matched: its folder and uid.
+struct Hit {
+    mailbox: i64;
+    uid: i64;
+}
+
+fn sqlSearch() -> StringView =>
+    """
+    SELECT m.mailbox_id, m.uid, m.meta FROM messages m JOIN mailboxes b ON b.id = m.mailbox_id
+    WHERE b.user_id = $1 AND ($2::int8 = 0 OR b.id = $2) AND m.flags & 8 = 0
+        AND ($3::int8 = 0 OR m.internal_date > to_timestamp($3::int8::float8))
+        AND ($4::int8 = 0 OR m.internal_date < to_timestamp($4::int8::float8))
+        AND (b.special_use IS NULL OR b.special_use NOT IN ('\\Trash', '\\Junk') OR $2::int8 <> 0)
+    ORDER BY m.internal_date DESC, m.uid DESC LIMIT 5000
+    """;
+
+/// The messages whose envelope (subject, addresses) holds `text`, newest first.
+async fn searchMail(
+    mail: borrow SmtpContext,
+    s: borrow Session,
+    mailbox: i64,
+    text: StringView,
+    after: i64,
+    before: i64,
+    into: borrow mut Vector<Hit>,
+) -> Result<void, EasFail> {
+    into.clear();
+    var params = PgParams.create();
+    pg(params.int64(s.userId))?;
+    pg(params.int64(mailbox))?;
+    pg(params.int64(after))?;
+    pg(params.int64(before))?;
+    let rows = await query(borrow mail.store, sqlSearch(), params)?;
+    var meta = MessageMeta.create();
+    var raw = Vector<u8>.create();
+    var decoded = Vector<u8>.create();
+    for (r in 0..rows.rowCount()) {
+        raw.clear();
+        match (rows.bytea(r, 2, mut raw)) {
+            Ok(_) => {}
+            Err(_) => { continue; }
+        }
+        let ok = match (meta.read(raw.view())) {
+            Ok(b) => b,
+            Err(_) => { return Err(EasFail.Memory); }
+        };
+        if (!ok) {
+            continue;
+        }
+        decoded.clear();
+        mem(decodeHeader(metaEnvelope(meta, raw.view()), mut decoded))?;
+        if (text.length == 0 || containsFolded(decoded.view(), text.bytes())) {
+            mem(into.push(Hit { mailbox: rows.int64(r, 0) ?? 0, uid: rows.int64(r, 1) ?? 0 }))?;
+        }
+    }
+    return Ok();
+}
+
+fn searchStatus(code: StringView) -> Result<Response, EasFail> {
+    var w = WbxmlWriter.create();
+    w.start(PAGE_SEARCH, "Search");
+    w.element(PAGE_SEARCH, "Status", code);
+    w.end();
+    return written(w);
+}
+
+async fn search(mail: borrow SmtpContext, s: borrow Session, body: borrow Body) -> Result<Response, EasFail> {
+    let doc = borrow body.doc;
+    if (!body.present) {
+        return searchStatus("2");
+    }
+    let store = match (doc.find(doc.root(), NS_SEARCH, "Store")) {
+        Some(st) => st,
+        null => { return searchStatus("2"); }
+    };
+    let name = childValue(doc, store, NS_SEARCH, "Name");
+    let options = doc.child(store, NS_SEARCH, "Options");
+    var range: [i64; 2] = [0, 99];
+    match (options) {
+        Some(o) => {
+            match (rangeOf(childValue(doc, o, NS_SEARCH, "Range"))) {
+                Some(r) => { range = r; }
+                null => {}
+            }
+        }
+        null => {}
+    }
+    let queryElement = doc.child(store, NS_SEARCH, "Query");
+    var w = WbxmlWriter.create();
+    w.start(PAGE_SEARCH, "Search");
+    w.element(PAGE_SEARCH, "Status", "1");
+    w.start(PAGE_SEARCH, "Response");
+    w.start(PAGE_SEARCH, "Store");
+    if (name.equalsIgnoreAsciiCase("GAL")) {
+        let text = match (queryElement) {
+            Some(q) => doc.trimmed(q),
+            null => "",
+        };
+        await galResults(mail, s, text, range, mut w)?;
+    } else if (name.equalsIgnoreAsciiCase("Mailbox")) {
+        var text = String.create();
+        var collection = String.create();
+        var after: i64 = 0;
+        var before: i64 = 0;
+        match (queryElement) {
+            Some(q) => {
+                mem(text.append(findValue(doc, q, NS_SEARCH, "FreeText")))?;
+                mem(collection.append(findValue(doc, q, NS_AIRSYNC, "CollectionId")))?;
+                match (doc.find(q, NS_SEARCH, "GreaterThan")) {
+                    Some(g) => { after = easTime(childValue(doc, g, NS_SEARCH, "Value")) ?? 0; }
+                    null => {}
+                }
+                match (doc.find(q, NS_SEARCH, "LessThan")) {
+                    Some(l) => { before = easTime(childValue(doc, l, NS_SEARCH, "Value")) ?? 0; }
+                    null => {}
+                }
+            }
+            null => {}
+        }
+        let mailbox = match (parseFolderId(collection.view())) {
+            Some(f) => if (f[0] == KIND_MAILBOX as i64) f[1] else -1,
+            null => 0,
+        };
+        var hits = Vector<Hit>.create();
+        if (mailbox >= 0) {
+            await searchMail(mail, s, mailbox, text.view(), after, before, mut hits)?;
+        }
+        let opts = match (options) {
+            Some(o) => bodyOptionsOf(doc, o, 1),
+            null => BodyOptions { bodyType: 1, truncation: 256 },
+        };
+        w.element(PAGE_SEARCH, "Status", "1");
+        var shown: i64 = 0;
+        for (i in 0..hits.length) {
+            if (truncate<i64>(i) < range[0] || truncate<i64>(i) > range[1]) {
+                continue;
+            }
+            shown += 1;
+            let h = hits[i];
+            var folder = String.create();
+            idText("m", h.mailbox, mut folder)?;
+            var id = String.create();
+            itemServerId(folder.view(), h.uid, mut id)?;
+            w.start(PAGE_SEARCH, "Result");
+            w.element(PAGE_AIRSYNC, "Class", "Email");
+            w.element(PAGE_SEARCH, "LongId", id.view());
+            w.element(PAGE_AIRSYNC, "CollectionId", folder.view());
+            w.start(PAGE_SEARCH, "Properties");
+            let state = FolderState {
+                id: 0,
+                kind: KIND_MAILBOX,
+                sourceId: h.mailbox,
+                syncKey: 0,
+                filterType: 0,
+                bodyType: opts.bodyType,
+                truncation: opts.truncation,
+                mimeSupport: 0,
+            };
+            await writeItemWith(mail, s, state, folder.view(), h.uid, mut w)?;
+            w.end();
+            w.end();
+        }
+        if (shown > 0) {
+            var r = String.create();
+            mem(r.appendNumber(range[0]))?;
+            mem(r.append("-"))?;
+            mem(r.appendNumber(range[0] + shown - 1))?;
+            w.element(PAGE_SEARCH, "Range", r.view());
+        }
+        w.number(PAGE_SEARCH, "Total", truncate<i64>(hits.length));
+    } else {
+        w.element(PAGE_SEARCH, "Status", "3"); // DocumentLibrary and others: not here
+    }
+    w.end();
+    w.end();
+    w.end();
+    return written(w);
+}
+
+fn sqlGal() -> StringView =>
+    """
+    SELECT u.email FROM users u
+    WHERE u.active AND u.domain_id = (SELECT domain_id FROM users WHERE id = $1)
+        AND position(lower($2) IN lower(u.email)) > 0
+    ORDER BY u.email LIMIT 100
+    """;
+
+async fn galResults(
+    mail: borrow SmtpContext,
+    s: borrow Session,
+    text: StringView,
+    range: [i64; 2],
+    w: borrow mut WbxmlWriter,
+) -> Result<void, EasFail> {
+    var params = PgParams.create();
+    pg(params.int64(s.userId))?;
+    pg(params.text(text))?;
+    let rows = await query(borrow mail.store, sqlGal(), params)?;
+    w.element(PAGE_SEARCH, "Status", "1");
+    var shown: i64 = 0;
+    for (r in 0..rows.rowCount()) {
+        if (truncate<i64>(r) < range[0] || truncate<i64>(r) > range[1]) {
+            continue;
+        }
+        shown += 1;
+        let email = rows.text(r, 0) ?? "";
+        w.start(PAGE_SEARCH, "Result");
+        w.start(PAGE_SEARCH, "Properties");
+        w.element(PAGE_GAL, "DisplayName", email);
+        w.element(PAGE_GAL, "EmailAddress", email);
+        w.element(PAGE_GAL, "Alias", email[0..(email.indexOf("@") ?? email.length)]);
+        w.end();
+        w.end();
+    }
+    if (shown > 0) {
+        var rr = String.create();
+        mem(rr.appendNumber(range[0]))?;
+        mem(rr.append("-"))?;
+        mem(rr.appendNumber(range[0] + shown - 1))?;
+        w.element(PAGE_SEARCH, "Range", rr.view());
+    }
+    w.number(PAGE_SEARCH, "Total", truncate<i64>(rows.rowCount()));
+    return Ok();
+}
+
+async fn find(mail: borrow SmtpContext, s: borrow Session, body: borrow Body) -> Result<Response, EasFail> {
+    let doc = borrow body.doc;
+    var w = WbxmlWriter.create();
+    w.start(PAGE_FIND, "Find");
+    if (!body.present) {
+        w.element(PAGE_FIND, "Status", "2");
+        w.end();
+        return written(w);
+    }
+    let criterion = doc.find(doc.root(), NS_FIND, "MailBoxSearchCriterion");
+    match (criterion) {
+        null => {
+            w.element(PAGE_FIND, "Status", "2"); // the GAL through Find: not here; Search's GAL store serves it
+            w.end();
+            return written(w);
+        }
+        Some(_) => {}
+    }
+    let c = criterion ?? 0;
+    let text = findValue(doc, c, NS_FIND, "FreeText");
+    let collection = findValue(doc, c, NS_AIRSYNC, "CollectionId");
+    var range: [i64; 2] = [0, 99];
+    match (rangeOf(findValue(doc, c, NS_FIND, "Range"))) {
+        Some(r) => { range = r; }
+        null => {}
+    }
+    let mailbox = match (parseFolderId(collection)) {
+        Some(f) => if (f[0] == KIND_MAILBOX as i64) f[1] else -1,
+        null => 0,
+    };
+    var hits = Vector<Hit>.create();
+    if (mailbox >= 0) {
+        await searchMail(mail, s, mailbox, text, 0, 0, mut hits)?;
+    }
+    w.element(PAGE_FIND, "Status", "1");
+    w.start(PAGE_FIND, "Response");
+    w.element(PAGE_ITEMOPS, "Store", "Mailbox");
+    w.element(PAGE_FIND, "Status", "1");
+    var shown: i64 = 0;
+    for (i in 0..hits.length) {
+        if (truncate<i64>(i) < range[0] || truncate<i64>(i) > range[1]) {
+            continue;
+        }
+        shown += 1;
+        let h = hits[i];
+        var folder = String.create();
+        idText("m", h.mailbox, mut folder)?;
+        var id = String.create();
+        itemServerId(folder.view(), h.uid, mut id)?;
+        w.start(PAGE_FIND, "Result");
+        w.element(PAGE_AIRSYNC, "Class", "Email");
+        w.element(PAGE_AIRSYNC, "ServerId", id.view());
+        w.element(PAGE_AIRSYNC, "CollectionId", folder.view());
+        w.start(PAGE_FIND, "Properties");
+        let state = FolderState {
+            id: 0,
+            kind: KIND_MAILBOX,
+            sourceId: h.mailbox,
+            syncKey: 0,
+            filterType: 0,
+            bodyType: 1,
+            truncation: 255,
+            mimeSupport: 0,
+        };
+        await writeItemWith(mail, s, state, folder.view(), h.uid, mut w)?;
+        w.end();
+        w.end();
+    }
+    if (shown > 0) {
+        var r = String.create();
+        mem(r.appendNumber(range[0]))?;
+        mem(r.append("-"))?;
+        mem(r.appendNumber(range[0] + shown - 1))?;
+        w.element(PAGE_FIND, "Range", r.view());
+    }
+    w.number(PAGE_FIND, "Total", truncate<i64>(hits.length));
+    w.end();
+    w.end();
+    return written(w);
+}
+
+// ---- ResolveRecipients ----
+
+fn sqlResolveUsers() -> StringView =>
+    """
+    SELECT u.email FROM users u
+    WHERE u.active AND (lower(u.email) = lower($2)
+        OR (u.domain_id = (SELECT domain_id FROM users WHERE id = $1) AND position(lower($2) IN lower(u.email)) > 0))
+    ORDER BY u.email LIMIT 20
+    """;
+
+fn sqlResolveContacts() -> StringView =>
+    """
+    SELECT o.data FROM dav_objects o JOIN dav_collections c ON c.id = o.collection_id
+    WHERE c.user_id = $1 AND c.kind = 'addressbook' AND NOT o.deleted AND position(lower($2) IN lower(o.data)) > 0
+    LIMIT 20
+    """;
+
+async fn resolveRecipients(
+    mail: borrow SmtpContext,
+    s: borrow Session,
+    body: borrow Body,
+) -> Result<Response, EasFail> {
+    let doc = borrow body.doc;
+    var w = WbxmlWriter.create();
+    w.start(PAGE_RESOLVE, "ResolveRecipients");
+    if (!body.present) {
+        w.element(PAGE_RESOLVE, "Status", "5");
+        w.end();
+        return written(w);
+    }
+    w.element(PAGE_RESOLVE, "Status", "1");
+    var tos = Vector<usize>.create();
+    mem(doc.findAll(doc.root(), NS_RESOLVE, "To", mut tos))?;
+    for (t in tos.view()) {
+        if (doc.parent(t) != doc.root()) {
+            continue; // a To inside Options is something else
+        }
+        let text = doc.trimmed(t);
+        var names = Vector<String>.create();
+        var emails = Vector<String>.create();
+        var types = Vector<i64>.create();
+        var params = PgParams.create();
+        pg(params.int64(s.userId))?;
+        pg(params.text(text))?;
+        let users = await query(borrow mail.store, sqlResolveUsers(), params)?;
+        for (r in 0..users.rowCount()) {
+            var e = String.create();
+            mem(e.append(users.text(r, 0) ?? ""))?;
+            var n = String.create();
+            mem(n.append(users.text(r, 0) ?? ""))?;
+            mem(emails.push(e))?;
+            mem(names.push(n))?;
+            mem(types.push(1))?;
+        }
+        let contacts = await query(borrow mail.store, sqlResolveContacts(), params)?;
+        for (r in 0..contacts.rowCount()) {
+            let lines = match (ContentLines.parse((contacts.text(r, 0) ?? "").bytes())) {
+                Ok(l) => l,
+                Err(_) => { return Err(EasFail.Memory); }
+            };
+            var name = Vector<u8>.create();
+            for (i in 0..lines.count()) {
+                if (lines.nameIs(i, "FN")) {
+                    mem(lines.textValue(i, mut name))?;
+                }
+            }
+            for (i in 0..lines.count()) {
+                if (lines.nameIs(i, "EMAIL")) {
+                    var e = Vector<u8>.create();
+                    mem(lines.textValue(i, mut e))?;
+                    let ev = StringView.fromUtf8(e.view().trim()) ?? "";
+                    let nv = StringView.fromUtf8(name.view()) ?? "";
+                    if (containsFolded(e.view(), text.bytes()) || containsFolded(name.view(), text.bytes())) {
+                        var es = String.create();
+                        mem(es.append(ev))?;
+                        var ns = String.create();
+                        mem(ns.append(if (nv.length > 0) nv else ev))?;
+                        mem(emails.push(es))?;
+                        mem(names.push(ns))?;
+                        mem(types.push(2))?;
+                    }
+                }
+            }
+        }
+        w.start(PAGE_RESOLVE, "Response");
+        w.element(PAGE_RESOLVE, "To", text);
+        w.element(PAGE_RESOLVE, "Status", if (emails.length == 0) "4" else if (emails.length == 1) "1" else "2");
+        w.number(PAGE_RESOLVE, "RecipientCount", truncate<i64>(emails.length));
+        for (i in 0..emails.length) {
+            w.start(PAGE_RESOLVE, "Recipient");
+            w.number(PAGE_RESOLVE, "Type", types[i]);
+            w.element(PAGE_RESOLVE, "DisplayName", names[i].view());
+            w.element(PAGE_RESOLVE, "EmailAddress", emails[i].view());
+            w.end();
+        }
+        w.end();
+    }
+    w.end();
+    return written(w);
+}
+
+// ---- MeetingResponse ----
+
+/// The text/calendar part of a message (an invitation), decoded; false when there is none.
+fn invitationOf(m: borrow LoadedMessage, into: borrow mut Vector<u8>) -> Result<bool, EasFail> {
+    for (p in 0..m.index.parts.length) {
+        if (m.index.parts[p].kind != PART_LEAF) {
+            continue;
+        }
+        var media = MediaType.create();
+        let typed = match (headerOf(m.index, p, "Content-Type")) {
+            Some(v) => match (parseMediaType(v, mut media)) {
+                Ok(t) => t,
+                Err(_) => { return Err(EasFail.Memory); }
+            },
+            null => false,
+        };
+        if (typed && media.isType("text") && media.isSubtype("calendar")) {
+            var kind = String.create();
+            return attachmentContent(m, p, into, mut kind);
+        }
+    }
+    return Ok(false);
+}
+
+/// `data` (an invitation, or a stored event) rewritten with the account's PARTSTAT, without METHOD; as REPLY when
+/// `reply` (then only the VEVENT's identifying fields and the account's attendee line are kept).
+fn answeredCalendar(
+    data: Slice<u8>,
+    me: StringView,
+    partstat: StringView,
+    reply: bool,
+    into: borrow mut Vector<u8>,
+) -> Result<void, EasFail> {
+    into.clear();
+    let lines = match (ContentLines.parse(data)) {
+        Ok(l) => l,
+        Err(_) => { return Err(EasFail.Memory); }
+    };
+    for (i in 0..lines.count()) {
+        let name = lines.name(i);
+        if (lines.nameIs(i, "METHOD")) {
+            if (reply) {
+                mem(into.extend("METHOD:REPLY\r\n".bytes()))?;
+            }
+            continue;
+        }
+        if (reply && lines.depth(i) == 2 && !lines.nameIs(i, "BEGIN") && !lines.nameIs(i, "END")) {
+            // A REPLY keeps the event's identity and the replying attendee (RFC 5546 §3.2.3).
+            let keep = lines.nameIs(
+                i,
+                "UID",
+            ) || lines.nameIs(i, "DTSTART") || lines.nameIs(i, "DTEND") || lines.nameIs(i, "SEQUENCE") ||
+                lines.nameIs(i, "ORGANIZER") || lines.nameIs(i, "RECURRENCE-ID") || lines.nameIs(i, "SUMMARY") ||
+                lines.nameIs(i, "DTSTAMP");
+            if (!keep && !lines.nameIs(i, "ATTENDEE")) {
+                continue;
+            }
+        }
+        let attendeeIsMe = lines.nameIs(i, "ATTENDEE") && mailtoOf(lines.rawValue(i)).equalsIgnoreAsciiCase(me.bytes());
+        if (reply && lines.nameIs(i, "ATTENDEE") && !attendeeIsMe) {
+            continue;
+        }
+        var head = Vector<u8>.create();
+        mem(head.extend(name))?;
+        let params = lines.rawParams(i);
+        if (attendeeIsMe) {
+            // The parameters but PARTSTAT and RSVP, then the answer.
+            var at: usize = 0;
+            while (at < params.length) {
+                var e = at;
+                var quoted = false;
+                while (e < params.length && !(params[e] == 0x3b && !quoted)) {
+                    if (params[e] == 0x22) {
+                        quoted = !quoted;
+                    }
+                    e += 1;
+                }
+                let p = params[at..e];
+                let drop1 = p.length >= 9 && p[0..9].equalsIgnoreAsciiCase("PARTSTAT=".bytes());
+                let drop2 = p.length >= 5 && p[0..5].equalsIgnoreAsciiCase("RSVP=".bytes());
+                if (!drop1 && !drop2 && p.length > 0) {
+                    mem(head.push(0x3b))?;
+                    mem(head.extend(p))?;
+                }
+                at = e + 1;
+            }
+            mem(head.extend(";PARTSTAT=".bytes()))?;
+            mem(head.extend(partstat.bytes()))?;
+        } else if (params.length > 0) {
+            mem(head.push(0x3b))?;
+            mem(head.extend(params))?;
+        }
+        mem(appendLine(into, StringView.fromUtf8(head.view()) ?? "X", lines.rawValue(i)))?;
+    }
+    return Ok();
+}
+
+async fn meetingResponse(mail: borrow SmtpContext, s: borrow Session, body: borrow Body) -> Result<Response, EasFail> {
+    let doc = borrow body.doc;
+    var w = WbxmlWriter.create();
+    w.start(PAGE_MEETING, "MeetingResponse");
+    if (!body.present) {
+        w.end();
+        return written(w);
+    }
+    var requests = Vector<usize>.create();
+    mem(doc.findAll(doc.root(), NS_MEETING, "Request", mut requests))?;
+    for (r in requests.view()) {
+        let answer = childNumber(doc, r, NS_MEETING, "UserResponse", 0);
+        let folder = childValue(doc, r, NS_MEETING, "CollectionId");
+        let requestId = childValue(doc, r, NS_MEETING, "RequestId");
+        let partstat: StringView = if (answer == 1) "ACCEPTED" else if (answer == 2) "TENTATIVE" else "DECLINED";
+        w.start(PAGE_MEETING, "Result");
+        w.element(PAGE_MEETING, "RequestId", requestId);
+        if (answer < 1 || answer > 3) {
+            w.element(PAGE_MEETING, "Status", "2");
+            w.end();
+            continue;
+        }
+        var invitation = Vector<u8>.create();
+        var calendarItem = String.create();
+        let parsed = parseFolderId(folder);
+        var found = false;
+        match (parsed) {
+            Some(f) => {
+                if (f[0] == KIND_MAILBOX as i64) {
+                    match (longIdOf(requestId)) {
+                        Some(ids) => {
+                            var m = emptyMessage();
+                            if (await originalMessage(mail, s, ids[0], ids[1], mut m)?) {
+                                found = invitationOf(m, mut invitation)?;
+                            }
+                        }
+                        null => {}
+                    }
+                } else if (f[0] == KIND_EVENTS as i64) {
+                    match (itemOf(folder, requestId)) {
+                        Some(item) => {
+                            var object = PimObject.create();
+                            match (await objectById(borrow mail.store, s.userId, item, mut object)) {
+                                Ok(true) => {
+                                    mem(invitation.extend(object.data.view().bytes()))?;
+                                    found = true;
+                                }
+                                Ok(false) => {}
+                                Err(_) => { return Err(EasFail.Unavailable); }
+                            }
+                        }
+                        null => {}
+                    }
+                }
+            }
+            null => {}
+        }
+        if (!found) {
+            w.element(PAGE_MEETING, "Status", "2");
+            w.end();
+            continue;
+        }
+        // Into the default calendar, answered; and the answer to the organizer.
+        var stored = Vector<u8>.create();
+        answeredCalendar(invitation.view(), s.email.view(), partstat, false, mut stored)?;
+        var facts = ObjectFacts.create();
+        let ok = match (objectFacts(stored.view(), mut facts)) {
+            Ok(b) => b,
+            Err(_) => { return Err(EasFail.Memory); }
+        };
+        if (!ok) {
+            w.element(PAGE_MEETING, "Status", "2");
+            w.end();
+            continue;
+        }
+        var calendar = Collection.create();
+        match (await collectionNamed(borrow mail.store, s.userId, KIND_CALENDAR, DEFAULT_COLLECTION, mut calendar)) {
+            Ok(_) => {}
+            Err(_) => { return Err(EasFail.Unavailable); }
+        }
+        var href = String.create();
+        mem(href.append(facts.uid.view()))?;
+        mem(href.append(".ics"))?;
+        var outcome = PutOutcome.create();
+        if (answer != 3) {
+            match (await putObject(
+                borrow mail.store,
+                s.userId,
+                calendar.id,
+                href.view(),
+                StringView.fromUtf8(stored.view()) ?? "",
+                "",
+                false,
+                mut outcome,
+            )) {
+                Ok() => {}
+                Err(_) => {}
+            }
+        }
+        var reply = Vector<u8>.create();
+        answeredCalendar(invitation.view(), s.email.view(), partstat, true, mut reply)?;
+        let lines = match (ContentLines.parse(invitation.view())) {
+            Ok(l) => l,
+            Err(_) => { return Err(EasFail.Memory); }
+        };
+        var organizer = Vector<u8>.create();
+        var subject = Vector<u8>.create();
+        for (i in 0..lines.count()) {
+            if (lines.nameIs(i, "ORGANIZER") && organizer.length == 0) {
+                mem(organizer.extend(mailtoOf(lines.rawValue(i))))?;
+            }
+            if (lines.nameIs(i, "SUMMARY") && subject.length == 0) {
+                mem(lines.textValue(i, mut subject))?;
+            }
+        }
+        if (organizer.length > 0 && !organizer.view().equalsIgnoreAsciiCase(s.email.view().bytes())) {
+            var title = Vector<u8>.create();
+            mem(
+                title.extend(
+                    if (answer ==
+                        1) "Accepted: ".bytes() else if (answer == 2) "Tentative: ".bytes() else "Declined: ".bytes(),
+                ),
+            )?;
+            mem(title.extend(subject.view()))?;
+            await sendCalendarReply(mail, s, organizer.view(), title.view(), reply.view())?;
+        }
+        w.element(PAGE_MEETING, "Status", "1");
+        if (outcome.id > 0) {
+            var c = String.create();
+            idText("c", calendar.id, mut c)?;
+            itemServerId(c.view(), outcome.id, mut calendarItem)?;
+            w.element(PAGE_MEETING, "CalendarId", calendarItem.view());
+        }
+        w.end();
+    }
+    w.end();
+    return written(w);
+}

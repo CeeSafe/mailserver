@@ -1,0 +1,12 @@
+size 9587
+envelope ("Tue, 9 Jun 92 03:45:24 JST" "Re: How to see Japanese characters (Re: malformed message)" (("Yutaka Sato =?ISO-2022-JP?B?GyRAOjRGI0stGyhK?=" NIL "ysato" "etl.go.jp")) (("Yutaka Sato =?ISO-2022-JP?B?GyRAOjRGI0stGyhK?=" NIL "ysato" "etl.go.jp")) (("Yutaka Sato =?ISO-2022-JP?B?GyRAOjRGI0stGyhK?=" NIL "ysato" "etl.go.jp")) ((NIL NIL "nsb" "thumper.bellcore.com")) (("Yutaka Sato =?ISO-2022-JP?B?GyRAOjRGI0stGyhK?=" NIL "ysato" "etl.go.jp")) NIL NIL "<gCvvx.ysato@etl.go.jp>")
+bodystructure (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 1965 43 NIL NIL NIL NIL) ("image" "gif" NIL NIL "README.jp shown in kterm" "base64" 6308 NIL NIL NIL NIL) "mixed" ("boundary" "==") NIL NIL NIL)
+body (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 1965 43) ("image" "gif" NIL NIL "README.jp shown in kterm" "base64" 6308) "mixed")
+section HEADER 1179 062a70ff9c545483f12224b25a5594f061fb43ec55ff891195f32fbc04436840
+section TEXT 8408 356c543cb79b845b6dcd3018654dbafbd7447aa40bda225f105c857865281af3
+section HEADER.FIELDS 361 3cdde251906c7abbf5971a7d11ba5dea59e05eff016ab22cb10b1299afd46814
+section HEADER.FIELDS.NOT 820 f1d303a071450395e0c4fac7c00d0686d9356a8e53c0493ae1a5e5ad909d11d7
+section 1 1965 d58a0300a1186470108993205599343b513ef70c3faf41706772e0e376a60986
+section 1.MIME 2 7eb70257593da06f682a3ddda54a9d260d4fc514f645237f5ca74b08f8da61a6
+section 2 6308 a26831eeda6fc9096dc97b11805d39b98ed503620f6c77089402e79f65a339eb
+section 2.MIME 109 2086806a92c9d0df8f5618fc282c6e1afc7feaca920759b9c1817fe6f406b066

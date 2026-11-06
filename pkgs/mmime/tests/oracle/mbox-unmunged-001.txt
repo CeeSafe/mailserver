@@ -1,0 +1,10 @@
+size 188
+envelope (NIL "Another test message with an unmunged From line" (("Jeffrey Stedfast" NIL "jeff" "xamarin.com")) (("Jeffrey Stedfast" NIL "jeff" "xamarin.com")) (("Jeffrey Stedfast" NIL "jeff" "xamarin.com")) NIL NIL NIL NIL NIL)
+bodystructure ("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 40 1 NIL NIL NIL NIL)
+body ("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 40 1)
+section HEADER 148 bcf7d42f89cb37b064406b7ebbc0a9cdd48cdd7ccb91d06599db50595d9d353e
+section TEXT 40 1bb1efb269dd9cfb6c2b43e9a5307cde0d1a0a4f1d3f2de91069b92638072887
+section HEADER.FIELDS 129 0efecdf8fb04da996a6f58bb6f3dbb7f8492d2e6ffff313c4c1bb8845e5d8615
+section HEADER.FIELDS.NOT 21 07a26ab8981ff3b1de28da29cf47f47e315b9c25685121dc5ebb60391005b2de
+section 1 40 1bb1efb269dd9cfb6c2b43e9a5307cde0d1a0a4f1d3f2de91069b92638072887
+section 1.MIME 148 bcf7d42f89cb37b064406b7ebbc0a9cdd48cdd7ccb91d06599db50595d9d353e

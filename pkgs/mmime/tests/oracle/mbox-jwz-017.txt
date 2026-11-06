@@ -1,0 +1,16 @@
+size 438287
+envelope ("Mon, 26 Jun 1995 16:53:52 -0800" "AppleDouble example" (("Aleksandar Totic" NIL "atotic" "netscape.com")) (("Aleksandar Totic" NIL "atotic" "netscape.com")) (("Aleksandar Totic" NIL "atotic" "netscape.com")) ((NIL NIL "atotic" "mcom.com") (NIL NIL "jwz" "mcom.com")) NIL NIL NIL "<ac15067506021004778a@[198.93.92.66]>")
+bodystructure (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 77 5 NIL NIL NIL NIL) (("application" "applefile" ("name" "%Aete_Editor_b1") NIL NIL "base64" 66874 NIL ("attachment" ("filename" "%Aete_Editor_b1")) NIL NIL) ("application" "octet-stream" ("name" "Aete_Editor_b1" "x-mac-type" "5354414B" "x-mac-creator" "57494C44") NIL NIL "base64" 369562 NIL ("attachment" ("filename" "Aete_Editor_b1")) NIL NIL) "header-set" ("boundary" "========================_26885646==_D") NIL NIL NIL) "mixed" ("boundary" "========================_26885646==_") NIL NIL NIL)
+body (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 77 5) (("application" "applefile" ("name" "%Aete_Editor_b1") NIL NIL "base64" 66874) ("application" "octet-stream" ("name" "Aete_Editor_b1" "x-mac-type" "5354414B" "x-mac-creator" "57494C44") NIL NIL "base64" 369562) "header-set") "mixed")
+section HEADER 999 051ea4537c0bca4c833fa8d93249fef47926cd2ac73e89043a6bf0e639dcf2cc
+section TEXT 437288 ffd366af4bb53b743fc2949f777a1dd8cb822031612dd89874665e43b652481d
+section HEADER.FIELDS 283 245321f670e7db383a0bf6e8dc638347ce64770bd992ab1c9f74c62348088483
+section HEADER.FIELDS.NOT 718 2b2d1ef6ee169e114ac2fda9eb3f6530fa80be885588034280022daa02c3b929
+section 1 77 f408297c39058274555a2cb37e33c3f0ad1a303bc2fb831037a02faea1338a51
+section 1.MIME 48 f6340d15a791d3f78b6810598c67e16678990337cc09688252be0932c6c9240e
+section 2 436945 68e9c933524345bbbc67b3fec645c8465a4c903804da14997f9d57449597c36b
+section 2.MIME 88 b182bbf0b2548d8db0e9b9d93ca23a0bb7e29c27f1f1ff2150af2d070182e08b
+section 2.1 66874 da68dcb0f9d2e512175998bf910be759a8cc64ef3c15fdb40eef50c0cddb2b9a
+section 2.1.MIME 159 89571f5a179439ea4526516788181f8ae093f526c9924ddba2aa9d01f4fdd540
+section 2.2 369562 fc5c17251b98dc23d55ffe48e5ebaea0ed512602db3fdd063ebab62d0ba966a8
+section 2.2.MIME 215 a1950fbabfde0499ef11c85a92430b3780d9006734d264aeab09f03a47d82328

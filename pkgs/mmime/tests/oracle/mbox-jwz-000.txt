@@ -1,0 +1,26 @@
+size 181615
+envelope ("Thu, 19 Sep 91 12:41:43 EDT" "Star Trek Party!" (("Nathaniel Borenstein" NIL "nsb" "MISSING_DOMAIN")) (("Nathaniel Borenstein" NIL "nsb" "MISSING_DOMAIN")) (("Nathaniel Borenstein" NIL "nsb" "MISSING_DOMAIN")) ((NIL NIL "abel" "MISSING_DOMAIN") (NIL NIL "bianchi" "MISSING_DOMAIN") (NIL NIL "braun" "MISSING_DOMAIN") (NIL NIL "cameron" "MISSING_DOMAIN") (NIL NIL "carmen" "MISSING_DOMAIN") (NIL NIL "jfp" "MISSING_DOMAIN") (NIL NIL "jxr" "MISSING_DOMAIN") (NIL NIL "kraut" "MISSING_DOMAIN") (NIL NIL "lamb" "MISSING_DOMAIN") (NIL NIL "lowery" "MISSING_DOMAIN") (NIL NIL "lynn" "MISSING_DOMAIN") (NIL NIL "mlittman" "MISSING_DOMAIN") (NIL NIL "nancyg" "MISSING_DOMAIN") (NIL NIL "sau" "MISSING_DOMAIN") (NIL NIL "shoshi" "MISSING_DOMAIN") (NIL NIL "slr" "MISSING_DOMAIN") (NIL NIL "stornett" "flash") (NIL NIL "tkl" "MISSING_DOMAIN")) ((NIL NIL "nsb" "MISSING_DOMAIN") (NIL NIL "trina" "flash")) NIL NIL "<9109191641.AA12840@greenbush.bellcore.com>")
+bodystructure ((("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 731 16 NIL NIL NIL NIL) ("audio" "basic" NIL NIL NIL "base64" 31472 NIL NIL NIL NIL) "parallel" ("boundary" "Where_No_One_Has_Gone_Before") NIL NIL NIL) (("image" "gif" NIL NIL NIL "base64" 26000 NIL NIL NIL NIL) ("image" "gif" NIL NIL NIL "base64" 18666 NIL NIL NIL NIL) ("" "" NIL NIL NIL "7bit" 46125 NIL NIL NIL NIL) ("application" "atomicmail" NIL NIL NIL "7bit" 9203 NIL NIL NIL NIL) "mixed" ("boundary" "Where_No_Man_Has_Gone_Before") NIL NIL NIL) ("audio" "basic" NIL NIL NIL "base64" 47822 NIL NIL NIL NIL) "mixed" ("boundary" "Outermost_Trek") NIL NIL NIL)
+body ((("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 731 16) ("audio" "basic" NIL NIL NIL "base64" 31472) "parallel") (("image" "gif" NIL NIL NIL "base64" 26000) ("image" "gif" NIL NIL NIL "base64" 18666) ("" "" NIL NIL NIL "7bit" 46125) ("application" "atomicmail" NIL NIL NIL "7bit" 9203) "mixed") ("audio" "basic" NIL NIL NIL "base64" 47822) "mixed")
+section HEADER 522 ffece9007c4d574f89f3c94a79b593c3f11b0efd0e9546d1f58db9da3666065c
+section TEXT 181093 aa03889fe92c27ab9fae4f9bc221c53c413126d1447039031af9bca1abf6e25e
+section HEADER.FIELDS 379 deff5310e8038c9948fcf717a981724f5567f700f175bbf47b9172c6581b3eb8
+section HEADER.FIELDS.NOT 145 149176cba98358792affe66a558a5647c226566bcae58247e225c82e49ab3c12
+section 1 32395 a62937d4633f1572b0c8e12529ad1d394898b02e966ac95123617db6de3c8ad7
+section 1.MIME 99 935557b5504d9fa9920a45af4b0c1ae4fabc2d6b37457f842240ee45a90bc296
+section 1.1 731 d8aca3988a222b8f2bdd4039d07a2dd3ff4eaae28359e58d02883488c6db0374
+section 1.1.MIME 2 7eb70257593da06f682a3ddda54a9d260d4fc514f645237f5ca74b08f8da61a6
+section 1.2 31472 61c1e8ab0c939d4786dd0561dbd13b7657775cc41f15f742f4323729b1d00520
+section 1.2.MIME 88 3990f5f02d906394a57759e67e61b8b03046c0b8e243f2cede80857b78d3cd1a
+section 2 100517 965b7d046341edda23cba663eea7bac31b08411aec2ac654b21ff63f87d4452e
+section 2.MIME 96 9d3727afd3d9bb7136d46775b988e6903a7eaad0d197762f68d78a456a81e24b
+section 2.1 26000 906180f1349eb60417e324df5528454c89df3af56be73ded7e03decb917c27c5
+section 2.1.MIME 86 9367b5495b7e5d85f7d859bb58e66617fdbbcc479186d9c83f7a3701e492b0dc
+section 2.2 18666 aa7465ed4caf6950587b8418b5be79679df121e3686b42e2cb616e27c9b73903
+section 2.2.MIME 86 9367b5495b7e5d85f7d859bb58e66617fdbbcc479186d9c83f7a3701e492b0dc
+section 2.3 46125 d339b40b5d2761c6969c59395ed41431924ce71fb481c285e7e6380ec32bce9e
+section 2.3.MIME 117 ac964aae80de712becb9094829616580c16e5de30f4cae4db07a46943649e6b3
+section 2.4 9203 afc0b77782ce3a91cb3e8697124f2cbff52ae0784e9ce74b54e2097563c3a18d
+section 2.4.MIME 64 e288def1ac954d89c54be7521d7fd5d82a8c96cc94a2f6e5d3b865e93d11ecf6
+section 3 47822 c7bf9e46ad23fb7aaa1a004df148e04ff31244f0c83d81291eeb2db162dfae64
+section 3.MIME 88 3990f5f02d906394a57759e67e61b8b03046c0b8e243f2cede80857b78d3cd1a

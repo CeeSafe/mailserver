@@ -1,0 +1,16 @@
+size 619
+envelope ("Tue, 12 Nov 2013 09:12:42 -0500" "test of a message/rfc822 part with a base64 Content-Transfer-Encoding" ((NIL NIL "mimekit" "example.com")) ((NIL NIL "mimekit" "example.com")) ((NIL NIL "mimekit" "example.com")) ((NIL NIL "mimekit" "example.com")) NIL NIL NIL "<54AD68C9E3B0184CAC6041320424FD1B5B81E74D@localhost.localdomain>")
+bodystructure ("message" "rfc822" NIL NIL NIL "base64" 284 (NIL NIL NIL NIL NIL NIL NIL NIL NIL NIL) ("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 0 0 NIL NIL NIL NIL) 4 NIL NIL NIL NIL)
+body ("message" "rfc822" NIL NIL NIL "base64" 284 (NIL NIL NIL NIL NIL NIL NIL NIL NIL NIL) ("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 0 0) 4)
+section HEADER 335 eaece65d0654d11211bc1ce3d066002e644656872e61bfa31fa9197e8bc3fbce
+section TEXT 284 cbf27bc5097d62c3f722298f918c0ef7544fb019b368d81e954c5dcc0832a164
+section HEADER.FIELDS 281 af2a905eb5cf5c10bd5b1e2ccd69e6885b5ab6f9e1c8096b2cc097f9974fc54a
+section HEADER.FIELDS.NOT 56 9c6fcf4aac5c58d2d64eed4390ea440b2f5f021d36bffc1b62d96b3395acb58e
+section 1 284 cbf27bc5097d62c3f722298f918c0ef7544fb019b368d81e954c5dcc0832a164
+section 1.MIME 335 eaece65d0654d11211bc1ce3d066002e644656872e61bfa31fa9197e8bc3fbce
+section 1.HEADER 284 cbf27bc5097d62c3f722298f918c0ef7544fb019b368d81e954c5dcc0832a164
+section 1.TEXT 0 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+section 1.HEADER.FIELDS 0 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+section 1.HEADER.FIELDS.NOT 284 cbf27bc5097d62c3f722298f918c0ef7544fb019b368d81e954c5dcc0832a164
+section 1.1 0 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+section 1.1.MIME 284 cbf27bc5097d62c3f722298f918c0ef7544fb019b368d81e954c5dcc0832a164

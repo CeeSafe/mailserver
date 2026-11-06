@@ -1,0 +1,14 @@
+size 4008
+envelope ("Mon, 9 Sep 1996 12:52:38 -0700" "plase help by returning what gets delivered..." (("Peter Williams" NIL "peter" "verisign.com")) ((NIL NIL "owner-smime-dev" "rsa.com")) (("Peter Williams" NIL "peter" "verisign.com")) (("'smime-dev@rsa.com'" NIL "smime-dev" "rsa.com")) NIL NIL NIL "<01BB9E4D.CA27D8A0@Peter.verisign.com>")
+bodystructure (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 466 13 NIL NIL NIL NIL) ("text" "html" ("name" "Page1.htm" "charset" "us-ascii") NIL NIL "7bit" 837 26 NIL NIL NIL NIL) ("application" "x-pkcs7-signature" ("name" "Page1.p7s") NIL NIL "base64" 1216 NIL NIL NIL NIL) "mixed" ("boundary" "---- =_NextPart_000_01BB9E4D.CA434FE0") NIL NIL NIL)
+body (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 466 13) ("text" "html" ("name" "Page1.htm" "charset" "us-ascii") NIL NIL "7bit" 837 26) ("application" "x-pkcs7-signature" ("name" "Page1.p7s") NIL NIL "base64" 1216) "mixed")
+section HEADER 1056 73a4592d7a1dbf45a96f53ca5df93d4e2360d3c741e5b90f16781a2db15b1024
+section TEXT 2952 2f50b9fb16d1225d9e15c8192393edc694d6c27efe5f1e029940b5c08b75d404
+section HEADER.FIELDS 320 670cbf042fa4adad6e1cd5389ec1205c0968a46232d6faa8ae56181d8ebbc3a4
+section HEADER.FIELDS.NOT 738 d2c48a6fd259aa55b94f2afc77e174c08c387408a686ef98e5975389d1081952
+section 1 466 082acd75fc787b86d78ffd5de17e48b69025c3bd15093abeefac30df663549c7
+section 1.MIME 81 11e512bb335700048a2f81e229896d81e68a6c0460f1135f1c57ff19506dfbe5
+section 2 837 bade00351fbcf1155769f01ef8b8128617f1ecbfe04c3448d9ff0ec54a1edd91
+section 2.MIME 78 d6d56c13f513a9af31dde972b40b92db9d0a5a0cfea17731385d3b9983d3cf97
+section 3 1216 7d18611e250ae6db40b250a1e31aa4c0c2e90b452d96dc922e55926915a6b77f
+section 3.MIME 100 1a2651585c72221860d4cea85e38ca7405b39f6ce75b0793b54e06e1bdf7476f

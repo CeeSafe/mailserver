@@ -1,0 +1,10 @@
+size 348488
+envelope ("Sat, 05 Oct 91 16:00:40 -0700" "Re: near closure on audio stuff" (("Marshall Rose" NIL "mrose" "dbc.mtview.ca.us")) (("Marshall Rose" NIL "mrose" "dbc.mtview.ca.us")) (("Marshall Rose" NIL "mrose" "dbc.mtview.ca.us")) (("Nathaniel Borenstein" NIL "nsb" "thumper.bellcore.com")) (("Stephen A. Uhler" NIL "sau" "thumper.bellcore.com")) NIL "Your message of \"Fri, 04 Oct 91 23:13:17 PDT.\"             <14836.686643197@dbc.mtview.ca.us> " "<22353.686703640@dbc.mtview.ca.us>")
+bodystructure ("audio" "basic" NIL NIL NIL "base64" 347516 NIL NIL NIL NIL)
+body ("audio" "basic" NIL NIL NIL "base64" 347516)
+section HEADER 972 cef9dc9b54b763df92f63a8000fbfe3096d98958ea361498523b87e613316ebe
+section TEXT 347516 3284f69e9bff70a0d5958a5bfeb59af06699d084eb133f47b03c765c1a20babb
+section HEADER.FIELDS 307 4984ced6fb6a8d28f5c0ff83217bc50383d148dbff666ae190032ced372a2f1e
+section HEADER.FIELDS.NOT 667 3e9dfeabf0d430513af12ede64e7add4e26dd6f49c2ca86473e76b26d650b32b
+section 1 347516 3284f69e9bff70a0d5958a5bfeb59af06699d084eb133f47b03c765c1a20babb
+section 1.MIME 972 cef9dc9b54b763df92f63a8000fbfe3096d98958ea361498523b87e613316ebe

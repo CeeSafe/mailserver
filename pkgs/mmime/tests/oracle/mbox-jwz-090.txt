@@ -1,0 +1,10 @@
+size 2260
+envelope ("Tue, 17 Mar 92 13:27 CST" "First impressions of metamail release 2" (("Daniel A. Glasser" NIL "dag" "persoft.com")) (("Daniel A. Glasser" NIL "dag" "persoft.com")) (("Daniel A. Glasser" NIL "dag" "persoft.com")) ((NIL NIL "nsb" "thumper.bellcore.com")) ((NIL NIL "dag" "gorgon")) NIL NIL "<m0lQjol-00018GC@persoft.persoft.com>")
+bodystructure ("text" "richtext" ("charset" "us-ascii") NIL NIL "quoted-printable" 1428 42 NIL NIL NIL NIL)
+body ("text" "richtext" ("charset" "us-ascii") NIL NIL "quoted-printable" 1428 42)
+section HEADER 832 33011da05e3bd5482362f9eb8ac7019cea0c54ef4d349f343aae2e8c7d440565
+section TEXT 1428 280ad5bff673649652545a13a8cc75b402c19016e8dadff8c7ca2762e9277cf1
+section HEADER.FIELDS 253 480e0a49fb307e0a85c29de19f2f56318a4f3a30bd02635a9ed9727991866fae
+section HEADER.FIELDS.NOT 581 d2e318f30cf95d94f8f185d205295c936731f741605852669ec0d13008cc8613
+section 1 1428 280ad5bff673649652545a13a8cc75b402c19016e8dadff8c7ca2762e9277cf1
+section 1.MIME 832 33011da05e3bd5482362f9eb8ac7019cea0c54ef4d349f343aae2e8c7d440565

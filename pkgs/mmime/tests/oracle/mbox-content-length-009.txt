@@ -1,0 +1,12 @@
+size 7112
+envelope ("Thu, 21 Nov 1996 16:10:23 -0500" "My encryption certificate for S/MIME testing" (("Eric Rosenquist" NIL "rosenqui" "strataware.com")) ((NIL NIL "owner-smime-dev" "rsa.com")) (("Eric Rosenquist" NIL "rosenqui" "strataware.com")) (("S/MIME Developers" NIL "smime-dev" "rsa.com")) (("Eric Rosenquist" NIL "rosenqui" "strataware.com") ("Michel Ranger" NIL "rangerm" "entrust.com") ("Ron Vandergeest" NIL "rvander" "entrust.com")) NIL NIL "<199611212110.QAA14653@krusty.strataware.com>")
+bodystructure (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 2858 46 NIL NIL NIL NIL) ("application" "x-pkcs7-mime" ("name" "eric.p7c") NIL NIL "base64" 2582 "uqh4Ulmz/0OvRmRYshEwJQ==" ("inline" ("filename" "eric.p7c")) NIL NIL) "mixed" ("boundary" "961121152248_14052") NIL NIL NIL)
+body (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 2858 46) ("application" "x-pkcs7-mime" ("name" "eric.p7c") NIL NIL "base64" 2582) "mixed")
+section HEADER 1160 134dd2d42a034b3d1364422dbf20f7076efe1b9efd85eceb2c5c70d06eb964a2
+section TEXT 5952 786e3b29846d34355d7ab609f757c55c8bf398a267ac25b62ac1fe779b3e9733
+section HEADER.FIELDS 450 ac53b2df4864325ef5e23c15db539dc6224e17db9a57edd90688d615555388f0
+section HEADER.FIELDS.NOT 712 03aec46a6098b5abba2c5cff62738b5d7b55ea0c16c2bcfe1f9bc427196a90e6
+section 1 2858 81f6301d2b087f271144f8e5856d2d707dbe8ad206613b1c4c8b651f9b37651c
+section 1.MIME 81 11e512bb335700048a2f81e229896d81e68a6c0460f1135f1c57ff19506dfbe5
+section 2 2582 2661cb3bc1af524a150edd242fee6c2058b1601ef46218e590603152849ce1f7
+section 2.MIME 183 f56803ed84b9e6759cbba4c24316dbfde4989b881877b5b548dd920be9f6f4d3

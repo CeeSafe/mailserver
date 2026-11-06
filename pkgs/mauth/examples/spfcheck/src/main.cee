@@ -1,0 +1,24 @@
+// spfcheck DNS_PORT IP MAIL_FROM HELO: the SPF result, asking 127.0.0.1:DNS_PORT. Prints the result, then the
+// explanation (empty when there is none). For tests/spf/run.py.
+
+import mauth.SpfOutcome;
+import mauth.checkSpf;
+import mauth.spfName;
+import mdns.IpAddress;
+import mdns.Resolver;
+import mdns.parseIp;
+
+fn main() {
+    let port = Process.argument(1)!.parseInt<u16>()!;
+    let ip = parseIp(Process.argument(2)!.bytes())!;
+    let from = Process.argument(3)!;
+    let helo = Process.argument(4)!;
+    var servers = Vector<IpAddress>.create();
+    servers.push(IpAddress.v4(127, 0, 0, 1))!;
+    var resolver = Resolver.create(servers, port)!;
+    resolver.timeout(300);
+    var outcome = SpfOutcome.create();
+    Async.run(checkSpf(resolver, ip, from, helo, mut outcome))!;
+    Console.writeLine(spfName(outcome.result));
+    Console.writeLine(outcome.explanation.view());
+}

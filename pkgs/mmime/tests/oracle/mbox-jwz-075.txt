@@ -1,0 +1,28 @@
+size 218095
+envelope ("Tue, 01 Apr 1997 16:55:24 -0800" "Netscape Announces Theme Park Plans" (("Jamie Zawinski" NIL "jwz" "netscape.com")) (("Jamie Zawinski" NIL "jwz" "netscape.com")) (("Jamie Zawinski" NIL "jwz" "netscape.com")) (("Paul Phillips" NIL "paulp" "go2net.com")) NIL NIL NIL "<3341AE7C.665F552F@netscape.com>")
+bodystructure (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 253 6 NIL NIL NIL NIL) (("text" "html" ("charset" "us-ascii" "name" "story12.htm") "<3341AE7C.665F552F.1@netscape.com>" NIL "7bit" 7327 179 NIL ("inline" ("filename" "story12.htm")) NIL NIL) ("image" "gif" NIL "<3341AE7C.665F552F.2@netscape.com>" NIL "base64" 8090 NIL ("inline" ("filename" "netscape1223_communicator.gif")) NIL NIL) ("image" "gif" NIL "<3341AE7C.665F552F.3@netscape.com>" NIL "base64" 7556 NIL ("inline" ("filename" "inbanner.gif")) NIL NIL) ("image" "gif" NIL "<3341AE7C.665F552F.4@netscape.com>" NIL "base64" 3378 NIL ("inline" ("filename" "topnews.gif")) NIL NIL) ("image" "gif" NIL "<3341AE7C.665F552F.5@netscape.com>" NIL "base64" 8566 NIL ("inline" ("filename" "headline.gif")) NIL NIL) ("image" "gif" NIL "<3341AE7C.665F552F.6@netscape.com>" NIL "base64" 105798 NIL ("inline" ("filename" "plans.GIF")) NIL NIL) ("image" "jpeg" NIL "<3341AE7C.665F552F.7@netscape.com>" NIL "base64" 38886 NIL ("inline" ("filename" "pirates.jpg")) NIL NIL) ("image" "jpeg" NIL "<3341AE7C.665F552F.8@netscape.com>" NIL "base64" 35798 NIL ("inline" ("filename" "stockcoaster.jpg")) NIL NIL) "related" ("boundary" "------------25F71003F6609771F5544031") NIL NIL NIL) "mixed" ("boundary" "------------25F71003F6609771F5544030") NIL NIL NIL)
+body (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 253 6) (("text" "html" ("charset" "us-ascii" "name" "story12.htm") "<3341AE7C.665F552F.1@netscape.com>" NIL "7bit" 7327 179) ("image" "gif" NIL "<3341AE7C.665F552F.2@netscape.com>" NIL "base64" 8090) ("image" "gif" NIL "<3341AE7C.665F552F.3@netscape.com>" NIL "base64" 7556) ("image" "gif" NIL "<3341AE7C.665F552F.4@netscape.com>" NIL "base64" 3378) ("image" "gif" NIL "<3341AE7C.665F552F.5@netscape.com>" NIL "base64" 8566) ("image" "gif" NIL "<3341AE7C.665F552F.6@netscape.com>" NIL "base64" 105798) ("image" "jpeg" NIL "<3341AE7C.665F552F.7@netscape.com>" NIL "base64" 38886) ("image" "jpeg" NIL "<3341AE7C.665F552F.8@netscape.com>" NIL "base64" 35798) "related") "mixed")
+section HEADER 459 5e9730b937a3aedb05fe2baba60a8deaeb4c82ceb01de69a4f221e575a807e2a
+section TEXT 217636 a56315d88bd241831b6a9a602c3996a981b29f131f4357f4b5f791df0d80c7f5
+section HEADER.FIELDS 297 a8fb196d70c6ea36b433c94a3cc9606d9cd862f3671cc904d49ca3d77545e5fb
+section HEADER.FIELDS.NOT 164 600668ba15ab34bccbb59b246db21eb4bd0879e87064f48ca41ddc7fe91a1318
+section 1 253 9694ba2db3854daf8e920ca45f25feed746b4912c6a1a356fcd65789f917bd6c
+section 1.MIME 28 c3204dd99ab0f23ec6029433de09a5ae168a2daab5b5352645a32379e329b040
+section 2 217142 2d62b4291a12dd7256e2f20f2142bf8a528e8f49d1d9d77cab7df928e7587c14
+section 2.MIME 89 b4483d771e725d1d823a0a27e75a2f04f4e626e509706454517836e1da0bde0a
+section 2.1 7327 62b5b09cc27c52858c272836e3a6ca0f9a6479b03de220f4a496704ffef73a76
+section 2.1.MIME 199 e9c627d3a6fbc6e9e26a362ad79b5aeb8b55a256d9f60d7b7d52d32f2e3931f8
+section 2.2 8090 33939b51c0a2e270658234ccb6c6f9207d4de4a7d67e7e0d49e37195f86ac850
+section 2.2.MIME 181 cdd4b53af090d886ca49eef7f24732991d56bd4f3d0c42eca3b1222a67c223c4
+section 2.3 7556 1cf06dade227b525ea9aea700a51f4d411240a5cdcd764932b88b859ed00a328
+section 2.3.MIME 164 bb7ab8982c7e61e03df57bb902eef394bd59bd55c0ac90bfa522c43b104ef7ec
+section 2.4 3378 c9e71074d3492606b863b8e1609a7565cc26adf67198f20d9ea1b4403bd001a7
+section 2.4.MIME 163 d3d1b25d5cd72a32c55adbb4fb67b0069ac8b7389e406bfc1102b2b8b402f0eb
+section 2.5 8566 b624b0e6b77926841f6007a535d6020a1f5351acff8a627b2bec1bef28183937
+section 2.5.MIME 164 ed8c9f6ae381bb93f8d6d093c097f2bb78dffd3b12b45f86b1995c881619522d
+section 2.6 105798 1aa6dfb110ed581e0869de45d5abdca3411778a7fc0bad517a749e7226a4375c
+section 2.6.MIME 161 54fd20fa9c2be82180bdade0a0ed28f3f72e57943cf876cba6722410cbb97f28
+section 2.7 38886 5ebc1dcd023ebaff5be0aa8c41253de249ba24a74f7d93ca6436f15666499f46
+section 2.7.MIME 164 3b331c6f8206f9bb421c7554b1a05a866c2821dcedbec9a57cf0fa20c23af462
+section 2.8 35798 a0e735a0dd3bb10cbe337dff95c9cde10c3567664461c23e0bff9d11ad19afa5
+section 2.8.MIME 169 0cdb9b7ed6db5c3f85d079d2a746cb7ba28425027688ced506b4387bf0fcc561

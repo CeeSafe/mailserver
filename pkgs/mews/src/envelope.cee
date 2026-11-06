@@ -1,0 +1,221 @@
+// A message's summary for EWS items, read from the IMAP ENVELOPE the store keeps in each message's meta (mmime's
+// renderer made it at delivery), so listing a folder never opens message files: date, subject (RFC 2047 words
+// decoded), From, To, Cc and Message-ID.
+
+import mmime.decodeHeader;
+
+/// One address: display name (decoded) and address.
+public struct MailAddress {
+    public name: Vector<u8>;
+    public email: Vector<u8>;
+}
+
+/// What an item shows of a message.
+public struct Summary {
+    /// The Date field, raw.
+    public date: Vector<u8>;
+    public subject: Vector<u8>;
+    public from: Vector<MailAddress>;
+    public to: Vector<MailAddress>;
+    public cc: Vector<MailAddress>;
+    public messageId: Vector<u8>;
+
+    public fn create() -> Summary => Summary {
+        date: Vector<u8>.create(),
+        subject: Vector<u8>.create(),
+        from: Vector<MailAddress>.create(),
+        to: Vector<MailAddress>.create(),
+        cc: Vector<MailAddress>.create(),
+        messageId: Vector<u8>.create(),
+    };
+}
+
+struct EnvelopeReader {
+    at: usize;
+    bad: bool;
+
+    fn skipSpace(borrow mut this, text: Slice<u8>) {
+        while (this.at < text.length && text[this.at] == 0x20) {
+            this.at += 1;
+        }
+    }
+
+    fn expect(borrow mut this, text: Slice<u8>, c: u8) -> bool {
+        this.skipSpace(text);
+        if (this.at < text.length && text[this.at] == c) {
+            this.at += 1;
+            return true;
+        }
+        this.bad = true;
+        return false;
+    }
+
+    /// An nstring onto `out` (cleared); false for NIL.
+    fn nstring(borrow mut this, text: Slice<u8>, out: borrow mut Vector<u8>) -> Result<bool, AllocError> {
+        out.clear();
+        this.skipSpace(text);
+        if (this.at >= text.length) {
+            this.bad = true;
+            return Ok(false);
+        }
+        let c = text[this.at];
+        if (c == 0x4e) {
+            // NIL
+            this.at += 3;
+            return Ok(false);
+        }
+        if (c == 0x22) {
+            this.at += 1;
+            while (this.at < text.length && text[this.at] != 0x22) {
+                if (text[this.at] == 0x5c && this.at + 1 < text.length) {
+                    this.at += 1;
+                }
+                out.push(text[this.at])?;
+                this.at += 1;
+            }
+            this.at += 1;
+            return Ok(true);
+        }
+        if (c == 0x7b) {
+            var n: usize = 0;
+            this.at += 1;
+            while (this.at < text.length && text[this.at] >= 0x30 && text[this.at] <= 0x39) {
+                n = n * 10 + (text[this.at] - 0x30) as usize;
+                this.at += 1;
+            }
+            // "}\r\n"
+            this.at += 3;
+            if (this.at + n > text.length) {
+                this.bad = true;
+                return Ok(false);
+            }
+            out.extend(text[this.at..(this.at + n)])?;
+            this.at += n;
+            return Ok(true);
+        }
+        this.bad = true;
+        return Ok(false);
+    }
+
+    /// An address list: NIL or a parenthesized list of (name adl mailbox host); groups are flattened.
+    fn addresses(borrow mut this, text: Slice<u8>, into: borrow mut Vector<MailAddress>) -> Result<void, AllocError> {
+        into.clear();
+        this.skipSpace(text);
+        if (this.at < text.length && text[this.at] == 0x4e) {
+            this.at += 3;
+            return Ok();
+        }
+        if (!this.expect(text, 0x28)) {
+            return Ok();
+        }
+        var name = Vector<u8>.create();
+        var route = Vector<u8>.create();
+        var mailbox = Vector<u8>.create();
+        var host = Vector<u8>.create();
+        loop {
+            this.skipSpace(text);
+            if (this.at >= text.length) {
+                this.bad = true;
+                return Ok();
+            }
+            if (text[this.at] == 0x29) {
+                this.at += 1;
+                return Ok();
+            }
+            if (!this.expect(text, 0x28)) {
+                return Ok();
+            }
+            let hasName = this.nstring(text, mut name)?;
+            this.nstring(text, mut route)?;
+            let hasMailbox = this.nstring(text, mut mailbox)?;
+            let hasHost = this.nstring(text, mut host)?;
+            if (!this.expect(text, 0x29) || this.bad) {
+                return Ok();
+            }
+            if (!hasHost || !hasMailbox) {
+                continue; // a group's start or end
+            }
+            var a = MailAddress { name: Vector<u8>.create(), email: Vector<u8>.create() };
+            if (hasName) {
+                decodeHeader(name.view(), mut a.name)?;
+            }
+            a.email.extend(mailbox.view())?;
+            a.email.push(0x40)?;
+            a.email.extend(host.view())?;
+            into.push(a)?;
+        }
+    }
+}
+
+/// Reads an ENVELOPE (`(date subject from sender reply-to to cc bcc in-reply-to message-id)`) into `into`; false
+/// when it is malformed (then `into` holds what was read before).
+public fn readEnvelope(text: Slice<u8>, into: borrow mut Summary) -> Result<bool, AllocError> {
+    var r = EnvelopeReader { at: 0, bad: false };
+    into.date.clear();
+    into.subject.clear();
+    into.from.clear();
+    into.to.clear();
+    into.cc.clear();
+    into.messageId.clear();
+    if (!r.expect(text, 0x28)) {
+        return Ok(false);
+    }
+    r.nstring(text, mut into.date)?;
+    var raw = Vector<u8>.create();
+    if (r.nstring(text, mut raw)?) {
+        decodeHeader(raw.view(), mut into.subject)?;
+    }
+    r.addresses(text, mut into.from)?;
+    var skip = Vector<MailAddress>.create();
+    r.addresses(text, mut skip)?; // sender
+    r.addresses(text, mut skip)?; // reply-to
+    r.addresses(text, mut into.to)?;
+    r.addresses(text, mut into.cc)?;
+    r.addresses(text, mut skip)?; // bcc
+    r.nstring(text, mut raw)?;    // in-reply-to
+    r.nstring(text, mut into.messageId)?;
+    return Ok(!r.bad);
+}
+
+/// The UTC time an RFC 5322 Date names, in seconds; null when it cannot be read.
+public fn dateSeconds(date: Slice<u8>) -> i64? {
+    let local = mimap.parseMessageDate(date)?;
+    // parseMessageDate gives the wall-clock time; its zone is the last token, when it is [+-]hhmm.
+    var end = date.length;
+    while (end > 0 &&
+        (date[end - 1] == 0x20 || date[end - 1] == 0x09 || date[end - 1] == 0x0d || date[end - 1] == 0x0a)) {
+        end -= 1;
+    }
+    // A trailing comment such as "(UTC)" is skipped.
+    if (end > 0 && date[end - 1] == 0x29) {
+        var open = end;
+        while (open > 0 && date[open - 1] != 0x28) {
+            open -= 1;
+        }
+        if (open > 0) {
+            end = open - 1;
+            while (end > 0 && date[end - 1] == 0x20) {
+                end -= 1;
+            }
+        }
+    }
+    if (end >= 5) {
+        let z = date[(end - 5)..end];
+        if ((z[0] == 0x2b || z[0] == 0x2d) && isDigits(z[1..])) {
+            let hours = ((z[1] - 0x30) as i64) * 10 + (z[2] - 0x30) as i64;
+            let minutes = ((z[3] - 0x30) as i64) * 10 + (z[4] - 0x30) as i64;
+            let offset = hours * 3600 + minutes * 60;
+            return if (z[0] == 0x2b) local - offset else local + offset;
+        }
+    }
+    return local;
+}
+
+fn isDigits(text: Slice<u8>) -> bool {
+    for (c in text) {
+        if (c < 0x30 || c > 0x39) {
+            return false;
+        }
+    }
+    return true;
+}

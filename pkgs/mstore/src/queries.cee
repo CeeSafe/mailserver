@@ -1,0 +1,566 @@
+// The store's statements, one function each. Each statement is one round trip; the ones that change messages keep
+// the mailbox's counters, UIDs and MODSEQ in the same statement, under the mailbox row's lock.
+
+/// $1 name, $2 default quota or NULL.
+fn sqlCreateDomain() -> StringView =>
+    """
+    INSERT INTO domains (name, default_quota) VALUES (lower($1), coalesce($2::int8, 1073741824)) RETURNING id
+    """;
+
+/// $1 alias domain, $2 target domain id.
+fn sqlAddDomainAlias() -> StringView =>
+    """
+    INSERT INTO domain_aliases (alias, domain_id) VALUES (lower($1), $2)
+    """;
+
+/// $1 domain id, $2 address or NULL.
+fn sqlSetCatchall() -> StringView =>
+    """
+    UPDATE domains SET catchall = lower($2) WHERE id = $1
+    """;
+
+/// $1 email, $2 password hash, $3 quota or NULL for the domain's default. Makes the standard mailboxes too.
+fn sqlCreateUser() -> StringView =>
+    """
+    WITH d AS (SELECT id, default_quota FROM domains WHERE name = lower(split_part($1, '@', 2))),
+    u AS (
+        INSERT INTO users (domain_id, email, password_hash, quota)
+        SELECT id, lower($1), $2, coalesce($3::int8, default_quota) FROM d
+        RETURNING id
+    ),
+    m AS (
+        INSERT INTO mailboxes (user_id, name, special_use)
+        SELECT u.id, x.name, x.special_use FROM u,
+            (VALUES ('INBOX', NULL), ('Sent', '\Sent'), ('Drafts', '\Drafts'), ('Trash', '\Trash'),
+                    ('Junk', '\Junk'), ('Archive', '\Archive')) AS x(name, special_use)
+    )
+    SELECT id FROM u
+    """;
+
+fn sqlSetPassword() -> StringView =>
+    """
+    UPDATE users SET password_hash = $2 WHERE id = $1
+    """;
+
+/// $1 address, $2 destination. The address's domain must be local.
+fn sqlAddAlias() -> StringView =>
+    """
+    INSERT INTO aliases (address, domain_id, destination)
+    SELECT lower($1), id, $2 FROM domains WHERE name = lower(split_part($1, '@', 2))
+    RETURNING 1
+    """;
+
+fn sqlFindLogin() -> StringView =>
+    """
+    SELECT id, email, password_hash, active FROM users WHERE email = lower($1)
+    """;
+
+fn sqlRecordLogin() -> StringView =>
+    """
+    UPDATE users SET last_login = now() WHERE id = $1
+    """;
+
+/// $1 address. One row: kind (1 user, 2 alias, 3 catch-all, 4 local domain without the address), the local user's
+/// id or 0, the address mail goes to, and for a local user their INBOX's id, quota, bytes used and active Sieve
+/// script (NULL without one). No row: the domain is not local.
+fn sqlResolve() -> StringView =>
+    """
+    WITH p AS (SELECT lower(split_part($1, '@', 1)) AS local, lower(split_part($1, '@', 2)) AS domain),
+    t AS (
+        SELECT p.local || '@' || coalesce(a.name, p.domain) AS address, coalesce(a.name, p.domain) AS domain
+        FROM p LEFT JOIN (
+            SELECT x.alias, d.name FROM domain_aliases x JOIN domains d ON d.id = x.domain_id WHERE x.active AND d.active
+        ) a ON a.alias = p.domain
+    ),
+    r AS (
+        SELECT kind, user_id, address FROM (
+            SELECT 1 AS kind, u.id AS user_id, u.email AS address
+            FROM t JOIN users u ON u.email = t.address WHERE u.active
+            UNION ALL
+            SELECT 2, coalesce(u.id, 0), al.destination
+            FROM t JOIN aliases al ON al.address = t.address AND al.active
+            LEFT JOIN users u ON u.email = lower(al.destination) AND u.active
+            UNION ALL
+            SELECT 3, coalesce(u.id, 0), d.catchall
+            FROM t JOIN domains d ON d.name = t.domain AND d.active AND d.catchall IS NOT NULL
+            LEFT JOIN users u ON u.email = d.catchall AND u.active
+            UNION ALL
+            SELECT 4, 0, t.address FROM t JOIN domains d ON d.name = t.domain AND d.active
+        ) x ORDER BY kind LIMIT 1
+    )
+    SELECT r.kind, r.user_id, r.address, coalesce(m.id, 0), coalesce(u.quota, 0), coalesce(u.used, 0), s.content
+    FROM r LEFT JOIN users u ON u.id = r.user_id
+    LEFT JOIN mailboxes m ON m.user_id = r.user_id AND m.name = 'INBOX'
+    LEFT JOIN sieve_scripts s ON s.user_id = r.user_id AND s.name = u.sieve_active
+    """;
+
+/// $1 user, $2 name, $3 content. Stores the script and makes it the active one, in one statement.
+fn sqlSetSieve() -> StringView =>
+    """
+    WITH s AS (
+        INSERT INTO sieve_scripts (user_id, name, content) VALUES ($1, $2, $3)
+        ON CONFLICT (user_id, name) DO UPDATE SET content = EXCLUDED.content, updated_at = now()
+    )
+    UPDATE users SET sieve_active = $2 WHERE id = $1
+    """;
+
+/// $1 user. No script is active afterwards (the scripts are kept).
+fn sqlClearSieve() -> StringView =>
+    """
+    UPDATE users SET sieve_active = NULL WHERE id = $1
+    """;
+
+/// $1 user, $2 sender (lowercase), $3 handle, $4 days. A row when a reply is due, and then notes it as sent: the
+/// check and the note are one statement, so two deliveries at once cannot both reply.
+fn sqlVacationDue() -> StringView =>
+    """
+    INSERT INTO vacation_sent (user_id, sender, handle, sent_at) VALUES ($1, $2, decode(md5($3), 'hex'), now())
+    ON CONFLICT (user_id, sender, handle) DO UPDATE SET sent_at = now()
+    WHERE vacation_sent.sent_at < now() - make_interval(days => $4::int)
+    RETURNING 1
+    """;
+
+/// Forgets replies older than the longest :days honoured (365), so the table does not grow without bound.
+fn sqlForgetVacations() -> StringView =>
+    """
+    DELETE FROM vacation_sent WHERE sent_at < now() - interval '366 days'
+    """;
+
+/// $1 address key. A row when the address may not try to log in now.
+fn sqlAuthBlocked() -> StringView =>
+    """
+    SELECT 1 FROM auth_failures WHERE kind = 1 AND key = $1 AND blocked_until > now()
+    """;
+
+/// $1 address key, $2 login name (lowercase, or empty). Counts a failed login against both, in a 15-minute window;
+/// blocks the address for 2 hours at 10 failures from it, or at 30 against the login name from anywhere (a botnet
+/// spread thin over many addresses). Gives whether the address is now blocked.
+fn sqlAuthFailed() -> StringView =>
+    """
+    WITH u AS (
+        INSERT INTO auth_failures (kind, key, failures, window_start)
+        SELECT 2, $2, 1, now() WHERE $2 <> ''
+        ON CONFLICT (kind, key) DO UPDATE SET
+            failures = CASE WHEN auth_failures.window_start < now() - interval '15 minutes' THEN 1
+                            ELSE auth_failures.failures + 1 END,
+            window_start = CASE WHEN auth_failures.window_start < now() - interval '15 minutes' THEN now()
+                                ELSE auth_failures.window_start END
+        RETURNING failures
+    )
+    INSERT INTO auth_failures AS f (kind, key, failures, window_start, blocked_until)
+    VALUES (1, $1, 1, now(),
+            CASE WHEN coalesce((SELECT failures FROM u), 0) >= 30 THEN now() + interval '2 hours' END)
+    ON CONFLICT (kind, key) DO UPDATE SET
+        failures = CASE WHEN f.window_start < now() - interval '15 minutes' THEN 1 ELSE f.failures + 1 END,
+        window_start = CASE WHEN f.window_start < now() - interval '15 minutes' THEN now() ELSE f.window_start END,
+        blocked_until = CASE
+            WHEN (CASE WHEN f.window_start < now() - interval '15 minutes' THEN 1 ELSE f.failures + 1 END) >= 10
+              OR coalesce((SELECT failures FROM u), 0) >= 30
+            THEN greatest(f.blocked_until, now() + interval '2 hours')
+            ELSE f.blocked_until END
+    RETURNING coalesce(blocked_until > now(), false)
+    """;
+
+/// $1 address key. A good login clears the address's count (not a block, and not the login name's count).
+fn sqlAuthSucceeded() -> StringView =>
+    """
+    DELETE FROM auth_failures WHERE kind = 1 AND key = $1 AND (blocked_until IS NULL OR blocked_until <= now())
+    """;
+
+/// $1 address key, $2 hours, or NULL for good.
+fn sqlBlockAddress() -> StringView =>
+    """
+    INSERT INTO auth_failures (kind, key, failures, window_start, blocked_until)
+    VALUES (1, $1, 0, now(), coalesce(now() + make_interval(hours => $2::int), 'infinity'))
+    ON CONFLICT (kind, key) DO UPDATE SET blocked_until = EXCLUDED.blocked_until
+    """;
+
+/// $1 address key.
+fn sqlUnblockAddress() -> StringView =>
+    """
+    DELETE FROM auth_failures WHERE kind = 1 AND key = $1
+    """;
+
+/// Counts whose window ended a day ago, and blocks that have run out.
+fn sqlForgetAuthFailures() -> StringView =>
+    """
+    DELETE FROM auth_failures
+    WHERE window_start < now() - interval '1 day' AND (blocked_until IS NULL OR blocked_until < now())
+    """;
+
+/// $1 user, $2 special use (such as \Sent). Its id, or no row.
+fn sqlSpecialMailbox() -> StringView =>
+    """
+    SELECT id FROM mailboxes WHERE user_id = $1 AND special_use = $2 ORDER BY id LIMIT 1
+    """;
+
+/// $1 blob, $2 size, $3 sender, $4 recipients (newline-separated), $5 submitting user or NULL.
+fn sqlEnqueue() -> StringView =>
+    """
+    INSERT INTO queue (blob, size, sender, recipients, user_id)
+    VALUES ($1, $2, $3, string_to_array($4, E'\n'), $5::int8)
+    RETURNING id
+    """;
+
+/// $1 most rows, $2 claim token, $3 seconds the claim lasts. Claims the rows due, oldest due first, skipping rows
+/// another worker holds. Each: id, blob, size, sender, recipients (newline-separated), attempts, age in seconds.
+/// The due rows are chosen once, in a materialized CTE: as a subquery joined to queue, the planner rescanned it in a
+/// nested loop, and each rescan could skip-lock a different row, so one claim of LIMIT 1 took several rows.
+fn sqlClaimQueue() -> StringView =>
+    """
+    WITH due AS MATERIALIZED (
+        SELECT id FROM queue
+        WHERE next_attempt <= now() AND (claimed_until IS NULL OR claimed_until < now())
+        ORDER BY next_attempt LIMIT $1
+        FOR UPDATE SKIP LOCKED
+    )
+    UPDATE queue q SET claim = $2, claimed_until = now() + make_interval(secs => $3::int)
+    FROM due
+    WHERE q.id = due.id
+    RETURNING q.id, q.blob, q.size, q.sender, array_to_string(q.recipients, E'\n'), q.attempts,
+        extract(epoch FROM now() - q.created_at)::int8, q.delay_notified
+    """;
+
+/// $1 id, $2 claim, $3 the recipients left (newline-separated), $4 seconds until the next attempt, $5 the last error,
+/// $6 whether a delay notice has gone.
+fn sqlDeferQueued() -> StringView =>
+    """
+    UPDATE queue SET recipients = string_to_array($3, E'\n'), attempts = attempts + 1,
+        next_attempt = now() + make_interval(secs => $4::int), last_error = $5, delay_notified = $6,
+        claim = NULL, claimed_until = NULL
+    WHERE id = $1 AND claim = $2
+    """;
+
+/// $1 id, $2 claim. The row is done; the trigger releases its blob.
+fn sqlDropQueued() -> StringView =>
+    """
+    DELETE FROM queue WHERE id = $1 AND claim = $2
+    """;
+
+/// Seconds until the next row is due (0 if one is due now), or no row when the queue is empty.
+fn sqlNextDue() -> StringView =>
+    """
+    SELECT greatest(extract(epoch FROM min(next_attempt) - now()), 0)::int8 FROM queue
+    """;
+
+/// $1 domain (lowercase), $2 selector, $3 private key (PKCS #8 DER). Added inactive.
+fn sqlAddDkimKey() -> StringView =>
+    """
+    INSERT INTO dkim_keys (domain, selector, private_key) VALUES ($1, $2, $3)
+    """;
+
+/// $1 domain, $2 selector. That key becomes the domain's only active one; no row changes if it does not exist.
+fn sqlActivateDkimKey() -> StringView =>
+    """
+    UPDATE dkim_keys SET active = (selector = $2)
+    WHERE domain = $1 AND EXISTS (SELECT 1 FROM dkim_keys WHERE domain = $1 AND selector = $2)
+    """;
+
+/// $1 domain, $2 selector, or '' for the active key. Its selector, private key and whether it is active.
+fn sqlDkimKey() -> StringView =>
+    """
+    SELECT selector, private_key, active FROM dkim_keys
+    WHERE domain = $1 AND (selector = $2 OR ($2 = '' AND active))
+    """;
+
+/// $1 address (lowercase), $2 the reply, $3 days. Suppresses it, or extends its suppression.
+fn sqlSuppress() -> StringView =>
+    """
+    INSERT INTO suppression (address, reply, expires_at) VALUES ($1, $2, now() + make_interval(days => $3::int))
+    ON CONFLICT (address) DO UPDATE SET reply = EXCLUDED.reply, expires_at = EXCLUDED.expires_at
+    """;
+
+/// $1 address (lowercase). Its reply when it is suppressed now.
+fn sqlSuppressed() -> StringView =>
+    """
+    SELECT reply FROM suppression WHERE address = $1 AND expires_at > now()
+    """;
+
+/// $1 address (lowercase).
+fn sqlUnsuppress() -> StringView =>
+    """
+    DELETE FROM suppression WHERE address = $1
+    """;
+
+fn sqlForgetSuppressions() -> StringView =>
+    """
+    DELETE FROM suppression WHERE expires_at < now()
+    """;
+
+fn sqlQuota() -> StringView =>
+    """
+    SELECT quota, used FROM users WHERE id = $1
+    """;
+
+fn sqlListMailboxes() -> StringView =>
+    """
+    SELECT id, name, coalesce(special_use, ''), subscribed, uid_validity, uid_next, highest_modseq, messages, unseen, size
+    FROM mailboxes WHERE user_id = $1 ORDER BY name
+    """;
+
+fn sqlFindMailbox() -> StringView =>
+    """
+    SELECT id, name, coalesce(special_use, ''), subscribed, uid_validity, uid_next, highest_modseq, messages, unseen, size
+    FROM mailboxes WHERE user_id = $1 AND name = $2
+    """;
+
+fn sqlMailboxById() -> StringView =>
+    """
+    SELECT id, name, coalesce(special_use, ''), subscribed, uid_validity, uid_next, highest_modseq, messages, unseen, size
+    FROM mailboxes WHERE user_id = $1 AND id = $2
+    """;
+
+/// $1 user, $2 name, $3 special use or NULL.
+fn sqlCreateMailbox() -> StringView =>
+    """
+    INSERT INTO mailboxes (user_id, name, special_use) VALUES ($1, $2, $3) RETURNING id
+    """;
+
+/// $1 user, $2 old name, $3 new name: the mailbox and every mailbox under it.
+fn sqlRenameMailbox() -> StringView =>
+    """
+    UPDATE mailboxes SET name = $3 || substr(name, length($2) + 1)
+    WHERE user_id = $1 AND (name = $2 OR left(name, length($2) + 1) = $2 || '/')
+    """;
+
+/// $1 user, $2 mailbox. INBOX cannot be deleted. Its messages go with it (the triggers release their blobs).
+fn sqlDeleteMailbox() -> StringView =>
+    """
+    WITH m AS (DELETE FROM mailboxes WHERE id = $2 AND user_id = $1 AND name <> 'INBOX' RETURNING size)
+    UPDATE users SET used = users.used - m.size FROM m WHERE users.id = $1 RETURNING 1
+    """;
+
+fn sqlSubscribe() -> StringView =>
+    """
+    UPDATE mailboxes SET subscribed = $3 WHERE id = $2 AND user_id = $1
+    """;
+
+/// $1 hash, $2 size. Locks the blob's row for the delivering transaction (see MailStore.deliver).
+fn sqlPinBlob() -> StringView =>
+    """
+    INSERT INTO blobs (hash, size) VALUES ($1, $2) ON CONFLICT (hash) DO UPDATE SET released_at = NULL
+    """;
+
+/// $1 user, $2 mailbox, $3 flags, $4 keywords (space-separated), $5 internal date (Unix ms), $6 size, $7 blob hash,
+/// $8 meta or NULL. Gives the new message's uid and modseq, or no row if the mailbox is not the user's.
+fn sqlDeliver() -> StringView =>
+    """
+    WITH mb AS (
+        UPDATE mailboxes SET uid_next = uid_next + 1, highest_modseq = highest_modseq + 1, messages = messages + 1,
+            unseen = unseen + CASE WHEN $3::int2 & 1 = 0 THEN 1 ELSE 0 END, size = size + $6::int8
+        WHERE id = $2 AND user_id = $1
+        RETURNING uid_next - 1 AS uid, highest_modseq AS modseq
+    ),
+    u AS (UPDATE users SET used = used + $6::int8 WHERE id = $1 AND EXISTS (SELECT 1 FROM mb))
+    INSERT INTO messages (mailbox_id, uid, modseq, flags, keywords, internal_date, size, blob, meta)
+    SELECT $2, mb.uid, mb.modseq, $3::int2,
+        ARRAY(SELECT DISTINCT w FROM unnest(string_to_array($4, ' ')) w WHERE w <> '' ORDER BY w),
+        to_timestamp($5::int8 / 1000.0), $6::int8, $7, $8::bytea
+    FROM mb
+    RETURNING uid, modseq
+    """;
+
+/// As sqlDeliver, at uid $9 (an import keeping the old server's uids): nothing when the mailbox has a uid at or above
+/// it, so uids only ever grow; uid_next moves past it.
+fn sqlDeliverAt() -> StringView =>
+    """
+    WITH mb AS (
+        UPDATE mailboxes SET uid_next = GREATEST(uid_next, $9::int8 + 1), highest_modseq = highest_modseq + 1,
+            messages = messages + 1, unseen = unseen + CASE WHEN $3::int2 & 1 = 0 THEN 1 ELSE 0 END,
+            size = size + $6::int8
+        WHERE id = $2 AND user_id = $1
+            AND NOT EXISTS (SELECT 1 FROM messages WHERE mailbox_id = $2 AND uid >= $9::int8)
+        RETURNING $9::int8 AS uid, highest_modseq AS modseq
+    ),
+    u AS (UPDATE users SET used = used + $6::int8 WHERE id = $1 AND EXISTS (SELECT 1 FROM mb))
+    INSERT INTO messages (mailbox_id, uid, modseq, flags, keywords, internal_date, size, blob, meta)
+    SELECT $2, mb.uid, mb.modseq, $3::int2,
+        ARRAY(SELECT DISTINCT w FROM unnest(string_to_array($4, ' ')) w WHERE w <> '' ORDER BY w),
+        to_timestamp($5::int8 / 1000.0), $6::int8, $7, $8::bytea
+    FROM mb
+    RETURNING uid, modseq
+    """;
+
+/// $1 user, $2 mailbox, $3 only messages changed after this modseq (0 for all).
+fn sqlListMessages() -> StringView =>
+    """
+    SELECT m.uid, m.modseq, m.flags, array_to_string(m.keywords, ' '),
+        (extract(epoch FROM m.internal_date) * 1000)::int8, m.size, m.blob
+    FROM mailboxes b JOIN messages m ON m.mailbox_id = b.id
+    WHERE b.id = $2 AND b.user_id = $1 AND m.modseq > $3
+    ORDER BY m.uid
+    """;
+
+/// $1 user, $2 mailbox, $3 uids (int8multirange text), $4 with meta. As sqlListMessages, plus the meta (NULL unless
+/// $4). Each range is an index range scan, so a few uids of a large mailbox read only their rows.
+fn sqlFetchMessages() -> StringView =>
+    """
+    SELECT m.uid, m.modseq, m.flags, array_to_string(m.keywords, ' '),
+        (extract(epoch FROM m.internal_date) * 1000)::int8, m.size, m.blob, CASE WHEN $4::bool THEN m.meta END
+    FROM mailboxes b JOIN messages m ON m.mailbox_id = b.id
+    JOIN unnest($3::int8multirange) r ON m.uid >= lower(r) AND m.uid < upper(r)
+    WHERE b.id = $2 AND b.user_id = $1
+    ORDER BY m.uid
+    """;
+
+fn sqlMessageMeta() -> StringView =>
+    """
+    SELECT m.meta FROM mailboxes b JOIN messages m ON m.mailbox_id = b.id WHERE b.id = $2 AND b.user_id = $1 AND m.uid = $3
+    """;
+
+/// $1 user, $2 mailbox, $3 uids (int8multirange text), $4 flags to add, $5 flags to remove, $6 replace (STORE FLAGS:
+/// the flags and keywords become $4 and $7), $7 keywords to add, $8 keywords to remove (space-separated), $9
+/// unchanged-since modseq (0: no condition). Gives each changed message's uid, new modseq, flags and keywords.
+fn sqlSetFlags() -> StringView =>
+    """
+    WITH b AS (SELECT id FROM mailboxes WHERE id = $2 AND user_id = $1 FOR UPDATE),
+    k AS (
+        SELECT ARRAY(SELECT DISTINCT w FROM unnest(string_to_array($7, ' ')) w WHERE w <> '' ORDER BY w) AS added,
+            string_to_array($8, ' ') AS removed
+    ),
+    t AS (
+        SELECT m.uid, m.flags AS old_flags, m.keywords AS old_keywords,
+            (CASE WHEN $6::bool THEN $4::int2 ELSE (m.flags | $4::int2) & ~$5::int2 END)::int2 AS new_flags,
+            CASE WHEN $6::bool THEN k.added
+                ELSE ARRAY(SELECT DISTINCT w FROM unnest(m.keywords || k.added) w WHERE w <> ALL (k.removed) ORDER BY w)
+            END AS new_keywords
+        FROM b JOIN messages m ON m.mailbox_id = b.id
+        JOIN unnest($3::int8multirange) r ON m.uid >= lower(r) AND m.uid < upper(r)
+        CROSS JOIN k
+        WHERE $9::int8 = 0 OR m.modseq <= $9::int8
+        FOR UPDATE OF m
+    ),
+    c AS (SELECT * FROM t WHERE new_flags <> old_flags OR new_keywords <> old_keywords),
+    mb AS (
+        UPDATE mailboxes SET highest_modseq = highest_modseq + 1,
+            unseen = unseen + (SELECT count(*) FROM c WHERE old_flags & 1 <> 0 AND new_flags & 1 = 0)
+                            - (SELECT count(*) FROM c WHERE old_flags & 1 = 0 AND new_flags & 1 <> 0)
+        WHERE id = (SELECT id FROM b) AND EXISTS (SELECT 1 FROM c)
+        RETURNING highest_modseq
+    )
+    UPDATE messages m SET flags = c.new_flags, keywords = c.new_keywords, modseq = mb.highest_modseq
+    FROM c, mb WHERE m.mailbox_id = $2 AND m.uid = c.uid
+    RETURNING m.uid, m.modseq, m.flags, array_to_string(m.keywords, ' ')
+    """;
+
+/// $1 user, $2 mailbox, $3 uids (int8multirange text) or NULL for all. Removes messages flagged \Deleted and gives
+/// their uids.
+fn sqlExpunge() -> StringView =>
+    """
+    WITH b AS (SELECT id FROM mailboxes WHERE id = $2 AND user_id = $1 FOR UPDATE),
+    g AS (
+        DELETE FROM messages m USING b
+        WHERE m.mailbox_id = b.id AND m.flags & 8 <> 0 AND ($3::int8multirange IS NULL OR m.uid <@ $3::int8multirange)
+        RETURNING m.uid, m.size, m.flags
+    ),
+    n AS (SELECT count(*) AS count, coalesce(sum(size), 0) AS size, count(*) FILTER (WHERE flags & 1 = 0) AS unseen FROM g),
+    mb AS (
+        UPDATE mailboxes SET messages = mailboxes.messages - n.count, unseen = mailboxes.unseen - n.unseen,
+            size = mailboxes.size - n.size,
+            highest_modseq = mailboxes.highest_modseq + 1
+        FROM n WHERE mailboxes.id = (SELECT id FROM b) AND n.count > 0
+    ),
+    u AS (UPDATE users SET used = users.used - n.size FROM n WHERE users.id = $1 AND n.count > 0)
+    SELECT uid FROM g ORDER BY uid
+    """;
+
+/// $1 user, $2 mailbox, $3 uids (int8multirange text). A MOVE to the mailbox itself (RFC 6851 allows it): each
+/// message takes a new UID past the last, and gives its old uid, its new uid and the UIDVALIDITY, in old order. The
+/// new UIDs are all above every existing one, so the key never collides; content, quota and counts are unchanged.
+fn sqlRenumberMessages() -> StringView =>
+    """
+    WITH s AS (SELECT id FROM mailboxes WHERE id = $2 AND user_id = $1 FOR UPDATE),
+    src AS (
+        SELECT m.uid, row_number() OVER (ORDER BY m.uid) - 1 AS k
+        FROM s JOIN messages m ON m.mailbox_id = s.id
+        JOIN unnest($3::int8multirange) r ON m.uid >= lower(r) AND m.uid < upper(r)
+    ),
+    n AS (SELECT count(*) AS count FROM src),
+    mb AS (
+        UPDATE mailboxes SET uid_next = mailboxes.uid_next + n.count, highest_modseq = mailboxes.highest_modseq + 1
+        FROM n, s WHERE mailboxes.id = s.id AND n.count > 0
+        RETURNING mailboxes.uid_next - n.count AS first, mailboxes.highest_modseq AS modseq, mailboxes.uid_validity
+    ),
+    up AS (
+        UPDATE messages m SET uid = mb.first + src.k, modseq = mb.modseq
+        FROM src, mb WHERE m.mailbox_id = $2 AND m.uid = src.uid
+    )
+    SELECT src.uid, mb.first + src.k, mb.uid_validity FROM src, mb ORDER BY src.uid
+    """;
+
+/// $1 user, $2 source mailbox, $3 target mailbox, $4 uids (int8multirange text), $5 move. Gives each message's
+/// source uid, its new uid, and the target's UIDVALIDITY (for COPYUID), in source order. A move removes the source
+/// messages in the same statement.
+fn sqlCopyMessages() -> StringView =>
+    """
+    WITH s AS (SELECT id FROM mailboxes WHERE id = $2 AND user_id = $1 FOR UPDATE),
+    d AS (SELECT id FROM mailboxes WHERE id = $3 AND user_id = $1 FOR UPDATE),
+    src AS (
+        SELECT m.uid, m.flags, m.keywords, m.internal_date, m.size, m.blob, m.meta,
+            row_number() OVER (ORDER BY m.uid) - 1 AS k
+        FROM s JOIN messages m ON m.mailbox_id = s.id
+        JOIN unnest($4::int8multirange) r ON m.uid >= lower(r) AND m.uid < upper(r)
+    ),
+    n AS (
+        SELECT count(*) AS count, coalesce(sum(size), 0) AS size, count(*) FILTER (WHERE flags & 1 = 0) AS unseen
+        FROM src
+    ),
+    mb AS (
+        UPDATE mailboxes SET uid_next = mailboxes.uid_next + n.count, highest_modseq = mailboxes.highest_modseq + 1,
+            messages = mailboxes.messages + n.count, unseen = mailboxes.unseen + n.unseen, size = mailboxes.size + n.size
+        FROM n, d WHERE mailboxes.id = d.id AND n.count > 0
+        RETURNING mailboxes.uid_next - n.count AS first, mailboxes.highest_modseq AS modseq, mailboxes.uid_validity
+    ),
+    ins AS (
+        INSERT INTO messages (mailbox_id, uid, modseq, flags, keywords, internal_date, size, blob, meta)
+        SELECT $3, mb.first + src.k, mb.modseq, src.flags, src.keywords, src.internal_date, src.size, src.blob, src.meta
+        FROM src, mb
+    ),
+    del AS (DELETE FROM messages m USING src WHERE $5::bool AND m.mailbox_id = $2 AND m.uid = src.uid),
+    sb AS (
+        UPDATE mailboxes SET messages = mailboxes.messages - n.count, unseen = mailboxes.unseen - n.unseen,
+            size = mailboxes.size - n.size,
+            highest_modseq = mailboxes.highest_modseq + 1
+        FROM n WHERE $5::bool AND mailboxes.id = (SELECT id FROM s) AND n.count > 0
+    ),
+    u AS (UPDATE users SET used = users.used + n.size FROM n WHERE NOT $5::bool AND users.id = $1 AND n.count > 0)
+    SELECT src.uid, mb.first + src.k, mb.uid_validity FROM src, mb ORDER BY src.uid
+    """;
+
+/// $1 grace seconds, $2 limit. Locks blobs no message has referenced for the grace period.
+fn sqlReleasedBlobs() -> StringView =>
+    """
+    SELECT hash FROM blobs
+    WHERE refs = 0 AND released_at < now() - make_interval(secs => $1::int8)
+    ORDER BY released_at LIMIT $2::int8
+    FOR UPDATE SKIP LOCKED
+    """;
+
+fn sqlDropBlob() -> StringView =>
+    """
+    DELETE FROM blobs WHERE hash = $1 AND refs = 0
+    """;
+
+/// $1 domain (lowercase). Its cached MTA-STS policy, while it has not expired: the policy id, the policy file, and
+/// when it expires (Unix seconds).
+fn sqlStsPolicy() -> StringView =>
+    """
+    SELECT policy_id, policy, extract(epoch FROM expires_at)::int8 FROM mta_sts_policies
+    WHERE domain = $1 AND expires_at > now()
+    """;
+
+/// $1 domain (lowercase), $2 policy id, $3 the policy file, $4 its max_age in seconds. Caches it, replacing any
+/// older one.
+fn sqlSaveStsPolicy() -> StringView =>
+    """
+    INSERT INTO mta_sts_policies (domain, policy_id, policy, expires_at)
+    VALUES ($1, $2, $3, now() + make_interval(secs => $4::int8))
+    ON CONFLICT (domain) DO UPDATE
+    SET policy_id = EXCLUDED.policy_id, policy = EXCLUDED.policy, fetched_at = now(), expires_at = EXCLUDED.expires_at
+    """;
+
+/// Forgets the policies that have expired.
+fn sqlForgetStsPolicies() -> StringView =>
+    """
+    DELETE FROM mta_sts_policies WHERE expires_at <= now()
+    """;

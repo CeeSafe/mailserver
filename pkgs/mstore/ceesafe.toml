@@ -1,0 +1,11 @@
+[package]
+name = "mstore"
+version = "0.1.0"
+kind = "library"
+tests = ["tests"]
+
+[dependencies]
+postgres = { path = "../../../PostgresClient" }
+diskio = { path = "../../../../CeeSafeLibs/diskio" }
+sha256 = { path = "../../../../CeeSafeLibs/sha256" }
+encoding = { path = "../../../../CeeSafeLibs/encoding" }

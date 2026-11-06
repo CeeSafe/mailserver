@@ -1,0 +1,10 @@
+size 4467
+envelope (NIL "enrypted" ((NIL NIL "blaker" "craswell.com")) ((NIL NIL "blaker" "craswell.com")) ((NIL NIL "blaker" "craswell.com")) NIL NIL NIL NIL NIL)
+bodystructure ("application" "x-pkcs7-mime" ("name" "smime.p7m") NIL NIL "base64" 4252 NIL ("attachment" ("filename" "smime.p7m")) NIL NIL)
+body ("application" "x-pkcs7-mime" ("name" "smime.p7m") NIL NIL "base64" 4252)
+section HEADER 215 3d9c7ca70431c0f4f49daa5806411a74b4c8b5283e80e31df21edeab5917251c
+section TEXT 4252 3eb36381ba2ba0c569f676f5de55310a3083b4386b4aa633d67f6bf50543f6f6
+section HEADER.FIELDS 106 f669d87d0fa21f1183c8c972ae14114ebff720acdb5c8d80f9341575bd221699
+section HEADER.FIELDS.NOT 111 aeaa7b5bb53ee23b676e7906c94a418f90d05ee8ae45c5476fb69b83378b7017
+section 1 4252 3eb36381ba2ba0c569f676f5de55310a3083b4386b4aa633d67f6bf50543f6f6
+section 1.MIME 215 3d9c7ca70431c0f4f49daa5806411a74b4c8b5283e80e31df21edeab5917251c

@@ -1,0 +1,838 @@
+// Tests against the Postgres of PostgresClient/tests/setup-docker.sh, on 127.0.0.1:$PG_TEST_PORT. Each test makes
+// its own database (mstore_<test>) and blob directory, so tests may run at once. Without PG_TEST_PORT they pass
+// without running.
+
+import postgres.PgConfig;
+import postgres.PgConnection;
+import postgres.PgParams;
+import postgres.PgRows;
+import postgres.SslMode;
+
+fn testPort() -> u16? {
+    let text = Environment.variable("PG_TEST_PORT")?;
+    return text.parseInt<u16>();
+}
+
+fn configFor(port: u16, database: StringView) -> PgConfig {
+    var config = PgConfig.create("127.0.0.1", "cee", "cee_test_pw", database)!;
+    config.setPort(port);
+    config.sslMode(SslMode.Disable)!;
+    return config;
+}
+
+/// A new, empty database for one test.
+async fn freshDatabase(port: u16, name: StringView) -> Result<void, StoreError> {
+    var admin = match (await PgConnection.connect(configFor(port, "ceetest"))) {
+        Ok(c) => c,
+        Err(e) => { return Err(StoreError.Db(e)); }
+    };
+    var sql = String.create();
+    grown(sql.append("DROP DATABASE IF EXISTS "))?;
+    grown(sql.append(name))?;
+    grown(sql.append(" WITH (FORCE)"))?;
+    await batchOn(mut admin, sql.view())?;
+    sql.clear();
+    grown(sql.append("CREATE DATABASE "))?;
+    grown(sql.append(name))?;
+    await batchOn(mut admin, sql.view())?;
+    return Ok();
+}
+
+fn blobRoot(name: StringView) -> String {
+    var path = Directory.temporary()!;
+    path.append("/mstore-test-")!;
+    path.append(name)!;
+    var tag = [0u8; 4];
+    Random.fill(mut tag[..])!;
+    for (b in tag) {
+        path.append(if (b % 2 == 0) "a" else "b")!;
+    }
+    return path;
+}
+
+async fn openStore(port: u16, name: StringView, root: StringView) -> Result<MailStore, StoreError> {
+    await freshDatabase(port, name)?;
+    return await MailStore.open(configFor(port, name), 4, root);
+}
+
+/// A finished blob holding `text`.
+async fn blob(store: borrow MailStore, text: StringView) -> Result<BlobWriter, StoreError> {
+    let blobs = store.blobs();
+    let made: Result<BlobWriter, StoreError> = await Async.blocking(() => written(blobs, text));
+    return made;
+}
+
+fn written(blobs: borrow BlobStore, text: StringView) -> Result<BlobWriter, StoreError> {
+    var writer = blobs.begin()?;
+    writer.write(text.bytes())?;
+    writer.finish()?;
+    return Ok(writer);
+}
+
+/// The mailbox `name` of `userId`: its row in `into`, and its id.
+async fn mailbox(
+    store: borrow MailStore,
+    userId: i64,
+    name: StringView,
+    into: borrow mut MailboxList,
+) -> Result<i64, StoreError> {
+    if (!(await store.findMailbox(userId, name, into)?)) {
+        return Err(StoreError.NotFound);
+    }
+    return Ok(into.id(0));
+}
+
+async fn deliverText(
+    store: borrow MailStore,
+    userId: i64,
+    mailboxId: i64,
+    text: StringView,
+) -> Result<Delivered, StoreError> {
+    var content = await blob(store, text)?;
+    var targets = Vector<Delivery>.create();
+    grown(targets.push(Delivery.to(userId, mailboxId, 1700000000000)))?;
+    var done = Vector<Delivered>.create();
+    await store.deliver(mut content, targets, mut done)?;
+    return Ok(done[0]);
+}
+
+/// A number from the test database.
+async fn count(store: borrow MailStore, sql: StringView) -> Result<i64, StoreError> {
+    var lease = match (await store.connections().acquire()) {
+        Ok(l) => l,
+        Err(e) => { return Err(StoreError.Db(e)); }
+    };
+    let none = PgParams.create();
+    var rows = PgRows.create();
+    await queryOn(lease.connection(), sql, none, mut rows)?;
+    return Ok(orElse(rows.int64(0, 0), -1));
+}
+
+/// Fails naming the first check that did not hold, or a wrong number of checks.
+fn verdict(checks: borrow Vector<bool>, expected: usize) -> Result<void, TestFailure> {
+    var message = String.create();
+    for (i in 0..checks.length) {
+        if (!checks[i]) {
+            message.append("check ")!;
+            appendNumber(mut message, i + 1);
+            message.append(" failed")!;
+            return Check.fail(message.view());
+        }
+    }
+    if (checks.length != expected) {
+        message.append("ran ")!;
+        appendNumber(mut message, checks.length);
+        message.append(" checks")!;
+        return Check.fail(message.view());
+    }
+    return Ok();
+}
+
+fn appendNumber(out: borrow mut String, n: usize) {
+    var digits = Vector<u8>.create();
+    appendInt(mut digits, truncate<i64>(n))!;
+    out.append(StringView.fromUtf8(digits.view())!)!;
+}
+
+fn outcome(result: Result<void, StoreError>) -> Result<void, TestFailure> {
+    match (result) {
+        Ok() => { return Ok(); }
+        Err(e) => { return Check.fail(StoreErrors.describe(e)); }
+    }
+}
+
+// ── Schema ──────────────────────────────────────────────────────────────────────────────────────────────────────
+
+async fn migrationScenario(port: u16, root: StringView, seen: borrow mut [i64; 2]) -> Result<void, StoreError> {
+    {
+        let store = await openStore(port, "mstore_migrate", root)?;
+        seen[0] = await count(store, "SELECT count(*) FROM mstore_schema")?;
+    }
+    let again = await MailStore.open(configFor(port, "mstore_migrate"), 2, root)?;
+    seen[1] = await count(again, "SELECT max(version) FROM mstore_schema")?;
+    return Ok();
+}
+
+@test
+fn migratesOnce() -> Result<void, TestFailure> {
+    let port = match (testPort()) {
+        Some(p) => p,
+        null => { return Ok(); }
+    };
+    var seen = [0i64; 2];
+    let root = blobRoot("t");
+    outcome(Async.run(migrationScenario(port, root.view(), mut seen)))?;
+    Check.isTrue(seen[0] == SCHEMA_VERSION as i64, "every migration recorded")?;
+    return Check.isTrue(seen[1] == SCHEMA_VERSION as i64, "reopening applies nothing new");
+}
+
+// ── Accounts and addresses ──────────────────────────────────────────────────────────────────────────────────────
+
+/// Each check's outcome, in order.
+async fn addressScenario(port: u16, root: StringView, checks: borrow mut Vector<bool>) -> Result<void, StoreError> {
+    let store = await openStore(port, "mstore_addresses", root)?;
+    let domain = await store.createDomain("Example.ORG")?;
+    await store.addDomainAlias("example.net", domain)?;
+    let alice = await store.createUser("Alice@example.org", "$2b$10$hash", null)?;
+    let bob = await store.createUser("bob@example.org", "$2b$10$other", 1000)?;
+    await store.addAlias("info@example.org", "alice@example.org")?;
+    await store.addAlias("ext@example.org", "someone@remote.test")?;
+
+    var r = Recipient.create();
+    await store.resolve("alice@example.org", mut r)?;
+    grown(checks.push(r.isUser() && r.userId == alice && r.address.view() == "alice@example.org"))?;
+    await store.resolve("ALICE@Example.Net", mut r)?;
+    grown(checks.push(r.isUser() && r.userId == alice))?;
+    await store.resolve("info@example.net", mut r)?;
+    grown(checks.push(r.isUser() && r.userId == alice))?;
+    await store.resolve("ext@example.org", mut r)?;
+    grown(checks.push(r.isRemote() && r.address.view() == "someone@remote.test"))?;
+    await store.resolve("nobody@example.org", mut r)?;
+    grown(checks.push(r.isUnknownUser()))?;
+    await store.setCatchall(domain, "bob@example.org")?;
+    await store.resolve("nobody@example.org", mut r)?;
+    grown(checks.push(r.isUser() && r.userId == bob))?;
+    await store.setCatchall(domain, null)?;
+    await store.resolve("nobody@example.org", mut r)?;
+    grown(checks.push(r.isUnknownUser()))?;
+    await store.resolve("x@elsewhere.test", mut r)?;
+    grown(checks.push(r.isNotLocal()))?;
+    await store.resolve("not-an-address", mut r)?;
+    grown(checks.push(r.isNotLocal()))?;
+
+    let duplicate = await store.createUser("alice@EXAMPLE.org", "x", null);
+    grown(checks.push(match (duplicate) {
+        Err(StoreError.Exists) => true,
+        _ => false,
+    }))?;
+    let foreign = await store.createUser("carol@elsewhere.test", "x", null);
+    grown(checks.push(match (foreign) {
+        Err(StoreError.NotFound) => true,
+        _ => false,
+    }))?;
+
+    var login = LoginRecord.create();
+    grown(checks.push(await store.findLogin("ALICE@example.org", mut login)?))?;
+    grown(checks.push(login.userId == alice && login.passwordHash.view() == "$2b$10$hash" && login.active))?;
+    grown(checks.push(!(await store.findLogin("ghost@example.org", mut login)?)))?;
+
+    var boxes = MailboxList.create();
+    await store.mailboxes(alice, mut boxes)?;
+    grown(checks.push(boxes.count() == 6 && boxes.name(2) == "INBOX"))?; // Archive, Drafts, INBOX, …
+    var junk = false;
+    for (i in 0..boxes.count()) {
+        if (boxes.name(i) == "Junk") {
+            junk = boxes.specialUse(i) == "\\Junk";
+        }
+    }
+    grown(checks.push(junk))?;
+    let quota = await store.quota(bob)?;
+    grown(checks.push(quota[0] == 1000 && quota[1] == 0))?;
+    return Ok();
+}
+
+@test
+fn resolvesAddresses() -> Result<void, TestFailure> {
+    let port = match (testPort()) {
+        Some(p) => p,
+        null => { return Ok(); }
+    };
+    var checks = Vector<bool>.create();
+    let root = blobRoot("t");
+    outcome(Async.run(addressScenario(port, root.view(), mut checks)))?;
+    return verdict(checks, 17);
+}
+
+// ── Mailboxes ───────────────────────────────────────────────────────────────────────────────────────────────────
+
+async fn mailboxScenario(port: u16, root: StringView, checks: borrow mut Vector<bool>) -> Result<void, StoreError> {
+    let store = await openStore(port, "mstore_mailboxes", root)?;
+    await store.createDomain("example.org")?;
+    let alice = await store.createUser("alice@example.org", "h", null)?;
+    let bob = await store.createUser("bob@example.org", "h", null)?;
+    let work = await store.createMailbox(alice, "Work", "")?;
+    await store.createMailbox(alice, "Work/2026", "")?;
+    await store.createMailbox(alice, "Workshop", "")?;
+    let again = await store.createMailbox(alice, "Work", "");
+    grown(checks.push(match (again) {
+        Err(StoreError.Exists) => true,
+        _ => false,
+    }))?;
+    let bad = await store.createMailbox(alice, "a//b", "");
+    grown(checks.push(match (bad) {
+        Err(StoreError.Invalid) => true,
+        _ => false,
+    }))?;
+    await store.renameMailbox(alice, "Work", "Projects")?;
+    var boxes = MailboxList.create();
+    grown(checks.push(await store.findMailbox(alice, "Projects/2026", mut boxes)?))?;
+    grown(checks.push(await store.findMailbox(alice, "Workshop", mut boxes)?))?; // not under Work/
+    grown(checks.push(!(await store.findMailbox(alice, "Work", mut boxes)?)))?;
+    let inbox = await store.renameMailbox(alice, "INBOX", "Old");
+    grown(checks.push(match (inbox) {
+        Err(StoreError.Invalid) => true,
+        _ => false,
+    }))?;
+    // Bob cannot touch Alice's mailbox.
+    let theirs = await store.deleteMailbox(bob, work);
+    grown(checks.push(match (theirs) {
+        Err(StoreError.NotFound) => true,
+        _ => false,
+    }))?;
+    let inboxId = await mailbox(store, alice, "INBOX", mut boxes)?;
+    let inboxDelete = await store.deleteMailbox(alice, inboxId);
+    grown(checks.push(match (inboxDelete) {
+        Err(StoreError.NotFound) => true,
+        _ => false,
+    }))?;
+    await store.subscribe(alice, work, false)?;
+    await store.findMailbox(alice, "Projects", mut boxes)?;
+    grown(checks.push(!boxes.subscribed(0)))?;
+    await store.deleteMailbox(alice, work)?;
+    grown(checks.push(!(await store.findMailbox(alice, "Projects", mut boxes)?)))?;
+    return Ok();
+}
+
+@test
+fn managesMailboxes() -> Result<void, TestFailure> {
+    let port = match (testPort()) {
+        Some(p) => p,
+        null => { return Ok(); }
+    };
+    var checks = Vector<bool>.create();
+    let root = blobRoot("t");
+    outcome(Async.run(mailboxScenario(port, root.view(), mut checks)))?;
+    return verdict(checks, 10);
+}
+
+// ── Messages ────────────────────────────────────────────────────────────────────────────────────────────────────
+
+async fn deliveryScenario(port: u16, root: StringView, checks: borrow mut Vector<bool>) -> Result<void, StoreError> {
+    let store = await openStore(port, "mstore_delivery", root)?;
+    await store.createDomain("example.org")?;
+    let alice = await store.createUser("alice@example.org", "h", null)?;
+    let bob = await store.createUser("bob@example.org", "h", null)?;
+    var boxes = MailboxList.create();
+    let aliceInbox = await mailbox(store, alice, "INBOX", mut boxes)?;
+    let aliceArchive = await mailbox(store, alice, "Archive", mut boxes)?;
+    let bobInbox = await mailbox(store, bob, "INBOX", mut boxes)?;
+
+    // One blob, three mailboxes, one transaction.
+    let text = "From: x@remote.test\r\nSubject: hello\r\n\r\nbody\r\n";
+    var content = await blob(store, text)?;
+    var targets = Vector<Delivery>.create();
+    grown(targets.push(Delivery.to(alice, aliceInbox, 1700000000123)))?;
+    var archived = Delivery.to(alice, aliceArchive, 1700000000123);
+    archived.flags = FLAG_SEEN;
+    grown(archived.keywords.append("$Forwarded work"))?;
+    grown(archived.meta.extend("part-index".bytes()))?;
+    grown(targets.push(archived))?;
+    grown(targets.push(Delivery.to(bob, bobInbox, 1700000000123)))?;
+    var done = Vector<Delivered>.create();
+    await store.deliver(mut content, targets, mut done)?;
+    grown(checks.push(done.length == 3 && done[0].uid == 1 && done[1].uid == 1 && done[2].uid == 1))?;
+    grown(checks.push(await count(store, "SELECT refs FROM blobs")? == 3))?;
+
+    await store.findMailbox(alice, "INBOX", mut boxes)?;
+    let size = truncate<i64>(text.length);
+    grown(
+        checks.push(boxes.messages(0) == 1 && boxes.unseen(0) == 1 && boxes.size(0) == size && boxes.uidNext(0) == 2),
+    )?;
+    await store.findMailbox(alice, "Archive", mut boxes)?;
+    grown(checks.push(boxes.messages(0) == 1 && boxes.unseen(0) == 0))?;
+    grown(checks.push((await store.quota(alice)?)[1] == 2 * size))?;
+
+    var list = MessageList.create();
+    await store.messages(alice, aliceArchive, 0, mut list)?;
+    grown(checks.push(list.count() == 1 && list.flags(0) == FLAG_SEEN && list.keywords(0) == "$Forwarded work"))?;
+    grown(checks.push(list.internalDate(0) == 1700000000123 && list.size(0) == size))?;
+    var hash = Vector<u8>.create();
+    list.blob(0, mut hash)?;
+    grown(checks.push(hash.length == HASH_LENGTH))?;
+    var meta = Vector<u8>.create();
+    grown(checks.push(await store.messageMeta(alice, aliceArchive, 1, mut meta)?))?;
+    grown(checks.push(meta.view().startsWith("part-index".bytes()) && meta.length == 10))?;
+
+    // The content is on disk under its hash.
+    let blobs = store.blobs();
+    let key = hash.view();
+    let read: Result<Vector<u8>, StoreError> = await Async.blocking(() => contentOf(blobs, key));
+    let back = read?;
+    grown(checks.push(back.length == text.length && back.view().startsWith(text.bytes())))?;
+
+    // Bob's id with Alice's mailbox: nothing is delivered, not even to Bob's own INBOX in the same call.
+    var again = await blob(store, "Subject: second\r\n\r\n")?;
+    targets.clear();
+    grown(targets.push(Delivery.to(bob, bobInbox, 1700000000999)))?;
+    grown(targets.push(Delivery.to(bob, aliceInbox, 1700000000999)))?;
+    let refused = await store.deliver(mut again, targets, mut done);
+    grown(checks.push(match (refused) {
+        Err(StoreError.NotFound) => done.length == 0,
+        _ => false,
+    }))?;
+    await store.findMailbox(bob, "INBOX", mut boxes)?;
+    grown(checks.push(boxes.messages(0) == 1 && boxes.uidNext(0) == 2))?;
+
+    let next = await deliverText(store, alice, aliceInbox, "Subject: third\r\n\r\n")?;
+    grown(checks.push(next.uid == 2 && next.modseq > 1))?;
+    return Ok();
+}
+
+fn contentOf(blobs: borrow BlobStore, hash: Slice<u8>) -> Result<Vector<u8>, StoreError> {
+    let file = blobs.open(hash)?;
+    var out = Vector<u8>.create();
+    var buffer = [0u8; 4096];
+    var offset: u64 = 0;
+    loop {
+        let n = match (file.readAt(mut buffer[..], offset)) {
+            Ok(n) => n,
+            Err(e) => { return Err(StoreError.File(e)); }
+        };
+        if (n == 0) {
+            return Ok(out);
+        }
+        grown(out.extend(buffer[0..n]))?;
+        offset += n as u64;
+    }
+}
+
+@test
+fn deliversMessages() -> Result<void, TestFailure> {
+    let port = match (testPort()) {
+        Some(p) => p,
+        null => { return Ok(); }
+    };
+    var checks = Vector<bool>.create();
+    let root = blobRoot("t");
+    outcome(Async.run(deliveryScenario(port, root.view(), mut checks)))?;
+    return verdict(checks, 14);
+}
+
+async fn flagsScenario(port: u16, root: StringView, checks: borrow mut Vector<bool>) -> Result<void, StoreError> {
+    let store = await openStore(port, "mstore_flags", root)?;
+    await store.createDomain("example.org")?;
+    let alice = await store.createUser("alice@example.org", "h", null)?;
+    var boxes = MailboxList.create();
+    let inbox = await mailbox(store, alice, "INBOX", mut boxes)?;
+    let archive = await mailbox(store, alice, "Archive", mut boxes)?;
+    let trash = await mailbox(store, alice, "Trash", mut boxes)?;
+    for (i in 0..4) {
+        await deliverText(store, alice, inbox, if (i == 3) "Subject: same\r\n\r\n" else "Subject: same\r\n\r\n")?;
+    }
+    grown(checks.push(await count(store, "SELECT count(*) FROM blobs")? == 1))?; // identical content, one blob
+    grown(checks.push(await count(store, "SELECT refs FROM blobs")? == 4))?;
+
+    var uids = UidSet.create();
+    uids.addRange(1, 2)?;
+    var change = FlagChange.create();
+    change.add = FLAG_SEEN | FLAG_FLAGGED;
+    var changed = MessageList.create();
+    await store.setFlags(alice, inbox, uids, change, mut changed)?;
+    grown(checks.push(changed.count() == 2 && changed.flags(0) == (FLAG_SEEN | FLAG_FLAGGED)))?;
+    let firstModseq = changed.modseq(0);
+    await store.setFlags(alice, inbox, uids, change, mut changed)?;
+    grown(checks.push(changed.count() == 0))?; // nothing new to set
+    await store.findMailbox(alice, "INBOX", mut boxes)?;
+    grown(checks.push(boxes.unseen(0) == 2 && boxes.highestModseq(0) == firstModseq))?;
+
+    change = FlagChange.create();
+    grown(change.addKeywords.append("work $Junk work"))?;
+    change.remove = FLAG_FLAGGED;
+    await store.setFlags(alice, inbox, uids, change, mut changed)?;
+    grown(checks.push(changed.count() == 2 && changed.keywords(0) == "$Junk work" && changed.flags(0) == FLAG_SEEN))?;
+    grown(checks.push(changed.modseq(0) > firstModseq))?;
+
+    // UNCHANGEDSINCE an old modseq changes nothing.
+    change = FlagChange.create();
+    change.add = FLAG_ANSWERED;
+    change.unchangedSince = firstModseq;
+    await store.setFlags(alice, inbox, uids, change, mut changed)?;
+    grown(checks.push(changed.count() == 0))?;
+
+    // FLAGS replaces flags and keywords; unseen goes back up.
+    change = FlagChange.create();
+    change.replace = true;
+    change.add = FLAG_DELETED;
+    uids.clear();
+    uids.add(2)?;
+    uids.add(4)?;
+    await store.setFlags(alice, inbox, uids, change, mut changed)?;
+    grown(checks.push(changed.count() == 2 && changed.flags(0) == FLAG_DELETED && changed.keywords(0) == ""))?;
+    await store.findMailbox(alice, "INBOX", mut boxes)?;
+    grown(checks.push(boxes.unseen(0) == 3))?;
+
+    // UID EXPUNGE 4 only, then EXPUNGE the rest.
+    var gone = Vector<i64>.create();
+    uids.clear();
+    uids.add(4)?;
+    await store.expungeUids(alice, inbox, uids, mut gone)?;
+    grown(checks.push(gone.length == 1 && gone[0] == 4))?;
+    await store.expunge(alice, inbox, mut gone)?;
+    grown(checks.push(gone.length == 1 && gone[0] == 2))?;
+    await store.findMailbox(alice, "INBOX", mut boxes)?;
+    grown(checks.push(boxes.messages(0) == 2 && boxes.unseen(0) == 1))?;
+    grown(checks.push(await count(store, "SELECT refs FROM blobs")? == 2))?;
+
+    // COPY 1,3 to Archive; MOVE 1 to Trash.
+    uids.clear();
+    uids.addRange(1, 3)?;
+    var copied = CopyResult.create();
+    await store.copy(alice, inbox, archive, uids, false, mut copied)?;
+    await store.findMailbox(alice, "Archive", mut boxes)?;
+    grown(checks.push(copied.source.length == 2 && copied.source[0] == 1 && copied.source[1] == 3))?;
+    grown(checks.push(copied.target[0] == 1 && copied.target[1] == 2 && copied.uidValidity == boxes.uidValidity(0)))?;
+    grown(checks.push(boxes.messages(0) == 2 && boxes.unseen(0) == 1 && boxes.uidNext(0) == 3))?;
+    uids.clear();
+    uids.add(1)?;
+    await store.copy(alice, inbox, trash, uids, true, mut copied)?;
+    grown(checks.push(copied.source.length == 1 && copied.target[0] == 1))?;
+    await store.findMailbox(alice, "INBOX", mut boxes)?;
+    grown(checks.push(boxes.messages(0) == 1))?;
+    var list = MessageList.create();
+    await store.messages(alice, inbox, 0, mut list)?;
+    grown(checks.push(list.count() == 1 && list.uid(0) == 3))?;
+    grown(checks.push(await count(store, "SELECT refs FROM blobs")? == 4))?; // inbox 3, archive 1 and 3, trash 1
+    let size = truncate<i64>("Subject: same\r\n\r\n".length);
+    grown(checks.push((await store.quota(alice)?)[1] == 4 * size))?;
+    // CONDSTORE: only what changed after the copy.
+    await store.messages(alice, trash, boxes.highestModseq(0), mut list)?;
+    grown(checks.push(list.count() == 0))?;
+    return Ok();
+}
+
+@test
+fn changesFlagsAndCopies() -> Result<void, TestFailure> {
+    let port = match (testPort()) {
+        Some(p) => p,
+        null => { return Ok(); }
+    };
+    var checks = Vector<bool>.create();
+    let root = blobRoot("t");
+    outcome(Async.run(flagsScenario(port, root.view(), mut checks)))?;
+    return verdict(checks, 23);
+}
+
+async fn fetchScenario(port: u16, root: StringView, checks: borrow mut Vector<bool>) -> Result<void, StoreError> {
+    let store = await openStore(port, "mstore_fetch", root)?;
+    await store.createDomain("example.org")?;
+    let alice = await store.createUser("alice@example.org", "h", null)?;
+    let bob = await store.createUser("bob@example.org", "h", null)?;
+    var boxes = MailboxList.create();
+    let inbox = await mailbox(store, alice, "INBOX", mut boxes)?;
+    let archive = await mailbox(store, alice, "Archive", mut boxes)?;
+    for (i in 0..5) {
+        var content = await blob(store, if (i == 2) "Subject: three\r\n\r\n" else "Subject: other\r\n\r\n")?;
+        var target = Delivery.to(alice, inbox, 1700000000000 + truncate<i64>(i));
+        if (i == 2) {
+            grown(target.meta.extend("part-index".bytes()))?;
+        }
+        var targets = Vector<Delivery>.create();
+        grown(targets.push(target))?;
+        var done = Vector<Delivered>.create();
+        await store.deliver(mut content, targets, mut done)?;
+    }
+    await deliverText(store, alice, archive, "Subject: elsewhere\r\n\r\n")?;
+
+    // 2:3,5,9 without meta: only the uids that exist, from this mailbox.
+    var uids = UidSet.create();
+    uids.addRange(2, 3)?;
+    uids.add(5)?;
+    uids.add(9)?;
+    var list = MessageList.create();
+    await store.fetchMessages(alice, inbox, uids, false, mut list)?;
+    grown(checks.push(list.count() == 3 && list.uid(0) == 2 && list.uid(1) == 3 && list.uid(2) == 5))?;
+    var meta = Vector<u8>.create();
+    grown(checks.push(!(list.meta(1, mut meta)?) && meta.length == 0))?;
+    grown(checks.push(list.internalDate(1) == 1700000000002 && list.size(1) == 18 && list.flags(1) == 0))?;
+    var hash = Vector<u8>.create();
+    list.blob(1, mut hash)?;
+    grown(checks.push(hash.length == 32))?;
+
+    // 1:* with meta, in uid order whatever the order given.
+    uids.clear();
+    uids.add(5)?;
+    uids.addRange(1, 4294967295)?;
+    await store.fetchMessages(alice, inbox, uids, true, mut list)?;
+    var ordered = list.count() == 5;
+    for (i in 0..list.count()) {
+        ordered = ordered && list.uid(i) == truncate<i64>(i + 1) && list.modseq(i) > 0;
+    }
+    grown(checks.push(ordered))?;
+    grown(checks.push(list.meta(2, mut meta)? && meta.view() == "part-index".bytes()))?;
+    grown(checks.push(!(list.meta(0, mut meta)?)))?;
+
+    // Nothing for an empty set, or for another user.
+    uids.clear();
+    await store.fetchMessages(alice, inbox, uids, true, mut list)?;
+    grown(checks.push(list.count() == 0))?;
+    uids.addRange(1, 5)?;
+    await store.fetchMessages(bob, inbox, uids, true, mut list)?;
+    grown(checks.push(list.count() == 0))?;
+
+    // A mailbox by id, the user's only.
+    grown(checks.push(await store.mailboxById(alice, inbox, mut boxes)?))?;
+    grown(checks.push(boxes.name(0) == "INBOX" && boxes.messages(0) == 5 && boxes.uidNext(0) == 6))?;
+    grown(checks.push(boxes.uidValidity(0) > 0 && boxes.unseen(0) == 5))?;
+    grown(checks.push(!(await store.mailboxById(bob, inbox, mut boxes)?)))?;
+    return Ok();
+}
+
+@test
+fn fetchesMessagesByUid() -> Result<void, TestFailure> {
+    let port = match (testPort()) {
+        Some(p) => p,
+        null => { return Ok(); }
+    };
+    var checks = Vector<bool>.create();
+    let root = blobRoot("t");
+    outcome(Async.run(fetchScenario(port, root.view(), mut checks)))?;
+    return verdict(checks, 13);
+}
+
+// ── Blob collection ─────────────────────────────────────────────────────────────────────────────────────────────
+
+async fn collectScenario(port: u16, root: StringView, checks: borrow mut Vector<bool>) -> Result<void, StoreError> {
+    let store = await openStore(port, "mstore_collect", root)?;
+    await store.createDomain("example.org")?;
+    let alice = await store.createUser("alice@example.org", "h", null)?;
+    var boxes = MailboxList.create();
+    let inbox = await mailbox(store, alice, "INBOX", mut boxes)?;
+    let work = await store.createMailbox(alice, "Work", "")?;
+    await deliverText(store, alice, inbox, "Subject: one\r\n\r\n")?;
+    await deliverText(store, alice, work, "Subject: two\r\n\r\n")?;
+    var list = MessageList.create();
+    await store.messages(alice, inbox, 0, mut list)?;
+    var hash = Vector<u8>.create();
+    list.blob(0, mut hash)?;
+
+    // Referenced blobs are kept.
+    grown(checks.push(await store.collectBlobs(0, 100)? == 0))?;
+    var uids = UidSet.create();
+    uids.add(1)?;
+    var change = FlagChange.create();
+    change.add = FLAG_DELETED;
+    await store.setFlags(alice, inbox, uids, change, mut list)?;
+    var gone = Vector<i64>.create();
+    await store.expunge(alice, inbox, mut gone)?;
+    // Released, but within the grace period.
+    grown(checks.push(await store.collectBlobs(3600, 100)? == 0))?;
+    grown(checks.push(await store.collectBlobs(0, 100)? == 1))?;
+    let blobs = store.blobs();
+    let key = hash.view();
+    let opened: Result<Vector<u8>, StoreError> = await Async.blocking(() => contentOf(blobs, key));
+    grown(checks.push(match (opened) {
+        Err(StoreError.File(_)) => true,
+        _ => false,
+    }))?;
+    // Deleting a mailbox releases its messages' blobs through the cascade.
+    await store.deleteMailbox(alice, work)?;
+    grown(checks.push(await store.collectBlobs(0, 100)? == 1))?;
+    grown(checks.push(await count(store, "SELECT count(*) FROM blobs")? == 0))?;
+    grown(checks.push((await store.quota(alice)?)[1] == 0))?;
+    return Ok();
+}
+
+@test
+fn collectsReleasedBlobs() -> Result<void, TestFailure> {
+    let port = match (testPort()) {
+        Some(p) => p,
+        null => { return Ok(); }
+    };
+    var checks = Vector<bool>.create();
+    let root = blobRoot("t");
+    outcome(Async.run(collectScenario(port, root.view(), mut checks)))?;
+    return verdict(checks, 7);
+}
+
+// ── Concurrency ─────────────────────────────────────────────────────────────────────────────────────────────────
+
+async fn deliverMany(store: borrow MailStore, userId: i64, mailboxId: i64, k: usize) -> Result<void, StoreError> {
+    for (i in 0..10) {
+        let text = if ((k + truncate<usize>(i)) % 2 == 0) "Subject: even\r\n\r\n" else "Subject: odd\r\n\r\n";
+        await deliverText(store, userId, mailboxId, text)?;
+    }
+    return Ok();
+}
+
+async fn concurrencyScenario(port: u16, root: StringView, seen: borrow mut [i64; 4]) -> Result<void, StoreError> {
+    let store = await openStore(port, "mstore_concurrent", root)?;
+    await store.createDomain("example.org")?;
+    let alice = await store.createUser("alice@example.org", "h", null)?;
+    var boxes = MailboxList.create();
+    let inbox = await mailbox(store, alice, "INBOX", mut boxes)?;
+    await Async.scope(StoreError.OutOfMemory, (s) => {
+        for (k in 0..8) {
+            let n = truncate<usize>(k);
+            s.spawnSend(async () => await deliverMany(store, alice, inbox, n));
+        }
+    })?;
+    await store.findMailbox(alice, "INBOX", mut boxes)?;
+    seen[0] = boxes.messages(0);
+    seen[1] = boxes.uidNext(0);
+    seen[2] = await count(store, "SELECT count(DISTINCT uid) FROM messages")?;
+    seen[3] = await count(store, "SELECT sum(refs) FROM blobs")?;
+    return Ok();
+}
+
+@test
+fn deliversConcurrently() -> Result<void, TestFailure> {
+    let port = match (testPort()) {
+        Some(p) => p,
+        null => { return Ok(); }
+    };
+    var seen = [0i64; 4];
+    let root = blobRoot("t");
+    outcome(Async.runWorkers(4, concurrencyScenario(port, root.view(), mut seen)))?;
+    Check.isTrue(seen[0] == 80, "80 messages")?;
+    Check.isTrue(seen[1] == 81, "uids 1 to 80 handed out")?;
+    Check.isTrue(seen[2] == 80, "no uid twice")?;
+    return Check.isTrue(seen[3] == 80, "every message counted on its blob");
+}
+
+// ── Queue ───────────────────────────────────────────────────────────────────────────────────────────────────────
+
+async fn queueScenario(port: u16, root: StringView, checks: borrow mut Vector<bool>) -> Result<void, StoreError> {
+    let store = await openStore(port, "mstore_queue", root)?;
+    await store.createDomain("example.org")?;
+    let alice = await store.createUser("alice@example.org", "h", 5000)?;
+    var to = Recipient.create();
+    await store.resolve("Alice@example.org", mut to)?;
+    var boxes = MailboxList.create();
+    let inbox = await mailbox(store, alice, "INBOX", mut boxes)?;
+    grown(checks.push(to.isUser() && to.inboxId == inbox && to.quota == 5000 && to.used == 0))?;
+    grown(checks.push(!to.overQuota(5000) && to.overQuota(5001)))?;
+    let sent = await store.specialMailbox(alice, "\\Sent")?;
+    grown(checks.push(match (sent) {
+        Some(_) => true,
+        null => false,
+    }))?;
+    // A submitted message: a copy in Sent, and queued for two remote recipients, sharing one blob.
+    var content = await blob(store, "Subject: out\r\n\r\nhello\r\n")?;
+    var targets = Vector<Delivery>.create();
+    var copy = Delivery.to(alice, orElse(sent, 0), 1700000000000);
+    copy.flags = FLAG_SEEN;
+    grown(targets.push(copy))?;
+    var outbound = Outbound.create();
+    grown(outbound.sender.append("alice@example.org"))?;
+    var r1 = String.create();
+    grown(r1.append("bob@remote.test"))?;
+    grown(outbound.recipients.push(r1))?;
+    var r2 = String.create();
+    grown(r2.append("carol@remote.test"))?;
+    grown(outbound.recipients.push(r2))?;
+    outbound.userId = alice;
+    var done = Vector<Delivered>.create();
+    let id = await store.accept(mut content, targets, outbound, mut done)?;
+    grown(checks.push(id > 0 && done.length == 1))?;
+    grown(checks.push(await count(store, "SELECT refs FROM blobs")? == 2))?;
+    grown(checks.push(await count(store, "SELECT cardinality(recipients) FROM queue")? == 2))?;
+    await store.resolve("alice@example.org", mut to)?;
+    grown(checks.push(to.used == 23))?; // the Sent copy counts toward the quota
+    return Ok();
+}
+
+@test
+fn queuesOutboundMail() -> Result<void, TestFailure> {
+    let port = match (testPort()) {
+        Some(p) => p,
+        null => { return Ok(); }
+    };
+    var checks = Vector<bool>.create();
+    let root = blobRoot("t");
+    outcome(Async.run(queueScenario(port, root.view(), mut checks)))?;
+    return verdict(checks, 7);
+}
+
+async fn guardScenario(port: u16, root: StringView, checks: borrow mut Vector<bool>) -> Result<void, StoreError> {
+    let store = await openStore(port, "mstore_guard", root)?;
+    // 10 failures from one address block it; the 9th does not.
+    var blocked = false;
+    for (n in 0..9) {
+        blocked = await store.authFailed("192.0.2.1", "Alice@Example.org")?;
+    }
+    grown(checks.push(!blocked && !(await store.authBlocked("192.0.2.1")?)))?;
+    grown(checks.push(await store.authFailed("192.0.2.1", "alice@example.org")?))?;
+    grown(checks.push(await store.authBlocked("192.0.2.1")?))?;
+    // A good login does not lift a block.
+    await store.authSucceeded("192.0.2.1")?;
+    grown(checks.push(await store.authBlocked("192.0.2.1")?))?;
+    // A good login clears an address's count below the threshold.
+    for (n in 0..9) {
+        let ignored = await store.authFailed("192.0.2.2", "")?;
+    }
+    await store.authSucceeded("192.0.2.2")?;
+    grown(checks.push(!(await store.authFailed("192.0.2.2", "")?)))?;
+    // 30 failures against one login from many addresses: the 30th address is blocked (alice already has 10, the
+    // name counted case-insensitively), the user is not.
+    var tripped: usize = 0;
+    var i: usize = 0;
+    while (i < 25) {
+        var key = String.create();
+        grown(key.append("198.51.100."))?;
+        appendNumber(mut key, i);
+        if (await store.authFailed(key.view(), "ALICE@example.org")?) {
+            tripped += 1;
+        }
+        i += 1;
+    }
+    grown(checks.push(tripped == 6))?; // failures 30 to 35
+    // Blocks by hand, for good, and lifted.
+    await store.blockAddress("2001:db8::/64", null)?;
+    grown(checks.push(await store.authBlocked("2001:db8::/64")?))?;
+    await store.unblockAddress("2001:db8::/64")?;
+    grown(checks.push(!(await store.authBlocked("2001:db8::/64")?)))?;
+    await store.blockAddress("203.0.113.9", 1)?;
+    grown(checks.push(await store.authBlocked("203.0.113.9")?))?;
+    grown(checks.push(await store.forgetAuthFailures()? == 0))?; // nothing is old yet
+    return Ok();
+}
+
+@test
+fn guardsLogins() -> Result<void, TestFailure> {
+    let port = match (testPort()) {
+        Some(p) => p,
+        null => { return Ok(); }
+    };
+    var checks = Vector<bool>.create();
+    let root = blobRoot("g");
+    outcome(Async.run(guardScenario(port, root.view(), mut checks)))?;
+    return verdict(checks, 10);
+}
+
+async fn sieveScenario(port: u16, root: StringView, checks: borrow mut Vector<bool>) -> Result<void, StoreError> {
+    let store = await openStore(port, "mstore_sieve", root)?;
+    await store.createDomain("example.org")?;
+    let alice = await store.createUser("alice@example.org", "h", null)?;
+    var to = Recipient.create();
+    await store.resolve("alice@example.org", mut to)?;
+    grown(checks.push(to.script.length == 0))?;
+    await store.setSieve(alice, "one", "keep;")?;
+    await store.setSieve(alice, "two", "discard;")?;
+    await store.resolve("alice@example.org", mut to)?;
+    grown(checks.push(to.script.view() == "discard;"))?; // the last set is the active one
+    await store.setSieve(alice, "one", "stop;")?;
+    await store.resolve("alice@example.org", mut to)?;
+    grown(checks.push(to.script.view() == "stop;"))?;
+    grown(checks.push(await count(store, "SELECT count(*) FROM sieve_scripts")? == 2))?; // both kept
+    await store.clearSieve(alice)?;
+    await store.resolve("alice@example.org", mut to)?;
+    grown(checks.push(to.script.length == 0))?;
+    // A reply is due once per sender and handle within the days.
+    grown(checks.push(await store.vacationDue(alice, "bob@remote.test", "h", 7)?))?;
+    grown(checks.push(!(await store.vacationDue(alice, "bob@remote.test", "h", 7)?)))?;
+    grown(checks.push(await store.vacationDue(alice, "bob@remote.test", "other handle", 7)?))?;
+    grown(checks.push(await store.vacationDue(alice, "carol@remote.test", "h", 7)?))?;
+    return Ok();
+}
+
+@test
+fn storesSieveScripts() -> Result<void, TestFailure> {
+    let port = match (testPort()) {
+        Some(p) => p,
+        null => { return Ok(); }
+    };
+    var checks = Vector<bool>.create();
+    let root = blobRoot("s");
+    outcome(Async.run(sieveScenario(port, root.view(), mut checks)))?;
+    return verdict(checks, 9);
+}

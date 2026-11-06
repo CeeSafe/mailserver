@@ -1,0 +1,41 @@
+// Autodiscover for ActiveSync clients (MS-ASCMD §2.2.1.1, the mobilesync response schema): where the server is.
+
+import mhttp.Response;
+
+fn appendEscaped(out: borrow mut Vector<u8>, text: StringView) -> Result<void, AllocError> {
+    for (b in text.bytes()) {
+        if (b == 0x26) {
+            out.extend("&amp;".bytes())?;
+        } else if (b == 0x3c) {
+            out.extend("&lt;".bytes())?;
+        } else if (b == 0x3e) {
+            out.extend("&gt;".bytes())?;
+        } else if (b == 0x22) {
+            out.extend("&quot;".bytes())?;
+        } else {
+            out.push(b)?;
+        }
+    }
+    return Ok();
+}
+
+/// The answer to an autodiscover request for the mobilesync schema: the ActiveSync URL on `host`.
+public fn mobileSyncAutodiscover(email: StringView, host: StringView) -> Result<Response, AllocError> {
+    var out = Vector<u8>.create();
+    out.extend(
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<Autodiscover xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\" xmlns=\"http://schemas.microsoft.com/exchange/autodiscover/responseschema/2006\">\n  <Response xmlns=\"http://schemas.microsoft.com/exchange/autodiscover/mobilesync/responseschema/2006\">\n    <Culture>en:en</Culture>\n    <User>\n      <DisplayName>".bytes(),
+    )?;
+    appendEscaped(mut out, email)?;
+    out.extend("</DisplayName>\n      <EMailAddress>".bytes())?;
+    appendEscaped(mut out, email)?;
+    out.extend(
+        "</EMailAddress>\n    </User>\n    <Action>\n      <Settings>\n        <Server>\n          <Type>MobileSync</Type>\n          <Url>https://".bytes(),
+    )?;
+    appendEscaped(mut out, host)?;
+    out.extend("/Microsoft-Server-ActiveSync</Url>\n          <Name>https://".bytes())?;
+    appendEscaped(mut out, host)?;
+    out.extend(
+        "/Microsoft-Server-ActiveSync</Name>\n        </Server>\n      </Settings>\n    </Action>\n  </Response>\n</Autodiscover>\n".bytes(),
+    )?;
+    return Response.of(200, "text/xml; charset=utf-8", out);
+}

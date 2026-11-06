@@ -1,0 +1,10 @@
+size 2744
+envelope ("Sun, 07 May 1995 15:21:33 +0200" "SOLVED: MIME linewrap => A/UX Sendmail 8.6.9 discarding after CRLF.CRLF" (("Lasse =?ISO-8859-1?Q?Hiller=F8e?= Petersen" NIL "lassehp" "imv.aau.dk")) (("Lasse =?ISO-8859-1?Q?Hiller=F8e?= Petersen" NIL "lassehp" "imv.aau.dk")) (("Lasse =?ISO-8859-1?Q?Hiller=F8e?= Petersen" NIL "lassehp" "imv.aau.dk")) NIL NIL NIL NIL "<lassehp-0705951521330001@ratatosk.imv.aau.dk>")
+bodystructure ("text" "plain" ("charset" "iso-8859-1") NIL NIL "8bit" 1921 49 NIL NIL NIL NIL)
+body ("text" "plain" ("charset" "iso-8859-1") NIL NIL "8bit" 1921 49)
+section HEADER 823 413ab04e2e2db2ba9ff45f83e0f5c94665a1db41ff9826b38505d0e2637f8530
+section TEXT 1921 f15701bc21be08cafa556c03d4f9458db949fb357c6acc9297455853fdb04a09
+section HEADER.FIELDS 300 895d92e70d177316c94ab7f77c4f5e9115ca1334f82c1a65aaab16a8eed28279
+section HEADER.FIELDS.NOT 525 524d9a2a87b00258dbaa04f5842d3d3baef9fdb0285d2046002c10b84f9ee7af
+section 1 1921 f15701bc21be08cafa556c03d4f9458db949fb357c6acc9297455853fdb04a09
+section 1.MIME 823 413ab04e2e2db2ba9ff45f83e0f5c94665a1db41ff9826b38505d0e2637f8530

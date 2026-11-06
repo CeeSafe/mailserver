@@ -1,0 +1,338 @@
+// CalDAV (RFC 4791) and CardDAV (RFC 6352) under /dav, at the C# server's URLs:
+//
+//     /dav/principals/<email>/                     the account's principal
+//     /dav/calendars/<email>/[<calendar>/[<href>]] calendars and their objects
+//     /dav/contacts/<email>/[<book>/[<href>]]      address books and their vCards
+//
+// Every request but OPTIONS logs in with HTTP Basic (mpim's `basicLogin`), and the path's address must be the
+// account's. Collections and objects live in mpim's store; its modseqs are the CTags and sync tokens
+// (`http://cosmomail/sync/<modseq>`, as the C# server wrote them).
+
+import mhttp.Request;
+import mhttp.Response;
+import mhttp.percentDecode;
+import mpim.Account;
+import mpim.Collection;
+import mpim.KIND_ADDRESSBOOK;
+import mpim.KIND_CALENDAR;
+import mpim.PimError;
+import mpim.basicLogin;
+import mpim.loginAnswer;
+import mpim.collectionNamed;
+import msmtp.SmtpContext;
+import mxml.XmlWriter;
+
+const REALM: StringView = "CosmoMail CalDAV/CardDAV";
+
+const NS_DAV: StringView = "DAV:";
+const NS_CAL: StringView = "urn:ietf:params:xml:ns:caldav";
+const NS_CARD: StringView = "urn:ietf:params:xml:ns:carddav";
+const NS_CS: StringView = "http://calendarserver.org/ns/";
+const NS_IC: StringView = "http://apple.com/ns/ical/";
+
+const SYNC_PREFIX: StringView = "http://cosmomail/sync/";
+
+/// What a path names.
+const T_ROOT: u8 = 0;
+const T_PRINCIPALS: u8 = 1;
+const T_PRINCIPAL: u8 = 2;
+const T_CAL_HOME: u8 = 3;
+const T_CALENDAR: u8 = 4;
+const T_CAL_OBJECT: u8 = 5;
+const T_CARD_HOME: u8 = 6;
+const T_BOOK: u8 = 7;
+const T_CARD: u8 = 8;
+const T_UNKNOWN: u8 = 9;
+
+/// A request's path, decoded.
+struct DavPath {
+    kind: u8;
+    /// The address in the path (lowercased); empty for the root.
+    email: String;
+    /// The calendar's or address book's name.
+    collection: String;
+    /// The object's name in its collection.
+    href: String;
+
+    fn create() -> DavPath => DavPath {
+        kind: T_UNKNOWN,
+        email: String.create(),
+        collection: String.create(),
+        href: String.create(),
+    };
+
+    fn isCalendarSide(borrow this) -> bool =>
+        this.kind == T_CAL_HOME || this.kind == T_CALENDAR || this.kind == T_CAL_OBJECT;
+
+    fn kindName(borrow this) -> StringView => if (this.isCalendarSide()) KIND_CALENDAR else KIND_ADDRESSBOOK;
+}
+
+/// Splits `/dav/...` into its decoded segments and reads what it names.
+fn parseTarget(path: StringView, into: borrow mut DavPath) -> Result<void, AllocError> {
+    var segments = Vector<String>.create();
+    for (part in path.split("/")) {
+        if (part.length == 0) {
+            continue;
+        }
+        var s = String.create();
+        percentDecode(part, false, mut s)?;
+        segments.push(s)?;
+    }
+    into.kind = T_UNKNOWN;
+    if (segments.length == 0 || segments[0].view() != "dav") {
+        return Ok();
+    }
+    let n = segments.length;
+    if (n == 1) {
+        into.kind = T_ROOT;
+        return Ok();
+    }
+    let area = segments[1].view();
+    if (area == "principals") {
+        if (n == 2) {
+            into.kind = T_PRINCIPALS;
+        } else if (n == 3 || n == 4) {
+            // /dav/principals/<email>/, and /dav/principals/users/<email>/ as the C# server took it.
+            into.kind = T_PRINCIPAL;
+            lowerInto(segments[n - 1].view(), mut into.email)?;
+        }
+        return Ok();
+    }
+    let calendars = area == "calendars";
+    if (!calendars && area != "contacts") {
+        return Ok();
+    }
+    if (n < 3 || n > 5) {
+        return Ok();
+    }
+    lowerInto(segments[2].view(), mut into.email)?;
+    if (n == 3) {
+        into.kind = if (calendars) T_CAL_HOME else T_CARD_HOME;
+        return Ok();
+    }
+    into.collection.append(segments[3].view())?;
+    if (n == 4) {
+        into.kind = if (calendars) T_CALENDAR else T_BOOK;
+        return Ok();
+    }
+    into.href.append(segments[4].view())?;
+    into.kind = if (calendars) T_CAL_OBJECT else T_CARD;
+    return Ok();
+}
+
+fn lowerInto(text: StringView, into: borrow mut String) -> Result<void, AllocError> {
+    var bytes = Vector<u8>.create();
+    for (b in text.bytes()) {
+        bytes.push(if (b >= 0x41 && b <= 0x5a) b + 0x20 else b)?;
+    }
+    into.clear();
+    return into.append(StringView.fromUtf8(bytes.view()) ?? "");
+}
+
+/// Appends `text` percent-encoded as one path segment.
+fn appendSegment(into: borrow mut String, text: StringView) -> Result<void, AllocError> {
+    let hex = "0123456789ABCDEF".bytes();
+    var out = Vector<u8>.create();
+    for (b in text.bytes()) {
+        let plain = (b >= 0x41 && b <= 0x5a) || (b >= 0x61 && b <= 0x7a) || (b >= 0x30 && b <= 0x39) || b == 0x2d ||
+            b == 0x2e || b == 0x5f || b == 0x7e || b == 0x40 || b == 0x2b || b == 0x3d || b == 0x21 || b == 0x24 ||
+            b == 0x27 || b == 0x28 || b == 0x29 || b == 0x2a || b == 0x2c || b == 0x3b || b == 0x3a;
+        if (plain) {
+            out.push(b)?;
+        } else {
+            out.push(0x25)?;
+            out.push(hex[truncate<usize>(b >> 4)])?;
+            out.push(hex[truncate<usize>(b & 0x0f)])?;
+        }
+    }
+    return into.append(StringView.fromUtf8(out.view()) ?? "");
+}
+
+/// `/dav/principals/<email>/`.
+fn principalHref(email: StringView, into: borrow mut String) -> Result<void, AllocError> {
+    into.clear();
+    into.append("/dav/principals/")?;
+    appendSegment(into, email)?;
+    return into.append("/");
+}
+
+/// `/dav/calendars/<email>/` or `/dav/contacts/<email>/`, and the collection's `<name>/` when `name` is not empty.
+fn collectionHref(
+    calendar: bool,
+    email: StringView,
+    name: StringView,
+    into: borrow mut String,
+) -> Result<void, AllocError> {
+    into.clear();
+    into.append(if (calendar) "/dav/calendars/" else "/dav/contacts/")?;
+    appendSegment(into, email)?;
+    into.append("/")?;
+    if (name.length > 0) {
+        appendSegment(into, name)?;
+        into.append("/")?;
+    }
+    return Ok();
+}
+
+/// An object's href.
+fn objectHref(
+    calendar: bool,
+    email: StringView,
+    name: StringView,
+    href: StringView,
+    into: borrow mut String,
+) -> Result<void, AllocError> {
+    collectionHref(calendar, email, name, into)?;
+    return appendSegment(into, href);
+}
+
+/// Answers a request under `/dav/` or `/.well-known/caldav|carddav`.
+public async fn serveDav(mail: borrow SmtpContext, request: borrow Request) -> Result<Response, AllocError> {
+    let path = request.path.view();
+    if (path.equalsIgnoreAsciiCase("/.well-known/caldav") || path.equalsIgnoreAsciiCase("/.well-known/carddav")) {
+        // RFC 6764 §5: the context path; clients then ask it for their principal.
+        var r = Response.create(301);
+        r.header("Location", "/dav/")?;
+        return Ok(r);
+    }
+    if (request.isMethod("OPTIONS")) {
+        return options(200);
+    }
+    var account = Account.create();
+    match (await basicLogin(mail, request, mut account)) {
+        Ok() => {}
+        Err(f) => { return loginAnswer(f, REALM); }
+    }
+    var target = DavPath.create();
+    parseTarget(path, mut target)?;
+    if (target.kind == T_UNKNOWN) {
+        return Response.text(404, "Not found.");
+    }
+    if (target.email.length > 0 && target.email.view() != account.email.view()) {
+        return Response.text(403, "Only your own calendars and address books.");
+    }
+    let email = account.email.view();
+    if (request.isMethod("PROPFIND")) {
+        return await propfind(mail, request, target, email, account.userId);
+    }
+    if (request.isMethod("REPORT")) {
+        return await report(mail, request, target, email, account.userId);
+    }
+    if (request.isMethod("GET") || request.isMethod("HEAD")) {
+        return await getObject(mail, request, target, account.userId);
+    }
+    if (request.isMethod("PUT")) {
+        return await putResource(mail, request, target, account.userId);
+    }
+    if (request.isMethod("DELETE")) {
+        return await deleteResource(mail, request, target, account.userId);
+    }
+    if (request.isMethod("MKCALENDAR") || request.isMethod("MKCOL")) {
+        return await makeCollection(mail, request, target, email, account.userId);
+    }
+    if (request.isMethod("PROPPATCH")) {
+        return await proppatch(mail, request, target, email, account.userId);
+    }
+    var r = Response.text(405, "Method not allowed.")?;
+    r.header("Allow", ALLOW)?;
+    return Ok(r);
+}
+
+const ALLOW: StringView = "OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, PROPPATCH, REPORT, MKCALENDAR, MKCOL";
+
+fn options(status: u16) -> Result<Response, AllocError> {
+    var r = Response.create(status);
+    r.header("DAV", "1, 3, calendar-access, addressbook, extended-mkcol")?;
+    r.header("Allow", ALLOW)?;
+    return Ok(r);
+}
+
+/// The status for a store failure.
+fn pimAnswer(e: PimError) -> Result<Response, AllocError> => match (e) {
+    PimError.NotFound => Response.text(404, "Not found."),
+    PimError.Exists => Response.text(405, "It exists already."),
+    PimError.Precondition => Response.text(412, "The precondition failed."),
+    PimError.Unavailable => Response.text(503, "The store is not available; try again later."),
+    PimError.OutOfMemory => Err(AllocError.OutOfMemory),
+    _ => Response.text(400, "Not accepted."),
+};
+
+/// A `DAV:error` body (RFC 4918 §16) naming the precondition `local` in `space`.
+fn preconditionFailed(status: u16, space: StringView, local: StringView) -> Result<Response, AllocError> {
+    var w = XmlWriter.document();
+    w.start("D:error");
+    declareSpaces(mut w);
+    var name = String.create();
+    qualifiedName(space, local, mut name)?;
+    w.empty(name.view());
+    w.end();
+    return Response.of(status, "application/xml; charset=utf-8", w.finish()?);
+}
+
+/// The prefixes every document here uses, declared on its root.
+fn declareSpaces(w: borrow mut XmlWriter) {
+    w.attribute("xmlns:D", NS_DAV);
+    w.attribute("xmlns:C", NS_CAL);
+    w.attribute("xmlns:CARD", NS_CARD);
+    w.attribute("xmlns:CS", NS_CS);
+    w.attribute("xmlns:IC", NS_IC);
+}
+
+/// `space`'s prefix and `local`; false (and `X:local`) when the namespace has no declared prefix, so the caller
+/// declares `xmlns:X`.
+fn qualifiedName(space: StringView, local: StringView, into: borrow mut String) -> Result<bool, AllocError> {
+    into.clear();
+    let prefix =
+        if (space == NS_DAV) "D" else if (space == NS_CAL) "C" else if (space == NS_CARD) "CARD" else if (space ==
+            NS_CS) "CS" else if (space == NS_IC) "IC" else "X";
+    into.append(prefix)?;
+    into.append(":")?;
+    into.append(local)?;
+    return Ok(prefix != "X");
+}
+
+/// The Depth header: 0, 1, or (absent, or `infinity`) 2.
+fn depthOf(request: borrow Request) -> u8 {
+    let value = match (request.header("Depth")) {
+        Some(v) => v.view(),
+        null => { return 2; }
+    };
+    if (value == "0") {
+        return 0;
+    }
+    if (value == "1") {
+        return 1;
+    }
+    return 2;
+}
+
+/// The user's collection a target is in; false (with nothing changed) when there is none.
+async fn targetCollection(
+    mail: borrow SmtpContext,
+    userId: i64,
+    target: borrow DavPath,
+    into: borrow mut Collection,
+) -> Result<bool, PimError> =>
+    await collectionNamed(mail.store, userId, target.kindName(), target.collection.view(), into);
+
+/// A header's value as an etag, without quotes or a weak prefix; empty when absent.
+fn etagHeader(request: borrow Request, name: StringView, into: borrow mut String) -> Result<void, AllocError> {
+    into.clear();
+    let value = match (request.header(name)) {
+        Some(v) => v.view(),
+        null => { return Ok(); }
+    };
+    let v = value.trim();
+    var start: usize = 0;
+    if (v.startsWith("W/")) {
+        start = 2;
+    }
+    var end = v.length;
+    if (end > start && v[start..end].startsWith("\"")) {
+        start += 1;
+    }
+    if (end > start && v[start..end].endsWith("\"")) {
+        end -= 1;
+    }
+    return into.append(v[start..end]);
+}

@@ -1,0 +1,130 @@
+// Idle SMTP sessions, kept for the next message to the same server: a transaction on a reused session costs one
+// RSET round trip instead of a TCP connection, a TLS handshake and EHLO. Any worker may take any session; one is
+// used by one worker at a time (it is out of the pool meanwhile). Sessions idle too long, or used too often, close.
+
+import msmtp.SmtpSession;
+import msmtp.TLS_OPPORTUNISTIC;
+import msmtp.closeSession;
+import msmtp.ClientSettings;
+
+@noncopy
+struct SessionPool {
+    idle: AsyncMutex<Vector<SmtpSession>>;
+
+    fn create() -> Result<SessionPool, AllocError> =>
+        Ok(SessionPool { idle: AsyncMutex<Vector<SmtpSession>>.create(Vector<SmtpSession>.create())? });
+
+    /// An idle session with the server at `address` named `name`, with at least the TLS `level` asks (a msmtp
+    /// TLS_ constant; TLS_OPPORTUNISTIC and below take any), moved into `into` (which gets 0 or 1).
+    async fn take(
+        borrow this,
+        address: SocketAddress,
+        name: StringView,
+        level: u8,
+        into: borrow mut Vector<SmtpSession>,
+    ) -> Result<void, AllocError> {
+        into.clear();
+        var guard = match (await this.idle.lock()) {
+            Ok(g) => g,
+            Err(_) => { return Ok(); }
+        };
+        let list = guard.data();
+        var i = list.length;
+        while (i > 0) {
+            i -= 1; // the most recently used first: the least likely to have been closed by the server
+            let secureEnough = level <= TLS_OPPORTUNISTIC || list[i].security >= level;
+            if (sameSocket(
+                list[i].address,
+                address,
+            ) && list[i].name.view().equalsIgnoreAsciiCase(name) && secureEnough) {
+                let last = list.length - 1;
+                list.swap(i, last);
+                into.push(list.pop()!)?;
+                return Ok();
+            }
+        }
+        return Ok();
+    }
+
+    /// Keeps `session` for reuse; when the pool is full it is handed back in `overflow`, to be closed.
+    async fn give(
+        borrow this,
+        session: SmtpSession,
+        limit: usize,
+        overflow: borrow mut Vector<SmtpSession>,
+    ) -> Result<void, AllocError> {
+        var guard = match (await this.idle.lock()) {
+            Ok(g) => g,
+            Err(_) => { return overflow.push(session); }
+        };
+        let list = guard.data();
+        if (list.length >= limit) {
+            return overflow.push(session);
+        }
+        return list.push(session);
+    }
+
+    /// Moves the sessions idle since before `cutoff` (Unix milliseconds) into `into`, to be closed.
+    async fn expired(borrow this, cutoff: i64, into: borrow mut Vector<SmtpSession>) -> Result<void, AllocError> {
+        var guard = match (await this.idle.lock()) {
+            Ok(g) => g,
+            Err(_) => { return Ok(); }
+        };
+        let list = guard.data();
+        var i = list.length;
+        while (i > 0) {
+            i -= 1;
+            if (list[i].idleSince < cutoff) {
+                let last = list.length - 1;
+                list.swap(i, last);
+                into.push(list.pop()!)?;
+            }
+        }
+        return Ok();
+    }
+}
+
+fn sameSocket(a: SocketAddress, b: SocketAddress) -> bool {
+    match (a) {
+        SocketAddress.V4(x, p) => {
+            match (b) {
+                SocketAddress.V4(y, q) => {
+                    if (p != q) {
+                        return false;
+                    }
+                    for (i in 0..4) {
+                        if (x[i] != y[i]) {
+                            return false;
+                        }
+                    }
+                    return true;
+                }
+                SocketAddress.V6(_, _, _) => { return false; }
+            }
+        }
+        SocketAddress.V6(x, p, _) => {
+            match (b) {
+                SocketAddress.V6(y, q, _) => {
+                    if (p != q) {
+                        return false;
+                    }
+                    for (i in 0..16) {
+                        if (x[i] != y[i]) {
+                            return false;
+                        }
+                    }
+                    return true;
+                }
+                SocketAddress.V4(_, _) => { return false; }
+            }
+        }
+    }
+}
+
+/// Closes every session in `sessions`.
+async fn closeAll(sessions: borrow mut Vector<SmtpSession>, settings: borrow ClientSettings) {
+    while (sessions.length > 0) {
+        let s = sessions.pop()!;
+        await closeSession(s, settings);
+    }
+}

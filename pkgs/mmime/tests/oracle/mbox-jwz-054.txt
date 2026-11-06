@@ -1,0 +1,10 @@
+size 1127
+envelope ("Tue, 16 Jun 92 20:33:31 EDT" "greek mail" (("Taso N. Devetzis" NIL "devetzis" "MISSING_DOMAIN")) (("Taso N. Devetzis" NIL "devetzis" "MISSING_DOMAIN")) (("Taso N. Devetzis" NIL "devetzis" "MISSING_DOMAIN")) ((NIL NIL "nsb" "MISSING_DOMAIN")) ((NIL NIL "devetzis" "MISSING_DOMAIN")) NIL NIL "<9206170033.AA10194@dexter.bellcore.com>")
+bodystructure ("text" "richtext" ("charset" "iso-8859-7") NIL NIL "quoted-printable" 589 21 NIL NIL NIL NIL)
+body ("text" "richtext" ("charset" "iso-8859-7") NIL NIL "quoted-printable" 589 21)
+section HEADER 538 a969c75b2b38193eb2b09c3918e23524307a012fd1f1c338b063a89fd8d644bf
+section TEXT 589 7166f29757719a2e2d62ea3207ec8fec0916b082e7af2dcf1ce6146383f4c668
+section HEADER.FIELDS 219 454f57f94cdcae3549c5fc9d84fa4c2bd801d29bc501e15f664f74b1131c3fa7
+section HEADER.FIELDS.NOT 321 b48c1063537437185f0920366c4b27c2ef88ee18f94bdb8fe3a340a349948ef4
+section 1 589 7166f29757719a2e2d62ea3207ec8fec0916b082e7af2dcf1ce6146383f4c668
+section 1.MIME 538 a969c75b2b38193eb2b09c3918e23524307a012fd1f1c338b063a89fd8d644bf

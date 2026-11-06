@@ -1,0 +1,824 @@
+// One IMAP session (RFC 3501, with the extensions the README lists): the greeting, reading commands with their
+// literals, the state machine, and the commands of any state and of the not-authenticated state. The mailbox
+// commands are in mailbox.cee, the selected-state commands in selected.cee.
+
+import msmtp.Fault;
+import msmtp.LoginRefusal;
+import msmtp.SmtpContext;
+import msmtp.Wire;
+import msmtp.WireError;
+import msmtp.checkLogin;
+import msmtp.decodePlain;
+import msmtp.loginBlocked;
+import msmtp.loginFailed;
+import msmtp.peerBytes;
+import msmtp.proxyPeer;
+import mstore.Watch;
+
+/// The listener a connection came in on: port 143 (STARTTLS) or 993 (implicit TLS).
+public enum ImapMode {
+    Plain,
+    Tls,
+}
+
+/// The `[imap]` settings a session needs.
+public struct ImapSettings {
+    /// Allow LOGIN and AUTHENTICATE without TLS (tests, or behind a TLS-terminating proxy).
+    public allowPlaintextAuth: bool;
+    /// The largest APPEND, in bytes.
+    public maxAppendSize: u64;
+
+    public fn defaults() -> ImapSettings => ImapSettings { allowPlaintextAuth: false, maxAppendSize: 50 * 1024 * 1024 };
+}
+
+/// The longest command line; a longer one ends the session with `* BYE`.
+const MAX_LINE: usize = 64 * 1024;
+/// The autologout timer (RFC 3501 §5.4 asks for at least 30 minutes).
+public const AUTOLOGOUT: u64 = 30 * 60 * 1000;
+const HANDSHAKE_TIMEOUT: u64 = 30000;
+/// How long the client may pause inside a literal.
+const LITERAL_TIMEOUT: u64 = 5 * 60 * 1000;
+const LITERAL_CHUNK: usize = 64 * 1024;
+const MAX_AUTH_FAILURES: u32 = 3;
+
+const NOT_AUTHENTICATED: u8 = 0;
+const AUTHENTICATED: u8 = 1;
+const SELECTED: u8 = 2;
+const LOGGED_OUT: u8 = 3;
+
+/// What a command leaves the conversation to do.
+const CONTINUE: u8 = 0;
+const ENDED: u8 = 1;
+const UPGRADE: u8 = 2;
+
+const READ_COMMAND: u8 = 0;
+const READ_SKIP: u8 = 1;
+const READ_CLOSE: u8 = 2;
+
+const BASE_CAPABILITIES: StringView =
+    "IMAP4rev1 SASL-IR LITERAL+ ID ENABLE IDLE NAMESPACE UIDPLUS MOVE UNSELECT CHILDREN SPECIAL-USE";
+
+/// Why a command stopped: the connection failed, or its arguments are invalid (a `BAD`).
+public enum Problem {
+    Wire(WireError),
+    Parse(ParseError),
+}
+
+fn io<T>(r: Result<T, WireError>) -> Result<T, Problem> => match (r) {
+    Ok(v) => Ok(v),
+    Err(e) => Err(Problem.Wire(e)),
+};
+
+fn parsed<T>(r: Result<T, ParseError>) -> Result<T, Problem> => match (r) {
+    Ok(v) => Ok(v),
+    Err(e) => Err(Problem.Parse(e)),
+};
+
+fn mem<T>(r: Result<T, AllocError>) -> Result<T, Problem> => match (r) {
+    Ok(v) => Ok(v),
+    Err(_) => Err(Problem.Wire(WireError.OutOfMemory)),
+};
+
+@noncopy
+struct Session {
+    state: u8;
+    settings: ImapSettings;
+    peer: [u8; 16];
+    userId: i64;
+    authFailures: u32;
+    /// The current command's tag, and its tagged response, sent after any untagged updates.
+    tag: Vector<u8>;
+    tail: Vector<u8>;
+    // The selected mailbox.
+    mailboxId: i64;
+    readOnly: bool;
+    uidValidity: i64;
+    snapshot: Snapshot;
+    /// The keywords the client has been told of in FLAGS, space-separated: a keyword new to the mailbox is announced
+    /// in a new FLAGS before a FETCH first shows it (RFC 3501 §7.2.6).
+    keywords: Vector<u8>;
+    /// The notify bus's watch on the selected mailbox, which wakes IDLE; dropped when the mailbox is deselected or
+    /// the session ends, however it ends.
+    watch: Watch?;
+    /// Whether the session ever selected a mailbox (then its end logs the bus's count).
+    watched: bool;
+    /// APPEND's message literal, announced and left on the wire for APPEND to stream into the blob store: its size
+    /// and whether it is synchronizing (`+` is sent only once APPEND accepts it). A command that does not read it
+    /// leaves it pending, and the session skips it.
+    literalPending: bool;
+    literalSize: u64;
+    literalSync: bool;
+}
+
+fn newSession(settings: ImapSettings) -> Session => Session {
+    state: NOT_AUTHENTICATED,
+    settings: settings,
+    peer: [0u8; 16],
+    userId: 0,
+    authFailures: 0,
+    tag: Vector<u8>.create(),
+    tail: Vector<u8>.create(),
+    mailboxId: 0,
+    readOnly: false,
+    uidValidity: 0,
+    snapshot: Snapshot.create(),
+    keywords: Vector<u8>.create(),
+    watch: null,
+    watched: false,
+    literalPending: false,
+    literalSize: 0,
+    literalSync: false,
+};
+
+/// Leaves the selected state.
+fn deselect(s: borrow mut Session) {
+    if (s.state == SELECTED) {
+        s.state = AUTHENTICATED;
+    }
+    s.mailboxId = 0;
+    s.readOnly = false;
+    s.uidValidity = 0;
+    s.snapshot.clear();
+    s.keywords.clear();
+    s.watch = null;
+}
+
+// ---- Tagged responses ----
+
+fn startTagged(s: borrow mut Session, status: StringView) -> Result<void, AllocError> {
+    s.tail.clear();
+    s.tail.extend(s.tag.view())?;
+    s.tail.push(0x20)?;
+    s.tail.extend(status.bytes())?;
+    return s.tail.push(0x20);
+}
+
+fn endTagged(s: borrow mut Session, text: StringView) -> Result<void, AllocError> {
+    s.tail.extend(text.bytes())?;
+    return s.tail.extend("\r\n".bytes());
+}
+
+/// `tag STATUS text`, sent once the command's untagged responses are out.
+fn tagged(s: borrow mut Session, status: StringView, text: StringView) -> Result<u8, Problem> {
+    mem(startTagged(s, status))?;
+    mem(endTagged(s, text))?;
+    return Ok(CONTINUE);
+}
+
+/// A store failure: `NO [UNAVAILABLE]`.
+fn unavailable(s: borrow mut Session) -> Result<u8, Problem> =>
+    tagged(s, "NO", "[UNAVAILABLE] Temporary server failure, try again later");
+
+// ---- The connection ----
+
+/// Serves one connection to the end. Errors end the session, never the server.
+public async fn serveConnection(
+    ctx: borrow SmtpContext,
+    stream: AsyncTcpStream,
+    mode: ImapMode,
+    settings: ImapSettings,
+) -> Result<void, Fault> {
+    let proxied = match (await proxyPeer(ctx, stream)) {
+        Ok(p) => p,
+        Err(_) => { return Ok(); }
+    };
+    var wire = match (await openWire(ctx, stream, mode)) {
+        Ok(w) => w,
+        Err(_) => { return Ok(); }
+    };
+    wire.setProxied(proxied);
+    var s = newSession(settings);
+    s.peer = peerBytes(wire.peer());
+    if (await loginBlocked(ctx.login, ctx.store, s.peer)) {
+        match (wire.send("* BYE Too many failed logins from your address, try again later\r\n".bytes())) {
+            Ok() => {}
+            Err(_) => {}
+        }
+        await wire.close();
+        return Ok();
+    }
+    var greeting = Vector<u8>.create();
+    match (writeGreeting(ctx, s, wire.isTls(), mut greeting)) {
+        Ok() => {}
+        Err(_) => { return Err(Fault.OutOfMemory); }
+    }
+    match (wire.send(greeting.view())) {
+        Ok() => {}
+        Err(_) => { return Ok(); }
+    }
+    await talk(ctx, wire, mut s);
+    s.watch = null;
+    if (s.watched) {
+        await logWatches(ctx);
+    }
+    return Ok();
+}
+
+/// The conversation after the greeting, to its end: the session's own errors end it here.
+async fn talk(ctx: borrow SmtpContext, opened: Wire, s: borrow mut Session) {
+    var wire = opened;
+    loop {
+        let ended = match (await converse(ctx, mut wire, s)) {
+            Ok(e) => e,
+            Err(_) => { return; }
+        };
+        if (ended != UPGRADE) {
+            break;
+        }
+        let current = ctx.tlsConfig();
+        let config = match (borrow current) {
+            Some(c) => c,
+            null => { return; }
+        };
+        // The handshake replaces the wire: what the client pipelined in the clear goes with the old buffer.
+        wire = match (await wire.startTls(config, HANDSHAKE_TIMEOUT)) {
+            Ok(w) => w,
+            Err(_) => { return; }
+        };
+    }
+    await wire.close();
+}
+
+/// `imap: mailbox watches N` on standard error, once a session that selected a mailbox has ended: the notify bus's
+/// live watches, which the tests check go back to 0.
+async fn logWatches(ctx: borrow SmtpContext) {
+    let n = await ctx.store.notifications().count();
+    var line = String.create();
+    var number = String.create();
+    let built: Result<void, AllocError> = buildLine(n, mut number, mut line);
+    match (built) {
+        Ok() => {}
+        Err(_) => { return; }
+    }
+    match (await AsyncConsole.writeError(line.view())) {
+        Ok() => {}
+        Err(_) => {}
+    }
+}
+
+fn buildLine(n: usize, number: borrow mut String, line: borrow mut String) -> Result<void, AllocError> {
+    number.appendNumber(n as u64)?;
+    line.append("imap: mailbox watches ")?;
+    line.append(number.view())?;
+    return line.append("\n");
+}
+
+async fn openWire(ctx: borrow SmtpContext, stream: AsyncTcpStream, mode: ImapMode) -> Result<Wire, WireError> {
+    match (mode) {
+        ImapMode.Tls => {
+            let current = ctx.tlsConfig();
+            match (borrow current) {
+                Some(config) => { return await Wire.implicitTls(stream, config, HANDSHAKE_TIMEOUT); }
+                null => { return Err(WireError.Tls); }
+            }
+        }
+        ImapMode.Plain => { return Wire.plain(stream); }
+    }
+}
+
+fn writeGreeting(
+    ctx: borrow SmtpContext,
+    s: borrow Session,
+    secure: bool,
+    out: borrow mut Vector<u8>,
+) -> Result<void, AllocError> {
+    out.extend("* OK [CAPABILITY ".bytes())?;
+    writeCapabilities(ctx, s, secure, out)?;
+    out.extend("] ".bytes())?;
+    out.extend(ctx.settings.hostname.view().bytes())?;
+    return out.extend(" IMAP4rev1 server ready\r\n".bytes());
+}
+
+/// Whether LOGIN and AUTHENTICATE are refused on this connection now.
+fn loginDisabled(s: borrow Session, secure: bool) -> bool => !secure && !s.settings.allowPlaintextAuth;
+
+/// The capability list for the session's state: STARTTLS and the login mechanisms only before login.
+fn writeCapabilities(
+    ctx: borrow SmtpContext,
+    s: borrow Session,
+    secure: bool,
+    out: borrow mut Vector<u8>,
+) -> Result<void, AllocError> {
+    out.extend(BASE_CAPABILITIES.bytes())?;
+    if (s.state == NOT_AUTHENTICATED) {
+        if (ctx.hasTls() && !secure) {
+            out.extend(" STARTTLS".bytes())?;
+        }
+        if (loginDisabled(s, secure)) {
+            out.extend(" LOGINDISABLED".bytes())?;
+        } else {
+            out.extend(" AUTH=PLAIN".bytes())?;
+        }
+    }
+    return Ok();
+}
+
+fn readerLimits(s: borrow Session) -> Limits {
+    var limits = Limits.defaults();
+    limits.maxAppendLiteral = s.settings.maxAppendSize;
+    return limits;
+}
+
+/// Reads and answers commands until LOGOUT or an error (`ENDED`), or an accepted STARTTLS (`UPGRADE`).
+async fn converse(ctx: borrow SmtpContext, wire: borrow mut Wire, s: borrow mut Session) -> Result<u8, WireError> {
+    var reader = CommandReader.create(readerLimits(s));
+    var line = Vector<u8>.create();
+    loop {
+        reader.reset();
+        s.literalPending = false;
+        let read = await readCommand(wire, s, mut reader, mut line)?;
+        if (read == READ_CLOSE) {
+            return Ok(ENDED);
+        }
+        if (read == READ_SKIP) {
+            continue;
+        }
+        let action = await execute(ctx, wire, s, mut reader)?;
+        if (s.literalPending) {
+            // The command was refused before it read its message (a synchronizing literal is then never sent).
+            s.literalPending = false;
+            let pending = TrailingLiteral { size: s.literalSize, synchronizing: s.literalSync };
+            if (await skipLiterals(wire, s, mut line, pending)? == READ_CLOSE) {
+                return Ok(ENDED);
+            }
+        }
+        if (action == UPGRADE) {
+            await wire.flush()?;
+        }
+        if (action != CONTINUE) {
+            return Ok(action);
+        }
+    }
+}
+
+/// Reads one whole command into `reader`: its lines and literals. A command that cannot be parsed is answered here
+/// (`READ_SKIP`); a line over the limit or the autologout timer ends the session (`READ_CLOSE`).
+async fn readCommand(
+    wire: borrow mut Wire,
+    s: borrow mut Session,
+    reader: borrow mut CommandReader,
+    line: borrow mut Vector<u8>,
+) -> Result<u8, WireError> {
+    var chunk = Vector<u8>.create();
+    loop {
+        match (await wire.readLineWithin(line, MAX_LINE, AUTOLOGOUT)) {
+            Ok() => {}
+            Err(WireError.TooLong) => {
+                wire.send("* BYE Command line too long\r\n".bytes())?;
+                return Ok(READ_CLOSE);
+            }
+            Err(WireError.Timeout) => {
+                wire.send("* BYE Autologout; idle for too long\r\n".bytes())?;
+                return Ok(READ_CLOSE);
+            }
+            Err(e) => { return Err(e); }
+        }
+        if (reader.isEmpty() && line.length == 0) {
+            // A blank line between commands: nothing to answer.
+            continue;
+        }
+        match (reader.feedLine(line.view())) {
+            Ok(Feed.Complete) => { return Ok(READ_COMMAND); }
+            Ok(Feed.NeedLiteral(request)) => {
+                if (reader.isAppendMessage()) {
+                    // APPEND streams its message from the wire itself, after checking the size, the mailbox and
+                    // the quota.
+                    reader.deferLiteral();
+                    s.literalPending = true;
+                    s.literalSize = request.size;
+                    s.literalSync = request.synchronizing;
+                    return Ok(READ_COMMAND);
+                }
+                if (request.synchronizing) {
+                    wire.send("+ Ready for literal data\r\n".bytes())?;
+                }
+                var left = request.size;
+                while (left > 0) {
+                    let take = if (left > (LITERAL_CHUNK as u64)) LITERAL_CHUNK else truncate<usize>(left);
+                    chunk.clear();
+                    await wire.readExact(take, mut chunk, LITERAL_TIMEOUT)?;
+                    left = match (reader.feedLiteral(chunk.view())) {
+                        Ok(n) => n,
+                        Err(_) => { return Ok(READ_CLOSE); }
+                    };
+                }
+            }
+            Err(problem) => {
+                return await refuseCommand(wire, s, reader, line, problem);
+            }
+        }
+    }
+}
+
+/// Answers a command that failed to parse, and skips what the client still sends of it: a non-synchronizing
+/// literal is read and thrown away (or, when it is absurdly large, the session ends). A synchronizing literal is
+/// never read: the client waits for `+`, which does not come, and reads the answer instead.
+async fn refuseCommand(
+    wire: borrow mut Wire,
+    s: borrow mut Session,
+    reader: borrow CommandReader,
+    line: borrow mut Vector<u8>,
+    e: ParseError,
+) -> Result<u8, WireError> {
+    var out = Vector<u8>.create();
+    let built: Result<void, AllocError> = refusal(reader, e, mut out);
+    match (built) {
+        Ok() => {}
+        Err(_) => { return Err(WireError.OutOfMemory); }
+    }
+    wire.send(out.view())?;
+    return match (trailingLiteral(line.view())) {
+        Some(t) => await skipLiterals(wire, s, line, t),
+        null => Ok(READ_SKIP),
+    };
+}
+
+/// Skips what the client still sends of a refused command from the literal `first` on: a non-synchronizing literal
+/// is read and thrown away with the line after it, which may announce another (or, when one is absurdly large, the
+/// session ends: `READ_CLOSE`). A synchronizing literal is never read: the client waits for `+`, which does not
+/// come, and reads the answer instead.
+async fn skipLiterals(
+    wire: borrow mut Wire,
+    s: borrow Session,
+    line: borrow mut Vector<u8>,
+    first: TrailingLiteral,
+) -> Result<u8, WireError> {
+    var trailing: TrailingLiteral? = first;
+    var scratch = Vector<u8>.create();
+    let most = if (s.settings.maxAppendSize > 64 * 1024 * 1024) s.settings.maxAppendSize else 64 * 1024 * 1024;
+    loop {
+        let t = match (trailing) {
+            Some(t) => t,
+            null => { return Ok(READ_SKIP); }
+        };
+        if (t.synchronizing) {
+            return Ok(READ_SKIP);
+        }
+        if (t.size > most) {
+            wire.send("* BYE Literal too large\r\n".bytes())?;
+            return Ok(READ_CLOSE);
+        }
+        var left = t.size;
+        while (left > 0) {
+            let take = if (left > (LITERAL_CHUNK as u64)) LITERAL_CHUNK else truncate<usize>(left);
+            scratch.clear();
+            await wire.readExact(take, mut scratch, LITERAL_TIMEOUT)?;
+            left -= take as u64;
+        }
+        // The rest of the command: another line, which may announce another literal.
+        match (await wire.readLineWithin(line, MAX_LINE, LITERAL_TIMEOUT)) {
+            Ok() => {}
+            Err(WireError.TooLong) => {
+                wire.send("* BYE Command line too long\r\n".bytes())?;
+                return Ok(READ_CLOSE);
+            }
+            Err(other) => { return Err(other); }
+        }
+        trailing = trailingLiteral(line.view());
+    }
+}
+
+fn refusal(reader: borrow CommandReader, e: ParseError, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    match (reader.tagForReply()) {
+        Some(t) => { out.extend(reader.text(t))?; }
+        null => { out.push(0x2a)?; }
+    }
+    if (e == ParseError.LiteralTooLarge) {
+        out.extend(" NO [TOOBIG] ".bytes())?;
+    } else {
+        out.extend(" BAD ".bytes())?;
+    }
+    out.extend(describeError(e).bytes())?;
+    return out.extend("\r\n".bytes());
+}
+
+/// Which state a command needs: 0 any, 1 not authenticated, 2 authenticated (or selected), 3 selected.
+fn requiredState(command: Command) -> u8 => match (command) {
+    Command.Capability => 0,
+    Command.Noop => 0,
+    Command.Logout => 0,
+    Command.Id => 0,
+    Command.Enable => 0,
+    Command.StartTls => 1,
+    Command.Login => 1,
+    Command.Authenticate => 1,
+    Command.Check => 3,
+    Command.Close => 3,
+    Command.Expunge => 3,
+    Command.Search => 3,
+    Command.Fetch => 3,
+    Command.Store => 3,
+    Command.Copy => 3,
+    Command.Move => 3,
+    Command.Unselect => 3,
+    _ => 2,
+};
+
+/// Runs one complete command, then sends the updates of the selected mailbox and the tagged response.
+async fn execute(
+    ctx: borrow SmtpContext,
+    wire: borrow mut Wire,
+    s: borrow mut Session,
+    r: borrow mut CommandReader,
+) -> Result<u8, WireError> {
+    s.tail.clear();
+    s.tag.clear();
+    let tagSpan = match (r.tag()) {
+        Ok(t) => t,
+        Err(_) => {
+            wire.send("* BAD Invalid tag\r\n".bytes())?;
+            return Ok(CONTINUE);
+        }
+    };
+    match (s.tag.extend(r.text(tagSpan))) {
+        Ok() => {}
+        Err(_) => { return Err(WireError.OutOfMemory); }
+    }
+    let name = match (r.command()) {
+        Ok(n) => n,
+        Err(e) => {
+            match (tagged(s, "BAD", describeError(e))) {
+                Ok(_) => {}
+                Err(_) => { return Err(WireError.OutOfMemory); }
+            }
+            wire.send(s.tail.view())?;
+            return Ok(CONTINUE);
+        }
+    };
+    var action = CONTINUE;
+    match (await run(ctx, wire, s, r, name)) {
+        Ok(a) => { action = a; }
+        Err(Problem.Parse(e)) => {
+            match (tagged(s, "BAD", describeError(e))) {
+                Ok(_) => {}
+                Err(_) => { return Err(WireError.OutOfMemory); }
+            }
+        }
+        Err(Problem.Wire(e)) => { return Err(e); }
+    }
+    if (s.state == SELECTED && action == CONTINUE) {
+        // RFC 3501 §7.4.1: no EXPUNGE while answering FETCH, STORE or SEARCH (their UID forms may).
+        let quiet = !name.uid &&
+            (name.command == Command.Fetch || name.command == Command.Store || name.command == Command.Search);
+        await sync(ctx, wire, s, !quiet)?;
+    }
+    wire.send(s.tail.view())?;
+    return Ok(action);
+}
+
+async fn run(
+    ctx: borrow SmtpContext,
+    wire: borrow mut Wire,
+    s: borrow mut Session,
+    r: borrow mut CommandReader,
+    name: CommandName,
+) -> Result<u8, Problem> {
+    let need = requiredState(name.command);
+    if (need == 1 && s.state != NOT_AUTHENTICATED) {
+        return tagged(s, "BAD", "Already authenticated");
+    }
+    if (need >= 2 && s.state == NOT_AUTHENTICATED) {
+        return tagged(s, "BAD", "Log in first");
+    }
+    if (need == 3 && s.state != SELECTED) {
+        return tagged(s, "BAD", "No mailbox selected");
+    }
+    let uid = name.uid;
+    return match (name.command) {
+        Command.Capability => await capability(ctx, wire, s, r),
+        Command.Noop => noop(s, r, "NOOP completed"),
+        Command.Check => noop(s, r, "CHECK completed"),
+        Command.Logout => logout(s, r),
+        Command.Id => await id(wire, s, r),
+        Command.Enable => await enable(wire, s, r),
+        Command.StartTls => startTls(ctx, wire, s, r),
+        Command.Login => await login(ctx, wire, s, r),
+        Command.Authenticate => await authenticate(ctx, wire, s, r),
+        Command.Select => await select(ctx, wire, s, r, false),
+        Command.Examine => await select(ctx, wire, s, r, true),
+        Command.Create => await create(ctx, s, r),
+        Command.Delete => await delete(ctx, s, r),
+        Command.Rename => await rename(ctx, s, r),
+        Command.Subscribe => await subscribe(ctx, s, r, true),
+        Command.Unsubscribe => await subscribe(ctx, s, r, false),
+        Command.List => await list(ctx, wire, s, r, false),
+        Command.Lsub => await list(ctx, wire, s, r, true),
+        Command.Namespace => await namespaces(wire, s, r),
+        Command.Status => await status(ctx, wire, s, r),
+        Command.Append => await append(ctx, wire, s, r),
+        Command.Close => await close(ctx, s, r, true),
+        Command.Unselect => await close(ctx, s, r, false),
+        Command.Expunge => await expunge(ctx, wire, s, r, uid),
+        Command.Search => await searchCommand(ctx, wire, s, r, uid),
+        Command.Fetch => await fetchCommand(ctx, wire, s, r, uid),
+        Command.Store => await storeCommand(ctx, wire, s, r, uid),
+        Command.Copy => await copy(ctx, wire, s, r, uid, false),
+        Command.Move => await copy(ctx, wire, s, r, uid, true),
+        Command.Idle => await idle(ctx, wire, s, r),
+    };
+}
+
+// ---- Any state ----
+
+async fn capability(
+    ctx: borrow SmtpContext,
+    wire: borrow mut Wire,
+    s: borrow mut Session,
+    r: borrow mut CommandReader,
+) -> Result<u8, Problem> {
+    parsed(r.finish())?;
+    var out = Vector<u8>.create();
+    mem(out.extend("* CAPABILITY ".bytes()))?;
+    mem(writeCapabilities(ctx, s, wire.isTls(), mut out))?;
+    mem(out.extend("\r\n".bytes()))?;
+    io(wire.send(out.view()))?;
+    return tagged(s, "OK", "CAPABILITY completed");
+}
+
+fn noop(s: borrow mut Session, r: borrow mut CommandReader, text: StringView) -> Result<u8, Problem> {
+    parsed(r.finish())?;
+    return tagged(s, "OK", text);
+}
+
+fn logout(s: borrow mut Session, r: borrow mut CommandReader) -> Result<u8, Problem> {
+    parsed(r.finish())?;
+    s.tail.clear();
+    mem(s.tail.extend("* BYE Logging out\r\n".bytes()))?;
+    mem(s.tail.extend(s.tag.view()))?;
+    mem(s.tail.extend(" OK LOGOUT completed\r\n".bytes()))?;
+    deselect(s);
+    s.state = LOGGED_OUT;
+    return Ok(ENDED);
+}
+
+/// ID (RFC 2971): the client's list is read and not kept.
+async fn id(wire: borrow mut Wire, s: borrow mut Session, r: borrow mut CommandReader) -> Result<u8, Problem> {
+    if ((r.peek() ?? TokenKind.Open) == TokenKind.Nil) {
+        parsed(r.next())?;
+    } else {
+        parsed(r.open())?;
+        while (!r.closeIfNext()) {
+            let field = parsed(r.string())?;
+            if ((r.peek() ?? TokenKind.Open) == TokenKind.Nil) {
+                parsed(r.next())?;
+            } else {
+                parsed(r.string())?;
+            }
+            if (r.text(field).length > 30) {
+                return Err(Problem.Parse(ParseError.BadCharacter));
+            }
+        }
+    }
+    parsed(r.finish())?;
+    io(wire.send("* ID (\"name\" \"CeeSafe-mailserver\")\r\n".bytes()))?;
+    return tagged(s, "OK", "ID completed");
+}
+
+/// ENABLE (RFC 5161): no extension that needs enabling is offered yet.
+async fn enable(wire: borrow mut Wire, s: borrow mut Session, r: borrow mut CommandReader) -> Result<u8, Problem> {
+    if (s.state == NOT_AUTHENTICATED) {
+        return tagged(s, "BAD", "Log in first");
+    }
+    parsed(r.atom())?;
+    while (!r.atEnd()) {
+        parsed(r.atom())?;
+    }
+    io(wire.send("* ENABLED\r\n".bytes()))?;
+    return tagged(s, "OK", "ENABLE completed");
+}
+
+// ---- Not authenticated ----
+
+fn startTls(
+    ctx: borrow SmtpContext,
+    wire: borrow mut Wire,
+    s: borrow mut Session,
+    r: borrow mut CommandReader,
+) -> Result<u8, Problem> {
+    parsed(r.finish())?;
+    if (!ctx.hasTls()) {
+        return tagged(s, "BAD", "STARTTLS is not available");
+    }
+    if (wire.isTls()) {
+        return tagged(s, "BAD", "TLS is already active");
+    }
+    tagged(s, "OK", "Begin TLS negotiation now")?;
+    return Ok(UPGRADE);
+}
+
+async fn login(
+    ctx: borrow SmtpContext,
+    wire: borrow mut Wire,
+    s: borrow mut Session,
+    r: borrow mut CommandReader,
+) -> Result<u8, Problem> {
+    let user = parsed(r.astring())?;
+    let password = parsed(r.astring())?;
+    parsed(r.finish())?;
+    if (loginDisabled(s, wire.isTls())) {
+        return tagged(s, "NO", "[PRIVACYREQUIRED] Use STARTTLS before LOGIN");
+    }
+    return await checked(ctx, wire.isTls(), s, r.text(user), r.text(password), true);
+}
+
+/// AUTHENTICATE PLAIN (RFC 4616), with the initial response in the command (SASL-IR, RFC 4959) or after `+ `.
+async fn authenticate(
+    ctx: borrow SmtpContext,
+    wire: borrow mut Wire,
+    s: borrow mut Session,
+    r: borrow mut CommandReader,
+) -> Result<u8, Problem> {
+    let mechanism = parsed(r.atom())?;
+    var initial = Vector<u8>.create();
+    var hasInitial = false;
+    if (!r.atEnd()) {
+        let t = parsed(r.atom())?;
+        mem(initial.extend(r.text(t)))?;
+        hasInitial = true;
+    }
+    parsed(r.finish())?;
+    if (!r.text(mechanism).equalsIgnoreAsciiCase("PLAIN".bytes())) {
+        return tagged(s, "NO", "[CANNOT] Unsupported authentication mechanism");
+    }
+    let secure = wire.isTls();
+    if (loginDisabled(s, secure)) {
+        return tagged(s, "NO", "[PRIVACYREQUIRED] Use STARTTLS before AUTHENTICATE");
+    }
+    // The guard first, so a blocked address is refused before it sends a password.
+    if (await loginBlocked(ctx.login, ctx.store, s.peer)) {
+        return tagged(s, "NO", "[UNAVAILABLE] Too many failed logins, try again later");
+    }
+    if (!hasInitial) {
+        io(wire.send("+ \r\n".bytes()))?;
+        match (await wire.readLineWithin(mut initial, MAX_LINE, AUTOLOGOUT)) {
+            Ok() => {}
+            Err(WireError.TooLong) => {
+                io(wire.send("* BYE Line too long\r\n".bytes()))?;
+                s.tail.clear();
+                return Ok(ENDED);
+            }
+            Err(e) => { return Err(Problem.Wire(e)); }
+        }
+        if (initial.length == 1 && initial[0] == 0x2a) {
+            return tagged(s, "BAD", "Authentication cancelled");
+        }
+    } else if (initial.length == 1 && initial[0] == 0x3d) {
+        initial.clear(); // "=": an empty initial response
+    }
+    var user = Vector<u8>.create();
+    var password = Vector<u8>.create();
+    let wellFormed = mem(decodePlain(initial.view(), mut user, mut password))?;
+    let outcome = await checked(ctx, secure, s, user.view(), password.view(), wellFormed);
+    for (i in 0..password.length) {
+        password[i] = 0;
+    }
+    return outcome;
+}
+
+/// The shared login check (msmtp's login.cee), and the session's answer.
+async fn checked(
+    ctx: borrow SmtpContext,
+    secure: bool,
+    s: borrow mut Session,
+    user: Slice<u8>,
+    password: Slice<u8>,
+    wellFormed: bool,
+) -> Result<u8, Problem> {
+    var email = Vector<u8>.create();
+    var outcome: Result<i64, LoginRefusal> = Err(LoginRefusal.Unavailable);
+    if (wellFormed) {
+        outcome = await checkLogin(ctx.login, ctx.store, s.peer, user, password, mut email);
+    } else {
+        outcome = Err(LoginRefusal.BadCredentials(await loginFailed(ctx.login, ctx.store, s.peer, user)));
+    }
+    let blocked = match (outcome) {
+        Ok(userId) => {
+            s.userId = userId;
+            s.state = AUTHENTICATED;
+            mem(startTagged(s, "OK"))?;
+            var caps = Vector<u8>.create();
+            mem(caps.extend("[CAPABILITY ".bytes()))?;
+            mem(writeCapabilities(ctx, s, secure, mut caps))?;
+            mem(caps.extend("] Logged in".bytes()))?;
+            mem(s.tail.extend(caps.view()))?;
+            mem(s.tail.extend("\r\n".bytes()))?;
+            return Ok(CONTINUE);
+        }
+        Err(LoginRefusal.Blocked) => {
+            tagged(s, "NO", "[UNAVAILABLE] Too many failed logins, try again later")?;
+            mem(s.tail.extend("* BYE Closing the connection\r\n".bytes()))?;
+            return Ok(ENDED);
+        }
+        Err(LoginRefusal.Unavailable) => {
+            return tagged(s, "NO", "[UNAVAILABLE] Temporary authentication failure");
+        }
+        Err(LoginRefusal.BadCredentials(b)) => b,
+    };
+    s.authFailures += 1;
+    tagged(s, "NO", "[AUTHENTICATIONFAILED] Authentication failed")?;
+    if (blocked || s.authFailures >= MAX_AUTH_FAILURES) {
+        mem(s.tail.extend("* BYE Too many authentication failures\r\n".bytes()))?;
+        return Ok(ENDED);
+    }
+    return Ok(CONTINUE);
+}

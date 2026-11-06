@@ -1,0 +1,22 @@
+size 1430
+envelope (NIL "Mail delivery failed: returning message to sender" NIL NIL NIL NIL NIL NIL NIL NIL)
+bodystructure (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 254 7 NIL NIL NIL NIL) ("message" "delivery-status" NIL NIL NIL "7bit" 122 NIL NIL NIL NIL) ("message" "rfc822" NIL NIL NIL "7bit" 581 (NIL NIL NIL NIL NIL NIL NIL NIL NIL NIL) (("text" "plain" ("charset" "utf-8") NIL NIL "8bit" 9 2 NIL NIL NIL NIL) ("text" "html" ("charset" "utf-8") "<1DQ418BYWKU4.24XDT2YZ1B0B3@daikoz.com>" NIL "8bit" 124 8 NIL NIL NIL NIL) "alternative" ("boundary" "=-iWPtdQHtSjT1IRqQrHYSXQ==") NIL NIL NIL) 27 NIL NIL NIL NIL) "report" ("report-type" "delivery-status" "boundary" "1693976473-eximdsn-1701494602") NIL NIL NIL)
+body (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 254 7) ("message" "delivery-status" NIL NIL NIL "7bit" 122) ("message" "rfc822" NIL NIL NIL "7bit" 581 (NIL NIL NIL NIL NIL NIL NIL NIL NIL NIL) (("text" "plain" ("charset" "utf-8") NIL NIL "8bit" 9 2) ("text" "html" ("charset" "utf-8") "<1DQ418BYWKU4.24XDT2YZ1B0B3@daikoz.com>" NIL "8bit" 124 8) "alternative") 27) "report")
+section HEADER 214 bd977fde6a073b55741a6bfaf850844a39dc09ac201c12cb3ecbc2114721e029
+section TEXT 1216 97ab92c2c2c63f7929afa8a30ad2c1531bf022f6d18a6179cd771d8f301e649e
+section HEADER.FIELDS 163 1e68d45522afd8268dc3bea6c13526ad39c1ebdebbc68821da0cd5d390bca6a0
+section HEADER.FIELDS.NOT 53 0b6f8144e1ad0a7d97caff255d76dda664e003c7e2f6c7a3cf9dc65c881c0de0
+section 1 254 938867d666acbb0fe98f862c1b347541473e4ee11b0870dca8468a4fa139cbcf
+section 1.MIME 46 1c05ebcf186dbe5b1fd1149ee14959a5b4f86c338cc04410030799a4bbad106b
+section 2 122 94cfae35e78134be43ab22bae1871d2cb6275c93cde8fbb23d9d6b2f35c1c3f3
+section 2.MIME 41 ed63a3ee2f11872550d5d71e8d4ff2af1c5b12465333dbf69e6793cd231994b6
+section 3 581 16afb3c6535347b5a381c4ecf68aa7d03ec89d245ce4eaff84fc95c9084b168f
+section 3.MIME 32 b877528c3494e577355ecd2cefe181b49f8d34fb0f432c1db33c2776902a6a31
+section 3.HEADER 148 7015987702c471437fd24c75c4769331e7de8d373e01a95e492c9d430ad6e1eb
+section 3.TEXT 433 3a71edb76550199988e92b564dc7541b802cb120062f64e48aee6375a71b3e64
+section 3.HEADER.FIELDS 78 946ca0b2491c23597f7a4b7768fe8845bffd3012138413ee9c8161992180781d
+section 3.HEADER.FIELDS.NOT 72 dca912e8472745cac69c7450e1cbbaccd1f7978662d15c3acd8e683300522d21
+section 3.1 9 588128c19659bd1e45b90ccf73a79d35f52698928902b5e67783eb4f8eaa6a89
+section 3.1.MIME 76 78e619202c78aadd6c7c4a99b9deeda415533f5fa622e8d0fb927daea8e83dc4
+section 3.2 124 6cf88a37802ca7b4a0ebf4df4f8bf0bdf56aa4d2958ef47a21330c72ffea4b8c
+section 3.2.MIME 128 005d2802eddb43330a8f23d2b7756346913ee87ae017a48a9adf6fa4a325f460

@@ -1,0 +1,14 @@
+# SPF and DMARC records for the end-to-end tests; tests/run.sh adds tests/dkim/zone.yaml's keys.
+example.org:
+  - TXT: "v=spf1 ip4:192.0.2.1 -all"
+_dmarc.example.org:
+  - TXT: "v=DMARC1; p=reject; sp=quarantine; pct=100"
+_dmarc.quarantine.test:
+  - TXT: "v=DMARC1; p=quarantine; adkim=s; aspf=s"
+_dmarc.none.test:
+  - TXT: "v=DMARC1; p=none"
+_dmarc.broken.test:
+  - TXT: "v=DMARC1; p=bogus"
+_dmarc.two.test:
+  - TXT: "v=DMARC1; p=reject"
+  - TXT: "v=DMARC1; p=none"

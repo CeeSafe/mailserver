@@ -1,0 +1,24 @@
+size 758826
+envelope ("Mon, 18 Aug 1997 21:07:07 -0700" "3.01 MIME prob message [Fwd: communicator 4.01 a conference problem]" (("Chuck Simmons" NIL "chrlsim" "futureone.com")) ((NIL NIL "chrlsim" "futureone.com")) (("Chuck Simmons" NIL "chrlsim" "futureone.com")) (("Jamie Zawinski" NIL "jwz" "netscape.com")) NIL NIL NIL "<33F91BEB.10E2A9D5@futureone.com>")
+bodystructure (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 30 3 NIL NIL NIL NIL) ("message" "rfc822" NIL NIL NIL "7bit" 757196 ("Tue, 19 Aug 1997 00:35:46 +0300" "communicator 4.01 a conference problem" (("NIRI ELLERT" NIL "nirie3" "gezernet.co.il")) (("NIRI ELLERT" NIL "nirie3" "gezernet.co.il")) ((NIL NIL "nirie3" "gezernet.co.il")) ((NIL NIL "chrlsim" "futureone.com")) NIL NIL NIL "<33F8C032.C5DC0CA2@gezernet.co.il>") (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 643 16 NIL NIL NIL NIL) (("text" "html" ("charset" "us-ascii") NIL NIL "7bit" 868 18 NIL NIL NIL NIL) ("image" "tiff" NIL "<part1.33F8C032.E4CBCE7F@gezernet.co.il>" NIL "base64" 754158 NIL ("inline" ("filename" "C:¥win95¥TEMP¥nsmailRJ.tiff")) NIL NIL) "related" ("boundary" "------------A9E4A76F8F8B49A8F9408311") NIL NIL NIL) "alternative" ("boundary" "------------D866708591E89309695535AC") NIL NIL NIL) 10268 NIL ("inline" NIL) NIL NIL) "mixed" ("boundary" "------------746A59DD382995F41B0947E") NIL NIL NIL)
+body (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 30 3) ("message" "rfc822" NIL NIL NIL "7bit" 757196 ("Tue, 19 Aug 1997 00:35:46 +0300" "communicator 4.01 a conference problem" (("NIRI ELLERT" NIL "nirie3" "gezernet.co.il")) (("NIRI ELLERT" NIL "nirie3" "gezernet.co.il")) ((NIL NIL "nirie3" "gezernet.co.il")) ((NIL NIL "chrlsim" "futureone.com")) NIL NIL NIL "<33F8C032.C5DC0CA2@gezernet.co.il>") (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 643 16) (("text" "html" ("charset" "us-ascii") NIL NIL "7bit" 868 18) ("image" "tiff" NIL "<part1.33F8C032.E4CBCE7F@gezernet.co.il>" NIL "base64" 754158) "related") "alternative") 10268) "mixed")
+section HEADER 1256 056b159f9c8baeb13c98392d2760bac1c48485e74a8a18009dcea9808e857b15
+section TEXT 757570 415549eb7dee60320e48c06a5f40a0ed8b06acd793ab3025e6c4ed65d87c6e95
+section HEADER.FIELDS 331 3f953c768c55ec12c0a6613645fed214242687487af17c5d99106d8a77c83605
+section HEADER.FIELDS.NOT 927 1d03939e6817e900109e7f3d3473c1ba80f85145ad2b58505b1d2735b56c7315
+section 1 30 8b273ed2cd96080d75a02a92fa116f6f3c82861e5ed58ff0ba2eae1e11e02b9e
+section 1.MIME 79 0c7232bcecc3ffb84bb1ae647f2ba1256591d4391f0f1b8a41938a97660cddcb
+section 2 757196 09197f69001dd479b1ed30fe1b1f551f07454133c9112cb70b61928c5b234378
+section 2.MIME 94 e5dc4a3fedd181b4ba79347b44e0fd26ac9dc293e7c8769fbd5393131e58efe1
+section 2.HEADER 837 1d1bb7ff8debbf1dd8a2f183bf9f1f26e6059fc44600ef52d3323e839ea38247
+section 2.TEXT 756359 50c7ee53c72cbc9b3e79b616ce4635c7499863167b9aecbfc9e1572fdd9c8a46
+section 2.HEADER.FIELDS 295 27bddb44700865e01f83ae8bacd0267ec251735b57b45ad5b3fdbfa6d36208d7
+section 2.HEADER.FIELDS.NOT 544 53517d5e5f97604f3e2122bf8f797ead222210a417e87c7c6ede7d202c8b5aa0
+section 2.1 643 1b8588dd223b453058da929ba4ccf0dc18b49fca0c2e827b7ac3c59bb014c336
+section 2.1.MIME 79 0c7232bcecc3ffb84bb1ae647f2ba1256591d4391f0f1b8a41938a97660cddcb
+section 2.2 755421 c07e6ef87ada565609f20cba8edebfdd772d870fbf6f3dbc3532cdc7c43320ee
+section 2.2.MIME 84 2e43a8ce4652c1db8f0ae5be3de61add75c1dedbf0a9f822c7acff3f8087bb7f
+section 2.2.1 868 ccefc33dde1c28210fc16c4e8d555c02e6d85d5eb66dc54cd8c2696a449d132a
+section 2.2.1.MIME 78 5faa852b09fb670d6bce3a7ac179cba2fda221d51b84b35562bb7c0ced077415
+section 2.2.2 754158 e5a68a6f1454b494ca1ac2ed4abd6f9c5438825bb132864035b0d4435f87f04a
+section 2.2.2.MIME 189 d7b9afd45f209bb610a1ad308542e70ebd2d6c331a164dabab81f62dc93e6471

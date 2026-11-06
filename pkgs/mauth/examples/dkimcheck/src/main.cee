@@ -1,0 +1,39 @@
+// dkimcheck DNS_PORT FILE: each DKIM signature's result, one per line ("pass", or the status and the reason),
+// asking 127.0.0.1:DNS_PORT for keys. The file is fed in 7-byte pieces, to exercise the streaming. For
+// tests/dkim/run.py.
+
+import mauth.DkimResult;
+import mauth.DkimVerifier;
+import mauth.dkimName;
+import mdns.IpAddress;
+import mdns.Resolver;
+
+fn main() {
+    let port = Process.argument(1)!.parseInt<u16>()!;
+    var file = File.open(Process.argument(2)!)!;
+    var verifier = DkimVerifier.create();
+    var buffer = [0u8; 7];
+    loop {
+        let n = file.read(mut buffer[..])!;
+        if (n == 0) {
+            break;
+        }
+        verifier.feed(buffer[0..n])!;
+    }
+    var servers = Vector<IpAddress>.create();
+    servers.push(IpAddress.v4(127, 0, 0, 1))!;
+    var resolver = Resolver.create(servers, port)!;
+    resolver.timeout(500);
+    var results = Vector<DkimResult>.create();
+    // Signatures this old would have expired (x=); the tests' have none, so any time works.
+    Async.run(verifier.verify(resolver, Clock.unixMillis() / 1000, mut results))!;
+    for (i in 0..results.length) {
+        Console.write(dkimName(results[i].status));
+        if (results[i].reason.length > 0) {
+            Console.write(" (");
+            Console.write(results[i].reason.view());
+            Console.write(")");
+        }
+        Console.writeLine("");
+    }
+}

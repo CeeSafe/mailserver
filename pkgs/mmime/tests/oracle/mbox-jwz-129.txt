@@ -1,0 +1,12 @@
+size 5315
+envelope ("Fri, 18 Oct 1996 13:57:46 -0700" "S/MIME Cert" (("Kurt Stammberger" NIL "kurt" "rsa.com")) ((NIL NIL "owner-smime-dev" "rsa.com")) (("Kurt Stammberger" NIL "kurt" "rsa.com")) (("'set-discuss@commerce.net'" NIL "set-discuss" "commerce.net") ("'smime-dev@rsa.com'" NIL "smime-dev" "rsa.com")) NIL NIL NIL "<c=US%a=_%p=RSA_Data_Securit%l=LOBESTER-961018205746Z-5325@LOBESTER.rsa.com>")
+bodystructure (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 77 5 NIL NIL NIL NIL) ("application" "octet-stream" ("name" "verisign.p7m") NIL NIL "base64" 3606 NIL NIL NIL NIL) "mixed" ("boundary" "---- =_NextPart_000_01BBBCFC.5826AA10") NIL NIL NIL)
+body (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 77 5) ("application" "octet-stream" ("name" "verisign.p7m") NIL NIL "base64" 3606) "mixed")
+section HEADER 1184 4b3b7664c5615a84a10ba1a10f6a6a940fd7f82f7a2d2eda0afba3c0e85b6c3c
+section TEXT 4131 099c29779735fb259fe697b4d8555ec42e001436a31eedc5da11df32d7638f8b
+section HEADER.FIELDS 386 416027ec0063c1e6cbb390c126aeae82c3dde834581a0498cdfde4f7b53bfe39
+section HEADER.FIELDS.NOT 800 54daf36ac08d6b6bb85ac016f3b47240f7bd967aeee6cd865cf778cf4b031baa
+section 1 77 0485d5d9fd6b3a2ce60aa83fcb204be92583f3b5abe2d436e8940c9395a0721f
+section 1.MIME 81 11e512bb335700048a2f81e229896d81e68a6c0460f1135f1c57ff19506dfbe5
+section 2 3606 311da3ca086f12cc37d1a54f1c79418acb9bc6628e2ab68a4ee4030d06fec327
+section 2.MIME 98 f26c67b60719e61077aacd9492c0a0feeeabbcb323105a4135b9b8111990fe08

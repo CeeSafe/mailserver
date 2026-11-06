@@ -1,0 +1,10 @@
+size 526
+envelope ("Fri, 29 Nov 91 07:13:35 EST" "Please check this out" (("Nathaniel Borenstein" NIL "nsb" "thumper.bellcore.com")) (("Nathaniel Borenstein" NIL "nsb" "thumper.bellcore.com")) (("Nathaniel Borenstein" NIL "nsb" "thumper.bellcore.com")) (("Yves J Caseau" NIL "caseau" "france.bellcore.com")) NIL NIL NIL NIL)
+bodystructure ("text" "plain" ("charset" "iso-8859-1") NIL NIL "quoted-printable" 263 6 NIL NIL NIL NIL)
+body ("text" "plain" ("charset" "iso-8859-1") NIL NIL "quoted-printable" 263 6)
+section HEADER 263 3387c5c19ed30b85fad40fc5dbf620b22052429420fc68ec12a6b5fda0dcd779
+section TEXT 263 2bc8d188e4c3dcc3c9bcd4a8a84f849a4c71c33634701b4e29e1e20883b9bd71
+section HEADER.FIELDS 218 a156c114b105254016c4ed97075e4afbf11b44c25ae2734b3801ba04fa5b8216
+section HEADER.FIELDS.NOT 47 2832e5ffb420fb972bea7305e851bf47126253e46f410c74cfb2184a3a449f18
+section 1 263 2bc8d188e4c3dcc3c9bcd4a8a84f849a4c71c33634701b4e29e1e20883b9bd71
+section 1.MIME 263 3387c5c19ed30b85fad40fc5dbf620b22052429420fc68ec12a6b5fda0dcd779

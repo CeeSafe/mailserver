@@ -1,0 +1,18 @@
+size 2097
+envelope ("Wed, 26 Apr 1995 21:07:36 +0100" "Alternative medicine" (("Chromosome Terror" NIL "abrdlher" "reading.ac.uk")) (("Chromosome Terror" NIL "abrdlher" "reading.ac.uk")) (("Chromosome Terror" NIL "abrdlher" "reading.ac.uk")) NIL NIL NIL NIL "<Pine.SOL.3.91.950426210608.18431A-110000@suma3.reading.ac.uk>")
+bodystructure (("TEXT" "PLAIN" ("CHARSET" "us-ascii") "<Pine.SOL.3.91.950426210608.18431C@suma3.reading.ac.uk>" NIL "7bit" 0 0 NIL NIL NIL NIL) ("message" "rfc822" NIL "<Pine.SOL.3.91.950426210608.18431D@suma3.reading.ac.uk>" NIL "7bit" 915 ("Fri, 21 Apr 1995 12:28:50 +0100 (BST)" "Re: Alternative Medicine" (("Chromosome Terror" NIL "J.I.De-las-Heras" "reading.ac.uk")) (("Chromosome Terror" NIL "J.I.De-las-Heras" "reading.ac.uk")) (("Chromosome Terror" NIL "J.I.De-las-Heras" "reading.ac.uk")) (("Pavilion Subscriber" NIL "Pavilion_sub" "pavilion.co.uk")) NIL NIL "<Pavilion_sub-2004950803380001@line07.gunn-du.pavilion.co.uk> " "<Pine.SOL.3.91.950421122449.28779E-100000@suma3.reading.ac.uk>") ("TEXT" "PLAIN" ("charset" "US-ASCII") NIL NIL "7bit" 362 16 NIL NIL NIL NIL) 28 NIL NIL NIL NIL) "MIXED" ("BOUNDARY" "---Multi-Part-Message-Level-1-1-18170") NIL NIL NIL)
+body (("TEXT" "PLAIN" ("CHARSET" "us-ascii") "<Pine.SOL.3.91.950426210608.18431C@suma3.reading.ac.uk>" NIL "7bit" 0 0) ("message" "rfc822" NIL "<Pine.SOL.3.91.950426210608.18431D@suma3.reading.ac.uk>" NIL "7bit" 915 ("Fri, 21 Apr 1995 12:28:50 +0100 (BST)" "Re: Alternative Medicine" (("Chromosome Terror" NIL "J.I.De-las-Heras" "reading.ac.uk")) (("Chromosome Terror" NIL "J.I.De-las-Heras" "reading.ac.uk")) (("Chromosome Terror" NIL "J.I.De-las-Heras" "reading.ac.uk")) (("Pavilion Subscriber" NIL "Pavilion_sub" "pavilion.co.uk")) NIL NIL "<Pavilion_sub-2004950803380001@line07.gunn-du.pavilion.co.uk> " "<Pine.SOL.3.91.950421122449.28779E-100000@suma3.reading.ac.uk>") ("TEXT" "PLAIN" ("charset" "US-ASCII") NIL NIL "7bit" 362 16) 28) "MIXED")
+section HEADER 617 67edb141211e170de07929f63ac3f47ff86ca09c732b7c71eb44bec9c467fcd6
+section TEXT 1480 e79c2584c0c2cef9763109d9ffe3a079335e345de75384f94418037d61f37030
+section HEADER.FIELDS 277 be9cf9aeac515dcf16e1a5d5aba4bb90ebf8060e542f7f576cb629affe816812
+section HEADER.FIELDS.NOT 342 bcc39c15e3d0599f6f5863294a782686ffa52b2dc1cbf2e901137cfc41ef4eda
+section 1 0 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+section 1.MIME 115 1a698e5b176a3cabf214669b65899dcba494e26524c7dc661d5924a64892030a
+section 2 915 3b1b5a77d0554bbfd24f0e139e7c22f87230ef3ac7d01ab15caed5051d557022
+section 2.MIME 101 513df778aca18051a2189dd9a09fc1c1e83981123d91a951fa24bfc3970296dc
+section 2.HEADER 553 21f0fa9d74fd616200a1490a2c746f985ebbcd09ebdc59ec90de25bc05bb4b67
+section 2.TEXT 362 c6bb309f6bf1e41b6dc19a997aad268206851dfbb078872465bb5efdd4cbfcb7
+section 2.HEADER.FIELDS 318 80e8951229bd6345dd9fd6a5f8c825285737c312731daeff5d1c7c7cf3657d79
+section 2.HEADER.FIELDS.NOT 237 f7a72315278de9f55d87c46f1420e28558aea0f0c7e6b3b62c924c12aaeacf05
+section 2.1 362 c6bb309f6bf1e41b6dc19a997aad268206851dfbb078872465bb5efdd4cbfcb7
+section 2.1.MIME 553 21f0fa9d74fd616200a1490a2c746f985ebbcd09ebdc59ec90de25bc05bb4b67

@@ -1,0 +1,12 @@
+size 548
+envelope ("Fri, 26 Sep 2025 10:19:54 -0700" "Message 4" (("Sender" NIL "sender" "example.com")) (("Sender" NIL "sender" "example.com")) (("Sender" NIL "sender" "example.com")) (("Recipient" NIL "recipient" "example.com")) NIL NIL NIL "<7fbaba61-56f5-4e06-9453-5fbf941593a0@example.com>")
+bodystructure (("text" "plain" ("charset" "UTF-8") NIL NIL "7bit" 20 1 NIL NIL NIL NIL) ("text" "html" ("charset" "UTF-8") NIL NIL "7bit" 41 1 NIL NIL NIL NIL) "alternative" ("boundary" "00000000000079ff95063fb77ed6") NIL NIL NIL)
+body (("text" "plain" ("charset" "UTF-8") NIL NIL "7bit" 20 1) ("text" "html" ("charset" "UTF-8") NIL NIL "7bit" 41 1) "alternative")
+section HEADER 296 16563ef8e7479f9984f12cb0fa2f58e4eaa923b088733519dd3d1d258c28da6b
+section TEXT 252 57bdbb7732def0a6de83706ee1f22ad93e42ad2fa320ed3a2ad595b72d812fc2
+section HEADER.FIELDS 277 da28315d3d065b134eca5a264f7126cc865bbbdc3f9f5fabf9880365b82739be
+section HEADER.FIELDS.NOT 21 07a26ab8981ff3b1de28da29cf47f47e315b9c25685121dc5ebb60391005b2de
+section 1 20 810e72b0e8e1fc82942c04e7c0103b0ca0cfc35581ef5ae561326682775bee28
+section 1.MIME 45 df4562d7758c913a321643b6efb6e9e99e8991f77c61e563f29bc2235b7aa8c8
+section 2 41 fd73d5adc22f6abc7de2ad33d7e01e70a3cd0fbd4b78fce04531350b08df3a10
+section 2.MIME 44 333eccc95febbc3abbb745983582c82b5e92e401d059dfe33628ec0f6fb3e977

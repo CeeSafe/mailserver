@@ -1,0 +1,10 @@
+size 504
+envelope ("Fri, 26 Mar 1993 12:59:38 -0500 (EST)" "Audio mail (part 1 of 2)" ((NIL NIL "Bill" "host.com")) ((NIL NIL "Bill" "host.com")) ((NIL NIL "Bill" "host.com")) ((NIL NIL "joe" "otherhost.com")) NIL NIL NIL "<id1@host.com>")
+bodystructure ("message" "partial" ("id" "ABC@host.com" "number" "1" "total" "2") NIL NIL "7bit" 237 NIL NIL NIL NIL)
+body ("message" "partial" ("id" "ABC@host.com" "number" "1" "total" "2") NIL NIL "7bit" 237)
+section HEADER 267 49c7409630bfdf34feab601cf30a1bc6e3138bd44ebc6a4b9cafd8dde41e69b6
+section TEXT 237 30dbb8d5a00a0fa019f3ead66c301b79e086a055a5832b655de4d76f86b03527
+section HEADER.FIELDS 225 33d09bd0e7caa23611ec3963438992ba1fd182025c106d9f65c9fcd6078bfac4
+section HEADER.FIELDS.NOT 44 f14ba70ffec607d770349057aebbdd6817a85fc0a6ca4ef492c174a21ba77b50
+section 1 237 30dbb8d5a00a0fa019f3ead66c301b79e086a055a5832b655de4d76f86b03527
+section 1.MIME 267 49c7409630bfdf34feab601cf30a1bc6e3138bd44ebc6a4b9cafd8dde41e69b6

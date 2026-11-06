@@ -1,0 +1,820 @@
+// The SMTP client of the relay (RFC 5321): one transaction with one server, for the recipients of one domain.
+// Opportunistic STARTTLS (RFC 3207), PIPELINING (RFC 2920), SIZE (RFC 1870), 8BITMIME and SMTPUTF8 (RFC 6531),
+// and every recipient's own outcome, as the queue needs to retry or bounce each one.
+
+import diskio.FileError;
+import diskio.RawFile;
+import tls.TlsConfig;
+import tls.Tlsa;
+
+/// A recipient's outcome.
+public const OUTCOME_DELIVERED: u8 = 0;
+/// Try again later (a 4xx, or the transaction did not finish).
+public const OUTCOME_TRANSIENT: u8 = 1;
+/// Give up and bounce (a 5xx).
+public const OUTCOME_PERMANENT: u8 = 2;
+/// Accepted at RCPT, waiting for the reply to the message (never left in a result).
+const OUTCOME_PENDING: u8 = 3;
+
+/// How a session with one server ended.
+/// The transaction ran: see each recipient's outcome.
+public const HOST_DONE: u8 = 0;
+/// No usable session: try the next MX host (connection refused or dropped, a 4xx or 5xx greeting or EHLO).
+public const HOST_UNUSABLE: u8 = 1;
+/// The STARTTLS handshake failed: try this host again without TLS (as opportunistic TLS allows, RFC 7435).
+public const HOST_TLS_FAILED: u8 = 2;
+/// The host could not give the TLS its domain's policy requires (it offered no STARTTLS, or its certificate did not
+/// pass): try the next MX host, and never this one in the clear (RFC 7672 §2.2, RFC 8461 §4.2).
+public const HOST_TLS_POLICY: u8 = 3;
+
+/// The TLS a session must have, and, on a session, what it has. Each level satisfies those below it.
+/// No STARTTLS.
+public const TLS_NONE: u8 = 0;
+/// STARTTLS when the server offers it, its certificate unchecked; a failed handshake may be retried in the clear.
+/// Required, it accepts any session.
+public const TLS_OPPORTUNISTIC: u8 = 1;
+/// STARTTLS required, the certificate unchecked: a DANE host whose TLSA records are all unusable (RFC 7672 §2.2).
+/// Achieved, any TLS session.
+public const TLS_ENCRYPTED: u8 = 2;
+/// STARTTLS required, the certificate valid for the MX host's name under trusted roots (MTA-STS, RFC 8461 §4.2).
+public const TLS_VERIFIED: u8 = 3;
+/// STARTTLS required, the chain matching the MX host's TLSA records (DANE, RFC 7672 §3).
+public const TLS_DANE: u8 = 4;
+
+/// The client's settings. Timeouts in milliseconds; RFC 5321 §4.5.3.2 gives the minimums used by default.
+@noncopy
+public struct ClientSettings {
+    /// The name in EHLO: this server's hostname.
+    public helo: String;
+    public connectTimeout: u64;
+    /// Greeting, EHLO, MAIL, RCPT, DATA: 5 minutes.
+    public commandTimeout: u64;
+    /// Each block of the message: 3 minutes.
+    public blockTimeout: u64;
+    /// The reply to the final dot: 10 minutes.
+    public finalTimeout: u64;
+    public tlsTimeout: u64;
+
+    public fn create(helo: StringView) -> Result<ClientSettings, AllocError> {
+        var name = String.create();
+        name.append(helo)?;
+        return Ok(ClientSettings {
+            helo: name,
+            connectTimeout: 30 * 1000,
+            commandTimeout: 5 * 60 * 1000,
+            blockTimeout: 3 * 60 * 1000,
+            finalTimeout: 10 * 60 * 1000,
+            tlsTimeout: 60 * 1000,
+        });
+    }
+}
+
+/// One recipient's result: its outcome and the server's reply (or our own reason), one line.
+@noncopy
+public struct RecipientResult {
+    public outcome: u8;
+    public reply: String;
+}
+
+/// The message to send: `prefix` (header fields added on the way out, such as a DKIM-Signature), then the blob
+/// file. `size` is the whole, prefix included.
+public struct Message<region r> {
+    public prefix: Slice<r, u8>;
+    public file: borrow(r) RawFile;
+    public size: u64;
+    /// Whether it has bytes over 127 (then BODY=8BITMIME is declared when the server offers it).
+    public eightBit: bool;
+}
+
+/// How the session went, and what the server said that mattered (for the log and the bounce).
+@noncopy
+public struct HostResult {
+    public kind: u8;
+    public reply: String;
+    /// Whether the session ran over TLS.
+    public tls: bool;
+    /// The TLS it had: TLS_NONE, TLS_ENCRYPTED, TLS_VERIFIED or TLS_DANE.
+    public security: u8;
+}
+
+/// A server's reply: its code and its text (lines joined with spaces, at most 512 bytes kept).
+@noncopy
+struct Reply {
+    code: u16;
+    text: Vector<u8>;
+}
+
+fn newReply() -> Reply => Reply { code: 0, text: Vector<u8>.create() };
+
+fn digit(c: u8) -> bool => c >= 0x30 && c <= 0x39;
+
+/// Reads one reply, however many lines (`250-…` then `250 …`). A line that is not a reply is a protocol error.
+async fn readReply(wire: borrow mut Wire, reply: borrow mut Reply, timeoutMs: u64) -> Result<void, WireError> {
+    reply.code = 0;
+    reply.text.clear();
+    var line = Vector<u8>.create();
+    loop {
+        await wire.readLine(mut line, timeoutMs)?;
+        if (line.length < 3 || !digit(line[0]) || !digit(line[1]) || !digit(line[2])) {
+            return Err(WireError.Io);
+        }
+        reply.code = ((line[0] - 0x30) as u16) * 100 + ((line[1] - 0x30) as u16) * 10 + ((line[2] - 0x30) as u16);
+        if (reply.text.length > 0) {
+            match (reply.text.push(0x20)) {
+                Ok() => {}
+                Err(_) => { return Err(WireError.OutOfMemory); }
+            }
+        }
+        for (c in line.view()) {
+            if (reply.text.length < 512) {
+                match (reply.text.push(if (c < 0x20 || c == 0x7f) 0x20 else c)) {
+                    Ok() => {}
+                    Err(_) => { return Err(WireError.OutOfMemory); }
+                }
+            }
+        }
+        if (line.length == 3 || line[3] != 0x2d) {
+            return Ok();
+        }
+    }
+}
+
+/// What EHLO said the server can do.
+struct Capabilities {
+    startTls: bool;
+    pipelining: bool;
+    eightBit: bool;
+    smtpUtf8: bool;
+    /// SIZE's limit; 0 when none was given.
+    size: u64;
+}
+
+fn noCapabilities() -> Capabilities =>
+    Capabilities { startTls: false, pipelining: false, eightBit: false, smtpUtf8: false, size: 0 };
+
+/// EHLO, falling back to HELO when the server does not know it; reads the capabilities. False when neither works.
+async fn greet(
+    wire: borrow mut Wire,
+    settings: borrow ClientSettings,
+    caps: borrow mut Capabilities,
+    reply: borrow mut Reply,
+) -> Result<bool, WireError> {
+    caps.startTls = false;
+    caps.pipelining = false;
+    caps.eightBit = false;
+    caps.smtpUtf8 = false;
+    caps.size = 0;
+    wire.send("EHLO ".bytes())?;
+    wire.send(settings.helo.view().bytes())?;
+    wire.send("\r\n".bytes())?;
+    await wire.flush()?;
+    // The reply's lines one by one, for the keywords.
+    reply.code = 0;
+    reply.text.clear();
+    var line = Vector<u8>.create();
+    var first = true;
+    loop {
+        await wire.readLine(mut line, settings.commandTimeout)?;
+        if (line.length < 3 || !digit(line[0]) || !digit(line[1]) || !digit(line[2])) {
+            return Err(WireError.Io);
+        }
+        reply.code = ((line[0] - 0x30) as u16) * 100 + ((line[1] - 0x30) as u16) * 10 + ((line[2] - 0x30) as u16);
+        if (first) {
+            match (reply.text.extend(line.view())) {
+                Ok() => {}
+                Err(_) => { return Err(WireError.OutOfMemory); }
+            }
+        }
+        if (!first && reply.code == 250 && line.length > 4) {
+            let keyword = line[4..];
+            let end = match (keyword.indexOfByte(0x20)) {
+                Some(i) => i,
+                null => keyword.length,
+            };
+            let word = keyword[0..end];
+            if (word.equalsIgnoreAsciiCase("STARTTLS".bytes())) {
+                caps.startTls = true;
+            } else if (word.equalsIgnoreAsciiCase("PIPELINING".bytes())) {
+                caps.pipelining = true;
+            } else if (word.equalsIgnoreAsciiCase("8BITMIME".bytes())) {
+                caps.eightBit = true;
+            } else if (word.equalsIgnoreAsciiCase("SMTPUTF8".bytes())) {
+                caps.smtpUtf8 = true;
+            } else if (word.equalsIgnoreAsciiCase("SIZE".bytes()) && end < keyword.length) {
+                caps.size = parseNumber(keyword[end + 1..]);
+            }
+        }
+        first = false;
+        if (line.length == 3 || line[3] != 0x2d) {
+            break;
+        }
+    }
+    if (reply.code == 250) {
+        return Ok(true);
+    }
+    if (reply.code != 500 && reply.code != 502) {
+        return Ok(false);
+    }
+    // An old server: HELO, and no extensions.
+    wire.send("HELO ".bytes())?;
+    wire.send(settings.helo.view().bytes())?;
+    wire.send("\r\n".bytes())?;
+    await wire.flush()?;
+    await readReply(wire, reply, settings.commandTimeout)?;
+    return Ok(reply.code == 250);
+}
+
+fn parseNumber(text: Slice<u8>) -> u64 {
+    var n: u64 = 0;
+    for (c in text) {
+        if (!digit(c)) {
+            return n;
+        }
+        if (n > 100000000000) {
+            return n;
+        }
+        n = n * 10 + ((c - 0x30) as u64);
+    }
+    return n;
+}
+
+fn isAscii(text: Slice<u8>) -> bool {
+    for (c in text) {
+        if (c >= 0x80) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn setResult(r: borrow mut RecipientResult, outcome: u8, text: Slice<u8>) -> Result<void, WireError> {
+    r.outcome = outcome;
+    r.reply.clear();
+    match (StringView.fromUtf8(text)) {
+        Some(t) => {
+            match (r.reply.append(t)) {
+                Ok() => {}
+                Err(_) => { return Err(WireError.OutOfMemory); }
+            }
+        }
+        null => {}
+    }
+    return Ok();
+}
+
+fn outcomeOf(code: u16) -> u8 =>
+    if (code >= 200 && code < 300) OUTCOME_DELIVERED else (if (code >= 500) OUTCOME_PERMANENT else OUTCOME_TRANSIENT);
+
+/// A RCPT reply's outcome: accepted means pending, not delivered.
+fn rcptOutcome(code: u16) -> u8 => if (code >= 200 && code < 300) OUTCOME_PENDING else outcomeOf(code);
+
+fn noteHost(result: borrow mut HostResult, kind: u8, text: Slice<u8>) {
+    result.kind = kind;
+    result.reply.clear();
+    match (StringView.fromUtf8(text)) {
+        Some(t) => {
+            match (result.reply.append(t)) {
+                Ok() => {}
+                Err(_) => {}
+            }
+        }
+        null => {}
+    }
+}
+
+/// A session with one server: connected, greeted, over TLS when it could be. The relay keeps idle ones for reuse.
+@noncopy
+public struct SmtpSession {
+    wires: Vector<Wire>;
+    caps: Capabilities;
+    /// Whether it runs over TLS.
+    public tls: bool;
+    /// The TLS it has, as `HostResult.security`: a pooled session serves only a host requiring no more.
+    public security: u8;
+    /// The server, and its MX name.
+    public address: SocketAddress;
+    public name: String;
+    /// Transactions so far, and when it was last used (Unix milliseconds).
+    public uses: u32;
+    public idleSince: i64;
+}
+
+/// How a transaction left its session.
+/// Fit for another transaction.
+public const SESSION_REUSABLE: u8 = 0;
+/// Closed, or in a state not worth trusting: close it.
+public const SESSION_BROKEN: u8 = 1;
+/// A reused session that turned out to be dead before anything was sent: open a new one and try again.
+public const SESSION_STALE: u8 = 2;
+
+/// Opens a session with the server at `address` (`serverName` its MX name, for SNI and the certificate checks):
+/// connects, reads the greeting, says EHLO, and starts TLS as `level` asks (a TLS_ constant). `tlsConfig` checks the
+/// certificate as the level needs: none for TLS_OPPORTUNISTIC and TLS_ENCRYPTED, trusted roots and the name for
+/// TLS_VERIFIED, and DANE (with `tlsa`, the host's usable records) for TLS_DANE. `result` says how it went:
+/// HOST_DONE with the session in `into`, else HOST_UNUSABLE, HOST_TLS_FAILED or HOST_TLS_POLICY and nothing.
+public async fn openSession(
+    address: SocketAddress,
+    serverName: StringView,
+    settings: borrow ClientSettings,
+    tlsConfig: borrow TlsConfig,
+    level: u8,
+    tlsa: borrow Vector<Tlsa>,
+    result: borrow mut HostResult,
+    into: borrow mut Vector<SmtpSession>,
+) -> Result<void, AllocError> {
+    into.clear();
+    result.tls = false;
+    result.security = TLS_NONE;
+    noteHost(result, HOST_UNUSABLE, "451 4.4.1 Connection failed".bytes());
+    let connected: Result<AsyncTcpStream, AsyncError> = await Async.timeout(
+        settings.connectTimeout,
+        AsyncError.TimedOut,
+        async () => await AsyncTcpStream.connectTo(address),
+    );
+    let stream = match (connected) {
+        Ok(s) => s,
+        Err(_) => { return Ok(); }
+    };
+    var wires = Vector<Wire>.create();
+    match (Wire.plain(stream)) {
+        Ok(w) => { wires.push(w)?; }
+        Err(_) => { return Err(AllocError.OutOfMemory); }
+    }
+    var caps = noCapabilities();
+    match (await establish(mut wires, serverName, settings, tlsConfig, level, tlsa, mut caps, result)) {
+        Ok() => {}
+        Err(WireError.OutOfMemory) => { return Err(AllocError.OutOfMemory); }
+        Err(_) => {
+            if (result.kind != HOST_TLS_FAILED && result.kind != HOST_TLS_POLICY) {
+                noteHost(result, HOST_UNUSABLE, "451 4.4.2 Connection to the receiving server was lost".bytes());
+            }
+        }
+    }
+    if (result.kind != HOST_DONE) {
+        if (wires.length > 0) {
+            await wires[0].close();
+        }
+        return Ok();
+    }
+    var name = String.create();
+    name.append(serverName)?;
+    into.push(SmtpSession {
+        wires: wires,
+        caps: caps,
+        tls: result.tls,
+        security: result.security,
+        address: address,
+        name: name,
+        uses: 0,
+        idleSince: Clock.unixMillis(),
+    })?;
+    return Ok();
+}
+
+/// Runs one transaction on `session`: `message` from `sender` to `recipients`, each recipient's outcome into
+/// `results` (in order). `reused` says the session has carried a transaction before: it is reset first, and if
+/// that fails nothing has happened (SESSION_STALE). Gives how the session was left.
+public async fn transact(
+    session: borrow mut SmtpSession,
+    reused: bool,
+    settings: borrow ClientSettings,
+    sender: StringView,
+    recipients: borrow Vector<String>,
+    message: Message,
+    results: borrow mut Vector<RecipientResult>,
+) -> Result<u8, AllocError> {
+    results.clear();
+    for (i in 0..recipients.length) {
+        var reason = String.create();
+        reason.append("451 4.4.1 No answer from the receiving server")?;
+        results.push(RecipientResult { outcome: OUTCOME_TRANSIENT, reply: reason })?;
+    }
+    if (session.wires.length == 0) {
+        return Ok(SESSION_BROKEN);
+    }
+    let w = borrow mut session.wires[0];
+    if (reused) {
+        // RSET: clears whatever an earlier transaction left, and shows whether the server still listens.
+        var reply = newReply();
+        let alive = match (w.send("RSET\r\n".bytes())) {
+            Ok() => match (await w.flush()) {
+                Ok() => match (await readReply(w, mut reply, settings.commandTimeout)) {
+                    Ok() => reply.code == 250,
+                    Err(_) => false,
+                },
+                Err(_) => false,
+            },
+            Err(_) => false,
+        };
+        if (!alive) {
+            return Ok(SESSION_STALE);
+        }
+    }
+    session.uses += 1;
+    match (await transaction(w, session.caps, settings, sender, recipients, message, results)) {
+        Ok() => {
+            session.idleSince = Clock.unixMillis();
+            return Ok(SESSION_REUSABLE);
+        }
+        Err(WireError.OutOfMemory) => { return Err(AllocError.OutOfMemory); }
+        Err(_) => {
+            // The connection broke: accepted recipients are transient, since the server never said it took the
+            // message.
+            for (i in 0..results.length) {
+                if (results[i].outcome == OUTCOME_PENDING) {
+                    match (setResult(
+                        mut results[i],
+                        OUTCOME_TRANSIENT,
+                        "451 4.4.2 Connection lost during the transaction".bytes(),
+                    )) {
+                        Ok() => {}
+                        Err(_) => { return Err(AllocError.OutOfMemory); }
+                    }
+                }
+            }
+            return Ok(SESSION_BROKEN);
+        }
+    }
+}
+
+/// Ends a session: QUIT, then the connection is closed.
+public async fn closeSession(session: SmtpSession, settings: borrow ClientSettings) {
+    var s = session;
+    if (s.wires.length > 0) {
+        await quit(mut s.wires[0], settings);
+        await s.wires[0].close();
+    }
+}
+
+/// Delivers `message` from `sender` to `recipients` through the server at `address` in a session of its own:
+/// `openSession`, `transact`, `closeSession`. `result.kind` says whether the server was usable at all; when it was
+/// not, every recipient is left transient.
+public async fn deliverTo(
+    address: SocketAddress,
+    serverName: StringView,
+    settings: borrow ClientSettings,
+    tlsConfig: borrow TlsConfig,
+    tryTls: bool,
+    sender: StringView,
+    recipients: borrow Vector<String>,
+    message: Message,
+    results: borrow mut Vector<RecipientResult>,
+    result: borrow mut HostResult,
+) -> Result<void, AllocError> {
+    results.clear();
+    for (i in 0..recipients.length) {
+        var reason = String.create();
+        reason.append("451 4.4.1 No answer from the receiving server")?;
+        results.push(RecipientResult { outcome: OUTCOME_TRANSIENT, reply: reason })?;
+    }
+    var sessions = Vector<SmtpSession>.create();
+    let level = if (tryTls) TLS_OPPORTUNISTIC else TLS_NONE;
+    let noRecords = Vector<Tlsa>.create();
+    await openSession(address, serverName, settings, tlsConfig, level, noRecords, result, mut sessions)?;
+    if (sessions.length == 0) {
+        return Ok();
+    }
+    var session = sessions.pop()!;
+    let state = await transact(mut session, false, settings, sender, recipients, message, results)?;
+    if (state != SESSION_REUSABLE) {
+        // Broken before any recipient was settled: the server was not usable after all.
+        var finished = false;
+        for (i in 0..results.length) {
+            if (results[i].outcome != OUTCOME_TRANSIENT) {
+                finished = true;
+            }
+        }
+        if (!finished) {
+            noteHost(result, HOST_UNUSABLE, "451 4.4.2 Connection to the receiving server was lost".bytes());
+        }
+    }
+    await closeSession(session, settings);
+    return Ok();
+}
+
+/// Greeting, EHLO, and STARTTLS when offered: a usable session, or `result` says why not.
+async fn establish(
+    wires: borrow mut Vector<Wire>,
+    serverName: StringView,
+    settings: borrow ClientSettings,
+    tlsConfig: borrow TlsConfig,
+    level: u8,
+    tlsa: borrow Vector<Tlsa>,
+    caps: borrow mut Capabilities,
+    result: borrow mut HostResult,
+) -> Result<void, WireError> {
+    var reply = newReply();
+    await readReply(mut wires[0], mut reply, settings.commandTimeout)?;
+    if (reply.code != 220) {
+        // 421 or 554 at the greeting: not this host (RFC 5321 §3.1, §5.1).
+        noteHost(result, HOST_UNUSABLE, reply.text.view());
+        return Ok();
+    }
+    if (!(await greet(mut wires[0], settings, caps, mut reply)?)) {
+        noteHost(result, HOST_UNUSABLE, reply.text.view());
+        return Ok();
+    }
+    // At TLS_ENCRYPTED and above, a server that cannot give TLS is not used in the clear (RFC 7672 §2.2,
+    // RFC 8461 §4.2): the next MX host is tried instead.
+    let required = level >= TLS_ENCRYPTED;
+    if (level == TLS_NONE) {
+        noteHost(result, HOST_DONE, "".bytes());
+        return Ok();
+    }
+    if (!caps.startTls) {
+        if (required) {
+            noteHost(
+                result,
+                HOST_TLS_POLICY,
+                "451 4.7.10 The receiving server does not offer STARTTLS, which the recipient domain's TLS policy requires".bytes(),
+            );
+            return Ok();
+        }
+        noteHost(result, HOST_DONE, "".bytes());
+        return Ok();
+    }
+    wires[0].send("STARTTLS\r\n".bytes())?;
+    await wires[0].flush()?;
+    await readReply(mut wires[0], mut reply, settings.commandTimeout)?;
+    if (reply.code != 220) {
+        if (required) {
+            noteHost(
+                result,
+                HOST_TLS_POLICY,
+                "451 4.7.10 The receiving server refused STARTTLS, which the recipient domain's TLS policy requires".bytes(),
+            );
+            return Ok();
+        }
+        noteHost(result, HOST_DONE, "".bytes());
+        return Ok();
+    }
+    let plain = wires.pop()!;
+    let upgraded = if (level == TLS_DANE) await plain.startTlsDaneClient(
+        tlsConfig,
+        serverName,
+        tlsa,
+        settings.tlsTimeout,
+    ) else await plain.startTlsClient(tlsConfig, serverName, settings.tlsTimeout);
+    match (upgraded) {
+        Ok(w) => {
+            match (wires.push(w)) {
+                Ok() => {}
+                Err(_) => { return Err(WireError.OutOfMemory); }
+            }
+        }
+        Err(WireError.OutOfMemory) => { return Err(WireError.OutOfMemory); }
+        Err(_) => {
+            if (level == TLS_DANE) {
+                noteHost(
+                    result,
+                    HOST_TLS_POLICY,
+                    "451 4.7.5 The receiving server's certificate does not match its DANE TLSA records".bytes(),
+                );
+            } else if (level == TLS_VERIFIED) {
+                noteHost(
+                    result,
+                    HOST_TLS_POLICY,
+                    "451 4.7.5 The receiving server's certificate is not valid for its name, which the recipient domain's MTA-STS policy requires".bytes(),
+                );
+            } else if (required) {
+                noteHost(
+                    result,
+                    HOST_TLS_POLICY,
+                    "451 4.7.5 TLS handshake failed, and the recipient domain's TLS policy requires TLS".bytes(),
+                );
+            } else {
+                noteHost(result, HOST_TLS_FAILED, "451 4.7.0 TLS handshake failed".bytes());
+            }
+            return Ok();
+        }
+    }
+    result.tls = true;
+    result.security = if (level > TLS_ENCRYPTED) level else TLS_ENCRYPTED;
+    // Forget what was said in the clear, and ask again (RFC 3207 §4.2).
+    if (!(await greet(mut wires[0], settings, caps, mut reply)?)) {
+        noteHost(result, HOST_UNUSABLE, reply.text.view());
+        return Ok();
+    }
+    noteHost(result, HOST_DONE, "".bytes());
+    return Ok();
+}
+
+/// MAIL, RCPT, DATA: one transaction on an established session.
+async fn transaction(
+    w: borrow mut Wire,
+    caps: Capabilities,
+    settings: borrow ClientSettings,
+    sender: StringView,
+    recipients: borrow Vector<String>,
+    message: Message,
+    results: borrow mut Vector<RecipientResult>,
+) -> Result<void, WireError> {
+    var reply = newReply();
+    // What the server cannot take is refused before the transaction.
+    if (caps.size > 0 && message.size > caps.size) {
+        for (i in 0..results.length) {
+            setResult(mut results[i], OUTCOME_PERMANENT, "552 5.3.4 Message too big for the receiving server".bytes())?;
+        }
+        return Ok();
+    }
+    var utf8 = !isAscii(sender.bytes());
+    for (i in 0..recipients.length) {
+        if (!isAscii(recipients[i].view().bytes())) {
+            utf8 = true;
+        }
+    }
+    if (utf8 && !caps.smtpUtf8) {
+        for (i in 0..results.length) {
+            setResult(
+                mut results[i],
+                OUTCOME_PERMANENT,
+                "553 5.6.7 The receiving server does not support internationalized addresses".bytes(),
+            )?;
+        }
+        return Ok();
+    }
+    // MAIL and every RCPT: at once when the server pipelines, else one at a time.
+    w.send("MAIL FROM:<".bytes())?;
+    w.send(sender.bytes())?;
+    w.send(">".bytes())?;
+    if (caps.size > 0) {
+        var n = Vector<u8>.create();
+        match (appendDecimal(mut n, message.size)) {
+            Ok() => {}
+            Err(_) => { return Err(WireError.OutOfMemory); }
+        }
+        w.send(" SIZE=".bytes())?;
+        w.send(n.view())?;
+    }
+    if (message.eightBit && caps.eightBit) {
+        w.send(" BODY=8BITMIME".bytes())?;
+    }
+    if (utf8) {
+        w.send(" SMTPUTF8".bytes())?;
+    }
+    w.send("\r\n".bytes())?;
+    if (!caps.pipelining) {
+        await w.flush()?;
+        await readReply(w, mut reply, settings.commandTimeout)?;
+        if (reply.code / 100 != 2) {
+            for (i in 0..results.length) {
+                setResult(mut results[i], outcomeOf(reply.code), reply.text.view())?;
+            }
+            return Ok();
+        }
+    }
+    for (i in 0..recipients.length) {
+        w.send("RCPT TO:<".bytes())?;
+        w.send(recipients[i].view().bytes())?;
+        w.send(">\r\n".bytes())?;
+        if (!caps.pipelining) {
+            await w.flush()?;
+            await readReply(w, mut reply, settings.commandTimeout)?;
+            setResult(mut results[i], rcptOutcome(reply.code), reply.text.view())?;
+        }
+    }
+    if (caps.pipelining) {
+        await w.flush()?;
+        await readReply(w, mut reply, settings.commandTimeout)?;
+        let mailCode = reply.code;
+        var mailText = Vector<u8>.create();
+        match (mailText.extend(reply.text.view())) {
+            Ok() => {}
+            Err(_) => { return Err(WireError.OutOfMemory); }
+        }
+        for (i in 0..recipients.length) {
+            await readReply(w, mut reply, settings.commandTimeout)?;
+            if (mailCode / 100 != 2) {
+                // The RCPT replies (most likely 503) do not matter: MAIL's does.
+                setResult(mut results[i], outcomeOf(mailCode), mailText.view())?;
+            } else {
+                setResult(mut results[i], rcptOutcome(reply.code), reply.text.view())?;
+            }
+        }
+        if (mailCode / 100 != 2) {
+            return Ok();
+        }
+    }
+    var accepted: usize = 0;
+    for (i in 0..results.length) {
+        if (results[i].outcome == OUTCOME_PENDING) {
+            accepted += 1;
+        }
+    }
+    if (accepted == 0) {
+        return Ok();
+    }
+    w.send("DATA\r\n".bytes())?;
+    await w.flush()?;
+    await readReply(w, mut reply, settings.commandTimeout)?;
+    if (reply.code != 354) {
+        for (i in 0..results.length) {
+            if (results[i].outcome == OUTCOME_PENDING) {
+                setResult(
+                    mut results[i],
+                    outcomeOf(if (reply.code / 100 == 2) 451 else reply.code),
+                    reply.text.view(),
+                )?;
+            }
+        }
+        return Ok();
+    }
+    await sendMessage(w, message, settings)?;
+    await readReply(w, mut reply, settings.finalTimeout)?;
+    for (i in 0..results.length) {
+        if (results[i].outcome == OUTCOME_PENDING) {
+            setResult(mut results[i], outcomeOf(reply.code), reply.text.view())?;
+        }
+    }
+    return Ok();
+}
+
+/// QUIT, waiting briefly for the 221; the transaction is settled already, so failures here do not matter.
+async fn quit(w: borrow mut Wire, settings: borrow ClientSettings) {
+    match (w.send("QUIT\r\n".bytes())) {
+        Ok() => {}
+        Err(_) => { return; }
+    }
+    match (await w.flush()) {
+        Ok() => {}
+        Err(_) => { return; }
+    }
+    var reply = newReply();
+    let wait = if (settings.commandTimeout < 5000) settings.commandTimeout else 5000;
+    match (await readReply(w, mut reply, wait)) {
+        Ok() => {}
+        Err(_) => {}
+    }
+}
+
+const SEND_CHUNK: usize = 64 * 1024;
+
+/// Where dot-stuffing is between pieces.
+struct Stuffing {
+    lineStart: bool;
+    lastCr: bool;
+}
+
+/// `bytes` with dot-stuffing and CRLF line ends (a bare LF becomes CRLF), into `out`.
+fn stuff(bytes: Slice<u8>, state: borrow mut Stuffing, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    for (c in bytes) {
+        if (state.lineStart && c == 0x2e) {
+            out.push(0x2e)?;
+        }
+        if (c == 0x0a && !state.lastCr) {
+            out.push(0x0d)?;
+        }
+        out.push(c)?;
+        state.lineStart = c == 0x0a;
+        state.lastCr = c == 0x0d;
+    }
+    return Ok();
+}
+
+/// Sends the message, prefix then file, stuffed, then the final dot.
+async fn sendMessage(w: borrow mut Wire, message: Message, settings: borrow ClientSettings) -> Result<void, WireError> {
+    var chunk = Vector<u8>.create();
+    match (chunk.resize(SEND_CHUNK, 0)) {
+        Ok() => {}
+        Err(_) => { return Err(WireError.OutOfMemory); }
+    }
+    var out = Vector<u8>.create();
+    var state = Stuffing { lineStart: true, lastCr: false };
+    match (stuff(message.prefix, mut state, mut out)) {
+        Ok() => {}
+        Err(_) => { return Err(WireError.OutOfMemory); }
+    }
+    w.send(out.view())?;
+    let fileSize = message.size - (message.prefix.length as u64);
+    var offset: u64 = 0;
+    let file = message.file;
+    while (offset < fileSize) {
+        let at = offset;
+        let read: Result<usize, FileError> = await Async.blocking(() => file.readAt(mut chunk[..], at));
+        let n = match (read) {
+            Ok(n) => n,
+            Err(_) => { return Err(WireError.Io); }
+        };
+        if (n == 0) {
+            return Err(WireError.Io);
+        }
+        out.clear();
+        match (stuff(chunk[0..n], mut state, mut out)) {
+            Ok() => {}
+            Err(_) => { return Err(WireError.OutOfMemory); }
+        }
+        w.send(out.view())?;
+        await flushWithin(w, settings.blockTimeout)?;
+        offset += n as u64;
+    }
+    if (!state.lineStart) {
+        w.send("\r\n".bytes())?;
+    }
+    w.send(".\r\n".bytes())?;
+    return await flushWithin(w, settings.blockTimeout);
+}
+
+async fn flushWithin(w: borrow mut Wire, timeoutMs: u64) -> Result<void, WireError> {
+    let done: Result<void, WireError> = await Async.timeout(timeoutMs, WireError.Timeout, async () => await w.flush());
+    return done;
+}

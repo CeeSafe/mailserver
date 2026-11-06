@@ -1,0 +1,9 @@
+[package]
+name = "mhttp"
+version = "0.1.0"
+kind = "library"
+tests = ["tests"]
+
+[dependencies]
+msmtp = { path = "../msmtp" }
+tls = { path = "../../../../CeeSafeLibs/tls" }

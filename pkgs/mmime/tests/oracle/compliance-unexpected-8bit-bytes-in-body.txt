@@ -1,0 +1,12 @@
+size 2176
+envelope ("Tue, 12 Nov 2013 09:12:42 -0500" "this is a sample message with unexpected 8bit content" ((NIL NIL "mimekit" "example.com")) ((NIL NIL "mimekit" "example.com")) ((NIL NIL "mimekit" "example.com")) ((NIL NIL "mimekit" "example.com")) NIL NIL NIL "<54AD68C9E3B0184CAC6041320424FD1B5B81E74D@localhost.localdomain>")
+bodystructure (("text" "plain" ("charset" "utf-8") NIL NIL "7bit" 27 1 NIL NIL NIL NIL) ("text" "plain" ("charset" "utf-8" "name" "lorem-ipsum-ru.txt") NIL NIL "7bit" 1313 13 NIL ("attachment" ("filename" "lorem-ipsum-ru.txt")) NIL NIL) "mixed" ("boundary" "----=_NextPart_000_003F_01CE98CE.6E826F90") NIL NIL NIL)
+body (("text" "plain" ("charset" "utf-8") NIL NIL "7bit" 27 1) ("text" "plain" ("charset" "utf-8" "name" "lorem-ipsum-ru.txt") NIL NIL "7bit" 1313 13) "mixed")
+section HEADER 382 79256c32e4a7f77847a2d3f949ede3c626d1f2a9047e3b00783a46d4427778da
+section TEXT 1794 45712ab321a007a3fac4e5be270667ee0f8b2867c62059b9bb1051a6ce1582ac
+section HEADER.FIELDS 322 888fda98d39e6fef3e4fc649f3ef4dc534d98ab4a939b9e94a915d6189cfaa99
+section HEADER.FIELDS.NOT 62 8d0ae3ff18a760dbb1cc2c639917d785bcdf38a0094ac02c43539fbf5a30d533
+section 1 27 271e157fddc5d111cdedc381414a4f7934aee1e5ccf1ebb131840efe3425754a
+section 1.MIME 76 1846c4d0060cddce97cb6de0c65f8c3b9b2f0fbd74673b1152866275be37c9ff
+section 2 1313 35cac0733d0a2bbb0de64e9d9c6f101c0d9a8a2e804dc72548ee3b52f73951af
+section 2.MIME 167 ef3ea611df7403ef43b007ca52266d8e94cc3a065b917f2942d5dd3fb30fd929

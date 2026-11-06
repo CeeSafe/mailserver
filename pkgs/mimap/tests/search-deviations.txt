@@ -1,0 +1,211 @@
+# SEARCH differences from Dovecot 2.4.5 (without full-text search) that are understood and kept, for
+# pkgs/mimap/tools/search-differential.py: `query | message | tag`, each tag defined by a `= tag: reason` line. The
+# tool fails on a difference not listed here, and on a listed one that no longer occurs.
+= address: Dovecot's FROM, TO, CC and BCC search its parsed and re-written address list (a missing domain becomes @MISSING_DOMAIN, malformed lists are rebuilt); ours search the field's decoded text, as HEADER does on both (HEADER From "@" agrees with our FROM "@")
+= html: ours searches HTML as a reader sees it (mmime drops tags, <style> and <script>, and decodes entities); Dovecot without full-text search searches the HTML source
+= embedded-header: BODY: an attached message's header is part of the outer message's body, and ours searches it (as Dovecot's own full-text index does); Dovecot's plain BODY skips every header line at any depth
+= message-leaf: Dovecot searches the raw body of message/* leaves other than message/rfc822 (message/partial, delivery-status, feedback-report); mmime reads only text/* leaves
+= mime-header: TEXT: Dovecot also searches the MIME header of every part (Content-Type and the like, and the base64 lines of a part with no blank line after its header); ours searches the message's header and attached messages' headers
+= untyped: a Content-Type with no subtype (X-ZIP, x-sun-attachment, X-BE2) is invalid, and mmime reads the part as text/plain (RFC 2045 §5.2); Dovecot skips it as not text
+= bad-encoding: an unknown Content-Transfer-Encoding (duckduckgo): mmime searches the body as it is; Dovecot skips the part
+= two-types: two Content-Type fields: mmime uses the first (text/plain), Dovecot the last (application/octet-stream)
+
+FROM "@" | mbox-jwz-000 | address
+FROM "@" | mbox-jwz-002 | address
+FROM "@" | mbox-jwz-003 | address
+FROM "@" | mbox-jwz-005 | address
+FROM "@" | mbox-jwz-011 | address
+FROM "@" | mbox-jwz-015 | address
+FROM "@" | mbox-jwz-032 | address
+FROM "@" | mbox-jwz-045 | address
+FROM "@" | mbox-jwz-047 | address
+FROM "@" | mbox-jwz-048 | address
+FROM "@" | mbox-jwz-049 | address
+FROM "@" | mbox-jwz-054 | address
+FROM "@" | mbox-jwz-065 | address
+FROM "@" | mbox-jwz-089 | address
+FROM "@" | mbox-jwz-093 | address
+FROM "@" | mbox-jwz-095 | address
+FROM "@" | mbox-jwz-098 | address
+FROM "@" | mbox-jwz-138 | address
+FROM "@" | mbox-jwz-139 | address
+FROM "@" | mbox-jwz-143 | address
+FROM "@" | mbox-jwz-151 | address
+BODY the | compliance-invalid-content-transfer-encoding-basic | bad-encoding
+BODY the | compliance-invalid-content-transfer-encoding-multiple | bad-encoding
+BODY the | compliance-invalid-content-type | untyped
+BODY the | compliance-multiple-content-types | two-types
+BODY the | mbox-jwz-024 | message-leaf
+BODY the | mbox-jwz-028 | untyped
+BODY the | mbox-jwz-041 | message-leaf
+BODY the | mbox-jwz-133 | untyped
+BODY the | mbox-jwz-134 | untyped
+BODY the | messages-feedback-report | message-leaf
+BODY the | partial-message-partial.0 | message-leaf
+BODY the | partial-message-partial.1 | message-leaf
+BODY the | partial-message-partial.2 | message-leaf
+BODY the | partial-rfc2046.0 | message-leaf
+BODY hello | partial-rfc2046.0 | message-leaf
+BODY boundary | mbox-content-length-004 | embedded-header
+BODY boundary | mbox-jwz-004 | embedded-header
+BODY boundary | mbox-jwz-023 | message-leaf
+BODY boundary | mbox-jwz-024 | message-leaf
+BODY boundary | mbox-jwz-029 | embedded-header
+BODY boundary | mbox-jwz-039 | embedded-header
+BODY boundary | mbox-jwz-041 | message-leaf
+BODY boundary | mbox-jwz-050 | message-leaf
+BODY boundary | mbox-jwz-082 | embedded-header
+BODY boundary | messages-bounce | embedded-header
+BODY boundary | messages-delivery-status2 | embedded-header
+BODY boundary | messages-multipart-digest | embedded-header
+BODY boundary | messages-rfc2060 | embedded-header
+BODY boundary | partial-message-partial.0 | message-leaf
+BODY "Contract draft" | crafted-attached-message | embedded-header
+BODY zebra | crafted-html-utf8 | html
+BODY "<b>" | mbox-content-length-001 | html
+BODY "<b>" | mbox-content-length-002 | html
+BODY "<b>" | mbox-content-length-003 | html
+BODY "<b>" | mbox-content-length-005 | html
+BODY "<b>" | mbox-jwz-037 | html
+BODY "<b>" | mbox-jwz-038 | html
+BODY "<b>" | mbox-jwz-039 | html
+BODY "<b>" | mbox-jwz-058 | html
+BODY "<b>" | mbox-jwz-069 | html
+BODY "<b>" | mbox-jwz-070 | html
+BODY "<b>" | mbox-jwz-072 | html
+BODY "<b>" | mbox-jwz-073 | html
+BODY "<b>" | mbox-jwz-074 | html
+BODY "<b>" | mbox-jwz-075 | html
+BODY "<b>" | mbox-jwz-076 | html
+BODY "<b>" | mbox-jwz-077 | html
+BODY "<b>" | mbox-jwz-078 | html
+BODY "<b>" | mbox-jwz-079 | html
+BODY "<b>" | mbox-jwz-080 | html
+BODY "<b>" | mbox-jwz-081 | html
+BODY "<b>" | mbox-jwz-083 | html
+BODY "<b>" | messages-bounce | html
+BODY "<b>" | crafted-html-utf8 | html
+BODY "Tom & Jerry" | crafted-html-utf8 | html
+BODY "&amp;" | mbox-jwz-070 | html
+BODY "&amp;" | messages-bounce | html
+BODY "&amp;" | crafted-html-utf8 | html
+BODY "nbsp" | mbox-content-length-004 | html
+BODY "nbsp" | mbox-jwz-068 | html
+BODY "nbsp" | mbox-jwz-075 | html
+BODY "nbsp" | mbox-jwz-082 | html
+BODY "nbsp" | messages-bounce | html
+BODY "nbsp" | crafted-alternative | html
+BODY {{café}} | crafted-html-utf8 | html
+BODY {{☺}} | crafted-html-utf8 | html
+BODY Content-Type | mbox-content-length-000 | embedded-header
+BODY Content-Type | mbox-content-length-001 | embedded-header
+BODY Content-Type | mbox-content-length-002 | embedded-header
+BODY Content-Type | mbox-content-length-004 | embedded-header
+BODY Content-Type | mbox-content-length-015 | embedded-header
+BODY Content-Type | mbox-content-length-016 | embedded-header
+BODY Content-Type | mbox-content-length-027 | embedded-header
+BODY Content-Type | mbox-jwz-004 | embedded-header
+BODY Content-Type | mbox-jwz-018 | embedded-header
+BODY Content-Type | mbox-jwz-020 | embedded-header
+BODY Content-Type | mbox-jwz-021 | embedded-header
+BODY Content-Type | mbox-jwz-023 | message-leaf
+BODY Content-Type | mbox-jwz-024 | message-leaf
+BODY Content-Type | mbox-jwz-028 | untyped
+BODY Content-Type | mbox-jwz-029 | embedded-header
+BODY Content-Type | mbox-jwz-035 | message-leaf
+BODY Content-Type | mbox-jwz-036 | message-leaf
+BODY Content-Type | mbox-jwz-037 | embedded-header
+BODY Content-Type | mbox-jwz-038 | embedded-header
+BODY Content-Type | mbox-jwz-039 | embedded-header
+BODY Content-Type | mbox-jwz-041 | message-leaf
+BODY Content-Type | mbox-jwz-044 | message-leaf
+BODY Content-Type | mbox-jwz-058 | embedded-header
+BODY Content-Type | mbox-jwz-071 | embedded-header
+BODY Content-Type | mbox-jwz-082 | embedded-header
+BODY Content-Type | mbox-jwz-089 | message-leaf
+BODY Content-Type | mbox-jwz-097 | embedded-header
+BODY Content-Type | mbox-jwz-115 | embedded-header
+BODY Content-Type | mbox-jwz-116 | embedded-header
+BODY Content-Type | mbox-jwz-122 | embedded-header
+BODY Content-Type | mbox-jwz-131 | embedded-header
+BODY Content-Type | mbox-jwz-150 | message-leaf
+BODY Content-Type | messages-delivery-status-no-blank-line | embedded-header
+BODY Content-Type | messages-delivery-status.anonymized | embedded-header
+BODY Content-Type | messages-delivery-status | embedded-header
+BODY Content-Type | messages-delivery-status2 | embedded-header
+BODY Content-Type | messages-disposition-notification.anonymized | embedded-header
+BODY Content-Type | messages-disposition-notification | embedded-header
+BODY Content-Type | messages-feedback-report | embedded-header
+BODY Content-Type | messages-issue358 | html
+BODY Content-Type | messages-multipart-digest | embedded-header
+BODY Content-Type | messages-multipart-related-mhtml | html
+BODY Content-Type | messages-rfc2060 | embedded-header
+BODY Content-Type | messages-simple-embedded-message.anonymized | embedded-header
+BODY Content-Type | messages-simple-embedded-message | embedded-header
+BODY Content-Type | partial-message-partial.0 | message-leaf
+BODY Content-Type | partial-rfc2046.0 | message-leaf
+BODY X-Mailer | mbox-content-length-000 | embedded-header
+BODY X-Mailer | mbox-content-length-001 | embedded-header
+BODY X-Mailer | mbox-content-length-002 | embedded-header
+BODY X-Mailer | mbox-content-length-004 | embedded-header
+BODY X-Mailer | mbox-content-length-015 | embedded-header
+BODY X-Mailer | mbox-content-length-016 | embedded-header
+BODY X-Mailer | mbox-content-length-027 | embedded-header
+BODY X-Mailer | mbox-jwz-020 | embedded-header
+BODY X-Mailer | mbox-jwz-021 | embedded-header
+BODY X-Mailer | mbox-jwz-029 | embedded-header
+BODY X-Mailer | mbox-jwz-037 | embedded-header
+BODY X-Mailer | mbox-jwz-038 | embedded-header
+BODY X-Mailer | mbox-jwz-082 | embedded-header
+BODY X-Mailer | mbox-jwz-115 | embedded-header
+BODY X-Mailer | mbox-jwz-116 | embedded-header
+BODY X-Mailer | mbox-jwz-131 | embedded-header
+BODY X-Mailer | messages-bounce | embedded-header
+BODY X-Mailer | messages-delivery-status-no-blank-line | embedded-header
+BODY X-Mailer | messages-delivery-status.anonymized | embedded-header
+BODY X-Mailer | messages-delivery-status | embedded-header
+TEXT jwz | mbox-issue1189-001 | mime-header
+TEXT jwz | mbox-jwz-028 | untyped
+TEXT jwz | mbox-jwz-035 | mime-header
+TEXT jwz | mbox-jwz-041 | message-leaf
+TEXT jwz | mbox-jwz-091 | message-leaf
+TEXT jwz | partial-message-partial.0 | message-leaf
+TEXT jwz | partial-message-partial.2 | message-leaf
+NOT (OR BODY the SUBJECT test) | mbox-jwz-024 | message-leaf
+NOT (OR BODY the SUBJECT test) | mbox-jwz-028 | untyped
+NOT (OR BODY the SUBJECT test) | mbox-jwz-041 | message-leaf
+NOT (OR BODY the SUBJECT test) | mbox-jwz-133 | untyped
+NOT (OR BODY the SUBJECT test) | mbox-jwz-134 | untyped
+NOT (OR BODY the SUBJECT test) | messages-feedback-report | message-leaf
+NOT (OR BODY the SUBJECT test) | partial-message-partial.0 | message-leaf
+NOT (OR BODY the SUBJECT test) | partial-message-partial.1 | message-leaf
+NOT (OR BODY the SUBJECT test) | partial-message-partial.2 | message-leaf
+NOT (OR BODY the SUBJECT test) | partial-rfc2046.0 | message-leaf
+(FROM a TO b) | mbox-content-length-006 | address
+(FROM a TO b) | mbox-jwz-085 | address
+(FROM a TO b) | mbox-jwz-087 | address
+SEEN SINCE 17-Jan-2020 NOT BODY the | mbox-jwz-134 | untyped
+SEEN SINCE 17-Jan-2020 NOT BODY the | messages-feedback-report | message-leaf
+SEEN SINCE 17-Jan-2020 NOT BODY the | partial-message-partial.1 | message-leaf
+OR SUBJECT test (UNSEEN BODY hello) | partial-rfc2046.0 | message-leaf
+FROM MISSING_DOMAIN | mbox-jwz-000 | address
+FROM MISSING_DOMAIN | mbox-jwz-002 | address
+FROM MISSING_DOMAIN | mbox-jwz-003 | address
+FROM MISSING_DOMAIN | mbox-jwz-005 | address
+FROM MISSING_DOMAIN | mbox-jwz-011 | address
+FROM MISSING_DOMAIN | mbox-jwz-015 | address
+FROM MISSING_DOMAIN | mbox-jwz-032 | address
+FROM MISSING_DOMAIN | mbox-jwz-045 | address
+FROM MISSING_DOMAIN | mbox-jwz-047 | address
+FROM MISSING_DOMAIN | mbox-jwz-048 | address
+FROM MISSING_DOMAIN | mbox-jwz-049 | address
+FROM MISSING_DOMAIN | mbox-jwz-054 | address
+FROM MISSING_DOMAIN | mbox-jwz-065 | address
+FROM MISSING_DOMAIN | mbox-jwz-089 | address
+FROM MISSING_DOMAIN | mbox-jwz-093 | address
+FROM MISSING_DOMAIN | mbox-jwz-095 | address
+FROM MISSING_DOMAIN | mbox-jwz-098 | address
+FROM MISSING_DOMAIN | mbox-jwz-138 | address
+FROM MISSING_DOMAIN | mbox-jwz-139 | address
+FROM MISSING_DOMAIN | mbox-jwz-143 | address
+FROM MISSING_DOMAIN | mbox-jwz-151 | address

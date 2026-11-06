@@ -1,0 +1,10 @@
+size 55093
+envelope ("Tue, 28 Mar 2017 18:40:37 -0400" "Photo of a girl with feather earrings" ((NIL NIL "anonymous" "mit.edu")) ((NIL NIL "anonymous" "mit.edu")) ((NIL NIL "anonymous" "mit.edu")) ((NIL NIL "photo-discuss" "lists.nesop.edu")) NIL NIL NIL "<W599PRPHW0U4.5COYF0XTOIRF2@mit.edu>")
+bodystructure ("message" "partial" ("id" "6MCVORPHW0U4.BCPTXD0EM9BT3@mit.edu" "number" "3" "total" "3") NIL NIL "7bit" 54782 NIL NIL NIL NIL)
+body ("message" "partial" ("id" "6MCVORPHW0U4.BCPTXD0EM9BT3@mit.edu" "number" "3" "total" "3") NIL NIL "7bit" 54782)
+section HEADER 311 fb1dc31155dcb05834416fa48839e3297fbcc206bd3dd593f04a2fef9e5a21fa
+section TEXT 54782 761f993c89d0ccd0f5c2d37c5c8a0c71625c1d279a63a9ce663bc84c9d64294e
+section HEADER.FIELDS 292 7ed74dfec9bf3c2de55fac49fd798ed37328ab66afba5e1063d543037966604c
+section HEADER.FIELDS.NOT 21 07a26ab8981ff3b1de28da29cf47f47e315b9c25685121dc5ebb60391005b2de
+section 1 54782 761f993c89d0ccd0f5c2d37c5c8a0c71625c1d279a63a9ce663bc84c9d64294e
+section 1.MIME 311 fb1dc31155dcb05834416fa48839e3297fbcc206bd3dd593f04a2fef9e5a21fa

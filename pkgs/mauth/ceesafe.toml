@@ -1,0 +1,12 @@
+[package]
+name = "mauth"
+version = "0.1.0"
+kind = "library"
+tests = ["tests"]
+
+[dependencies]
+mdns = { path = "../mdns" }
+mmime = { path = "../mmime" }
+pkey = { path = "../../../../CeeSafeLibs/pkey" }
+sha256 = { path = "../../../../CeeSafeLibs/sha256" }
+encoding = { path = "../../../../CeeSafeLibs/encoding" }

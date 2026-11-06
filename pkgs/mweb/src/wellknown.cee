@@ -1,0 +1,572 @@
+// The public endpoints: ACME HTTP-01 challenges (RFC 8555 §8.3), MTA-STS policies (RFC 8461 §3.2), Thunderbird's
+// autoconfig, and Outlook's autodiscover (the POX XML and the v2 JSON), as the C# server answered them.
+
+import mhttp.JsonWriter;
+import mhttp.Request;
+import mhttp.Response;
+import mhttp.appendIsoTime;
+import mdav.serveDav;
+import meas.mobileSyncAutodiscover;
+import meas.serveActiveSync;
+import mews.appendExchangeProtocol;
+import mews.ewsUrl;
+import mews.serveEws;
+import postgres.PgParams;
+import postgres.PgRows;
+
+const ACME_PREFIX: StringView = "/.well-known/acme-challenge/";
+
+/// Answers one request.
+async fn route(ctx: borrow WebContext, mode: WebMode, request: borrow Request) -> Result<Response, AllocError> {
+    let path = request.path.view();
+    let reading = request.isMethod("GET") || request.isMethod("HEAD");
+    if (path.startsWith(ACME_PREFIX)) {
+        if (!reading) {
+            return notAllowed("GET, HEAD");
+        }
+        return await acmeChallenge(ctx, path[ACME_PREFIX.length..]);
+    }
+    if (path == "/.well-known/mta-sts.txt") {
+        // Senders fetch policies over HTTPS only (§3.3); over plain HTTP there is none to find.
+        if (!reading) {
+            return notAllowed("GET, HEAD");
+        }
+        match (mode) {
+            WebMode.Plain => { return Response.text(404, "MTA-STS policies are served over HTTPS."); }
+            _ => {}
+        }
+        return await mtaStsPolicy(ctx, mode, request);
+    }
+    if (path == "/mail/config-v1.1.xml" || path == "/.well-known/autoconfig/mail/config-v1.1.xml") {
+        if (!reading) {
+            return notAllowed("GET, HEAD");
+        }
+        return await autoconfig(ctx, mode, request);
+    }
+    if (path.equalsIgnoreAsciiCase("/autodiscover/autodiscover.xml")) {
+        if (!request.isMethod("POST")) {
+            return notAllowed("POST");
+        }
+        return await autodiscoverXml(ctx, mode, request);
+    }
+    let lowered = lowerPath(path)?;
+    if (lowered.view() == "/autodiscover/autodiscover.json" || lowered.view().startsWith(
+        "/autodiscover/autodiscover.json/",
+    )) {
+        if (!reading) {
+            return notAllowed("GET, HEAD");
+        }
+        return await autodiscoverJson(ctx, mode, request);
+    }
+    if (path == "/api/health") {
+        if (!reading) {
+            return notAllowed("GET, HEAD");
+        }
+        return health();
+    }
+    match (mode) {
+        WebMode.Admin => {
+            if (path.startsWith("/api/")) {
+                return await adminApi(ctx, request);
+            }
+        }
+        _ => {}
+    }
+    let groupware = groupwareOf(lowered.view());
+    if (groupware != GROUPWARE_NONE) {
+        // Passwords travel in every request: never over plain HTTP from the network.
+        match (mode) {
+            WebMode.Plain => { return Response.text(403, "Use HTTPS."); }
+            _ => {}
+        }
+        let mail = ctx.mail.get();
+        if (groupware == GROUPWARE_DAV) {
+            return await serveDav(mail, request);
+        }
+        if (groupware == GROUPWARE_EAS) {
+            return await serveActiveSync(mail, request);
+        }
+        return await serveEws(mail, request);
+    }
+    return Response.text(404, "Not found.");
+}
+
+const GROUPWARE_NONE: u8 = 0;
+const GROUPWARE_DAV: u8 = 1;
+const GROUPWARE_EAS: u8 = 2;
+const GROUPWARE_EWS: u8 = 3;
+
+/// Which groupware protocol a (lowercased) path is for.
+fn groupwareOf(path: StringView) -> u8 {
+    if (path == "/dav" || path.startsWith("/dav/") || path == "/.well-known/caldav" || path == "/.well-known/carddav") {
+        return GROUPWARE_DAV;
+    }
+    if (path == "/microsoft-server-activesync" || path.startsWith("/microsoft-server-activesync/")) {
+        return GROUPWARE_EAS;
+    }
+    if (path == "/ews/exchange.asmx" || path.startsWith("/ews/exchange.asmx/")) {
+        return GROUPWARE_EWS;
+    }
+    return GROUPWARE_NONE;
+}
+
+fn lowerPath(path: StringView) -> Result<String, AllocError> {
+    var out = String.create();
+    lowerInto(path, mut out)?;
+    return Ok(out);
+}
+
+/// Appends `text` lowercased (ASCII).
+fn lowerInto(text: StringView, out: borrow mut String) -> Result<void, AllocError> {
+    var bytes = Vector<u8>.create();
+    for (c in text.bytes()) {
+        bytes.push(if (c >= 0x41 && c <= 0x5a) c + 0x20 else c)?;
+    }
+    return out.append(StringView.fromUtf8(bytes.view()) ?? "");
+}
+
+fn notAllowed(allow: StringView) -> Result<Response, AllocError> {
+    var r = Response.text(405, "Method not allowed.")?;
+    r.header("Allow", allow)?;
+    return Ok(r);
+}
+
+fn health() -> Result<Response, AllocError> {
+    var w = JsonWriter.create();
+    w.beginObject();
+    w.stringField("status", "ok");
+    w.stringField("app", "mailserver");
+    var time = Vector<u8>.create();
+    appendIsoTime(mut time, Clock.unixMillis() / 1000)?;
+    w.key("time");
+    w.stringBytes(time.view());
+    w.endObject();
+    return Response.json(200, w.finish()?);
+}
+
+/// The host the request was sent to: its Host field, or on the admin listener (behind a reverse proxy)
+/// `X-Forwarded-Host` when present, lowercased, without a port.
+fn hostOf(mode: WebMode, request: borrow Request, into: borrow mut String) -> Result<void, AllocError> {
+    request.host(into)?;
+    if (!forwarded(mode)) {
+        return Ok();
+    }
+    let forwarded = match (request.header("X-Forwarded-Host")) {
+        Some(v) => v.view(),
+        null => "",
+    };
+    // A list when several proxies forwarded it: the first is the client's.
+    let first = forwarded[0..forwarded.indexOf(",") ?? forwarded.length].trim();
+    if (first.length == 0) {
+        return Ok();
+    }
+    into.clear();
+    let colon = if (first.startsWith("[")) first.length else first.indexOf(":") ?? first.length;
+    let named = first[0..colon];
+    let bare = if (named.endsWith(".")) named[0..named.length - 1] else named;
+    return lowerInto(bare, into);
+}
+
+// ---- ACME ----
+
+async fn acmeChallenge(ctx: borrow WebContext, token: StringView) -> Result<Response, AllocError> {
+    var keyAuthorization = String.create();
+    if (token.length == 0 || !(await ctx.challenges.lookup(token, mut keyAuthorization))?) {
+        return Response.text(404, "No such challenge.");
+    }
+    var body = Vector<u8>.create();
+    body.extend(keyAuthorization.bytes())?;
+    return Response.of(200, "application/octet-stream", body);
+}
+
+// ---- MTA-STS ----
+
+/// $1 the domain (lowercase): its mode, max_age, mx patterns.
+fn sqlMtaSts() -> StringView =>
+    """
+    SELECT mta_sts_mode, mta_sts_max_age, mta_sts_mx FROM domains WHERE name = $1 AND active
+    """;
+
+/// The policy of the domain the request names as `mta-sts.<domain>`. Domains that publish none get a 404, so that
+/// senders cache nothing.
+async fn mtaStsPolicy(ctx: borrow WebContext, mode: WebMode, request: borrow Request) -> Result<Response, AllocError> {
+    var host = String.create();
+    hostOf(mode, request, mut host)?;
+    if (!host.view().startsWith("mta-sts.") || host.length <= 8) {
+        return Response.text(404, "MTA-STS policies are served on mta-sts.<domain>.");
+    }
+    let domain = host.view()[8..];
+    var params = PgParams.create();
+    match (params.text(domain)) {
+        Ok() => {}
+        Err(_) => { return Err(AllocError.OutOfMemory); }
+    }
+    var rows = PgRows.create();
+    if (!(await queryRows(ctx, sqlMtaSts(), params, mut rows))) {
+        return Response.text(503, "The policy is not available now.");
+    }
+    if (rows.rowCount() == 0) {
+        return Response.text(404, "Unknown domain.");
+    }
+    let policyMode = rows.text(0, 0) ?? "none";
+    if (policyMode != "testing" && policyMode != "enforce") {
+        return Response.text(404, "This domain publishes no MTA-STS policy.");
+    }
+    let maxAge = rows.int64(0, 1) ?? 86400;
+    let patterns = rows.text(0, 2) ?? "";
+    var body = Vector<u8>.create();
+    writeMtaStsPolicy(policyMode, maxAge, patterns, domain, mut body)?;
+    var r = Response.of(200, "text/plain; charset=utf-8", body)?;
+    r.header("Cache-Control", "public, max-age=600")?;
+    return Ok(r);
+}
+
+/// The policy file (§3.2): CRLF lines, `mx:` once per pattern (`mail.<domain>` when none are set).
+fn writeMtaStsPolicy(
+    mode: StringView,
+    maxAge: i64,
+    patterns: StringView,
+    domain: StringView,
+    out: borrow mut Vector<u8>,
+) -> Result<void, AllocError> {
+    out.extend("version: STSv1\r\nmode: ".bytes())?;
+    out.extend(mode.bytes())?;
+    out.extend("\r\n".bytes())?;
+    // Separated by commas or white space, as the C# server read them.
+    var any = false;
+    let b = patterns.bytes();
+    var start: usize = 0;
+    for (i in 0..b.length + 1) {
+        let separator = i == b.length || b[i] == 0x2c || b[i] == 0x20 || b[i] == 0x09 || b[i] == 0x0d || b[i] == 0x0a;
+        if (!separator) {
+            continue;
+        }
+        if (i > start) {
+            out.extend("mx: ".bytes())?;
+            out.extend(b[start..i])?;
+            out.extend("\r\n".bytes())?;
+            any = true;
+        }
+        start = i + 1;
+    }
+    if (!any) {
+        out.extend("mx: mail.".bytes())?;
+        out.extend(domain.bytes())?;
+        out.extend("\r\n".bytes())?;
+    }
+    out.extend("max_age: ".bytes())?;
+    var digits = String.create();
+    digits.appendNumber(maxAge)?;
+    out.extend(digits.bytes())?;
+    return out.extend("\r\n".bytes());
+}
+
+/// Runs a query on a pooled connection; false when the database fails (the caller answers 503).
+async fn queryRows(
+    ctx: borrow WebContext,
+    sql: StringView,
+    params: borrow PgParams,
+    rows: borrow mut PgRows,
+) -> bool {
+    var lease = match (await ctx.mail.get().store.connections().acquire()) {
+        Ok(l) => l,
+        Err(_) => { return false; }
+    };
+    match (await lease.connection().query(sql, params)) {
+        Ok(r) => {
+            rows = r;
+            return true;
+        }
+        Err(_) => { return false; }
+    }
+}
+
+// ---- Autoconfiguration ----
+
+/// The host clients are told to connect to: the `mail.` host of the name the request came to (autoconfig.<d> and
+/// autodiscover.<d> become mail.<d>), else `mail.` of the address's domain, else the server's own name.
+fn advertisedHost(
+    ctx: borrow WebContext,
+    requestHost: StringView,
+    email: StringView,
+    into: borrow mut String,
+) -> Result<void, AllocError> {
+    into.clear();
+    if (requestHost.startsWith("mail.")) {
+        return into.append(requestHost);
+    }
+    if (requestHost.startsWith("autodiscover.")) {
+        into.append("mail.")?;
+        return into.append(requestHost[13..]);
+    }
+    if (requestHost.startsWith("autoconfig.")) {
+        into.append("mail.")?;
+        return into.append(requestHost[11..]);
+    }
+    let at = email.lastIndexOf("@") ?? email.length;
+    let domain = if (at < email.length) email[at + 1..].trim() else "";
+    if (domain.length > 0) {
+        into.append("mail.")?;
+        return lowerInto(domain, into);
+    }
+    let mail = ctx.mail.get();
+    return into.append(mail.settings.hostname.view());
+}
+
+/// Appends `text` with XML's five special characters escaped.
+fn appendXml(out: borrow mut Vector<u8>, text: StringView) -> Result<void, AllocError> {
+    for (c in text.bytes()) {
+        if (c == 0x26) {
+            out.extend("&amp;".bytes())?;
+        } else if (c == 0x3c) {
+            out.extend("&lt;".bytes())?;
+        } else if (c == 0x3e) {
+            out.extend("&gt;".bytes())?;
+        } else if (c == 0x22) {
+            out.extend("&quot;".bytes())?;
+        } else if (c == 0x27) {
+            out.extend("&apos;".bytes())?;
+        } else if (c >= 0x20 || c == 0x09 || c == 0x0a || c == 0x0d) {
+            out.push(c)?;
+        }
+    }
+    return Ok();
+}
+
+fn appendPort(out: borrow mut Vector<u8>, port: u16) -> Result<void, AllocError> {
+    var digits = String.create();
+    digits.appendNumber(port as i64)?;
+    return out.extend(digits.bytes());
+}
+
+/// Thunderbird's autoconfig (the ISPDB format): IMAP and SMTP with implicit TLS and the address as user name.
+async fn autoconfig(ctx: borrow WebContext, mode: WebMode, request: borrow Request) -> Result<Response, AllocError> {
+    var email = String.create();
+    if (!request.param("emailaddress", mut email)?) {
+        email.append("user@example.com")?;
+    }
+    let at = email.view().lastIndexOf("@") ?? email.length;
+    let domain = if (at < email.length) email.view()[at + 1..] else "example.com";
+    var host = String.create();
+    hostOf(mode, request, mut host)?;
+    var server = String.create();
+    advertisedHost(ctx, host.view(), email.view(), mut server)?;
+    var out = Vector<u8>.create();
+    out.extend(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<clientConfig version=\"1.1\">\n  <emailProvider id=\"".bytes(),
+    )?;
+    appendXml(mut out, domain)?;
+    out.extend("\">\n    <domain>".bytes())?;
+    appendXml(mut out, domain)?;
+    out.extend("</domain>\n    <displayName>".bytes())?;
+    appendXml(mut out, domain)?;
+    out.extend("</displayName>\n    <displayShortName>".bytes())?;
+    appendXml(mut out, domain)?;
+    out.extend("</displayShortName>\n    <incomingServer type=\"imap\">\n      <hostname>".bytes())?;
+    appendXml(mut out, server.view())?;
+    out.extend("</hostname>\n      <port>".bytes())?;
+    appendPort(mut out, ctx.settings.imapPort)?;
+    out.extend(
+        "</port>\n      <socketType>SSL</socketType>\n      <authentication>password-cleartext</authentication>\n      <username>%EMAILADDRESS%</username>\n    </incomingServer>\n    <outgoingServer type=\"smtp\">\n      <hostname>".bytes(),
+    )?;
+    appendXml(mut out, server.view())?;
+    out.extend("</hostname>\n      <port>".bytes())?;
+    appendPort(mut out, ctx.settings.submissionPort)?;
+    out.extend(
+        "</port>\n      <socketType>SSL</socketType>\n      <authentication>password-cleartext</authentication>\n      <username>%EMAILADDRESS%</username>\n    </outgoingServer>\n  </emailProvider>\n</clientConfig>\n".bytes(),
+    )?;
+    return Response.of(200, "text/xml; charset=utf-8", out);
+}
+
+/// The text of the first element named `name` (any namespace prefix) in `xml`, trimmed; empty when there is none.
+fn elementText<region r>(xml: StringView<r>, name: StringView) -> StringView<r> {
+    var from: usize = 0;
+    loop {
+        let rest = xml[from..];
+        let found = match (rest.indexOf(name)) {
+            Some(i) => i,
+            null => { return ""; }
+        };
+        let start = from + found;
+        let end = start + name.length;
+        // `<name>` or `<prefix:name>` (with attributes), not a longer name or a closing tag.
+        let before = if (start > 0) xml.bytes()[start - 1] else 0;
+        let after = if (end < xml.length) xml.bytes()[end] else 0;
+        let opens = before == 0x3c || before == 0x3a;
+        let closesName = after == 0x3e || after == 0x20 || after == 0x09 || after == 0x0a || after == 0x0d;
+        let isClosingTag = start >= 2 && xml.bytes()[start - 2] == 0x3c && before == 0x2f;
+        if (opens && closesName && !isClosingTag && !(before == 0x3a && precededBySlash(xml, start))) {
+            let gt = match (xml[end..].indexOf(">")) {
+                Some(i) => end + i + 1,
+                null => { return ""; }
+            };
+            let lt = xml[gt..].indexOf("<") ?? (xml.length - gt);
+            return xml[gt..gt + lt].trim();
+        }
+        from = end;
+    }
+}
+
+/// Whether the prefixed name at `start` (after `prefix:`) belongs to a closing tag `</prefix:name>`.
+fn precededBySlash(xml: StringView, start: usize) -> bool {
+    var i = start;
+    while (i > 0) {
+        i -= 1;
+        let c = xml.bytes()[i];
+        if (c == 0x3c) {
+            return false;
+        }
+        if (c == 0x2f) {
+            return i > 0 && xml.bytes()[i - 1] == 0x3c;
+        }
+    }
+    return false;
+}
+
+/// Outlook's POX autodiscover: the request names the address; the answer is IMAP and SMTP with implicit TLS. A
+/// request for the mobilesync schema (ActiveSync) gets 404: there is no ActiveSync here, and the client goes on to
+/// other methods.
+async fn autodiscoverXml(
+    ctx: borrow WebContext,
+    mode: WebMode,
+    request: borrow Request,
+) -> Result<Response, AllocError> {
+    let body = StringView.fromUtf8(request.body.view()) ?? "";
+    let given = elementText(body, "EMailAddress");
+    let schema = elementText(body, "AcceptableResponseSchema");
+    var schemaLower = String.create();
+    lowerInto(schema, mut schemaLower)?;
+    let email = if (given.length > 0) given else "user@example.com";
+    var host = String.create();
+    hostOf(mode, request, mut host)?;
+    var server = String.create();
+    advertisedHost(ctx, host.view(), email, mut server)?;
+    if (schemaLower.view().indexOf("/mobilesync/") != null) {
+        return mobileSyncAutodiscover(email, server.view());
+    }
+    var out = Vector<u8>.create();
+    out.extend(
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<Autodiscover xmlns=\"http://schemas.microsoft.com/exchange/autodiscover/responseschema/2006\">\n  <Response xmlns=\"http://schemas.microsoft.com/exchange/autodiscover/outlook/responseschema/2006a\">\n    <User>\n      <DisplayName>".bytes(),
+    )?;
+    appendXml(mut out, email)?;
+    out.extend("</DisplayName>\n      <AutoDiscoverSMTPAddress>".bytes())?;
+    appendXml(mut out, email)?;
+    out.extend(
+        "</AutoDiscoverSMTPAddress>\n    </User>\n    <Account>\n      <AccountType>email</AccountType>\n      <Action>settings</Action>\n".bytes(),
+    )?;
+    appendProtocol(mut out, "IMAP", server.view(), ctx.settings.imapPort, email)?;
+    appendProtocol(mut out, "SMTP", server.view(), ctx.settings.submissionPort, email)?;
+    if (ctx.settings.advertiseExchange) {
+        appendExchangeProtocol(mut out, server.view(), email)?;
+    }
+    out.extend("    </Account>\n  </Response>\n</Autodiscover>\n".bytes())?;
+    return Response.of(200, "text/xml; charset=utf-8", out);
+}
+
+fn appendProtocol(
+    out: borrow mut Vector<u8>,
+    kind: StringView,
+    server: StringView,
+    port: u16,
+    email: StringView,
+) -> Result<void, AllocError> {
+    out.extend("      <Protocol>\n        <Type>".bytes())?;
+    out.extend(kind.bytes())?;
+    out.extend("</Type>\n        <Server>".bytes())?;
+    appendXml(out, server)?;
+    out.extend("</Server>\n        <Port>".bytes())?;
+    appendPort(out, port)?;
+    out.extend("</Port>\n        <SSL>on</SSL>\n        <LoginName>".bytes())?;
+    appendXml(out, email)?;
+    return out.extend("</LoginName>\n        <AuthRequired>on</AuthRequired>\n      </Protocol>\n".bytes());
+}
+
+/// Autodiscover v2: `/autodiscover/autodiscover.json/v1.0/<address>?Protocol=<p>`. AutodiscoverV1 points at the
+/// XML endpoint; IMAP and SMTP get their settings inline; others (ActiveSync, EWS, POP3) are not offered.
+async fn autodiscoverJson(
+    ctx: borrow WebContext,
+    mode: WebMode,
+    request: borrow Request,
+) -> Result<Response, AllocError> {
+    var protocol = String.create();
+    let hasProtocol = request.param("Protocol", mut protocol)?;
+    if (!hasProtocol) {
+        request.param("protocol", mut protocol)?;
+    }
+    let path = request.path.view();
+    let marker = "/v1.0/";
+    var email = String.create();
+    match (path.indexOf(marker)) {
+        Some(i) => { mhttp.percentDecode(path[i + marker.length..], false, mut email)?; }
+        null => {
+            request.param("Email", mut email)?;
+        }
+    }
+    var host = String.create();
+    hostOf(mode, request, mut host)?;
+    var server = String.create();
+    advertisedHost(ctx, host.view(), email.view(), mut server)?;
+    var p = String.create();
+    lowerInto(protocol.view().trim(), mut p)?;
+    var w = JsonWriter.create();
+    if (p.view() == "autodiscoverv1") {
+        var url = String.create();
+        url.append("https://")?;
+        url.append(server.view())?;
+        url.append("/Autodiscover/Autodiscover.xml")?;
+        w.beginObject();
+        w.stringField("Protocol", protocol.view().trim());
+        w.stringField("Url", url.view());
+        w.endObject();
+        return Response.json(200, w.finish()?);
+    }
+    if (p.view() == "activesync") {
+        var url = String.create();
+        url.append("https://")?;
+        url.append(server.view())?;
+        url.append("/Microsoft-Server-ActiveSync")?;
+        w.beginObject();
+        w.stringField("Protocol", "ActiveSync");
+        w.stringField("Url", url.view());
+        w.endObject();
+        return Response.json(200, w.finish()?);
+    }
+    if (p.view() == "ews") {
+        var url = String.create();
+        ewsUrl(server.view(), mut url)?;
+        w.beginObject();
+        w.stringField("Protocol", protocol.view().trim());
+        w.stringField("Url", url.view());
+        w.endObject();
+        return Response.json(200, w.finish()?);
+    }
+    let imap = p.view() == "imap" || p.view() == "imap4";
+    let smtp = p.view() == "smtp" || p.view() == "smtpauth";
+    if (!imap && !smtp) {
+        var message = String.create();
+        message.append("Protocol '")?;
+        message.append(protocol.view().trim())?;
+        message.append("' is not supported.")?;
+        w.beginObject();
+        w.stringField("ErrorCode", "ProtocolNotSupported");
+        w.stringField("ErrorMessage", message.view());
+        w.endObject();
+        return Response.json(404, w.finish()?);
+    }
+    w.beginObject();
+    w.stringField("Protocol", if (imap) "IMAP" else "SMTP");
+    w.stringField("Server", server.view());
+    w.stringField("Hostname", server.view());
+    w.integerField("Port", (if (imap) ctx.settings.imapPort else ctx.settings.submissionPort) as i64);
+    w.integerField("DirectoryPort", 0);
+    w.integerField("ReferralPort", 0);
+    w.stringField("Login", "%EMAILADDRESS%");
+    w.stringField("DomainRequired", "off");
+    w.stringField("DomainName", "");
+    w.stringField("SPA", "off");
+    w.stringField("SSL", "on");
+    w.stringField("AuthRequired", "on");
+    w.stringField("Encryption", "TLS");
+    w.endObject();
+    return Response.json(200, w.finish()?);
+}

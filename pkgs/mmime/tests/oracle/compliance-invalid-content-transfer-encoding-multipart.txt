@@ -1,0 +1,10 @@
+size 587
+envelope ("Tue, 12 Nov 2013 09:12:42 -0500" "test of multipart with a base64 Content-Transfer-Encoding" ((NIL NIL "mimekit" "example.com")) ((NIL NIL "mimekit" "example.com")) ((NIL NIL "mimekit" "example.com")) ((NIL NIL "mimekit" "example.com")) NIL NIL NIL "<54AD68C9E3B0184CAC6041320424FD1B5B81E74D@localhost.localdomain>")
+bodystructure (("text" "plain" ("charset" "utf-8") NIL NIL "7bit" 27 1 NIL NIL NIL NIL) "mixed" ("boundary" "----=_NextPart_000_003F_01CE98CE.6E826F90") NIL NIL NIL)
+body (("text" "plain" ("charset" "utf-8") NIL NIL "7bit" 27 1) "mixed")
+section HEADER 421 93d4292d7458cbed1b24ce5ced8291743ff9cc2ce944e96a162d986cfeefaef6
+section TEXT 166 6f07e48fac2c7a57b731074634abbb19460ead4fa2ecc3a6e34a996bce1c9c23
+section HEADER.FIELDS 326 35f3c5041a69793b5a14bf1a43b773c240caede46bddf12cdc8fb1cd8d86f503
+section HEADER.FIELDS.NOT 97 3bd3fba2bdc5f66ea0e392406d7ecc1f9363343b6075ac664563c954b2b7e2dc
+section 1 27 271e157fddc5d111cdedc381414a4f7934aee1e5ccf1ebb131840efe3425754a
+section 1.MIME 43 898726ecfd03d1be63b954310c21c8a7603e00979b91fb78949c88de26d728fb

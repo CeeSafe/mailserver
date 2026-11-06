@@ -1,0 +1,1483 @@
+// One SMTP session (RFC 5321, with RFC 3207 STARTTLS, RFC 4954 AUTH, RFC 6409 submission). Mail is stored before
+// the 250 that accepts it: every local copy and the queued remote copy in one transaction (`MailStore.accept`), so
+// a 250 means the message is safe on disk and in the database.
+
+import diskio.FileError;
+import diskio.Files;
+import diskio.RawFile;
+import mauth.AuthReport;
+import mauth.DkimVerifier;
+import mauth.DmarcPolicy;
+import mauth.authenticate;
+import mauth.authenticationResults;
+import mdns.IpAddress;
+import mscan.ClamdScan;
+import mscan.SpamScore;
+import mscan.SpamdScan;
+import mscan.VirusVerdict;
+import mscan.appendTenths;
+import encoding.Hex;
+import mmime.MessageIndex;
+import mmime.MimeScanner;
+import mmime.Renderer;
+import mmime.encodeMeta;
+import mstore.BlobWriter;
+import mstore.Delivered;
+import mstore.Delivery;
+import mstore.FLAG_SEEN;
+import mstore.Outbound;
+import mstore.Recipient;
+import mstore.StoreError;
+import mstore.StoreErrors;
+
+/// Errors a connection's task gives its task set; a session's own failures end only that session.
+public enum Fault {
+    OutOfMemory,
+}
+
+/// How many bytes of decoded DATA are gathered before they are written to the blob in one call.
+const WRITE_BATCH: usize = 256 * 1024;
+/// How much of a message is held in memory before the rest goes to a spool file.
+const MEMORY_LIMIT: usize = 1024 * 1024;
+/// How long a TLS handshake may take.
+const HANDSHAKE_TIMEOUT: u64 = 30000;
+/// Failed AUTH attempts before the session is closed.
+const MAX_AUTH_FAILURES: u32 = 3;
+
+/// A local recipient of the message being received.
+@noncopy
+struct LocalTarget {
+    userId: i64;
+    mailboxId: i64;
+    /// The address as given in RCPT TO, and the user's own address.
+    rcpt: Vector<u8>;
+    email: String;
+    /// Their active Sieve script, or empty.
+    script: String;
+}
+
+@noncopy
+struct Session {
+    mode: SmtpMode;
+    peer: [u8; 16];
+    peerText: Vector<u8>;
+    helo: Vector<u8>;
+    greeted: bool;
+    // AUTH
+    userId: i64;
+    userEmail: Vector<u8>;
+    authFailures: u32;
+    // The transaction (MAIL to the end of DATA)
+    inMail: bool;
+    sender: Vector<u8>;
+    declaredSize: u64;
+    locals: Vector<LocalTarget>;
+    remotes: Vector<String>;
+    recipients: usize;
+    firstRecipient: Vector<u8>;
+}
+
+fn newSession(mode: SmtpMode) -> Session => Session {
+    mode: mode,
+    peer: [0u8; 16],
+    peerText: Vector<u8>.create(),
+    helo: Vector<u8>.create(),
+    greeted: false,
+    userId: 0,
+    userEmail: Vector<u8>.create(),
+    authFailures: 0,
+    inMail: false,
+    sender: Vector<u8>.create(),
+    declaredSize: 0,
+    locals: Vector<LocalTarget>.create(),
+    remotes: Vector<String>.create(),
+    recipients: 0,
+    firstRecipient: Vector<u8>.create(),
+};
+
+fn resetTransaction(s: borrow mut Session) {
+    s.inMail = false;
+    s.sender.clear();
+    s.declaredSize = 0;
+    s.locals.clear();
+    s.remotes.clear();
+    s.recipients = 0;
+    s.firstRecipient.clear();
+}
+
+/// The client's address as 16 bytes (IPv4 mapped into IPv6) and as text.
+fn describePeer(
+    address: SocketAddress?,
+    key: borrow mut [u8; 16],
+    text: borrow mut Vector<u8>,
+) -> Result<void, AllocError> {
+    text.clear();
+    match (address) {
+        Some(SocketAddress.V4(a, _)) => {
+            key[10] = 0xff;
+            key[11] = 0xff;
+            for (i in 0..4) {
+                key[12 + i] = a[i];
+                if (i > 0) {
+                    text.push(0x2e)?;
+                }
+                appendDecimal(text, a[i] as u64)?;
+            }
+        }
+        Some(SocketAddress.V6(a, _, _)) => {
+            text.extend("IPv6:".bytes())?;
+            for (i in 0..16) {
+                key[i] = a[i];
+            }
+            for (g in 0..8) {
+                if (g > 0) {
+                    text.push(0x3a)?;
+                }
+                var hex = Vector<u8>.create();
+                Hex.encode(a[g * 2..g * 2 + 2], mut hex)?;
+                text.extend(hex.view())?;
+            }
+        }
+        null => { text.extend("unknown".bytes())?; }
+    }
+    return Ok();
+}
+
+/// What ended a conversation.
+const ENDED: u8 = 0;
+const UPGRADE: u8 = 1;
+
+/// Serves one connection to the end. Errors end the session, never the server.
+public async fn serveConnection(
+    ctx: borrow SmtpContext,
+    stream: AsyncTcpStream,
+    mode: SmtpMode,
+) -> Result<void, Fault> {
+    let proxied = match (await proxyPeer(ctx, stream)) {
+        Ok(p) => p,
+        Err(_) => { return Ok(); }
+    };
+    var wire = match (await openWire(ctx, stream, mode)) {
+        Ok(w) => w,
+        Err(_) => { return Ok(); }
+    };
+    wire.setProxied(proxied);
+    var session = newSession(mode);
+    match (describePeer(wire.peer(), mut session.peer, mut session.peerText)) {
+        Ok() => {}
+        Err(_) => { return Err(Fault.OutOfMemory); }
+    }
+    var banner = Vector<u8>.create();
+    match (bannerLine(ctx, mut banner)) {
+        Ok() => {}
+        Err(_) => { return Err(Fault.OutOfMemory); }
+    }
+    match (wire.send(banner.view())) {
+        Ok() => {}
+        Err(_) => { return Ok(); }
+    }
+    loop {
+        let ended = match (await converse(ctx, mut wire, mut session)) {
+            Ok(e) => e,
+            Err(_) => { return Ok(); }
+        };
+        if (ended != UPGRADE) {
+            break;
+        }
+        let current = ctx.tlsConfig();
+        let config = match (borrow current) {
+            Some(c) => c,
+            null => { return Ok(); }
+        };
+        // The handshake replaces the wire; what the client pipelined in the clear is dropped with the old buffer.
+        wire = match (await wire.startTls(config, HANDSHAKE_TIMEOUT)) {
+            Ok(w) => w,
+            Err(_) => { return Ok(); }
+        };
+        // A fresh session (RFC 3207 §4.2): the client must say EHLO again. No new banner.
+        let peer = session.peer;
+        var text = Vector<u8>.create();
+        match (text.extend(session.peerText.view())) {
+            Ok() => {}
+            Err(_) => { return Err(Fault.OutOfMemory); }
+        }
+        session = newSession(mode);
+        session.peer = peer;
+        session.peerText = text;
+    }
+    await wire.close();
+    return Ok();
+}
+
+/// The connection's wire: TLS first on the implicit-TLS port.
+async fn openWire(ctx: borrow SmtpContext, stream: AsyncTcpStream, mode: SmtpMode) -> Result<Wire, WireError> {
+    match (mode) {
+        SmtpMode.SubmissionTls => {
+            let current = ctx.tlsConfig();
+            match (borrow current) {
+                Some(config) => { return await Wire.implicitTls(stream, config, HANDSHAKE_TIMEOUT); }
+                null => { return Err(WireError.Tls); }
+            }
+        }
+        _ => { return Wire.plain(stream); }
+    }
+}
+
+fn bannerLine(ctx: borrow SmtpContext, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    out.extend("220 ".bytes())?;
+    out.extend(ctx.settings.hostname.view().bytes())?;
+    return out.extend(" ESMTP ready\r\n".bytes());
+}
+
+/// Reads and answers commands until QUIT or an error (`ENDED`), or an accepted STARTTLS (`UPGRADE`).
+async fn converse(ctx: borrow SmtpContext, wire: borrow mut Wire, s: borrow mut Session) -> Result<u8, WireError> {
+    var line = Vector<u8>.create();
+    loop {
+        match (await wire.readLine(mut line, ctx.settings.commandTimeout)) {
+            Ok() => {}
+            Err(WireError.TooLong) => {
+                wire.reply("500 5.5.2 Line too long")?;
+                return Ok(ENDED);
+            }
+            Err(WireError.Timeout) => {
+                wire.reply("421 4.4.2 Idle timeout, closing connection")?;
+                return Ok(ENDED);
+            }
+            Err(e) => { return Err(e); }
+        }
+        let command = Command.parse(line.view());
+        if (command.is("QUIT")) {
+            wire.reply("221 2.0.0 Bye")?;
+            return Ok(ENDED);
+        }
+        if (command.is("EHLO") || command.is("HELO")) {
+            hello(ctx, wire, s, line.view(), command)?;
+        } else if (command.is("STARTTLS")) {
+            if (startTls(ctx, wire, s)?) {
+                await wire.flush()?;
+                return Ok(UPGRADE);
+            }
+        } else if (command.is("AUTH")) {
+            if (!(await handleAuth(ctx, wire, s, line.view(), command)?)) {
+                return Ok(ENDED);
+            }
+        } else if (command.is("MAIL")) {
+            mail(ctx, wire, s, line.view(), command)?;
+        } else if (command.is("RCPT")) {
+            await recipient(ctx, wire, s, line.view(), command)?;
+        } else if (command.is("DATA")) {
+            await data(ctx, wire, s)?;
+        } else if (command.is("RSET")) {
+            resetTransaction(s);
+            wire.reply("250 2.0.0 OK")?;
+        } else if (command.is("NOOP")) {
+            wire.reply("250 2.0.0 OK")?;
+        } else if (command.is("VRFY") || command.is("EXPN")) {
+            // RFC 5321 §3.5.3: do not reveal who exists.
+            wire.reply("252 2.5.2 Cannot verify the user, but will accept the message")?;
+        } else if (command.is("HELP")) {
+            wire.reply("214 2.0.0 See RFC 5321")?;
+        } else if (command.is("BDAT")) {
+            wire.reply("502 5.5.1 CHUNKING is not supported")?;
+        } else {
+            wire.reply("500 5.5.1 Unrecognized command")?;
+        }
+    }
+}
+
+fn reply(wire: borrow mut Wire, text: StringView) -> Result<void, WireError> => wire.reply(text);
+
+fn grown(outcome: Result<void, AllocError>) -> Result<void, WireError> {
+    match (outcome) {
+        Ok() => { return Ok(); }
+        Err(_) => { return Err(WireError.OutOfMemory); }
+    }
+}
+
+/// The text after the verb, without surrounding spaces.
+fn argument<region a>(line: Slice<a, u8>, command: Command) -> Slice<a, u8> {
+    var start = command.argsAt;
+    var end = line.length;
+    while (start < end && line[start] == 0x20) {
+        start += 1;
+    }
+    while (end > start && line[end - 1] == 0x20) {
+        end -= 1;
+    }
+    return line[start..end];
+}
+
+fn hello(
+    ctx: borrow SmtpContext,
+    wire: borrow mut Wire,
+    s: borrow mut Session,
+    line: Slice<u8>,
+    command: Command,
+) -> Result<void, WireError> {
+    let name = argument(line, command);
+    if (name.length == 0) {
+        return wire.reply("501 5.5.4 Syntax: EHLO hostname");
+    }
+    resetTransaction(s);
+    s.helo.clear();
+    // Kept for the Received header: printable ASCII only, at most 255 bytes.
+    for (c in name) {
+        if (s.helo.length >= 255) {
+            break;
+        }
+        grown(s.helo.push(if (c > 0x20 && c < 0x7f) c else 0x3f))?;
+    }
+    s.greeted = true;
+    let host = ctx.settings.hostname.view();
+    if (command.is("HELO")) {
+        wire.send("250 ".bytes())?;
+        wire.send(host.bytes())?;
+        return wire.send("\r\n".bytes());
+    }
+    var out = Vector<u8>.create();
+    grown(out.extend("250-".bytes()))?;
+    grown(out.extend(host.bytes()))?;
+    grown(out.extend(" Hello ".bytes()))?;
+    grown(out.extend(s.helo.view()))?;
+    grown(out.extend("\r\n250-PIPELINING\r\n250-SIZE ".bytes()))?;
+    grown(appendDecimal(mut out, ctx.settings.maxMessageSize))?;
+    grown(out.extend("\r\n250-8BITMIME\r\n250-ENHANCEDSTATUSCODES\r\n".bytes()))?;
+    if (ctx.hasTls() && !wire.isTls()) {
+        grown(out.extend("250-STARTTLS\r\n".bytes()))?;
+    }
+    if (isSubmission(s.mode) && s.userId == 0 && (wire.isTls() || ctx.settings.plaintextAuth)) {
+        grown(out.extend("250-AUTH PLAIN LOGIN\r\n".bytes()))?;
+    }
+    grown(out.extend("250 SMTPUTF8\r\n".bytes()))?;
+    return wire.send(out.view());
+}
+
+/// True when STARTTLS was accepted (the caller then upgrades).
+fn startTls(ctx: borrow SmtpContext, wire: borrow mut Wire, s: borrow Session) -> Result<bool, WireError> {
+    if (!ctx.hasTls()) {
+        wire.reply("454 4.7.0 TLS not available")?;
+        return Ok(false);
+    }
+    if (wire.isTls()) {
+        wire.reply("503 5.5.1 Already using TLS")?;
+        return Ok(false);
+    }
+    if (!s.greeted) {
+        wire.reply("503 5.5.1 Send EHLO first")?;
+        return Ok(false);
+    }
+    wire.reply("220 2.0.0 Ready to start TLS")?;
+    return Ok(true);
+}
+
+/// Reads one SASL response line into `into`; false (after answering 501) if the client cancelled with `*`.
+async fn saslLine(
+    ctx: borrow SmtpContext,
+    wire: borrow mut Wire,
+    prompt: StringView,
+    into: borrow mut Vector<u8>,
+) -> Result<bool, WireError> {
+    wire.reply(prompt)?;
+    await wire.readLine(into, ctx.settings.commandTimeout)?;
+    if (into.length == 1 && into[0] == 0x2a) {
+        wire.reply("501 5.0.0 Authentication cancelled")?;
+        return Ok(false);
+    }
+    return Ok(true);
+}
+
+/// AUTH PLAIN and LOGIN (RFC 4954, RFC 4616). False when the session must end (too many failures).
+async fn handleAuth(
+    ctx: borrow SmtpContext,
+    wire: borrow mut Wire,
+    s: borrow mut Session,
+    line: Slice<u8>,
+    command: Command,
+) -> Result<bool, WireError> {
+    if (!isSubmission(s.mode)) {
+        wire.reply("503 5.5.1 AUTH is not available on this port")?;
+        return Ok(true);
+    }
+    if (!s.greeted) {
+        wire.reply("503 5.5.1 Send EHLO first")?;
+        return Ok(true);
+    }
+    if (!wire.isTls() && !ctx.settings.plaintextAuth) {
+        wire.reply("538 5.7.11 Encryption required for requested authentication mechanism")?;
+        return Ok(true);
+    }
+    if (s.userId != 0) {
+        wire.reply("503 5.5.1 Already authenticated")?;
+        return Ok(true);
+    }
+    if (s.inMail) {
+        wire.reply("503 5.5.1 AUTH is not allowed during a mail transaction")?;
+        return Ok(true);
+    }
+    // The guard first, so that a blocked address is refused before the SASL exchange.
+    var keyBytes = Vector<u8>.create();
+    grown(guardKey(s.peer, mut keyBytes))?;
+    if (await loginBlocked(ctx.login, ctx.store, s.peer)) {
+        await logLine(s, "auth refused, blocked:", keyBytes.view());
+        wire.reply("454 4.7.0 Temporary authentication failure")?;
+        return Ok(true);
+    }
+    let args = argument(line, command);
+    let space = match (args.indexOfByte(0x20)) {
+        Some(i) => i,
+        null => args.length,
+    };
+    let mechanism = args[0..space];
+    var initial = Vector<u8>.create();
+    var hasInitial = false;
+    if (space < args.length) {
+        grown(initial.extend(args[space + 1..]))?;
+        hasInitial = true;
+    }
+    var user = Vector<u8>.create();
+    var password = Vector<u8>.create();
+    var wellFormed = false;
+    if (mechanism.equalsIgnoreAsciiCase("PLAIN".bytes())) {
+        if (!hasInitial) {
+            if (!(await saslLine(ctx, wire, "334 ", mut initial)?)) {
+                return Ok(true);
+            }
+        } else if (initial.length == 1 && initial[0] == 0x3d) {
+            initial.clear(); // "=": an empty initial response
+        }
+        wellFormed = match (decodePlain(initial.view(), mut user, mut password)) {
+            Ok(b) => b,
+            Err(_) => { return Err(WireError.OutOfMemory); }
+        };
+    } else if (mechanism.equalsIgnoreAsciiCase("LOGIN".bytes())) {
+        var text = Vector<u8>.create();
+        if (hasInitial) {
+            grown(text.extend(initial.view()))?;
+        } else if (!(await saslLine(ctx, wire, "334 VXNlcm5hbWU6", mut text)?)) {
+            return Ok(true);
+        }
+        let userOk = match (decodeLoginLine(text.view(), mut user)) {
+            Ok(b) => b,
+            Err(_) => { return Err(WireError.OutOfMemory); }
+        };
+        if (!(await saslLine(ctx, wire, "334 UGFzc3dvcmQ6", mut text)?)) {
+            return Ok(true);
+        }
+        let passwordOk = match (decodeLoginLine(text.view(), mut password)) {
+            Ok(b) => b,
+            Err(_) => { return Err(WireError.OutOfMemory); }
+        };
+        wellFormed = userOk && passwordOk && user.length > 0;
+    } else {
+        wire.reply("504 5.5.4 Unrecognized authentication mechanism")?;
+        return Ok(true);
+    }
+    // The shared check (login.cee); a malformed exchange counts as a failure without a lookup.
+    var email = Vector<u8>.create();
+    var outcome: Result<i64, LoginRefusal> = Err(LoginRefusal.Unavailable);
+    if (wellFormed) {
+        outcome = await checkLogin(ctx.login, ctx.store, s.peer, user.view(), password.view(), mut email);
+    } else {
+        outcome = Err(LoginRefusal.BadCredentials(await loginFailed(ctx.login, ctx.store, s.peer, user.view())));
+    }
+    // The password is not kept.
+    for (i in 0..password.length) {
+        password[i] = 0;
+    }
+    let nowBlocked = match (outcome) {
+        Ok(userId) => {
+            s.userId = userId;
+            s.userEmail.clear();
+            grown(s.userEmail.extend(email.view()))?;
+            wire.reply("235 2.7.0 Authentication successful")?;
+            return Ok(true);
+        }
+        Err(LoginRefusal.Blocked) => {
+            await logLine(s, "auth refused, blocked:", keyBytes.view());
+            wire.reply("454 4.7.0 Temporary authentication failure")?;
+            return Ok(true);
+        }
+        Err(LoginRefusal.Unavailable) => {
+            wire.reply("454 4.7.0 Temporary authentication failure")?;
+            return Ok(true);
+        }
+        Err(LoginRefusal.BadCredentials(b)) => b,
+    };
+    s.authFailures += 1;
+    await logLine(s, "auth failed", user.view());
+    wire.reply("535 5.7.8 Authentication credentials invalid")?;
+    if (nowBlocked) {
+        await logLine(s, "address blocked:", keyBytes.view());
+    }
+    if (nowBlocked || s.authFailures >= MAX_AUTH_FAILURES) {
+        wire.reply("421 4.7.0 Too many authentication failures, closing connection")?;
+        return Ok(false);
+    }
+    return Ok(true);
+}
+
+/// The domain of SRS addresses: the configured one, else this server's hostname.
+fn srsDomainOf<region a>(ctx: borrow(a) SmtpContext) -> Slice<a, u8> =>
+    if (ctx.settings.srsDomain.length >
+        0) ctx.settings.srsDomain.view().bytes() else ctx.settings.hostname.view().bytes();
+
+fn domainOf(address: Slice<u8>) -> Slice<u8> {
+    match (address.lastIndexOf("@".bytes())) {
+        Some(at) => { return address[at + 1..]; }
+        null => { return address[address.length..]; }
+    }
+}
+
+fn pathError(wire: borrow mut Wire, error: PathError, isSender: bool) -> Result<void, WireError> {
+    match (error) {
+        PathError.Syntax => {
+            return wire.reply(
+                if (isSender) "501 5.5.4 Syntax: MAIL FROM:<address>" else "501 5.5.4 Syntax: RCPT TO:<address>",
+            );
+        }
+        PathError.Address => {
+            return wire.reply(
+                if (isSender) "501 5.1.7 Bad sender address syntax" else "501 5.1.3 Bad recipient address syntax",
+            );
+        }
+        PathError.Parameter => { return wire.reply("555 5.5.4 Unsupported parameter"); }
+    }
+}
+
+fn mail(
+    ctx: borrow SmtpContext,
+    wire: borrow mut Wire,
+    s: borrow mut Session,
+    line: Slice<u8>,
+    command: Command,
+) -> Result<void, WireError> {
+    if (!s.greeted) {
+        return wire.reply("503 5.5.1 Send EHLO first");
+    }
+    if (isSubmission(s.mode) && s.userId == 0) {
+        return wire.reply("530 5.7.0 Authentication required");
+    }
+    if (s.inMail) {
+        return wire.reply("503 5.5.1 Nested MAIL command");
+    }
+    let path = match (parsePath(line, command.argsAt, "FROM:", true)) {
+        Ok(p) => p,
+        Err(e) => { return pathError(wire, e, true); }
+    };
+    if (path.size > ctx.settings.maxMessageSize) {
+        return wire.reply("552 5.3.4 Message too large");
+    }
+    let address = line[path.at..path.at + path.length];
+    if (isSubmission(s.mode)) {
+        // A user sends as their own domain only (as the C# server checks).
+        if (address.length == 0 || !domainOf(address).equalsIgnoreAsciiCase(domainOf(s.userEmail.view()))) {
+            return wire.reply("550 5.7.1 Sender address rejected: not owned by user");
+        }
+    }
+    s.sender.clear();
+    grown(s.sender.extend(address))?;
+    s.declaredSize = path.size;
+    s.inMail = true;
+    return wire.reply("250 2.1.0 OK");
+}
+
+async fn recipient(
+    ctx: borrow SmtpContext,
+    wire: borrow mut Wire,
+    s: borrow mut Session,
+    line: Slice<u8>,
+    command: Command,
+) -> Result<void, WireError> {
+    if (!s.inMail) {
+        return wire.reply("503 5.5.1 Need MAIL first");
+    }
+    if (s.recipients >= ctx.settings.maxRecipients) {
+        return wire.reply("452 4.5.3 Too many recipients");
+    }
+    let path = match (parsePath(line, command.argsAt, "TO:", false)) {
+        Ok(p) => p,
+        Err(e) => { return pathError(wire, e, false); }
+    };
+    let address = match (StringView.fromUtf8(line[path.at..path.at + path.length])) {
+        Some(a) => a,
+        null => { return wire.reply("501 5.1.3 Bad recipient address syntax"); }
+    };
+    // A bounce to an address SRS made when this server forwarded a message: it goes on to the original sender.
+    if (!isSubmission(s.mode) && ctx.settings.srsSecret.length > 0) {
+        var original = Vector<u8>.create();
+        let today = Clock.unixMillis() / 1000 / 86400;
+        let srsDomain = srsDomainOf(ctx);
+        let reversed = match (srsReverse(
+            ctx.settings.srsSecret.view().bytes(),
+            srsDomain,
+            address.bytes(),
+            today,
+            mut original,
+        )) {
+            Ok(b) => b,
+            Err(_) => { return Err(WireError.OutOfMemory); }
+        };
+        if (reversed) {
+            var copy = String.create();
+            grown(copy.append(StringView.fromUtf8(original.view())!))?;
+            grown(s.remotes.push(copy))?;
+            if (s.recipients == 0) {
+                grown(s.firstRecipient.extend(address.bytes()))?;
+            }
+            s.recipients += 1;
+            return wire.reply("250 2.1.5 OK");
+        }
+    }
+    var to = Recipient.create();
+    match (await ctx.store.resolve(address, mut to)) {
+        Ok() => {}
+        Err(_) => { return wire.reply("451 4.3.0 Temporary lookup failure, try again later"); }
+    }
+    if (to.isUser()) {
+        if (to.overQuota(truncate<i64>(s.declaredSize))) {
+            return wire.reply("452 4.2.2 Mailbox full");
+        }
+        if (to.inboxId == 0) {
+            return wire.reply("451 4.3.0 Temporary lookup failure, try again later");
+        }
+        var known = false;
+        for (i in 0..s.locals.length) {
+            if (s.locals[i].userId == to.userId) {
+                known = true; // an alias of someone already a recipient: one copy
+            }
+        }
+        if (!known) {
+            var target = LocalTarget {
+                userId: to.userId,
+                mailboxId: to.inboxId,
+                rcpt: Vector<u8>.create(),
+                email: String.create(),
+                script: String.create(),
+            };
+            grown(target.rcpt.extend(address.bytes()))?;
+            grown(target.email.append(to.address.view()))?;
+            grown(target.script.append(to.script.view()))?;
+            grown(s.locals.push(target))?;
+        }
+    } else if (to.isRemote() || (to.isNotLocal() && s.userId != 0)) {
+        // A forwarding alias, or relaying for an authenticated user: queued for the relay. A user writing to an
+        // address that bounced recently is told now, not by another bounce later.
+        if (isSubmission(s.mode)) {
+            var reason = String.create();
+            match (await ctx.store.suppressed(if (to.isRemote()) to.address.view() else address, mut reason)) {
+                Ok(true) => {
+                    wire.send("550 5.1.1 This address bounced recently and is not tried again for now: ".bytes())?;
+                    var clean = Vector<u8>.create();
+                    for (c in reason.view().bytes()) {
+                        grown(clean.push(if (c < 0x20 || c == 0x7f) 0x20 else c))?;
+                    }
+                    wire.send(clean.view())?;
+                    return wire.send("\r\n".bytes());
+                }
+                Ok(false) => {}
+                Err(_) => {}
+            }
+        }
+        var copy = String.create();
+        if (to.isRemote()) {
+            grown(copy.append(to.address.view()))?;
+        } else {
+            grown(copy.append(address))?;
+        }
+        grown(s.remotes.push(copy))?;
+    } else if (to.isUnknownUser()) {
+        return wire.reply("550 5.1.1 User unknown");
+    } else {
+        return wire.reply("550 5.7.1 Relay access denied");
+    }
+    if (s.recipients == 0) {
+        grown(s.firstRecipient.extend(address.bytes()))?;
+    }
+    s.recipients += 1;
+    return wire.reply("250 2.1.5 OK");
+}
+
+/// Decoded DATA, held until the end of the message (authentication results go at its top, and are known only then):
+/// in memory up to `MEMORY_LIMIT`, the rest in a spool file. The DKIM verifier reads it as it arrives.
+@noncopy
+struct DataSink {
+    piece: Vector<u8>;
+    held: Vector<u8>;
+    /// The spool file, once the message outgrew memory.
+    spool: Vector<RawFile>;
+    spoolPath: String;
+    spooled: u64;
+    size: u64;
+    limit: u64;
+    tooLarge: bool;
+    failed: bool;
+    verify: bool;
+    dkim: DkimVerifier;
+
+    /// Takes `piece`, decoded by the wire.
+    async fn take(borrow mut this) -> Result<void, AllocError> {
+        this.size += this.piece.length as u64;
+        if (this.tooLarge || this.size > this.limit) {
+            // Read to the end, so the session stays in step, but keep nothing.
+            this.tooLarge = true;
+            return Ok();
+        }
+        if (this.verify) {
+            this.dkim.feed(this.piece.view())?;
+        }
+        if (this.spool.length == 0 && this.held.length + this.piece.length <= MEMORY_LIMIT) {
+            return this.held.extend(this.piece.view());
+        }
+        if (this.failed) {
+            return Ok();
+        }
+        if (this.spool.length == 0) {
+            let path = this.spoolPath.view();
+            let opened: Result<RawFile, FileError> = await Async.blocking(() => RawFile.createNew(path));
+            match (opened) {
+                Ok(f) => { this.spool.push(f)?; }
+                Err(_) => {
+                    this.failed = true;
+                    return Ok();
+                }
+            }
+        }
+        let file = borrow mut this.spool[0];
+        let bytes = this.piece.view();
+        let written: Result<void, FileError> = await Async.blocking(() => file.write(bytes));
+        match (written) {
+            Ok() => { this.spooled += bytes.length as u64; }
+            Err(_) => { this.failed = true; }
+        }
+        return Ok();
+    }
+
+    /// Removes the spool file, if there is one.
+    async fn dropSpool(borrow mut this) {
+        if (this.spool.length > 0) {
+            this.spool.clear();
+            let path = this.spoolPath.view();
+            let removed: Result<void, FileError> = await Async.blocking(() => Files.remove(path));
+            match (removed) {
+                Ok() => {}
+                Err(_) => {}
+            }
+        }
+    }
+}
+
+/// What the content scans found.
+struct ScanOutcome {
+    /// 0 clean or not scanned, 1 infected, 2 could not scan.
+    virus: u8;
+    spamScored: bool;
+    spamTenths: i64;
+    spamThresholdTenths: i64;
+}
+
+/// Sends what `sink` holds (memory, then spool) to a scanner, one piece at a time.
+async fn sendHeld(
+    sink: borrow DataSink,
+    clamd: borrow mut Vector<ClamdScan>,
+    spamd: borrow mut Vector<SpamdScan>,
+) -> Result<bool, AsyncError> {
+    if (clamd.length > 0) {
+        await clamd[0].send(sink.held.view())?;
+    } else {
+        await spamd[0].send(sink.held.view())?;
+    }
+    if (sink.spool.length == 0) {
+        return Ok(true);
+    }
+    var chunk = Vector<u8>.create();
+    match (chunk.resize(WRITE_BATCH, 0)) {
+        Ok() => {}
+        Err(_) => { return Ok(false); }
+    }
+    var offset: u64 = 0;
+    while (offset < sink.spooled) {
+        let file = borrow sink.spool[0];
+        let at = offset;
+        let read: Result<usize, FileError> = await Async.blocking(() => readChunk(file, mut chunk, at));
+        let n = match (read) {
+            Ok(n) => n,
+            Err(_) => { return Ok(false); }
+        };
+        if (n == 0) {
+            return Ok(false);
+        }
+        if (clamd.length > 0) {
+            await clamd[0].send(chunk[0..n])?;
+        } else {
+            await spamd[0].send(chunk[0..n])?;
+        }
+        offset += n as u64;
+    }
+    return Ok(true);
+}
+
+/// clamd's verdict on the held message, into `signature` when infected: 0 clean, 1 infected, 2 could not scan.
+async fn virusScan(
+    address: SocketAddress,
+    sink: borrow DataSink,
+    signature: borrow mut Vector<u8>,
+) -> Result<u8, AsyncError> {
+    var clamd = Vector<ClamdScan>.create();
+    var none = Vector<SpamdScan>.create();
+    let scan = await ClamdScan.open(address)?;
+    match (clamd.push(scan)) {
+        Ok() => {}
+        Err(_) => { return Ok(2); }
+    }
+    if (!(await sendHeld(sink, mut clamd, mut none)?)) {
+        return Ok(2);
+    }
+    match (await clamd[0].finish()?) {
+        VirusVerdict.Clean => { return Ok(0); }
+        VirusVerdict.Infected => {
+            match (signature.extend(clamd[0].signature.view().bytes())) {
+                Ok() => {}
+                Err(_) => {}
+            }
+            return Ok(1);
+        }
+        VirusVerdict.Unavailable => { return Ok(2); }
+    }
+}
+
+async fn spamScan(address: SocketAddress, sink: borrow DataSink, user: StringView) -> Result<SpamScore, AsyncError> {
+    var none = Vector<ClamdScan>.create();
+    var spamd = Vector<SpamdScan>.create();
+    let length = (sink.held.length as u64) + sink.spooled;
+    let scan = await SpamdScan.open(address, length, user)?;
+    match (spamd.push(scan)) {
+        Ok() => {}
+        Err(_) => { return Err(AsyncError.Cancelled); }
+    }
+    if (!(await sendHeld(sink, mut none, mut spamd)?)) {
+        return Ok(SpamScore { scored: false, spam: false, tenths: 0, thresholdTenths: 0 });
+    }
+    return await spamd[0].finish();
+}
+
+/// The header block without Authentication-Results fields that claim to be ours (RFC 8601 §5: a sender could
+/// forge them to look verified).
+fn withoutForgedResults(
+    header: Slice<u8>,
+    hostname: Slice<u8>,
+    dropSpam: bool,
+    out: borrow mut Vector<u8>,
+) -> Result<void, AllocError> {
+    var at: usize = 0;
+    while (at < header.length) {
+        let start = at;
+        var end = start;
+        loop {
+            match (header[end..].indexOfByte(0x0a)) {
+                Some(lf) => { end = end + lf + 1; }
+                null => {
+                    end = header.length;
+                    break;
+                }
+            }
+            if (end >= header.length || (header[end] != 0x20 && header[end] != 0x09)) {
+                break;
+            }
+        }
+        at = end;
+        let field = header[start..end];
+        // X-Spam-* fields from the sender would read as our verdict once we scored the message.
+        if (dropSpam && field.length > 7 && field[0..7].equalsIgnoreAsciiCase("X-Spam-".bytes())) {
+            continue;
+        }
+        let name = "Authentication-Results:".bytes();
+        if (field.length > name.length && field[0..name.length].equalsIgnoreAsciiCase(name)) {
+            // The authserv-id: the value up to ';' or whitespace.
+            var i = name.length;
+            while (i < field.length && (field[i] == 0x20 || field[i] == 0x09 || field[i] == 0x0d || field[i] == 0x0a)) {
+                i += 1;
+            }
+            var j = i;
+            while (j < field.length && field[j] != 0x3b && field[j] != 0x20 && field[j] != 0x09 && field[j] != 0x0d) {
+                j += 1;
+            }
+            if (field[i..j].equalsIgnoreAsciiCase(hostname)) {
+                continue;
+            }
+        }
+        out.extend(field)?;
+    }
+    return Ok();
+}
+
+fn readChunk(file: borrow RawFile, chunk: borrow mut Vector<u8>, at: u64) -> Result<usize, FileError> =>
+    file.readAt(mut chunk[..], at);
+
+/// Writes the final message: `prefix` (our header fields), then what was held, the header filtered; scans it as it
+/// goes and syncs it. The blob's writer and the message index come back.
+async fn writeMessage(
+    ctx: borrow SmtpContext,
+    prefix: Slice<u8>,
+    sink: borrow mut DataSink,
+    dropSpam: bool,
+    wantsHeader: bool,
+    writer: borrow mut Vector<BlobWriter>,
+    index: borrow mut MessageIndex,
+    sieveHeader: borrow mut Vector<u8>,
+) -> Result<bool, AllocError> {
+    let blobs = ctx.store.blobs();
+    let begun: Result<BlobWriter, StoreError> = await Async.blocking(() => blobs.begin());
+    match (begun) {
+        Ok(w) => { writer.push(w)?; }
+        Err(_) => { return Ok(false); }
+    }
+    var scanner = MimeScanner.create();
+    var first = Vector<u8>.create();
+    first.extend(prefix)?;
+    let header = sink.dkim.headerBlock();
+    if ((sink.verify || dropSpam) && sink.dkim.headerDone() && header.length > 0 && header.length <= sink.held.length) {
+        withoutForgedResults(header, ctx.settings.hostname.view().bytes(), dropSpam, mut first)?;
+        first.extend(sink.held[header.length..])?;
+    } else {
+        first.extend(sink.held.view())?;
+    }
+    scanner.feed(first.view())?;
+    if (wantsHeader) {
+        // The header as stored, for Sieve: through the blank line, or all of what is held.
+        let f = first.view();
+        sieveHeader.extend(f[0..headerEnd(f)])?;
+    }
+    let w = borrow mut writer[0];
+    let bytes = first.view();
+    let wrote: Result<void, StoreError> = await Async.blocking(() => w.write(bytes));
+    match (wrote) {
+        Ok() => {}
+        Err(_) => { return Ok(false); }
+    }
+    // The spooled rest, read back in batches.
+    if (sink.spool.length > 0) {
+        var chunk = Vector<u8>.create();
+        chunk.resize(WRITE_BATCH, 0)?;
+        var offset: u64 = 0;
+        while (offset < sink.spooled) {
+            let file = borrow sink.spool[0];
+            let at = offset;
+            let read: Result<usize, FileError> = await Async.blocking(() => readChunk(file, mut chunk, at));
+            let n = match (read) {
+                Ok(n) => n,
+                Err(_) => { return Ok(false); }
+            };
+            if (n == 0) {
+                return Ok(false);
+            }
+            scanner.feed(chunk[0..n])?;
+            let piece = chunk[0..n];
+            let more: Result<void, StoreError> = await Async.blocking(() => w.write(piece));
+            match (more) {
+                Ok() => {}
+                Err(_) => { return Ok(false); }
+            }
+            offset += n as u64;
+        }
+    }
+    let done: Result<void, StoreError> = await Async.blocking(() => w.finish());
+    match (done) {
+        Ok() => {}
+        Err(_) => { return Ok(false); }
+    }
+    scanner.finish(index)?;
+    return Ok(true);
+}
+
+/// Where the header block of `m` ends: after the blank line's line end, or the end.
+fn headerEnd(m: Slice<u8>) -> usize {
+    var i: usize = 0;
+    while (i + 1 < m.length) {
+        if (m[i] == 0x0a) {
+            if (m[i + 1] == 0x0a) {
+                return i + 2;
+            }
+            if (i + 2 < m.length && m[i + 1] == 0x0d && m[i + 2] == 0x0a) {
+                return i + 3;
+            }
+        }
+        i += 1;
+    }
+    return m.length;
+}
+
+/// The Received header (RFC 5321 §4.4) with the protocol of RFC 3848 (ESMTP, ESMTPS, ESMTPA, ESMTPSA).
+fn receivedHeader(
+    ctx: borrow SmtpContext,
+    wire: borrow Wire,
+    s: borrow Session,
+    id: Slice<u8>,
+    out: borrow mut Vector<u8>,
+) -> Result<void, AllocError> {
+    out.extend("Received: from ".bytes())?;
+    out.extend(s.helo.view())?;
+    out.extend(" ([".bytes())?;
+    out.extend(s.peerText.view())?;
+    out.extend("])\r\n\tby ".bytes())?;
+    out.extend(ctx.settings.hostname.view().bytes())?;
+    out.extend(" with ESMTP".bytes())?;
+    if (wire.isTls()) {
+        out.push(0x53)?;
+    }
+    if (s.userId != 0) {
+        out.push(0x41)?;
+    }
+    out.extend(" id ".bytes())?;
+    out.extend(id)?;
+    if (s.recipients == 1) {
+        // Only for one recipient, so recipients do not learn of each other (RFC 5321 §7.2).
+        out.extend("\r\n\tfor <".bytes())?;
+        for (c in s.firstRecipient.view()) {
+            out.push(if (c > 0x20 && c < 0x7f || c >= 0x80) c else 0x3f)?;
+        }
+        out.push(0x3e)?;
+    }
+    out.extend("; ".bytes())?;
+    appendDate(out, Clock.unixMillis() / 1000)?;
+    return out.extend("\r\n".bytes());
+}
+
+async fn data(ctx: borrow SmtpContext, wire: borrow mut Wire, s: borrow mut Session) -> Result<void, WireError> {
+    if (!s.inMail) {
+        return wire.reply("503 5.5.1 Need MAIL first");
+    }
+    if (s.recipients == 0) {
+        return wire.reply("554 5.5.1 No valid recipients");
+    }
+    var idBytes = [0u8; 6];
+    match (Random.fill(mut idBytes[..])) {
+        Ok() => {}
+        Err(_) => {}
+    }
+    var id = Vector<u8>.create();
+    grown(Hex.encode(idBytes[..], mut id))?;
+    var spoolPath = String.create();
+    grown(spoolPath.append(ctx.store.blobs().root()))?;
+    grown(spoolPath.append("/tmp/"))?;
+    grown(spoolPath.append(StringView.fromUtf8(id.view())!))?;
+    grown(spoolPath.append(".spool.part"))?; // .part: swept like an abandoned blob if the server dies
+    let verify = !isSubmission(s.mode) && ctx.resolver != null;
+    let spamCheck = !isSubmission(s.mode) && ctx.scan.spamd != null;
+    var sink = DataSink {
+        piece: Vector<u8>.create(),
+        held: Vector<u8>.create(),
+        spool: Vector<RawFile>.create(),
+        spoolPath: spoolPath,
+        spooled: 0,
+        size: 0,
+        limit: ctx.settings.maxMessageSize,
+        tooLarge: false,
+        failed: false,
+        verify: verify || spamCheck, // the verifier also keeps the header, which the filters need
+        dkim: DkimVerifier.create(),
+    };
+    wire.reply("354 End data with <CR><LF>.<CR><LF>")?;
+    var decoder = DotDecoder.create();
+    match (await wire.readData(mut decoder, mut sink, ctx.settings.dataTimeout)) {
+        Ok() => {}
+        Err(e) => {
+            await sink.dropSpool();
+            match (e) {
+                WireError.Timeout => { wire.reply("421 4.4.2 Timeout waiting for data, closing connection")?; }
+                _ => {}
+            }
+            return Err(e);
+        }
+    }
+    if (sink.tooLarge) {
+        await sink.dropSpool();
+        resetTransaction(s);
+        return wire.reply("552 5.3.4 Message too large");
+    }
+    if (sink.failed) {
+        await sink.dropSpool();
+        resetTransaction(s);
+        return wire.reply("451 4.3.0 Local error in processing, try again later");
+    }
+    // Viruses first (both ports): an infected message is refused whatever else is true of it.
+    let size = (sink.held.length as u64) + sink.spooled;
+    match (ctx.scan.clamd) {
+        Some(address) => {
+            if (size <= ctx.scan.maxScanSize) {
+                let now = Clock.unixMillis();
+                var verdict: u8 = 2;
+                var signature = Vector<u8>.create();
+                if (ctx.clamdBreaker.allows(now)) {
+                    let scanned: Result<u8, AsyncError> = await Async.timeout(
+                        ctx.scan.clamdTimeout,
+                        AsyncError.TimedOut,
+                        async () => await virusScan(address, sink, mut signature),
+                    );
+                    verdict = match (scanned) {
+                        Ok(v) => v,
+                        Err(_) => 2,
+                    };
+                    if (verdict == 2) {
+                        ctx.clamdBreaker.failed(now);
+                    } else {
+                        ctx.clamdBreaker.succeeded();
+                    }
+                }
+                if (verdict == 1) {
+                    await logLine(s, "virus", signature.view());
+                    await sink.dropSpool();
+                    resetTransaction(s);
+                    wire.send("554 5.7.1 Message rejected: virus found (".bytes())?;
+                    wire.send(signature.view())?;
+                    return wire.send(")\r\n".bytes());
+                }
+                if (verdict == 2 && !ctx.scan.acceptUnscanned) {
+                    await logLine(s, "virus scanner unavailable", "".bytes());
+                    await sink.dropSpool();
+                    resetTransaction(s);
+                    return wire.reply("451 4.7.1 Unable to scan for viruses now, try again later");
+                }
+            }
+        }
+        null => {}
+    }
+    // Inbound authentication (port 25 only): SPF, DKIM, DMARC, recorded in Authentication-Results.
+    var prefix = Vector<u8>.create();
+    var quarantine = false;
+    if (verify) {
+        var report = AuthReport.create();
+        let resolver = match (borrow ctx.resolver) {
+            Some(r) => r,
+            null => { return Err(WireError.OutOfMemory); }
+        };
+        let senderText = StringView.fromUtf8(s.sender.view())!;
+        let heloText = StringView.fromUtf8(s.helo.view())!;
+        let ip = IpAddress { bytes: s.peer };
+        match (await authenticate(
+            resolver,
+            ip,
+            senderText,
+            heloText,
+            mut sink.dkim,
+            Clock.unixMillis() / 1000,
+            mut report,
+        )) {
+            Ok() => {}
+            Err(_) => { return Err(WireError.OutOfMemory); }
+        }
+        match (report.dmarc.disposition) {
+            DmarcPolicy.Reject => {
+                await logLine(s, "rejected by DMARC", report.dmarc.fromDomain.view().bytes());
+                await sink.dropSpool();
+                resetTransaction(s);
+                return wire.reply("550 5.7.1 Message rejected: it fails the sender domain's DMARC policy");
+            }
+            DmarcPolicy.Quarantine => { quarantine = true; }
+            DmarcPolicy.None => {}
+        }
+        grown(authenticationResults(ctx.settings.hostname.view(), report, mut prefix))?;
+    }
+    // Spam (port 25 only): scored, sent to Junk at the junk score, refused at the reject score. A scanner that
+    // fails leaves the message unscored: spam is never a reason to refuse mail on a technicality.
+    var scored = false;
+    match (ctx.scan.spamd) {
+        Some(address) => {
+            let now = Clock.unixMillis();
+            if (!isSubmission(s.mode) && size <= ctx.scan.maxSpamSize && ctx.spamdBreaker.allows(now)) {
+                let user = if (s.locals.length == 1) StringView.fromUtf8(s.firstRecipient.view())! else "";
+                let result: Result<SpamScore, AsyncError> = await Async.timeout(
+                    ctx.scan.spamdTimeout,
+                    AsyncError.TimedOut,
+                    async () => await spamScan(address, sink, user),
+                );
+                match (result) {
+                    Ok(score) => {
+                        if (score.scored) {
+                            ctx.spamdBreaker.succeeded();
+                            scored = true;
+                            if (score.tenths >= ctx.scan.rejectTenths) {
+                                var detail = Vector<u8>.create();
+                                grown(appendTenths(mut detail, score.tenths))?;
+                                await logLine(s, "spam rejected, score", detail.view());
+                                await sink.dropSpool();
+                                resetTransaction(s);
+                                return wire.reply("550 5.7.1 Message rejected as spam");
+                            }
+                            let isSpam = score.tenths >= ctx.scan.junkTenths;
+                            if (isSpam) {
+                                quarantine = true;
+                            }
+                            grown(prefix.extend("X-Spam-Score: ".bytes()))?;
+                            grown(appendTenths(mut prefix, score.tenths))?;
+                            grown(prefix.extend("\r\nX-Spam-Status: ".bytes()))?;
+                            grown(prefix.extend(if (isSpam) "Yes".bytes() else "No".bytes()))?;
+                            grown(prefix.extend(", score=".bytes()))?;
+                            grown(appendTenths(mut prefix, score.tenths))?;
+                            grown(prefix.extend(" required=".bytes()))?;
+                            grown(appendTenths(mut prefix, ctx.scan.junkTenths))?;
+                            grown(prefix.extend("\r\n".bytes()))?;
+                        } else {
+                            ctx.spamdBreaker.failed(now);
+                        }
+                    }
+                    Err(_) => { ctx.spamdBreaker.failed(now); }
+                }
+            }
+        }
+        null => {}
+    }
+    grown(receivedHeader(ctx, wire, s, id.view(), mut prefix))?;
+    var writer = Vector<BlobWriter>.create();
+    var index = MessageIndex.create();
+    var sieveHeader = Vector<u8>.create();
+    var scripted = false;
+    for (i in 0..s.locals.length) {
+        if (s.locals[i].script.length > 0) {
+            scripted = true;
+        }
+    }
+    let wantsHeader = scripted && !quarantine;
+    let written = match (await writeMessage(
+        ctx,
+        prefix.view(),
+        mut sink,
+        scored,
+        wantsHeader,
+        mut writer,
+        mut index,
+        mut sieveHeader,
+    )) {
+        Ok(w) => w,
+        Err(_) => false,
+    };
+    await sink.dropSpool();
+    if (!written) {
+        if (writer.length > 0) {
+            let w = borrow mut writer[0];
+            await Async.blocking(() => w.discard());
+        }
+        resetTransaction(s);
+        return wire.reply("451 4.3.0 Local error in processing, try again later");
+    }
+    let stored = size + prefix.length as u64;
+    var replies = Vector<PendingReply>.create();
+    match (await deliver(ctx, s, mut writer[0], index, quarantine, sieveHeader.view(), stored, mut replies)) {
+        Ok(queued) => {
+            await logDelivery(s, id.view(), stored, queued);
+            if (replies.length > 0) {
+                match (await sendVacations(ctx, s.sender.view(), sieveHeader.view(), replies)) {
+                    Ok(n) => {
+                        if (n > 0) {
+                            await logLine(s, "vacation replies queued for", s.sender.view());
+                        }
+                    }
+                    Err(_) => { await logLine(s, "vacation reply failed for", s.sender.view()); }
+                }
+            }
+            resetTransaction(s);
+            wire.send("250 2.0.0 OK: queued as ".bytes())?;
+            wire.send(id.view())?;
+            return wire.send("\r\n".bytes());
+        }
+        Err(_) => {
+            let w = borrow mut writer[0];
+            await Async.blocking(() => w.discard());
+            resetTransaction(s);
+            return wire.reply("451 4.3.0 Local error in processing, try again later");
+        }
+    }
+}
+
+/// Stores the received message: every local recipient's INBOX (their Junk folder when DMARC asked for
+/// quarantine), the sender's Sent folder on submission, and the queue for remote recipients, in one transaction.
+async fn deliver(
+    ctx: borrow SmtpContext,
+    s: borrow Session,
+    writer: borrow mut BlobWriter,
+    index: borrow MessageIndex,
+    quarantine: bool,
+    sieveHeader: Slice<u8>,
+    size: u64,
+    replies: borrow mut Vector<PendingReply>,
+) -> Result<i64, StoreError> {
+    var renderer = Renderer.create();
+    var meta = Vector<u8>.create();
+    match (encodeMeta(index, mut renderer, mut meta)) {
+        Ok() => {}
+        Err(_) => { return Err(StoreError.OutOfMemory); }
+    }
+    let now = Clock.unixMillis();
+    var targets = Vector<Delivery>.create();
+    var outbound = Outbound.create();
+    for (i in 0..s.locals.length) {
+        if (sieveHeader.length > 0 && s.locals[i].script.length > 0) {
+            // Their Sieve script decides. Quarantined mail never gets here (no header was kept for it): it goes to
+            // Junk unfiltered, so a script can neither forward spam nor answer it.
+            var problem = String.create();
+            await sieveTargets(
+                ctx,
+                s.sender.view(),
+                s.locals[i],
+                sieveHeader,
+                size,
+                meta.view(),
+                now,
+                mut targets,
+                mut outbound,
+                replies,
+                mut problem,
+            )?;
+            if (problem.length > 0) {
+                await logLine(s, "sieve:", problem.view().bytes());
+            }
+            continue;
+        }
+        var mailbox = s.locals[i].mailboxId;
+        if (quarantine) {
+            match (await ctx.store.specialMailbox(s.locals[i].userId, "\\Junk")?) {
+                Some(junk) => { mailbox = junk; }
+                null => {}
+            }
+        }
+        var d = Delivery.to(s.locals[i].userId, mailbox, now);
+        match (d.meta.extend(meta.view())) {
+            Ok() => {}
+            Err(_) => { return Err(StoreError.OutOfMemory); }
+        }
+        match (targets.push(d)) {
+            Ok() => {}
+            Err(_) => { return Err(StoreError.OutOfMemory); }
+        }
+    }
+    if (isSubmission(s.mode)) {
+        // A copy in the sender's Sent folder, as Gmail and Fastmail keep (and as the C# server did).
+        match (await ctx.store.specialMailbox(s.userId, "\\Sent")?) {
+            Some(sent) => {
+                var d = Delivery.to(s.userId, sent, now);
+                d.flags = FLAG_SEEN;
+                match (d.meta.extend(meta.view())) {
+                    Ok() => {}
+                    Err(_) => { return Err(StoreError.OutOfMemory); }
+                }
+                match (targets.push(d)) {
+                    Ok() => {}
+                    Err(_) => { return Err(StoreError.OutOfMemory); }
+                }
+            }
+            null => {}
+        }
+    }
+    // What this server forwards (port 25: Sieve redirects, aliases to remote addresses) goes out with an SRS sender,
+    // so SPF at the destination checks us; a bounce comes back here and on to the original sender (srs.cee).
+    var rewritten = Vector<u8>.create();
+    var useSrs = false;
+    if (!isSubmission(
+        s.mode,
+    ) && ctx.settings.srsSecret.length > 0 && s.sender.length > 0 &&
+        outbound.recipients.length + s.remotes.length > 0) {
+        var from = Recipient.create();
+        let senderText = StringView.fromUtf8(s.sender.view())!;
+        let local = match (await ctx.store.resolve(senderText, mut from)) {
+            Ok() => !from.isNotLocal(),
+            Err(_) => false,
+        };
+        if (!local) {
+            let today = Clock.unixMillis() / 1000 / 86400;
+            useSrs = match (srsForward(
+                ctx.settings.srsSecret.view().bytes(),
+                srsDomainOf(ctx),
+                s.sender.view(),
+                today,
+                mut rewritten,
+            )) {
+                Ok(b) => b,
+                Err(_) => { return Err(StoreError.OutOfMemory); }
+            };
+        }
+    }
+    match (outbound.sender.append(StringView.fromUtf8(if (useSrs) rewritten.view() else s.sender.view())!)) {
+        Ok() => {}
+        Err(_) => { return Err(StoreError.OutOfMemory); }
+    }
+    for (i in 0..s.remotes.length) {
+        var r = String.create();
+        match (r.append(s.remotes[i].view())) {
+            Ok() => {}
+            Err(_) => { return Err(StoreError.OutOfMemory); }
+        }
+        match (outbound.recipients.push(r)) {
+            Ok() => {}
+            Err(_) => { return Err(StoreError.OutOfMemory); }
+        }
+    }
+    outbound.userId = s.userId;
+    var done = Vector<Delivered>.create();
+    return await ctx.store.accept(writer, targets, outbound, mut done);
+}
+
+// ---- Logging: one line per event, on standard error ----
+
+async fn logLine(s: borrow Session, event: StringView, detail: Slice<u8>) {
+    var text = Vector<u8>.create();
+    match (logInto(mut text, s, event, detail)) {
+        Ok() => {}
+        Err(_) => { return; }
+    }
+    match (StringView.fromUtf8(text.view())) {
+        Some(t) => {
+            match (await AsyncConsole.writeError(t)) {
+                Ok() => {}
+                Err(_) => {}
+            }
+        }
+        null => {}
+    }
+}
+
+fn logInto(
+    out: borrow mut Vector<u8>,
+    s: borrow Session,
+    event: StringView,
+    detail: Slice<u8>,
+) -> Result<void, AllocError> {
+    out.extend("smtp [".bytes())?;
+    out.extend(s.peerText.view())?;
+    out.extend("] ".bytes())?;
+    out.extend(event.bytes())?;
+    out.push(0x20)?;
+    for (c in detail) {
+        out.push(if (c >= 0x20 && c < 0x7f) c else 0x3f)?;
+    }
+    return out.push(0x0a);
+}
+
+async fn logDelivery(s: borrow Session, id: Slice<u8>, size: u64, queued: i64) {
+    var detail = Vector<u8>.create();
+    match (deliveryDetail(mut detail, s, id, size, queued)) {
+        Ok() => { await logLine(s, "accepted", detail.view()); }
+        Err(_) => {}
+    }
+}
+
+fn deliveryDetail(
+    out: borrow mut Vector<u8>,
+    s: borrow Session,
+    id: Slice<u8>,
+    size: u64,
+    queued: i64,
+) -> Result<void, AllocError> {
+    out.extend(id)?;
+    out.extend(" from=<".bytes())?;
+    out.extend(s.sender.view())?;
+    out.extend("> size=".bytes())?;
+    appendDecimal(out, size)?;
+    out.extend(" local=".bytes())?;
+    appendDecimal(out, s.locals.length as u64)?;
+    out.extend(" remote=".bytes())?;
+    appendDecimal(out, s.remotes.length as u64)?;
+    if (queued > 0) {
+        out.extend(" queue=".bytes())?;
+        appendDecimal(out, truncate<u64>(queued))?;
+    }
+    return Ok();
+}

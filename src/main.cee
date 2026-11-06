@@ -1,0 +1,1059 @@
+// mailserver: the server, and the commands to set it up.
+//
+//   mailserver [--config FILE] serve                       (the default; FILE defaults to ./mailserver.toml)
+//   mailserver [--config FILE] add-domain example.org
+//   mailserver [--config FILE] add-user alice@example.org PASSWORD [QUOTA_BYTES]
+//   mailserver [--config FILE] set-password alice@example.org PASSWORD
+//   mailserver [--config FILE] add-admin USERNAME PASSWORD [DOMAIN]   (the admin UI's login: the server, or a domain)
+//   mailserver [--config FILE] set-sieve alice@example.org SCRIPT_FILE [NAME]   (checks it, stores it, activates it)
+//   mailserver [--config FILE] set-vacation alice@example.org DAYS SUBJECT MESSAGE
+//   mailserver [--config FILE] clear-sieve alice@example.org                    (no script runs; scripts are kept)
+//   mailserver [--config FILE] block-ip ADDRESS [HOURS]     (from logging in: for good without HOURS; IPv6 by /64)
+//   mailserver [--config FILE] unblock-ip ADDRESS
+//   mailserver [--config FILE] unsuppress ADDRESS                            (try a suppressed address again)
+//   mailserver [--config FILE] dkim-generate DOMAIN SELECTOR [rsa|ed25519]   (inactive; prints the DNS record)
+//   mailserver [--config FILE] dkim-import DOMAIN SELECTOR KEY.pem
+//   mailserver [--config FILE] dkim-activate DOMAIN SELECTOR                 (once the record is published)
+//   mailserver [--config FILE] dkim-show DOMAIN [SELECTOR]                   (the active key's record by default)
+//   mailserver [--config FILE] dns-records DOMAIN     (the zone records to publish: MX, SPF, DMARC, DKIM, MTA-STS,
+//                                                     autoconfig, and TLSA for DANE from [tls]'s certificate)
+//   mailserver [--config FILE] import-cosmomail       (copy [import]'s CosmoMailServer database, and its S3 content;
+//                                                     again later for what changed: see deploy/CUTOVER.md)
+
+import bcrypt.Bcrypt;
+import msmtp.ScanSettings;
+import msmtp.SmtpContext;
+import msmtp.SmtpMode;
+import msmtp.SmtpSettings;
+import msmtp.ProxyNetwork;
+import msmtp.parseProxyNetwork;
+import msmtp.guardKey;
+import msmtp.serve;
+import mimap.ImapMode;
+import mimap.ImapSettings;
+import msieve.Script;
+import msieve.parseScript;
+import mqueue.Relay;
+import mqueue.RelaySettings;
+import mqueue.TLS_POLICY_OPPORTUNISTIC;
+import mqueue.TLS_POLICY_PUBLISHED;
+import mqueue.TLS_POLICY_VERIFIED;
+import mqueue.relayJanitor;
+import mqueue.relayWorker;
+import mstore.LoginRecord;
+import pkey.KeyKind;
+import pkey.PrivateKey;
+import encoding.Base64;
+import encoding.Hex;
+import sha256.Sha256;
+import postgres.PgParams;
+import mstore.MailStore;
+import mstore.StoreError;
+import mstore.StoreErrors;
+import postgres.PgConfig;
+import postgres.PgErrors;
+import mdns.IpAddress;
+import mdns.Resolver;
+import mdns.parseIp;
+import tls.TlsConfig;
+import mweb.AcmeSettings;
+import mweb.AdminSettings;
+import mweb.CertificateFiles;
+import mweb.readInto;
+import mweb.renewCertificates;
+import mweb.writePlaceholder;
+import mweb.WebContext;
+import mweb.watchCertificate;
+import tls.SharedTlsConfig;
+import mweb.WebMode;
+import mweb.WebSettings;
+
+fn die(message: StringView) -> never {
+    Console.writeErrorLine(message);
+    Process.exit(1);
+}
+
+fn readFile(path: StringView) -> Vector<u8> {
+    var file = match (File.open(path)) {
+        Ok(f) => f,
+        Err(_) => {
+            Console.writeError("mailserver: cannot read ");
+            die(path);
+        }
+    };
+    var out = Vector<u8>.create();
+    var buffer = [0u8; 8192];
+    loop {
+        let n = file.read(mut buffer[..])!;
+        if (n == 0) {
+            return out;
+        }
+        out.extend(buffer[0..n])!;
+    }
+}
+
+/// Whether the arguments start with `--config FILE`.
+fn hasConfigFlag() -> bool {
+    match (Process.argument(1)) {
+        Some(a) => { return a == "--config"; }
+        null => { return false; }
+    }
+}
+
+fn configFile() -> StringView {
+    if (hasConfigFlag()) {
+        match (Process.argument(2)) {
+            Some(p) => { return p; }
+            null => {
+                die("mailserver: --config needs a file");
+            }
+        }
+    }
+    return "mailserver.toml";
+}
+
+fn main() {
+    let at: usize = if (hasConfigFlag()) 3 else 1;
+    let configPath = configFile();
+    let command = match (Process.argument(at)) {
+        Some(c) => c,
+        null => "serve",
+    };
+    let bytes = readFile(configPath);
+    let text = match (StringView.fromUtf8(bytes.view())) {
+        Some(t) => t,
+        null => {
+            die("mailserver: the configuration is not UTF-8");
+        }
+    };
+    let config = match (readConfig(text)) {
+        Ok(c) => c,
+        Err(e) => {
+            Console.writeError("mailserver: ");
+            Console.writeError(configPath);
+            if (e.line > 0) {
+                Console.writeError(" line ");
+                let number = lineText(e.line);
+                Console.writeError(number.view());
+            }
+            Console.writeError(": ");
+            die(e.message.view());
+        }
+    };
+    if (command == "serve") {
+        // TLS files are read here, before the async world: file reads block.
+        var tlsConfig: SharedTlsConfig? = null;
+        var certificate: CertificateFiles? = null;
+        let acme = acmeOf(config);
+        match (borrow acme) {
+            Some(a) => {
+                // Before the first certificate: a self-signed one, so TLS can start; the renewal replaces it.
+                var existing = Vector<u8>.create();
+                if (!readInto(config.certificate.view(), mut existing) &&
+                    !writePlaceholder(config.certificate.view(), config.key.view(), a.names)) {
+                    die("mailserver: [tls] certificate and key could not be written for ACME");
+                }
+            }
+            null => {}
+        }
+        if (config.certificate.length > 0) {
+            let chain = readFile(config.certificate.view());
+            let key = readFile(config.key.view());
+            let server = match (TlsConfig.server(chain.view(), key.view())) {
+                Ok(t) => t,
+                Err(_) => { die("mailserver: the TLS certificate or key could not be used"); }
+            };
+            tlsConfig = SharedTlsConfig.create(server)!;
+            certificate = CertificateFiles.create(config.certificate.view(), config.key.view(), chain, key)!;
+        }
+        // The resolver: the configured servers, or /etc/resolv.conf's (read here: it is a file).
+        var resolver: Resolver? = null;
+        if (config.inboundAuth) {
+            resolver = makeResolver(config);
+        }
+        var workers = config.workers;
+        if (workers == 0) {
+            workers = 4;
+        }
+        let relay = relayOf(config);
+        let proxies = proxyNetworks(config);
+        match (Async.runWorkers(workers, run(config, tlsConfig, certificate, acme, resolver, relay, proxies))) {
+            Ok() => {}
+            Err(e) => {
+                Console.writeError("mailserver: ");
+                die(StoreErrors.describe(e));
+            }
+        }
+        return;
+    }
+    // A script to store: read here (file reads block), and compiled first, so a broken script is never activated.
+    var script = Vector<u8>.create();
+    if (command == "set-sieve") {
+        match (Process.argument(at + 2)) {
+            Some(path) => { script = readFile(path); }
+            null => { die("usage: mailserver set-sieve USER SCRIPT_FILE [NAME]"); }
+        }
+    } else if (command == "set-vacation") {
+        script = vacationScript(at);
+    } else if (command == "dkim-import") {
+        match (Process.argument(at + 3)) {
+            Some(path) => { script = readFile(path); }
+            null => { die("usage: mailserver dkim-import DOMAIN SELECTOR KEY.pem"); }
+        }
+    }
+    if (command == "dns-records" && config.certificate.length > 0) {
+        // The certificate, for the TLSA record (read here: file reads block). Missing is no error.
+        let found = readInto(config.certificate.view(), mut script);
+    }
+    if (script.length > 0 && command != "dkim-import" && command != "dns-records") {
+        var compiled = Script.create();
+        if (!parseScript(script.view(), mut compiled)!) {
+            Console.writeError("mailserver: the script does not compile: line ");
+            let number = lineText(compiled.errorLine as usize);
+            Console.writeError(number.view());
+            Console.writeError(": ");
+            die(compiled.error.view());
+        }
+    }
+    var output = String.create();
+    match (Async.run(admin(config, command, at, script, mut output))) {
+        Ok() => {
+            if (output.length > 0) {
+                Console.write(output.view());
+            }
+        }
+        Err(e) => {
+            Console.writeError("mailserver: ");
+            die(StoreErrors.describe(e));
+        }
+    }
+}
+
+fn lineText(n: usize) -> String {
+    var digits = Vector<u8>.create();
+    var v = n;
+    loop {
+        digits.push(0x30 + truncate<u8>(v % 10))!;
+        v = v / 10;
+        if (v == 0) {
+            break;
+        }
+    }
+    var text = String.create();
+    var i = digits.length;
+    while (i > 0) {
+        i -= 1;
+        let one = [digits[i]];
+        text.append(StringView.fromUtf8(one[..])!)!;
+    }
+    return text;
+}
+
+async fn openStore(config: borrow Config) -> Result<MailStore, StoreError> {
+    let pg = match (PgConfig.parse(config.database.view())) {
+        Ok(p) => p,
+        Err(e) => { return Err(StoreError.Db(e)); }
+    };
+    return await MailStore.open(pg, config.poolSize, config.blobs.view());
+}
+
+/// The setup commands.
+async fn admin(
+    config: Config,
+    command: StringView,
+    at: usize,
+    script: Vector<u8>,
+    output: borrow mut String,
+) -> Result<void, StoreError> {
+    let store = await openStore(config)?;
+    if (command == "import-cosmomail") {
+        return await importCosmoMail(config, store);
+    }
+    let first = match (Process.argument(at + 1)) {
+        Some(a) => a,
+        null => { return Err(StoreError.Invalid); }
+    };
+    if (command == "add-domain") {
+        await store.createDomain(first)?;
+        return Ok();
+    }
+    if (command == "dkim-generate" ||
+        command == "dkim-import" || command == "dkim-activate" || command == "dkim-show") {
+        return await dkimCommand(store, command, at, script, output);
+    }
+    if (command == "unsuppress") {
+        if (!(await store.unsuppress(first)?)) {
+            return Err(StoreError.NotFound);
+        }
+        return Ok();
+    }
+    if (command == "block-ip" || command == "unblock-ip") {
+        let ip = match (parseIp(first.bytes())) {
+            Some(a) => a,
+            null => { return Err(StoreError.Invalid); }
+        };
+        var key = Vector<u8>.create();
+        match (guardKey(ip.bytes, mut key)) {
+            Ok() => {}
+            Err(_) => { return Err(StoreError.OutOfMemory); }
+        }
+        let text = StringView.fromUtf8(key.view())!;
+        if (command == "unblock-ip") {
+            return await store.unblockAddress(text);
+        }
+        var hours: i64? = null;
+        match (Process.argument(at + 2)) {
+            Some(h) => {
+                hours = h.parseInt<i64>();
+                if (hours == null) {
+                    return Err(StoreError.Invalid);
+                }
+            }
+            null => {}
+        }
+        return await store.blockAddress(text, hours);
+    }
+    if (command == "set-sieve" || command == "set-vacation" || command == "clear-sieve") {
+        var login = LoginRecord.create();
+        if (!(await store.findLogin(first, mut login)?)) {
+            return Err(StoreError.NotFound);
+        }
+        if (command == "clear-sieve") {
+            return await store.clearSieve(login.userId);
+        }
+        let given = if (command == "set-sieve") Process.argument(at + 3) else null;
+        let name = match (given) {
+            Some(n) => n,
+            null => (if (command == "set-sieve") "main" else "vacation"),
+        };
+        let content = match (StringView.fromUtf8(script.view())) {
+            Some(c) => c,
+            null => { return Err(StoreError.Invalid); }
+        };
+        return await store.setSieve(login.userId, name, content);
+    }
+    if (command == "dns-records") {
+        return await dnsRecords(store, config.hostname.view(), first, script.view(), output);
+    }
+    if (command == "add-admin") {
+        let password = match (Process.argument(at + 2)) {
+            Some(p) => p,
+            null => { return Err(StoreError.Invalid); }
+        };
+        if (password.length < 8) {
+            return Err(StoreError.Invalid);
+        }
+        let secret = password.bytes();
+        let hashed: Result<String, StoreError> = await Async.blocking(() => hashPassword(secret));
+        let hash = hashed?;
+        return await store.setAdmin(first, hash.view(), Process.argument(at + 3));
+    }
+    if (command == "add-user" || command == "set-password") {
+        let password = match (Process.argument(at + 2)) {
+            Some(p) => p,
+            null => { return Err(StoreError.Invalid); }
+        };
+        let secret = password.bytes();
+        let hashed: Result<String, StoreError> = await Async.blocking(() => hashPassword(secret));
+        let hash = hashed?;
+        if (command == "add-user") {
+            var quota: i64? = null;
+            match (Process.argument(at + 3)) {
+                Some(q) => { quota = q.parseInt<i64>(); }
+                null => {}
+            }
+            await store.createUser(first, hash.view(), quota)?;
+            return Ok();
+        }
+        var login = LoginRecord.create();
+        if (!(await store.findLogin(first, mut login)?)) {
+            return Err(StoreError.NotFound);
+        }
+        return await store.setPassword(login.userId, hash.view());
+    }
+    return Err(StoreError.Invalid);
+}
+
+/// The DKIM commands. `pem` holds the key file for dkim-import.
+async fn dkimCommand(
+    store: borrow MailStore,
+    command: StringView,
+    at: usize,
+    pem: Vector<u8>,
+    output: borrow mut String,
+) -> Result<void, StoreError> {
+    var domain = String.create();
+    match (Process.argument(at + 1)) {
+        Some(d) => {
+            var lowered = Vector<u8>.create();
+            for (c in d.bytes()) {
+                grown(lowered.push(if (c >= 0x41 && c <= 0x5a) c + 0x20 else c))?;
+            }
+            grown(domain.append(StringView.fromUtf8(lowered.view())!))?;
+        }
+        null => { return Err(StoreError.Invalid); }
+    }
+    let given = Process.argument(at + 2);
+    if (command == "dkim-show") {
+        var selector = String.create();
+        var der = Vector<u8>.create();
+        let wanted = match (given) {
+            Some(s) => s,
+            null => "",
+        };
+        if (!(await store.dkimKey(domain.view(), wanted, mut selector, mut der)?)) {
+            return Err(StoreError.NotFound);
+        }
+        let key = match (PrivateKey.fromDer(der.view())) {
+            Ok(k) => k,
+            Err(_) => { return Err(StoreError.Invalid); }
+        };
+        return recordText(domain.view(), selector.view(), key, output);
+    }
+    let selector = match (given) {
+        Some(s) => s,
+        null => { return Err(StoreError.Invalid); }
+    };
+    if (command == "dkim-activate") {
+        return await store.activateDkimKey(domain.view(), selector);
+    }
+    var made: Result<PrivateKey, pkey.KeyError> = Err(pkey.KeyError.BadKey);
+    if (command == "dkim-import") {
+        made = PrivateKey.fromPem(pem.view());
+    } else {
+        let kind = match (Process.argument(at + 3)) {
+            Some(k) => k,
+            null => "rsa",
+        };
+        if (kind == "ed25519") {
+            made = PrivateKey.generate(KeyKind.Ed25519, 0);
+        } else if (kind == "rsa") {
+            made = PrivateKey.generate(KeyKind.Rsa, 2048);
+        } else {
+            return Err(StoreError.Invalid); // the kind is rsa or ed25519
+        }
+    }
+    let key = match (made) {
+        Ok(k) => k,
+        Err(_) => { return Err(StoreError.Invalid); } // not a usable RSA or Ed25519 private key
+    };
+    await store.addDkimKey(domain.view(), selector, key.der())?;
+    grown(output.append("Publish this record, then run dkim-activate:\n"))?;
+    return recordText(domain.view(), selector, key, output);
+}
+
+/// The key's DNS record, as a zone file line, its text split into strings of at most 255 bytes, into `out`.
+/// The records a domain needs, in zone-file form, into `out`.
+async fn dnsRecords(
+    store: borrow MailStore,
+    hostname: StringView,
+    domain: StringView,
+    certificate: Slice<u8>,
+    out: borrow mut String,
+) -> Result<void, StoreError> {
+    var params = PgParams.create();
+    match (params.text(domain)) {
+        Ok() => {}
+        Err(_) => { return Err(StoreError.OutOfMemory); }
+    }
+    var lease = match (await store.connections().acquire()) {
+        Ok(l) => l,
+        Err(e) => { return Err(StoreError.Db(e)); }
+    };
+    let rows = match (await lease.connection().query(
+        "SELECT mta_sts_mode, mta_sts_id FROM domains WHERE name = lower($1)",
+        params,
+    )) {
+        Ok(r) => r,
+        Err(e) => { return Err(StoreError.Db(e)); }
+    };
+    if (rows.rowCount() == 0) {
+        return Err(StoreError.NotFound);
+    }
+    grown(out.append("; mail for "))?;
+    grown(out.append(domain))?;
+    grown(out.append("\n"))?;
+    grown(zoneLine(out, domain, "MX", "10 ", hostname, "."))?;
+    grown(zoneLine(out, domain, "TXT", "\"v=spf1 mx -all", "", "\""))?;
+    var dmarc = String.create();
+    grown(dmarc.append("_dmarc."))?;
+    grown(dmarc.append(domain))?;
+    var dmarcValue = String.create();
+    grown(dmarcValue.append("\"v=DMARC1; p=quarantine; rua=mailto:postmaster@"))?;
+    grown(dmarcValue.append(domain))?;
+    grown(zoneLine(out, dmarc.view(), "TXT", dmarcValue.view(), "", "\""))?;
+    var selector = String.create();
+    var der = Vector<u8>.create();
+    var found = await store.dkimKey(domain, "", mut selector, mut der)?;
+    if (!found) {
+        found = await store.dkimKey(domain, "mail", mut selector, mut der)?;
+    }
+    if (found) {
+        match (PrivateKey.fromDer(der.view())) {
+            Ok(k) => { recordText(domain, selector.view(), k, out)?; }
+            Err(_) => {}
+        }
+    } else {
+        grown(out.append("; no DKIM key yet: mailserver dkim-generate DOMAIN mail, then dkim-activate\n"))?;
+    }
+    let mode = rows.text(0, 0) ?? "none";
+    if (mode != "none") {
+        var name = String.create();
+        grown(name.append("_mta-sts."))?;
+        grown(name.append(domain))?;
+        var value = String.create();
+        grown(value.append("\"v=STSv1; id="))?;
+        grown(value.append(rows.text(0, 1) ?? ""))?;
+        grown(zoneLine(out, name.view(), "TXT", value.view(), "", "\""))?;
+        name.clear();
+        grown(name.append("mta-sts."))?;
+        grown(name.append(domain))?;
+        grown(zoneLine(out, name.view(), "CNAME", "", hostname, "."))?;
+    }
+    var host = String.create();
+    grown(host.append("autoconfig."))?;
+    grown(host.append(domain))?;
+    grown(zoneLine(out, host.view(), "CNAME", "", hostname, "."))?;
+    host.clear();
+    grown(host.append("autodiscover."))?;
+    grown(host.append(domain))?;
+    grown(zoneLine(out, host.view(), "CNAME", "", hostname, "."))?;
+    // DANE (RFC 7672): the certificate's public key (3 1 1). ACME renewals keep the key, so the record stays right;
+    // a certificate replaced by hand with a new key needs a new record first.
+    var blocks = Vector<Vector<u8>>.create();
+    grown(macme.pemBlocks(certificate, "CERTIFICATE", mut blocks))?;
+    if (blocks.length > 0) {
+        let leaf = blocks[0].view();
+        match (macme.certificateSpki(leaf)) {
+            Some(spki) => {
+                let digest = Sha256.hash(leaf[spki.start..spki.end]);
+                var hex = Vector<u8>.create();
+                grown(Hex.encode(digest[..], mut hex))?;
+                var name = String.create();
+                grown(name.append("_25._tcp."))?;
+                grown(name.append(hostname))?;
+                var value = String.create();
+                grown(value.append("3 1 1 "))?;
+                grown(value.append(StringView.fromUtf8(hex.view()) ?? ""))?;
+                grown(out.append("; DANE, for the current certificate (needs DNSSEC):\n"))?;
+                grown(zoneLine(out, name.view(), "TLSA", value.view(), "", ""))?;
+            }
+            null => {}
+        }
+    }
+    return Ok();
+}
+
+/// `name. IN type <prefix><host><suffix>`.
+fn zoneLine(
+    out: borrow mut String,
+    name: StringView,
+    kind: StringView,
+    prefix: StringView,
+    host: StringView,
+    suffix: StringView,
+) -> Result<void, AllocError> {
+    out.append(name)?;
+    out.append(". IN ")?;
+    out.append(kind)?;
+    out.append(" ")?;
+    out.append(prefix)?;
+    out.append(host)?;
+    out.append(suffix)?;
+    return out.append("\n");
+}
+
+fn recordText(
+    domain: StringView,
+    selector: StringView,
+    key: borrow PrivateKey,
+    out: borrow mut String,
+) -> Result<void, StoreError> {
+    var publicKey = Vector<u8>.create();
+    match (key.publicKey(mut publicKey)) {
+        Ok() => {}
+        Err(_) => { return Err(StoreError.Invalid); }
+    }
+    var text = Vector<u8>.create();
+    grown(text.extend("v=DKIM1; k=".bytes()))?;
+    grown(text.extend(if (key.isRsa()) "rsa".bytes() else "ed25519".bytes()))?;
+    grown(text.extend("; p=".bytes()))?;
+    grown(Base64.encode(publicKey.view(), mut text))?;
+    var line = Vector<u8>.create();
+    grown(line.extend(selector.bytes()))?;
+    grown(line.extend("._domainkey.".bytes()))?;
+    grown(line.extend(domain.bytes()))?;
+    grown(line.extend(". IN TXT (".bytes()))?;
+    var at: usize = 0;
+    let t = text.view();
+    while (at < t.length) {
+        let end = if (at + 255 < t.length) at + 255 else t.length;
+        grown(line.extend(" \"".bytes()))?;
+        grown(line.extend(t[at..end]))?;
+        grown(line.push(0x22))?;
+        at = end;
+    }
+    grown(line.extend(" )\n".bytes()))?;
+    return grown(out.append(StringView.fromUtf8(line.view())!));
+}
+
+fn grown(r: Result<void, AllocError>) -> Result<void, StoreError> => match (r) {
+    Ok() => Ok(),
+    Err(_) => Err(StoreError.OutOfMemory),
+};
+
+/// The script `set-vacation USER DAYS SUBJECT MESSAGE` stands for.
+fn vacationScript(at: usize) -> Vector<u8> {
+    let days = Process.argument(at + 2);
+    let subject = Process.argument(at + 3);
+    let message = Process.argument(at + 4);
+    if (days == null || subject == null || message == null) {
+        die("usage: mailserver set-vacation USER DAYS SUBJECT MESSAGE");
+    }
+    var out = Vector<u8>.create();
+    out.extend("require \"vacation\";\nvacation :days ".bytes())!;
+    out.extend(days!.bytes())!;
+    out.extend(" :subject ".bytes())!;
+    quoted(subject!.bytes(), mut out);
+    out.push(0x20)!;
+    quoted(message!.bytes(), mut out);
+    out.extend(";\n".bytes())!;
+    return out;
+}
+
+/// A Sieve quoted string.
+fn quoted(text: Slice<u8>, out: borrow mut Vector<u8>) {
+    out.push(0x22)!;
+    for (c in text) {
+        if (c == 0x22 || c == 0x5c) {
+            out.push(0x5c)!;
+        }
+        out.push(c)!;
+    }
+    out.push(0x22)!;
+}
+
+fn hashPassword(password: Slice<u8>) -> Result<String, StoreError> {
+    match (Bcrypt.hash(password, 12)) {
+        Ok(h) => { return Ok(h); }
+        Err(_) => { return Err(StoreError.OutOfMemory); }
+    }
+}
+
+/// [proxy] from: the networks whose connections start with a PROXY header.
+fn proxyNetworks(config: borrow Config) -> Vector<ProxyNetwork> {
+    var networks = Vector<ProxyNetwork>.create();
+    for (piece in config.proxyFrom.view().split(",")) {
+        let part = piece.trim();
+        if (part.length == 0) {
+            continue;
+        }
+        match (parseProxyNetwork(part.bytes())) {
+            Some(n) => { networks.push(n)!; }
+            null => { die("mailserver: [proxy] from must be addresses or networks, as 172.16.0.0/12"); }
+        }
+    }
+    return networks;
+}
+
+/// The server: every configured listener, until it is stopped.
+fn makeResolver(config: borrow Config) -> Resolver {
+    if (config.dnsServers.length == 0) {
+        match (Resolver.fromSystem()) {
+            Ok(r) => { return r; }
+            Err(_) => { die("mailserver: no DNS servers"); }
+        }
+    }
+    var servers = Vector<IpAddress>.create();
+    for (piece in config.dnsServers.view().split(",")) {
+        let part = piece.trim();
+        match (parseIp(part.bytes())) {
+            Some(ip) => { servers.push(ip)!; }
+            null => { die("mailserver: [dns] servers must be IP addresses"); }
+        }
+    }
+    match (Resolver.create(servers, config.dnsPort)) {
+        Ok(r) => { return r; }
+        Err(_) => {
+            die("mailserver: no DNS servers");
+        }
+    }
+}
+
+async fn run(
+    config: Config,
+    tlsConfig: SharedTlsConfig?,
+    certificate: CertificateFiles?,
+    acme: AcmeSettings?,
+    resolver: Resolver?,
+    relay: Relay,
+    proxies: Vector<ProxyNetwork>,
+) -> Result<void, StoreError> {
+    let store = await openStore(config)?;
+    var settings = match (SmtpSettings.create(config.hostname.view())) {
+        Ok(s) => s,
+        Err(_) => { return Err(StoreError.OutOfMemory); }
+    };
+    settings.maxMessageSize = config.maxMessageSize;
+    settings.plaintextAuth = config.plaintextAuth;
+    settings.proxyFrom = proxies;
+    match (settings.srsSecret.append(config.srsSecret.view())) {
+        Ok() => {}
+        Err(_) => { return Err(StoreError.OutOfMemory); }
+    }
+    match (settings.srsDomain.append(config.srsDomain.view())) {
+        Ok() => {}
+        Err(_) => { return Err(StoreError.OutOfMemory); }
+    }
+    let swept: Result<usize, StoreError> = await Async.blocking(() => store.blobs().sweepTemporary(3600));
+    match (swept) {
+        Ok(_) => {}
+        Err(e) => { return Err(e); }
+    }
+    var scan = ScanSettings.create();
+    scan.clamd = socketOf(config.clamd.view())?;
+    scan.spamd = socketOf(config.spamd.view())?;
+    scan.junkTenths = config.junkTenths;
+    scan.rejectTenths = config.rejectTenths;
+    scan.acceptUnscanned = config.acceptUnscanned;
+    scan.maxScanSize = config.maxScanSize;
+    scan.maxSpamSize = config.maxSpamSize;
+    scan.clamdTimeout = config.clamdTimeout * 1000;
+    scan.spamdTimeout = config.spamdTimeout * 1000;
+    let context = match (SmtpContext.create(store, settings, tlsConfig, resolver, scan)) {
+        Ok(c) => c,
+        Err(_) => { return Err(StoreError.OutOfMemory); }
+    };
+    let shared = match (Arc<SmtpContext>.create(context)) {
+        Ok(a) => a,
+        Err(_) => { return Err(StoreError.OutOfMemory); }
+    };
+    let mx = await listen(config.mx.view())?;
+    let submission = await listen(config.submission.view())?;
+    let submissions = await listen(config.submissions.view())?;
+    let imap = await listen(config.imap.view())?;
+    let imaps = await listen(config.imaps.view())?;
+    var imapSettings = ImapSettings.defaults();
+    imapSettings.allowPlaintextAuth = config.imapPlaintextAuth;
+    imapSettings.maxAppendSize = config.maxAppendSize;
+    let imapLimit = config.imapMaxConnections;
+    let limit = config.maxConnections;
+    let http = await listen(config.http.view())?;
+    let https = await listen(config.https.view())?;
+    let admin = await listen(config.admin.view())?;
+    let proxiedWeb = await listen(config.proxied.view())?;
+    var webSettings = WebSettings.defaults();
+    webSettings.imapPort = config.advertisedImapPort;
+    webSettings.submissionPort = config.advertisedSubmissionPort;
+    webSettings.advertiseExchange = config.advertiseExchange;
+    var adminSettings = AdminSettings.create();
+    let secret = Environment.variable("COSMOMAIL_JWT_SECRET") ?? config.jwtSecret.view();
+    let token = Environment.variable("COSMOMAIL_ADMIN_TOKEN") ?? config.adminToken.view();
+    match (adminSettings.jwtSecret.append(secret)) {
+        Ok() => {}
+        Err(_) => { return Err(StoreError.OutOfMemory); }
+    }
+    match (adminSettings.staticToken.append(token)) {
+        Ok() => {}
+        Err(_) => { return Err(StoreError.OutOfMemory); }
+    }
+    adminSettings.tokenHours = if (config.tokenHours < 1) 1 else config.tokenHours;
+    let web = match (WebContext.create(shared.clone(), webSettings, adminSettings)) {
+        Ok(w) => w,
+        Err(_) => { return Err(StoreError.OutOfMemory); }
+    };
+    let sharedWeb = match (Arc<WebContext>.create(web)) {
+        Ok(a) => a,
+        Err(_) => { return Err(StoreError.OutOfMemory); }
+    };
+    let httpLimit = config.httpMaxConnections;
+    var watched = certificate;
+    let reloadInterval = config.tlsReloadInterval;
+    let ready = await AsyncConsole.writeError("mailserver: listening\n");
+    match (ready) {
+        Ok() => {}
+        Err(_) => {}
+    }
+    return await Async.scope(StoreError.OutOfMemory, (s) => {
+        for (listener in mx.view()) {
+            s.spawn(async () => await serving(listener, SmtpMode.Mx, shared, limit));
+        }
+        for (listener in submission.view()) {
+            s.spawn(async () => await serving(listener, SmtpMode.Submission, shared, limit));
+        }
+        for (listener in submissions.view()) {
+            s.spawn(async () => await serving(listener, SmtpMode.SubmissionTls, shared, limit));
+        }
+        for (listener in imap.view()) {
+            s.spawn(async () => await imapServing(listener, ImapMode.Plain, shared, imapSettings, imapLimit));
+        }
+        for (listener in imaps.view()) {
+            s.spawn(async () => await imapServing(listener, ImapMode.Tls, shared, imapSettings, imapLimit));
+        }
+        for (listener in http.view()) {
+            s.spawn(async () => await webServing(listener, WebMode.Plain, sharedWeb, httpLimit));
+        }
+        for (listener in https.view()) {
+            s.spawn(async () => await webServing(listener, WebMode.Tls, sharedWeb, httpLimit));
+        }
+        for (listener in admin.view()) {
+            s.spawn(async () => await webServing(listener, WebMode.Admin, sharedWeb, httpLimit));
+        }
+        for (listener in proxiedWeb.view()) {
+            s.spawn(async () => await webServing(listener, WebMode.Proxied, sharedWeb, httpLimit));
+        }
+        s.spawn(async () => await housekeeping(shared));
+        s.spawn(async () => await certificateWatching(mut watched, shared, reloadInterval));
+        s.spawn(async () => await renewing(acme, sharedWeb));
+        for (i in 0..config.relayWorkers) {
+            s.spawn(async () => await relaying(borrow relay, shared));
+        }
+        if (config.relayWorkers > 0) {
+            s.spawn(async () => await janitoring(borrow relay));
+        }
+    });
+}
+
+async fn relaying(relay: borrow Relay, shared: borrow Arc<SmtpContext>) -> Result<void, StoreError> {
+    let context = shared.get();
+    match (await relayWorker(relay, borrow context.store)) {
+        Ok() => { return Ok(); }
+        Err(_) => { return Err(StoreError.OutOfMemory); }
+    }
+}
+
+async fn janitoring(relay: borrow Relay) -> Result<void, StoreError> {
+    match (await relayJanitor(relay)) {
+        Ok() => { return Ok(); }
+        Err(_) => { return Err(StoreError.OutOfMemory); }
+    }
+}
+
+/// The relay's settings from the configuration.
+fn relayOf(config: borrow Config) -> Relay {
+    var settings = RelaySettings.create(config.hostname.view())!;
+    settings.port = config.relayPort;
+    settings.startTls = config.relayStartTls;
+    let policy = config.relayTlsPolicy.view();
+    if (policy == "" || policy == "published") {
+        settings.tlsPolicy = TLS_POLICY_PUBLISHED;
+    } else if (policy == "opportunistic") {
+        settings.tlsPolicy = TLS_POLICY_OPPORTUNISTIC;
+    } else if (policy == "verified") {
+        settings.tlsPolicy = TLS_POLICY_VERIFIED;
+    } else {
+        die("mailserver: [relay] tls_policy is \"opportunistic\", \"published\" or \"verified\"");
+    }
+    if (config.relayTlsTrustFile.length > 0) {
+        settings.tlsTrustPem = readFile(config.relayTlsTrustFile.view());
+    }
+    settings.stsPort = config.relayStsPort;
+    settings.maxAge = config.relayMaxAge;
+    settings.delayNotice = config.relayDelayNotice;
+    settings.suppressDays = config.relaySuppressDays;
+    settings.breakerThreshold = config.relayBreakerThreshold;
+    settings.breakerBase = config.relayBreakerSeconds;
+    settings.poolSize = config.relayPoolSize;
+    settings.poolIdleMs = config.relayPoolIdle * 1000;
+    settings.client.connectTimeout = config.relayConnectTimeout * 1000;
+    settings.client.commandTimeout = config.relayCommandTimeout * 1000;
+    if (config.relayCommandTimeout < 600) {
+        // The other timeouts scale down with a short command timeout (tests); RFC 5321's are the floor otherwise.
+        settings.client.blockTimeout = config.relayCommandTimeout * 1000;
+        settings.client.finalTimeout = config.relayCommandTimeout * 2000;
+        settings.client.tlsTimeout = config.relayCommandTimeout * 1000;
+    }
+    if (config.relayRetry.length > 0) {
+        settings.retryDelays.clear();
+        for (part in config.relayRetry.view().split(",")) {
+            match (part.trim().parseInt<i64>()) {
+                Some(d) => { settings.retryDelays.push(d)!; }
+                null => { die("mailserver: [relay] retry is a list of seconds, such as \"300, 900\""); }
+            }
+        }
+        if (settings.retryDelays.length == 0) {
+            die("mailserver: [relay] retry needs at least one delay");
+        }
+    }
+    match (Relay.create(settings, makeResolver(config))) {
+        Ok(relay) => { return relay; }
+        Err(_) => { die("mailserver: the relay's TLS could not be set up (check [relay] tls_trust_file)"); }
+    }
+}
+
+async fn serving(
+    listener: borrow AsyncTcpListener,
+    mode: SmtpMode,
+    shared: borrow Arc<SmtpContext>,
+    limit: u32,
+) -> Result<void, StoreError> {
+    match (await serve(listener, mode, shared.clone(), limit)) {
+        Ok() => { return Ok(); }
+        Err(_) => { return Err(StoreError.OutOfMemory); }
+    }
+}
+
+async fn imapServing(
+    listener: borrow AsyncTcpListener,
+    mode: ImapMode,
+    shared: borrow Arc<SmtpContext>,
+    settings: ImapSettings,
+    limit: u32,
+) -> Result<void, StoreError> {
+    match (await mimap.serve(listener, mode, shared.clone(), settings, limit)) {
+        Ok() => { return Ok(); }
+        Err(_) => { return Err(StoreError.OutOfMemory); }
+    }
+}
+
+async fn webServing(
+    listener: borrow AsyncTcpListener,
+    mode: WebMode,
+    shared: borrow Arc<WebContext>,
+    limit: u32,
+) -> Result<void, StoreError> {
+    match (await mweb.serve(listener, mode, shared.clone(), limit)) {
+        Ok() => { return Ok(); }
+        Err(_) => { return Err(StoreError.OutOfMemory); }
+    }
+}
+
+/// Renews the certificate with ACME, when configured.
+async fn renewing(acme: borrow AcmeSettings?, shared: borrow Arc<WebContext>) -> Result<void, StoreError> {
+    match (acme) {
+        Some(settings) => { await renewCertificates(shared.get(), settings); }
+        null => {}
+    }
+    return Ok();
+}
+
+/// The ACME settings from `[acme]`, or null when it has no directory. Dies on settings that cannot work.
+fn acmeOf(config: borrow Config) -> AcmeSettings? {
+    if (config.acmeDirectory.length == 0) {
+        return null;
+    }
+    if (config.certificate.length == 0 || config.key.length == 0) {
+        die("mailserver: [acme] needs [tls] certificate and key: the files it writes");
+    }
+    if (config.acmeAccountKey.length == 0) {
+        die("mailserver: [acme] needs account_key: where the account key is kept");
+    }
+    var a = AcmeSettings.create();
+    a.directory.append(config.acmeDirectory.view())!;
+    a.email.append(config.acmeEmail.view())!;
+    a.accountKeyPath.append(config.acmeAccountKey.view())!;
+    a.chainPath.append(config.certificate.view())!;
+    a.keyPath.append(config.key.view())!;
+    a.mtaStsNames = config.acmeMtaStsNames;
+    a.renewDays = config.acmeRenewDays;
+    a.checkMs = config.acmeCheckInterval * 1000;
+    a.retryMs = config.acmeRetryInterval * 1000;
+    let names = if (config.acmeNames.length > 0) config.acmeNames.view() else config.hostname.view();
+    for (part in names.split(",")) {
+        let n = part.trim();
+        if (n.length > 0) {
+            var copy = String.create();
+            copy.append(n)!;
+            a.names.push(copy)!;
+        }
+    }
+    if (a.names.length == 0) {
+        die("mailserver: [acme] names lists no host");
+    }
+    if (config.acmeTrustFile.length > 0) {
+        a.trustPem = readFile(config.acmeTrustFile.view());
+    }
+    return a;
+}
+
+/// Installs a renewed certificate when its files change.
+async fn certificateWatching(
+    certificate: borrow mut CertificateFiles?,
+    shared: borrow Arc<SmtpContext>,
+    interval: u64,
+) -> Result<void, StoreError> {
+    match (certificate) {
+        Some(files) => { await watchCertificate(files, shared.get(), interval * 1000); }
+        null => {}
+    }
+    return Ok();
+}
+
+/// Removes blobs nothing has used for a day, every hour.
+async fn housekeeping(shared: borrow Arc<SmtpContext>) -> Result<void, StoreError> {
+    loop {
+        match (await Timer.sleep(3600 * 1000)) {
+            Ok() => {}
+            Err(_) => { return Ok(); }
+        }
+        match (await shared.get().store.forgetVacations()) {
+            Ok(_) => {}
+            Err(_) => {}
+        }
+        match (await shared.get().store.forgetAuthFailures()) {
+            Ok(_) => {}
+            Err(_) => {}
+        }
+        match (await shared.get().store.forgetSuppressions()) {
+            Ok(_) => {}
+            Err(_) => {}
+        }
+        match (await shared.get().store.forgetStsPolicies()) {
+            Ok(_) => {}
+            Err(_) => {}
+        }
+        loop {
+            match (await shared.get().store.collectBlobs(86400, 500)) {
+                Ok(n) => {
+                    if (n < 500) {
+                        break;
+                    }
+                }
+                Err(_) => { break; }
+            }
+        }
+    }
+}
+
+/// `ip:port` as a socket address; `null` for an empty setting.
+fn socketOf(text: StringView) -> Result<SocketAddress?, StoreError> {
+    if (text.length == 0) {
+        return Ok(null);
+    }
+    let e = match (endpoint(text)) {
+        Some(e) => e,
+        null => { return Err(StoreError.Invalid); }
+    };
+    match (parseIp(text[e.hostStart..e.hostEnd].bytes())) {
+        Some(ip) => { return Ok(ip.socket(e.port)); }
+        null => { return Err(StoreError.Invalid); }
+    }
+}
+
+/// A listener on `host:port`, or none for an empty setting.
+async fn listen(address: StringView) -> Result<Vector<AsyncTcpListener>, StoreError> {
+    var out = Vector<AsyncTcpListener>.create();
+    if (address.length == 0) {
+        return Ok(out);
+    }
+    let e = match (endpoint(address)) {
+        Some(e) => e,
+        null => { return Err(StoreError.Invalid); }
+    };
+    match (AsyncTcpListener.bind(address[e.hostStart..e.hostEnd], e.port)) {
+        Ok(l) => {
+            match (out.push(l)) {
+                Ok() => {}
+                Err(_) => { return Err(StoreError.OutOfMemory); }
+            }
+        }
+        Err(_) => {
+            match (await AsyncConsole.writeError("mailserver: cannot listen on an address\n")) {
+                Ok() => {}
+                Err(_) => {}
+            }
+            return Err(StoreError.Invalid);
+        }
+    }
+    return Ok(out);
+}

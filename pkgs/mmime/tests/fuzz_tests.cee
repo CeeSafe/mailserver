@@ -1,0 +1,148 @@
+// Randomised input: MIME-shaped messages with random structure, broken nesting and random bytes, fed in random
+// chunk sizes. The scanner must keep its invariants on all of them. Deterministic (a fixed seed), so a failure
+// reproduces.
+
+struct Rng {
+    state: u64;
+
+    fn next(borrow mut this) -> u64 {
+        var x = this.state;
+        x = x ^ (x << 13);
+        x = x ^ (x >> 7);
+        x = x ^ (x << 17);
+        this.state = x;
+        return x;
+    }
+
+    fn below(borrow mut this, n: u64) -> u64 => this.next() % n;
+}
+
+fn add(out: borrow mut Vector<u8>, text: StringView) {
+    out.extend(text.bytes())!;
+}
+
+/// A random message part at `depth`, with boundaries taken from a small set so that parts often close their
+/// parents' boundaries, or each other's.
+fn part(rng: borrow mut Rng, out: borrow mut Vector<u8>, depth: u32) {
+    let boundaries = ["b1", "b2", "=_x", "", "b1b"];
+    let choice = rng.below(10);
+    if (choice < 4 && depth < 6) {
+        let b = boundaries[truncate<usize>(rng.below(5))];
+        add(out, "Content-Type: multipart/mixed; boundary=\"");
+        add(out, b);
+        add(out, "\"\r\n\r\npreamble\r\n");
+        let n = rng.below(4);
+        for (i in 0..n) {
+            add(out, "--");
+            add(out, b);
+            add(out, "\r\n");
+            part(rng, out, depth + 1);
+            add(out, "\r\n");
+        }
+        if (rng.below(4) != 0) {
+            add(out, "--");
+            add(out, b);
+            add(out, "--\r\n");
+        }
+        if (rng.below(3) == 0) {
+            add(out, "epilogue\r\n");
+        }
+    } else if (choice < 6 && depth < 6) {
+        add(out, "Content-Type: message/rfc822\r\n\r\nSubject: inner\r\nFrom: \"x\" <x@y>\r\n");
+        part(rng, out, depth + 1);
+    } else {
+        if (rng.below(2) == 0) {
+            add(out, "Content-Type: text/plain; charset=utf-8\r\n");
+        }
+        if (rng.below(4) != 0) {
+            add(out, "\r\n");
+        }
+        let lines = rng.below(5);
+        for (i in 0..lines) {
+            let length = rng.below(40);
+            for (k in 0..length) {
+                // Mostly text, sometimes line breaks, dashes and arbitrary bytes.
+                let r = rng.below(20);
+                if (r == 0) {
+                    out.push(0x0a)!;
+                } else if (r == 1) {
+                    out.push(0x0d)!;
+                } else if (r == 2) {
+                    out.push(0x2d)!;
+                } else if (r == 3) {
+                    out.push(truncate<u8>(rng.next()))!;
+                } else {
+                    out.push(0x61 + truncate<u8>(rng.below(26)))!;
+                }
+            }
+            add(out, if (rng.below(5) == 0) "\n" else "\r\n");
+        }
+    }
+}
+
+fn indexOf(bytes: Slice<u8>, chunked: bool, rng: borrow mut Rng) -> MessageIndex {
+    var scanner = MimeScanner.create();
+    if (chunked) {
+        var at: usize = 0;
+        while (at < bytes.length) {
+            let n = 1 + truncate<usize>(rng.below(64));
+            let end = if (at + n > bytes.length) bytes.length else at + n;
+            scanner.feed(bytes[at..end])!;
+            at = end;
+        }
+    } else {
+        scanner.feed(bytes)!;
+    }
+    var index = MessageIndex.create();
+    scanner.finish(mut index)!;
+    return index;
+}
+
+fn check(index: borrow MessageIndex, size: usize) -> Result<void, TestFailure> {
+    Check.isTrue(index.size == size as u64, "size")?;
+    for (i in 0..index.parts.length) {
+        let p = index.parts[i];
+        Check.isTrue(p.headerStart <= p.bodyStart && p.bodyStart <= p.bodyEnd && p.bodyEnd <= index.size, "ranges")?;
+        if (i > 0) {
+            Check.isTrue(p.parent < i, "parents first")?;
+            let up = index.parts[p.parent];
+            Check.isTrue(up.kind != PART_LEAF, "a leaf has no children")?;
+            Check.isTrue(p.headerStart >= up.bodyStart && p.bodyEnd <= up.bodyEnd, "inside the parent")?;
+        }
+    }
+    return Ok();
+}
+
+@test
+fn keepsInvariantsOnRandomMessages() -> Result<void, TestFailure> {
+    var rng = Rng { state: 0x9e3779b97f4a7c15 };
+    var renderer = Renderer.create();
+    var whole = Vector<u8>.create();
+    var chunked = Vector<u8>.create();
+    var meta = MessageMeta.create();
+    var text = Vector<u8>.create();
+    for (round in 0..1500) {
+        var message = Vector<u8>.create();
+        add(mut message, "From: a@b.example\r\nSubject: fuzz\r\n");
+        part(mut rng, mut message, 0);
+        // Sometimes cut the message anywhere.
+        if (rng.below(4) == 0 && message.length > 0) {
+            message.truncate(truncate<usize>(rng.below(message.length as u64)));
+        }
+        let a = indexOf(message.view(), false, mut rng);
+        let b = indexOf(message.view(), true, mut rng);
+        check(a, message.length)?;
+        encodeMeta(a, mut renderer, mut whole)!;
+        encodeMeta(b, mut renderer, mut chunked)!;
+        Check.isTrue(
+            whole.length == chunked.length && whole.view().startsWith(chunked.view()),
+            "chunking changes nothing",
+        )?;
+        Check.isTrue(meta.read(whole.view())!, "the meta reads back")?;
+        Check.isTrue(meta.parts.length == a.parts.length, "every part stored")?;
+        text.clear();
+        renderer.envelope(a, 0, mut text)!;
+        Check.isTrue(text.length > 0, "an envelope")?;
+    }
+    return Ok();
+}

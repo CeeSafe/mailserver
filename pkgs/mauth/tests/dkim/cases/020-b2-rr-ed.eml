@@ -1,0 +1,17 @@
+DKIM-Signature: v=1; a=ed25519-sha256; c=relaxed/relaxed; d=example.org;
+ i=@example.org; q=dns/txt; s=ed; t=1793858444; h=from : to : subject :
+ date : message-id : x-folded;
+ bh=47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=;
+ b=1ZMUdDZKQkosfvbx8KyTnXGJKQ0c45nhnUQQVwRlUHvfPKUx5gZ6zhwLNjsB9mZySgDW6
+ ki1AW/Cs/mnB0+MCA==
+From: Alice <alice@example.org>
+To: bob@example.net
+Subject:  Spaced   subject 
+Date: Thu, 05 Nov 2026 10:00:00 +0000
+Message-ID: <340701929@example.org>
+X-Folded: first
+	second  line
+
+
+
+

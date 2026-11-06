@@ -1,0 +1,9 @@
+[package]
+name = "dkimsign"
+version = "0.1.0"
+kind = "executable"
+
+[dependencies]
+mauth = { path = "../.." }
+pkey = { path = "../../../../../../CeeSafeLibs/pkey" }
+encoding = { path = "../../../../../../CeeSafeLibs/encoding" }

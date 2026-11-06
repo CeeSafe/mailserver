@@ -1,0 +1,552 @@
+// The schema's migrations, one function call per statement. Version N brings the schema from N - 1 to N; add a
+// version by raising SCHEMA_VERSION and adding its statements, never by changing an applied one.
+
+/// The number of schema versions.
+const SCHEMA_VERSION: i32 = 11;
+
+/// Statement `part` of the script that brings the schema from `version - 1` to `version`, or empty after
+/// the last.
+fn migrationPart(version: i32, part: usize) -> StringView {
+    if (version == 1 && part == 0) {
+        // mstore schema, version 1. Applied once, inside a transaction, by Migrations.apply.
+        //
+        // Message content lives in content-addressed files (see BlobStore); the database holds what IMAP and SMTP need
+        // without opening them. Mailbox counters are kept in the mailbox row by the store's statements, which also allocate
+        // UIDs there, so a delivery is one row lock on its mailbox. Blob reference counts are kept by triggers, so every
+        // path that adds or removes a message row (deliveries, copies, moves, expunges, cascades) counts.
+        return """
+            CREATE SEQUENCE mstore_uid_validity START WITH 1;
+            """;
+    }
+    if (version == 1 && part == 1) {
+        return """
+            CREATE TABLE domains (
+                id            BIGSERIAL PRIMARY KEY,
+                name          TEXT        NOT NULL UNIQUE,   -- lowercase; IDNs as A-labels
+                active        BOOLEAN     NOT NULL DEFAULT TRUE,
+                catchall      TEXT        NULL,              -- an address that takes mail for unknown local parts
+                default_quota BIGINT      NOT NULL DEFAULT 1073741824,
+                settings      JSONB       NOT NULL DEFAULT '{}',  -- DKIM, SPF/DMARC and scanning policy, read by their packages
+                created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+            """;
+    }
+    if (version == 1 && part == 2) {
+        return """
+            CREATE TABLE domain_aliases (
+                alias      TEXT        PRIMARY KEY,          -- mail to user@alias goes to user@<the domain>
+                domain_id  BIGINT      NOT NULL REFERENCES domains(id) ON DELETE CASCADE,
+                active     BOOLEAN     NOT NULL DEFAULT TRUE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+            """;
+    }
+    if (version == 1 && part == 3) {
+        return """
+            CREATE TABLE users (
+                id            BIGSERIAL PRIMARY KEY,
+                domain_id     BIGINT      NOT NULL REFERENCES domains(id) ON DELETE CASCADE,
+                email         TEXT        NOT NULL UNIQUE,   -- lowercase
+                password_hash TEXT        NOT NULL,          -- bcrypt ($2a$/$2b$/$2y$) or argon2id
+                active        BOOLEAN     NOT NULL DEFAULT TRUE,
+                role          TEXT        NOT NULL DEFAULT 'user',
+                quota         BIGINT      NOT NULL,          -- bytes; 0 is unlimited
+                used          BIGINT      NOT NULL DEFAULT 0,
+                created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+                last_login    TIMESTAMPTZ NULL
+            );
+            """;
+    }
+    if (version == 1 && part == 4) {
+        return """
+            CREATE INDEX users_domain ON users(domain_id);
+            """;
+    }
+    if (version == 1 && part == 5) {
+        return """
+            CREATE TABLE aliases (
+                address     TEXT        PRIMARY KEY,         -- lowercase
+                domain_id   BIGINT      NOT NULL REFERENCES domains(id) ON DELETE CASCADE,
+                destination TEXT        NOT NULL,            -- a local or remote address
+                active      BOOLEAN     NOT NULL DEFAULT TRUE,
+                created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+            """;
+    }
+    if (version == 1 && part == 6) {
+        return """
+            CREATE INDEX aliases_domain ON aliases(domain_id);
+            """;
+    }
+    if (version == 1 && part == 7) {
+        return """
+            CREATE TABLE mailboxes (
+                id             BIGSERIAL PRIMARY KEY,
+                user_id        BIGINT      NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                name           TEXT        NOT NULL,         -- the full IMAP name, '/'-separated; "INBOX" in that case
+                special_use    TEXT        NULL,             -- \Sent, \Drafts, \Trash, \Junk, \Archive (RFC 6154)
+                subscribed     BOOLEAN     NOT NULL DEFAULT TRUE,
+                uid_validity   BIGINT      NOT NULL DEFAULT nextval('mstore_uid_validity'),
+                uid_next       BIGINT      NOT NULL DEFAULT 1,
+                highest_modseq BIGINT      NOT NULL DEFAULT 1,
+                messages       INT         NOT NULL DEFAULT 0,
+                unseen         INT         NOT NULL DEFAULT 0,
+                size           BIGINT      NOT NULL DEFAULT 0,
+                created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+                UNIQUE (user_id, name)
+            );
+            """;
+    }
+    if (version == 1 && part == 8) {
+        // One row per distinct message content; its file is <root>/<hash[0..2]>/<hash[2..4]>/<hash>.
+        return """
+            CREATE TABLE blobs (
+                hash        BYTEA       PRIMARY KEY,         -- SHA-256 of the content
+                size        BIGINT      NOT NULL,
+                refs        INT         NOT NULL DEFAULT 0,
+                released_at TIMESTAMPTZ NULL                 -- when refs last fell to 0; collected after a grace period
+            );
+            """;
+    }
+    if (version == 1 && part == 9) {
+        return """
+            CREATE INDEX blobs_released ON blobs(released_at) WHERE refs = 0;
+            """;
+    }
+    if (version == 1 && part == 10) {
+        return """
+            CREATE TABLE messages (
+                mailbox_id    BIGINT      NOT NULL REFERENCES mailboxes(id) ON DELETE CASCADE,
+                uid           BIGINT      NOT NULL,
+                modseq        BIGINT      NOT NULL,
+                flags         SMALLINT    NOT NULL DEFAULT 0, -- \Seen 1, \Answered 2, \Flagged 4, \Deleted 8, \Draft 16
+                keywords      TEXT[]      NOT NULL DEFAULT '{}',
+                internal_date TIMESTAMPTZ NOT NULL,
+                size          BIGINT      NOT NULL,
+                blob          BYTEA       NOT NULL REFERENCES blobs(hash),
+                meta          BYTEA       NULL,              -- the parsed-once part index, envelope and body structure
+                PRIMARY KEY (mailbox_id, uid)
+            );
+            """;
+    }
+    if (version == 1 && part == 11) {
+        return """
+            CREATE INDEX messages_changed ON messages(mailbox_id, modseq);
+            """;
+    }
+    if (version == 1 && part == 12) {
+        return """
+            CREATE INDEX messages_blob ON messages(blob);
+            """;
+    }
+    if (version == 1 && part == 13) {
+        // Blob reference counts, one UPDATE per statement however many rows it touched.
+        return """
+            CREATE FUNCTION mstore_blob_ref() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN
+                UPDATE blobs b SET refs = b.refs + n.count, released_at = NULL
+                FROM (SELECT blob, count(*) AS count FROM added GROUP BY blob) n
+                WHERE b.hash = n.blob;
+                RETURN NULL;
+            END $$;
+            """;
+    }
+    if (version == 1 && part == 14) {
+        return """
+            CREATE FUNCTION mstore_blob_unref() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN
+                UPDATE blobs b SET refs = b.refs - n.count,
+                                   released_at = CASE WHEN b.refs - n.count = 0 THEN now() ELSE b.released_at END
+                FROM (SELECT blob, count(*) AS count FROM removed GROUP BY blob) n
+                WHERE b.hash = n.blob;
+                RETURN NULL;
+            END $$;
+            """;
+    }
+    if (version == 1 && part == 15) {
+        return """
+            CREATE TRIGGER messages_blob_ref AFTER INSERT ON messages
+                REFERENCING NEW TABLE AS added FOR EACH STATEMENT EXECUTE FUNCTION mstore_blob_ref();
+            """;
+    }
+    if (version == 1 && part == 16) {
+        return """
+            CREATE TRIGGER messages_blob_unref AFTER DELETE ON messages
+                REFERENCING OLD TABLE AS removed FOR EACH STATEMENT EXECUTE FUNCTION mstore_blob_unref();
+            """;
+    }
+    if (version == 2 && part == 0) {
+        // mstore schema, version 2: the outbound queue. A queued message shares its blob with any local copies, counted by
+        // the same triggers as messages. The relay workers (mqueue) claim rows with FOR UPDATE SKIP LOCKED.
+        return """
+            CREATE TABLE queue (
+                id           BIGSERIAL   PRIMARY KEY,
+                blob         BYTEA       NOT NULL REFERENCES blobs(hash),
+                size         BIGINT      NOT NULL,
+                sender       TEXT        NOT NULL,          -- the reverse-path; empty for a bounce
+                recipients   TEXT[]      NOT NULL,          -- remaining recipients
+                user_id      BIGINT      NULL REFERENCES users(id) ON DELETE SET NULL,  -- the submitting user, if any
+                attempts     INT         NOT NULL DEFAULT 0,
+                next_attempt TIMESTAMPTZ NOT NULL DEFAULT now(),
+                last_error   TEXT        NULL,
+                created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+            """;
+    }
+    if (version == 2 && part == 1) {
+        return """
+            CREATE INDEX queue_due ON queue(next_attempt);
+            """;
+    }
+    if (version == 2 && part == 2) {
+        return """
+            CREATE TRIGGER queue_blob_ref AFTER INSERT ON queue
+                REFERENCING NEW TABLE AS added FOR EACH STATEMENT EXECUTE FUNCTION mstore_blob_ref();
+            """;
+    }
+    if (version == 2 && part == 3) {
+        return """
+            CREATE TRIGGER queue_blob_unref AFTER DELETE ON queue
+                REFERENCING OLD TABLE AS removed FOR EACH STATEMENT EXECUTE FUNCTION mstore_blob_unref();
+            """;
+    }
+    if (version == 3 && part == 0) {
+        // mstore schema, version 3: Sieve scripts (RFC 5228) and the vacation replies already sent (RFC 5230 :days).
+        // A user has any number of scripts; users.sieve_active names the one delivery runs (NULL: none). Naming it on the
+        // user, rather than flagging the script, makes "at most one active" hold by construction.
+        return """
+            CREATE TABLE sieve_scripts (
+                user_id    BIGINT      NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                name       TEXT        NOT NULL,
+                content    TEXT        NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                PRIMARY KEY (user_id, name)
+            );
+            """;
+    }
+    if (version == 3 && part == 1) {
+        return """
+            ALTER TABLE users ADD COLUMN sieve_active TEXT NULL;
+            """;
+    }
+    if (version == 3 && part == 2) {
+        // One row per (user, sender, handle): when the last reply went. The handle is stored as its MD5, so a long handle
+        // does not make a long key; a collision only means one reply too few.
+        return """
+            CREATE TABLE vacation_sent (
+                user_id BIGINT      NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                sender  TEXT        NOT NULL,          -- lowercase
+                handle  BYTEA       NOT NULL,
+                sent_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY (user_id, sender, handle)
+            );
+            """;
+    }
+    if (version == 3 && part == 3) {
+        return """
+            CREATE INDEX vacation_sent_at ON vacation_sent(sent_at);
+            """;
+    }
+    if (version == 4 && part == 0) {
+        // mstore schema, version 4: the persisted half of the brute-force guard, shared by every server process (SMTP now,
+        // IMAP later) and kept across restarts. One row per key, not one per failure, so a check is one index lookup.
+        //   kind 1: a client address (IPv4, or an IPv6 /64, as text); kind 2: a login name (lowercase).
+        // Only addresses are ever blocked: blocking a login name would let anyone lock its owner out.
+        return """
+            CREATE TABLE auth_failures (
+                kind          SMALLINT    NOT NULL,
+                key           TEXT        NOT NULL,
+                failures      INT         NOT NULL,
+                window_start  TIMESTAMPTZ NOT NULL,
+                blocked_until TIMESTAMPTZ NULL,          -- 'infinity' for a block set by hand
+                PRIMARY KEY (kind, key)
+            );
+            """;
+    }
+    if (version == 4 && part == 1) {
+        return """
+            CREATE INDEX auth_failures_window ON auth_failures(window_start);
+            """;
+    }
+    if (version == 5 && part == 0) {
+        // mstore schema, version 5: claiming queue rows for the relay workers (mqueue). A worker claims due rows with a
+        // random token for a while; a crashed worker's claims run out by themselves, and a worker whose claim ran out finds
+        // its token gone when it settles, so two workers never both settle one row.
+        return """
+            ALTER TABLE queue ADD COLUMN claim BIGINT NULL;
+            """;
+    }
+    if (version == 5 && part == 1) {
+        return """
+            ALTER TABLE queue ADD COLUMN claimed_until TIMESTAMPTZ NULL;
+            """;
+    }
+    if (version == 6 && part == 0) {
+        // mstore schema, version 6: DKIM signing keys. The relay signs a message with the active key of its From domain.
+        // A key is added inactive: its public half must be in DNS (selector._domainkey.domain) before it signs anything.
+        // Activating one deactivates the domain's others in the same statement, so at most one is active.
+        return """
+            CREATE TABLE dkim_keys (
+                domain      TEXT        NOT NULL,          -- lowercase
+                selector    TEXT        NOT NULL,
+                private_key BYTEA       NOT NULL,          -- PKCS #8 DER
+                active      BOOLEAN     NOT NULL DEFAULT FALSE,
+                created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+                PRIMARY KEY (domain, selector)
+            );
+            """;
+    }
+    if (version == 7 && part == 0) {
+        // mstore schema, version 7: the suppression list, and delay notices.
+        // An address whose mailbox or domain does not exist (a 5.1.x bounce) is suppressed for a while: local users who
+        // write to it are refused at RCPT, with the reason, instead of getting another bounce later. Policy and content
+        // rejections (5.7.x and others) are not recorded: they say nothing about the address.
+        return """
+            CREATE TABLE suppression (
+                address    TEXT        PRIMARY KEY,       -- lowercase
+                reply      TEXT        NOT NULL,          -- the reply that failed it, as the bounce gave it
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                expires_at TIMESTAMPTZ NOT NULL
+            );
+            """;
+    }
+    if (version == 7 && part == 1) {
+        return """
+            CREATE INDEX suppression_expires ON suppression(expires_at);
+            """;
+    }
+    if (version == 7 && part == 2) {
+        // Whether the sender was told the message is delayed (one notice per message, RFC 3464 Action: delayed).
+        return """
+            ALTER TABLE queue ADD COLUMN delay_notified BOOLEAN NOT NULL DEFAULT FALSE;
+            """;
+    }
+    if (version == 8 && part == 0) {
+        // mstore schema, version 8: MTA-STS policies (RFC 8461), cached for their max_age so that a policy survives
+        // a restart, and an attacker who blocks policy discovery cannot turn TLS off (§5.1).
+        return """
+            CREATE TABLE mta_sts_policies (
+                domain     TEXT        PRIMARY KEY,       -- lowercase
+                policy_id  TEXT        NOT NULL,          -- the _mta-sts TXT record's id when it was fetched
+                policy     TEXT        NOT NULL,          -- the policy file, as served
+                fetched_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                expires_at TIMESTAMPTZ NOT NULL           -- fetched_at + its max_age
+            );
+            """;
+    }
+    if (version == 9 && part == 0) {
+        // mstore schema, version 9: the MTA-STS policy each domain publishes (RFC 8461 §3.2), served at
+        // https://mta-sts.<domain>/.well-known/mta-sts.txt. The id is what the domain's _mta-sts TXT record must carry;
+        // it changes whenever the policy does, so senders fetch it again.
+        return """
+            ALTER TABLE domains
+                ADD COLUMN mta_sts_mode    TEXT    NOT NULL DEFAULT 'none'
+                    CHECK (mta_sts_mode IN ('none', 'testing', 'enforce')),
+                ADD COLUMN mta_sts_max_age INTEGER NOT NULL DEFAULT 86400
+                    CHECK (mta_sts_max_age BETWEEN 0 AND 31557600),
+                ADD COLUMN mta_sts_mx      TEXT    NULL,   -- the mx patterns, separated by spaces or commas; NULL: mail.<domain>
+                ADD COLUMN mta_sts_id      TEXT    NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYYMMDDHH24MISS');
+            """;
+    }
+    if (version == 10 && part == 0) {
+        // mstore schema, version 10: what the admin API needs. Accounts that administer (the whole server, or one
+        // domain) without being mailboxes; an audit trail of the API's changes; ids for rows the API names by number;
+        // and the mailbox, user and domain settings the admin UI shows. Columns marked "shown" are kept and returned
+        // but nothing else acts on them yet; domains.settings holds the UI's other domain settings the same way.
+        return """
+            CREATE TABLE admin_users (
+                id            BIGSERIAL   PRIMARY KEY,
+                username      TEXT        NOT NULL UNIQUE,
+                password_hash TEXT        NOT NULL,          -- bcrypt
+                display_name  TEXT        NULL,
+                role          TEXT        NOT NULL DEFAULT 'server' CHECK (role IN ('server', 'domain')),
+                domain_id     BIGINT      NULL REFERENCES domains(id) ON DELETE CASCADE,  -- for role 'domain'
+                active        BOOLEAN     NOT NULL DEFAULT TRUE,
+                last_login    TIMESTAMPTZ NULL,
+                created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+                updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+                CHECK (role = 'server' OR domain_id IS NOT NULL)
+            );
+            """;
+    }
+    if (version == 10 && part == 1) {
+        return """
+            CREATE TABLE audit_logs (
+                id            BIGSERIAL   PRIMARY KEY,
+                "timestamp"   TIMESTAMPTZ NOT NULL DEFAULT now(),
+                user_id       BIGINT      NULL,
+                username      TEXT        NULL,
+                action        TEXT        NOT NULL,          -- domain.update, user.create, admin.login.failed, ...
+                resource_type TEXT        NULL,
+                resource_id   TEXT        NULL,
+                details       TEXT        NULL,
+                ip_address    TEXT        NULL,
+                user_agent    TEXT        NULL,
+                severity      TEXT        NOT NULL DEFAULT 'info',
+                success       BOOLEAN     NOT NULL DEFAULT TRUE
+            );
+            CREATE INDEX audit_logs_time ON audit_logs("timestamp");
+            """;
+    }
+    if (version == 10 && part == 2) {
+        return """
+            ALTER TABLE aliases ADD COLUMN id BIGSERIAL UNIQUE;
+            ALTER TABLE sieve_scripts ADD COLUMN id BIGSERIAL UNIQUE,
+                ADD COLUMN created_at TIMESTAMPTZ NOT NULL DEFAULT now();
+            ALTER TABLE mailboxes
+                ADD COLUMN max_size       BIGINT  NOT NULL DEFAULT 0,   -- shown
+                ADD COLUMN retention_days INTEGER NOT NULL DEFAULT 0,   -- shown
+                ADD COLUMN description    TEXT    NULL;
+            ALTER TABLE users
+                ADD COLUMN language           TEXT        NOT NULL DEFAULT 'en',   -- shown
+                ADD COLUMN forward_to         TEXT        NULL,                    -- shown
+                ADD COLUMN auto_reply_enabled BOOLEAN     NOT NULL DEFAULT FALSE,  -- shown
+                ADD COLUMN auto_reply_subject TEXT        NULL,
+                ADD COLUMN auto_reply_body    TEXT        NULL,
+                ADD COLUMN updated_at         TIMESTAMPTZ NOT NULL DEFAULT now();
+            ALTER TABLE domains ADD COLUMN updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
+            """;
+    }
+    if (version == 11 && part == 0) {
+        // mstore schema, version 11: groupware. CalDAV calendars and CardDAV address books are collections of
+        // objects (one iCalendar or vCard text each). Every change raises the collection's modseq and stamps the
+        // object with it; deleted objects stay as tombstones, so a sync token (a modseq) gives exactly what changed
+        // since (RFC 6578), and ActiveSync and EWS sync the same way.
+        return """
+            CREATE TABLE dav_collections (
+                id           BIGSERIAL   PRIMARY KEY,
+                user_id      BIGINT      NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                kind         TEXT        NOT NULL CHECK (kind IN ('calendar', 'addressbook')),
+                name         TEXT        NOT NULL,          -- the URL segment
+                display_name TEXT        NOT NULL,
+                description  TEXT        NULL,
+                color        TEXT        NULL,              -- calendars: #RRGGBB or #RRGGBBAA
+                components   TEXT        NOT NULL DEFAULT 'VEVENT,VTODO',   -- calendars: what they hold
+                modseq       BIGINT      NOT NULL DEFAULT 1,
+                created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+                updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+                UNIQUE (user_id, kind, name)
+            );
+            """;
+    }
+    if (version == 11 && part == 1) {
+        return """
+            CREATE TABLE dav_objects (
+                id             BIGSERIAL   PRIMARY KEY,
+                collection_id  BIGINT      NOT NULL REFERENCES dav_collections(id) ON DELETE CASCADE,
+                href           TEXT        NOT NULL,        -- the resource's name in its collection (UID.ics)
+                uid            TEXT        NOT NULL,        -- the iCalendar or vCard UID
+                component      TEXT        NOT NULL,        -- VEVENT, VTODO, VJOURNAL or VCARD
+                data           TEXT        NOT NULL,
+                etag           TEXT        NOT NULL,
+                dtstart        TIMESTAMPTZ NULL,            -- calendars: the first instance, for time ranges
+                dtend          TIMESTAMPTZ NULL,            -- the last instance's end; NULL: open-ended
+                created_modseq BIGINT      NOT NULL,
+                modseq         BIGINT      NOT NULL,
+                deleted        BOOLEAN     NOT NULL DEFAULT FALSE,   -- a tombstone, kept for sync
+                created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+                updated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+                UNIQUE (collection_id, href)
+            );
+            CREATE INDEX dav_objects_changed ON dav_objects(collection_id, modseq);
+            CREATE INDEX dav_objects_uid ON dav_objects(collection_id, uid);
+            """;
+    }
+    if (version == 11 && part == 2) {
+        // ActiveSync: each device, the folders it was given (FolderSync), and for each folder what the device holds
+        // (the item, and the version, a modseq, it was sent), so a Sync gives the adds, changes and deletes since.
+        // A row the last response changed keeps what it replaced, so a client that repeats its previous sync key
+        // (the response was lost) gets the same changes again.
+        return """
+            CREATE TABLE eas_devices (
+                id               BIGSERIAL   PRIMARY KEY,
+                user_id          BIGINT      NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                device_id        TEXT        NOT NULL,
+                device_type      TEXT        NOT NULL,
+                model            TEXT        NULL,
+                friendly_name    TEXT        NULL,
+                os               TEXT        NULL,
+                user_agent       TEXT        NULL,
+                policy_key       BIGINT      NOT NULL DEFAULT 0,
+                status           TEXT        NOT NULL DEFAULT 'allowed'
+                    CHECK (status IN ('allowed', 'blocked', 'wipe', 'wiped')),
+                protocol_version TEXT        NOT NULL DEFAULT '14.1',
+                hierarchy_key    BIGINT      NOT NULL DEFAULT 0,   -- FolderSync's sync key
+                ping_folders     TEXT        NOT NULL DEFAULT '',  -- the last Ping's folders, for one that omits them
+                ping_heartbeat   INTEGER     NOT NULL DEFAULT 0,
+                last_sync_at     TIMESTAMPTZ NULL,
+                created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+                updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+                UNIQUE (user_id, device_id)
+            );
+            CREATE TABLE eas_folders (
+                id            BIGSERIAL   PRIMARY KEY,
+                device_id     BIGINT      NOT NULL REFERENCES eas_devices(id) ON DELETE CASCADE,
+                collection_id TEXT        NOT NULL,   -- the ServerId the device knows the folder by
+                kind          TEXT        NOT NULL CHECK (kind IN ('mailbox', 'calendar', 'addressbook')),
+                source_id     BIGINT      NOT NULL,   -- mailboxes.id or dav_collections.id
+                parent_id     TEXT        NOT NULL DEFAULT '0',
+                display_name  TEXT        NOT NULL,
+                folder_type   INTEGER     NOT NULL,
+                sync_key      BIGINT      NOT NULL DEFAULT 0,
+                -- The Sync options last sent (a Sync may omit them): FilterType, the body type and truncation
+                -- wanted (MS-ASAIRS BodyPreference), and MIMESupport.
+                filter_type   INTEGER     NOT NULL DEFAULT 0,
+                body_type     INTEGER     NOT NULL DEFAULT 1,
+                truncation    BIGINT      NOT NULL DEFAULT -1,     -- -1: none
+                mime_support  INTEGER     NOT NULL DEFAULT 0,
+                gone          BOOLEAN     NOT NULL DEFAULT FALSE,   -- deleted, the device not told yet
+                updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+                UNIQUE (device_id, collection_id)
+            );
+            CREATE TABLE eas_items (
+                folder_id BIGINT  NOT NULL REFERENCES eas_folders(id) ON DELETE CASCADE,
+                item      BIGINT  NOT NULL,   -- messages.uid or dav_objects.id
+                version   BIGINT  NOT NULL,   -- the modseq the device was sent
+                sync_key  BIGINT  NOT NULL,   -- the response that last changed this row
+                previous  BIGINT  NULL,       -- the version before that response; NULL: it added the row
+                gone      BOOLEAN NOT NULL DEFAULT FALSE,   -- that response deleted it
+                PRIMARY KEY (folder_id, item)
+            );
+            """;
+    }
+    return "";
+}
+
+/// The name of a version's migration.
+fn migrationName(version: i32) -> StringView {
+    if (version == 1) {
+        return "001_initial";
+    }
+    if (version == 2) {
+        return "002_queue";
+    }
+    if (version == 3) {
+        return "003_sieve";
+    }
+    if (version == 4) {
+        return "004_auth_guard";
+    }
+    if (version == 5) {
+        return "005_relay";
+    }
+    if (version == 6) {
+        return "006_dkim";
+    }
+    if (version == 7) {
+        return "007_suppression";
+    }
+    if (version == 8) {
+        return "008_mta_sts";
+    }
+    if (version == 9) {
+        return "009_mta_sts_publish";
+    }
+    if (version == 10) {
+        return "010_admin";
+    }
+    if (version == 11) {
+        return "011_groupware";
+    }
+    return "";
+}

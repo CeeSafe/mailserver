@@ -1,0 +1,178 @@
+// Bounces: delivery status notifications (RFC 3464, in a multipart/report of RFC 6522), one per message for all
+// its failed recipients, with each recipient's status and the remote server's own words, and the original header so
+// the sender can tell which message it was. Sent from the null sender, so a bounce never bounces.
+
+/// A recipient that failed for good.
+@noncopy
+struct Failure {
+    recipient: String;
+    /// The reply that settled it ("550 5.1.1 No such user"), or our own reason.
+    reply: String;
+    /// The server that said so, or empty when we decided (no such domain, expired).
+    remote: String;
+}
+
+/// The enhanced status code (RFC 3463) in `reply`, as `5.1.1`, or one made from the reply code.
+fn statusOf(reply: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    out.clear();
+    // "550 5.1.1 text": the second word, when it is class.subject.detail.
+    if (reply.length > 4) {
+        let rest = reply[4..];
+        let end = match (rest.indexOfByte(0x20)) {
+            Some(i) => i,
+            null => rest.length,
+        };
+        let word = rest[0..end];
+        if (isStatus(word) && word[0] == reply[0]) {
+            return out.extend(word);
+        }
+    }
+    let cls = if (reply.length > 0 && (reply[0] == 0x34 || reply[0] == 0x35)) reply[0] else 0x35;
+    out.push(cls)?;
+    return out.extend(".0.0".bytes());
+}
+
+fn isStatus(w: Slice<u8>) -> bool {
+    if (w.length < 5 || w.length > 11 || (w[0] != 0x32 && w[0] != 0x34 && w[0] != 0x35) || w[1] != 0x2e) {
+        return false;
+    }
+    var dots = 0;
+    for (c in w[2..]) {
+        if (c == 0x2e) {
+            dots += 1;
+        } else if (c < 0x30 || c > 0x39) {
+            return false;
+        }
+    }
+    return dots == 1 && w[w.length - 1] != 0x2e && w[2] != 0x2e;
+}
+
+/// The header of `message` (through the blank line), at most `limit` bytes, cut at a line end.
+fn headerOfMessage(message: Slice<u8>, limit: usize) -> Slice<u8> {
+    var i: usize = 0;
+    var lastLine: usize = 0;
+    while (i < message.length && i < limit) {
+        if (message[i] == 0x0a) {
+            lastLine = i + 1;
+            if (i + 1 < message.length && message[i + 1] == 0x0a) {
+                return message[0..i + 1];
+            }
+            if (i + 2 < message.length && message[i + 1] == 0x0d && message[i + 2] == 0x0a) {
+                return message[0..i + 1];
+            }
+        }
+        i += 1;
+    }
+    return message[0..lastLine];
+}
+
+fn appendClean(out: borrow mut Vector<u8>, text: Slice<u8>) -> Result<void, AllocError> {
+    for (c in text) {
+        out.push(if (c < 0x20 || c == 0x7f) 0x20 else c)?;
+    }
+    return Ok();
+}
+
+/// Writes the bounce to `sender` for `failures` of a message whose start is `original` (its header is quoted).
+/// `hostname` is this server's name, `date` the Date value, `messageId` the new Message-ID (with brackets),
+/// `boundary` a random MIME boundary. With `retryUntil` (a date) it is a delay notice instead: the recipients are
+/// still being tried, until then (RFC 3464 Action: delayed, Will-Retry-Until).
+fn buildBounce(
+    retryUntil: Slice<u8>,
+    hostname: Slice<u8>,
+    sender: Slice<u8>,
+    failures: borrow Vector<Failure>,
+    original: Slice<u8>,
+    date: Slice<u8>,
+    messageId: Slice<u8>,
+    boundary: Slice<u8>,
+    out: borrow mut Vector<u8>,
+) -> Result<void, AllocError> {
+    out.clear();
+    out.extend("From: Mail Delivery System <MAILER-DAEMON@".bytes())?;
+    out.extend(hostname)?;
+    out.extend(">\r\nTo: <".bytes())?;
+    appendClean(out, sender)?;
+    let delayed = retryUntil.length > 0;
+    out.extend(
+        if (delayed) ">\r\nSubject: Delayed Mail (still being retried)\r\nDate: ".bytes() else ">\r\nSubject: Undelivered Mail Returned to Sender\r\nDate: ".bytes(),
+    )?;
+    out.extend(date)?;
+    out.extend("\r\nMessage-ID: ".bytes())?;
+    out.extend(messageId)?;
+    out.extend("\r\nAuto-Submitted: auto-replied\r\nMIME-Version: 1.0\r\n".bytes())?;
+    out.extend("Content-Type: multipart/report; report-type=delivery-status;\r\n\tboundary=\"".bytes())?;
+    out.extend(boundary)?;
+    out.extend("\"\r\n\r\nThis is a MIME-encapsulated message.\r\n\r\n--".bytes())?;
+    // The part for people.
+    out.extend(boundary)?;
+    out.extend("\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n".bytes())?;
+    out.extend("This is the mail system at ".bytes())?;
+    out.extend(hostname)?;
+    if (delayed) {
+        out.extend(
+            ".\r\n\r\nYour message has not yet been delivered to the recipients below. This is only a\r\n".bytes(),
+        )?;
+        out.extend("warning: it will be tried again until ".bytes())?;
+        out.extend(retryUntil)?;
+        out.extend(", and you need not\r\nsend it again.\r\n\r\n".bytes())?;
+    } else {
+        out.extend(
+            ".\r\n\r\nYour message could not be delivered to the recipients below. This is a permanent\r\n".bytes(),
+        )?;
+        out.extend("error; it will not be tried again.\r\n\r\n".bytes())?;
+    }
+    for (i in 0..failures.length) {
+        let f = borrow failures[i];
+        out.extend("<".bytes())?;
+        appendClean(out, f.recipient.view().bytes())?;
+        out.extend(">: ".bytes())?;
+        appendClean(out, f.reply.view().bytes())?;
+        if (f.remote.length > 0) {
+            out.extend(" (from ".bytes())?;
+            appendClean(out, f.remote.view().bytes())?;
+            out.extend(")".bytes())?;
+        }
+        out.extend("\r\n".bytes())?;
+    }
+    // The part for programs (RFC 3464 §2).
+    out.extend("\r\n--".bytes())?;
+    out.extend(boundary)?;
+    out.extend("\r\nContent-Type: message/delivery-status\r\n\r\nReporting-MTA: dns; ".bytes())?;
+    out.extend(hostname)?;
+    out.extend("\r\n".bytes())?;
+    var status = Vector<u8>.create();
+    for (i in 0..failures.length) {
+        let f = borrow failures[i];
+        out.extend("\r\nFinal-Recipient: rfc822; ".bytes())?;
+        appendClean(out, f.recipient.view().bytes())?;
+        out.extend(
+            if (delayed) "\r\nAction: delayed\r\nStatus: ".bytes() else "\r\nAction: failed\r\nStatus: ".bytes(),
+        )?;
+        statusOf(f.reply.view().bytes(), mut status)?;
+        out.extend(status.view())?;
+        if (f.remote.length > 0) {
+            out.extend("\r\nRemote-MTA: dns; ".bytes())?;
+            appendClean(out, f.remote.view().bytes())?;
+            out.extend("\r\nDiagnostic-Code: smtp; ".bytes())?;
+            appendClean(out, f.reply.view().bytes())?;
+        }
+        if (delayed) {
+            out.extend("\r\nWill-Retry-Until: ".bytes())?;
+            out.extend(retryUntil)?;
+        }
+        out.extend("\r\n".bytes())?;
+    }
+    // The original header (RFC 6522 §3).
+    out.extend("\r\n--".bytes())?;
+    out.extend(boundary)?;
+    out.extend("\r\nContent-Type: text/rfc822-headers\r\n\r\n".bytes())?;
+    let header = headerOfMessage(original, 64 * 1024);
+    out.extend(header)?;
+    if (header.length > 0 && header[header.length - 1] != 0x0a) {
+        out.extend("\r\n".bytes())?;
+    }
+    out.extend("\r\n--".bytes())?;
+    out.extend(boundary)?;
+    return out.extend("--\r\n".bytes());
+}

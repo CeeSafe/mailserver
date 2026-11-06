@@ -1,0 +1,26 @@
+size 31537
+envelope ("Mon,  4 May 1992 10:01:12 -0400 (EDT)" "Re: MIME: Some real world FACTS of life" (("Nathaniel Borenstein" NIL "nsb" "MISSING_DOMAIN")) (("Nathaniel Borenstein" NIL "nsb" "MISSING_DOMAIN")) (("Nathaniel Borenstein" NIL "nsb" "MISSING_DOMAIN")) (("Mark Crispin" NIL "mrc" "tomobiki-cho.cac.washington.edu")) NIL NIL "<MS-C.704934000.1103527590.mrc@Tomobiki-Cho.CAC.Washington.EDU>" "<Ie1ICcG0M2Yt01U0or@thumper.bellcore.com>")
+bodystructure (("text" "plain" ("charset" "US-ASCII") NIL NIL "7bit" 421 7 NIL NIL NIL NIL) (("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 72 1 NIL NIL NIL NIL) ("audio" "basic" NIL NIL "Danger, danger!" "base64" 10854 NIL NIL NIL NIL) ("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 66 2 NIL NIL NIL NIL) ("audio" "basic" NIL NIL "illogical" "base64" 5990 NIL NIL NIL NIL) ("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 35 2 NIL NIL NIL NIL) ("audio" "basic" NIL NIL "Does not compute!" "base64" 11816 NIL NIL NIL NIL) ("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 33 2 NIL NIL NIL NIL) "mixed" ("boundary" "Alternative.Boundary.ce1ICbq0M2YtQ1U0dT") NIL NIL NIL) "alternative" ("boundary" "Interpart.Boundary.ce1ICbq0M2YtM1U0gA") NIL NIL NIL)
+body (("text" "plain" ("charset" "US-ASCII") NIL NIL "7bit" 421 7) (("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 72 1) ("audio" "basic" NIL NIL "Danger, danger!" "base64" 10854) ("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 66 2) ("audio" "basic" NIL NIL "illogical" "base64" 5990) ("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 35 2) ("audio" "basic" NIL NIL "Does not compute!" "base64" 11816) ("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 33 2) "mixed") "alternative")
+section HEADER 788 23ef79304e4ac59d4b8ea6a61a9188712964f6339f401f834d470fb5d083561c
+section TEXT 30749 95fa5271b686fb7dedaf3de1bca3a82aa06b819500ef30d055a7c7303f731f0d
+section HEADER.FIELDS 332 b3e86b1ff4661b452cd112f2c93386839f69fb0e6b7ae78c5fe423b25d127da7
+section HEADER.FIELDS.NOT 458 79e9eb21ca118b138c544bd266856b46ca92865f325aeb83a557f62eb858c6a7
+section 1 421 4c6cff31882b0b6378abc0331964c12f276aa87a45d91e884aa986ff1a1711bd
+section 1.MIME 46 b3532c649b28a23803c77a2acc4907f5048ea77b89e0c51dcf7f271f2db4bfa6
+section 2 29907 ce657a42c502acd3513fa2072d34ad84c9760f68e38fb33a82eb276e84340a23
+section 2.MIME 88 193e0ad601485352dfb7d607b9f0f673eaaba1391a319d1d9a9741f2627a6e71
+section 2.1 72 9146772e77b6fe8fccb76e31621e79f819748fa5af83a755bb6835d5efda8f0c
+section 2.1.MIME 94 7d35d8c48d3869c4391f6ff71123bfb4c8466e5b04f02d64c3961f23d7d8bf61
+section 2.2 10854 b4e85ebb3739277ccf8c126f2e8e8b958d63da1f325dd7029e554c94a45d456f
+section 2.2.MIME 103 cfe7b81d45353ffd9bce325e564d1d9050cc96eb68c7c04afae3aff90187919b
+section 2.3 66 c92255c0fcebc1a2517d461f76b3fb5c11c46c8f55332c5ab81a39cb1b82e5b9
+section 2.3.MIME 94 7d35d8c48d3869c4391f6ff71123bfb4c8466e5b04f02d64c3961f23d7d8bf61
+section 2.4 5990 1e5d70a5768649e62925b21d78596e240309bce2f34034e766f9418029b0dc90
+section 2.4.MIME 97 728dd57b24c9a6a3a29d01513e81a42d2fe80688fb91d9b5873875ded7c6406d
+section 2.5 35 eb1c723b0369e5bf1002fbf10ec93634adffdd75c6c085a5b05edd103d228526
+section 2.5.MIME 94 7d35d8c48d3869c4391f6ff71123bfb4c8466e5b04f02d64c3961f23d7d8bf61
+section 2.6 11816 8ecea579e35e74919864726405ae39c0f582432b48603f3fb1a11d87f9923bfe
+section 2.6.MIME 105 9219b401ce636c383a69ad99652b4af9de132188d4140fb6d5eae0e2c9ff2f5d
+section 2.7 33 34b31b45c3aaa92d3bf522c6179a9b88901636a4e311df73461fa09de4a6b778
+section 2.7.MIME 94 7d35d8c48d3869c4391f6ff71123bfb4c8466e5b04f02d64c3961f23d7d8bf61

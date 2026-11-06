@@ -1,0 +1,180 @@
+// The pure parts: DATA decoding, paths, SASL, dates.
+
+/// Decodes `input` fed in chunks of `chunk` bytes; gives the message and how much input was used.
+fn decodeIn(input: StringView, chunk: usize, used: borrow mut usize) -> String {
+    var d = DotDecoder.create();
+    var out = Vector<u8>.create();
+    let bytes = input.bytes();
+    var at: usize = 0;
+    while (at < bytes.length && !d.isFinished()) {
+        let end = if (at + chunk > bytes.length) bytes.length else at + chunk;
+        at += d.decode(bytes[at..end], mut out)!;
+    }
+    used = at;
+    var s = String.create();
+    s.append(StringView.fromUtf8(out.view())!)!;
+    return s;
+}
+
+fn decodes(input: StringView, want: StringView, wantUsed: usize, finished: bool) -> Result<void, TestFailure> {
+    for (c in 1..9) {
+        var used: usize = 0;
+        let got = decodeIn(input, truncate<usize>(c), mut used);
+        if (got.view() != want) {
+            Console.writeErrorLine(got.view());
+        }
+        Check.isTrue(got.view() == want, want)?;
+        if (finished) {
+            Check.isTrue(used == wantUsed, "stops after the end")?;
+        }
+    }
+    return Ok();
+}
+
+@test
+fn decodesData() -> Result<void, TestFailure> {
+    decodes("Subject: x\r\n\r\nbody\r\n.\r\nQUIT\r\n", "Subject: x\r\n\r\nbody\r\n", 23, true)?;
+    decodes(".\r\n", "", 3, true)?; // an empty message
+    decodes("..leading dot\r\n.\r\n", ".leading dot\r\n", 18, true)?;
+    decodes(".x\r\n.\r\n", "x\r\n", 7, true)?;
+    decodes("a\r\n.\rb\r\n.\r\n", "a\r\n\rb\r\n", 11, true)?;
+    // Bare LFs never end the message (SMTP smuggling).
+    decodes("a\n.\nb\n.\r\nc\r\n.\r\n", "a\n.\nb\n.\r\nc\r\n", 15, true)?;
+    decodes("a\r\n.\nb\r\n.\r\n", "a\r\n\nb\r\n", 11, true)?;
+    // Unfinished: everything so far is kept, except a held-back dot.
+    var used: usize = 0;
+    let open = decodeIn("abc\r\n.", 4, mut used);
+    return Check.isTrue(open.view() == "abc\r\n" && used == 6, "a dot held back at the end of input");
+}
+
+fn path(line: StringView, keyword: StringView, allowNull: bool) -> Result<PathArgs, PathError> =>
+    parsePath(line.bytes(), 5, keyword, allowNull);
+
+fn addressOf(line: StringView, args: PathArgs) -> StringView {
+    let bytes = line.bytes();
+    return StringView.fromUtf8(bytes[args.at..args.at + args.length])!;
+}
+
+@test
+fn parsesPaths() -> Result<void, TestFailure> {
+    let a = "MAIL FROM:<alice@example.org> SIZE=1234 BODY=8BITMIME";
+    let p = path(a, "FROM:", true)!;
+    Check.isTrue(addressOf(a, p) == "alice@example.org" && p.size == 1234, "address and SIZE")?;
+    let spaced = "MAIL FROM: <bob@example.org>";
+    Check.isTrue(addressOf(spaced, path(spaced, "FROM:", true)!) == "bob@example.org", "a space after the colon")?;
+    let bare = "RCPT TO:carol@example.org";
+    Check.isTrue(addressOf(bare, path(bare, "TO:", false)!) == "carol@example.org", "no brackets")?;
+    let routed = "RCPT TO:<@relay.example:dave@example.org>";
+    Check.isTrue(addressOf(routed, path(routed, "TO:", false)!) == "dave@example.org", "a source route")?;
+    Check.isTrue(path("MAIL FROM:<>", "FROM:", true)!.length == 0, "the null path")?;
+    match (path("RCPT TO:<>", "TO:", false)) {
+        Err(PathError.Address) => {}
+        _ => { return Check.fail("RCPT TO:<> refused"); }
+    }
+    match (path("MAIL FROM:<a@b.example> NOTIFY=NEVER", "FROM:", true)) {
+        Err(PathError.Parameter) => {}
+        _ => { return Check.fail("an unknown parameter"); }
+    }
+    match (path("MAIL TO:<a@b.example>", "FROM:", true)) {
+        Err(PathError.Syntax) => {}
+        _ => { return Check.fail("the wrong keyword"); }
+    }
+    Check.isTrue(
+        !isMailbox("no-at-sign".bytes()) && !isMailbox("a@".bytes()) && !isMailbox("@b".bytes()),
+        "malformed",
+    )?;
+    return Check.isTrue(
+        isMailbox("\"odd local\"@example.org".bytes()) == false && isMailbox("ü@exämple.org".bytes()),
+        "spaces, UTF-8",
+    );
+}
+
+@test
+fn decodesSasl() -> Result<void, TestFailure> {
+    var user = Vector<u8>.create();
+    var password = Vector<u8>.create();
+    // "\0alice@example.org\0secret"
+    Check.isTrue(decodePlain("AGFsaWNlQGV4YW1wbGUub3JnAHNlY3JldA==".bytes(), mut user, mut password)!, "PLAIN")?;
+    Check.isTrue(user.view().startsWith("alice@example.org".bytes()) && password.length == 6, "fields")?;
+    // "bob\0alice@example.org\0secret": acting as someone else is refused.
+    Check.isTrue(!decodePlain("Ym9iAGFsaWNlQGV4YW1wbGUub3JnAHNlY3JldA==".bytes(), mut user, mut password)!, "authzid")?;
+    Check.isTrue(!decodePlain("not base64!".bytes(), mut user, mut password)!, "garbage")?;
+    var line = Vector<u8>.create();
+    return Check.isTrue(decodeLoginLine("c2VjcmV0".bytes(), mut line)! && line.length == 6, "LOGIN");
+}
+
+@test
+fn formatsDates() -> Result<void, TestFailure> {
+    var out = Vector<u8>.create();
+    appendDate(mut out, 0)!;
+    Check.isTrue(StringView.fromUtf8(out.view())! == "Thu, 01 Jan 1970 00:00:00 +0000", "the epoch")?;
+    out.clear();
+    appendDate(mut out, 1793882096)!;
+    Check.isTrue(StringView.fromUtf8(out.view())! == "Thu, 05 Nov 2026 12:34:56 +0000", "today")?;
+    out.clear();
+    appendDate(mut out, 951782400)!;
+    return Check.isTrue(StringView.fromUtf8(out.view())! == "Tue, 29 Feb 2000 00:00:00 +0000", "a leap day");
+}
+
+
+fn forward(sender: StringView, today: i64) -> Vector<u8> {
+    var out = Vector<u8>.create();
+    let ok = srsForward("s3cret".bytes(), "fwd.example".bytes(), sender.bytes(), today, mut out)!;
+    if (!ok) {
+        out.clear();
+    }
+    return out;
+}
+
+/// The reversed address, or empty.
+fn back(address: Slice<u8>, today: i64, secret: StringView) -> String {
+    var out = Vector<u8>.create();
+    var text = String.create();
+    if (srsReverse(secret.bytes(), "fwd.example".bytes(), address, today, mut out)!) {
+        text.append(StringView.fromUtf8(out.view())!)!;
+    }
+    return text;
+}
+
+fn backIs(address: Slice<u8>, today: i64, secret: StringView, want: StringView) -> bool {
+    let got = back(address, today, secret);
+    return got.view() == want;
+}
+
+@test
+fn rewritesSenders() -> Result<void, TestFailure> {
+    let day: i64 = 20397;
+    let a = forward("alice=x@example.com", day);
+    let text = StringView.fromUtf8(a.view())!;
+    Check.isTrue(text.startsWith("SRS0=") && text.contains("=example.com=alice=x@fwd.example"), "the form")?;
+    Check.isTrue(backIs(a.view(), day, "s3cret", "alice=x@example.com"), "reverses")?;
+    Check.isTrue(backIs(a.view(), day + 21, "s3cret", "alice=x@example.com"), "for 21 days")?;
+    Check.isTrue(backIs(a.view(), day + 22, "s3cret", ""), "not after")?;
+    Check.isTrue(backIs(a.view(), day, "other secret", ""), "only with our secret")?;
+    // Lowercased by a server on the way: still good.
+    var lower = Vector<u8>.create();
+    for (c in a.view()) {
+        lower.push(if (c >= 0x41 && c <= 0x5a) c + 0x20 else c)!;
+    }
+    Check.isTrue(!backIs(lower.view(), day, "s3cret", ""), "case does not matter")?;
+    // Tampered: another destination with the same hash.
+    var forged = Vector<u8>.create();
+    forged.extend(a.view())!;
+    let at = text.indexOf("=example.com=")!;
+    forged[at + 1] = 0x45; // Example.com → Eample… : the hash no longer matches
+    forged[at + 2] = 0x76;
+    Check.isTrue(backIs(forged.view(), day, "s3cret", ""), "a changed address fails")?;
+    // Day numbers wrap at 1024.
+    let late = forward("bob@example.net", 1023);
+    Check.isTrue(backIs(late.view(), 1024 + 5, "s3cret", "bob@example.net"), "across the wrap")?;
+    // Not rewritten: the null sender, no domain, too long.
+    Check.isTrue(forward("", day).length == 0 && forward("nodomain", day).length == 0, "nothing to rewrite")?;
+    var long = String.create();
+    for (i in 0..240) {
+        long.append("x")!;
+    }
+    long.append("@example.com")!;
+    Check.isTrue(forward(long.view(), day).length == 0, "too long")?;
+    // Ordinary addresses at the SRS domain are not ours to reverse.
+    return Check.isTrue(backIs("postmaster@fwd.example".bytes(), day, "s3cret", ""), "not SRS");
+}

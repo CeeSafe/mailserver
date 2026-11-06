@@ -1,0 +1,185 @@
+// The Sender Rewriting Scheme, for mail this server forwards (Sieve redirects, aliases to remote addresses): the
+// envelope sender becomes an address of ours, so SPF at the destination checks our servers, not the original
+// sender's; a bounce to it comes back to us and goes on to the original sender.
+//
+//     alice@example.com  →  SRS0=HHHHHHHH=TT=example.com=alice@forwarder.example
+//
+// HHHHHHHH is a keyed hash (HMAC-SHA256, 40 bits in base32), so nobody else can make us forward to an address of
+// their choosing; TT is the day it was made (base32, mod 1024), so an address stops working after `SRS_MAX_DAYS`.
+// Base32 rather than base64: some servers lowercase local parts, and both survive that. Only this server checks the
+// hash, so its form need not match other implementations'.
+
+import sha256.HmacSha256;
+
+/// How long a rewritten address stays valid (the time a bounce may take to come back).
+const SRS_MAX_DAYS: i64 = 21;
+
+const BASE32: StringView = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+
+fn lowerByte(c: u8) -> u8 => if (c >= 0x41 && c <= 0x5a) c + 0x20 else c;
+
+/// The 8-character hash of the day and the address, uppercase base32.
+fn srsHash(
+    secret: Slice<u8>,
+    day: Slice<u8>,
+    domain: Slice<u8>,
+    local: Slice<u8>,
+    out: borrow mut Vector<u8>,
+) -> Result<void, AllocError> {
+    // Hashed lowercase, so a lowercased address still checks.
+    var data = Vector<u8>.create();
+    for (c in day) {
+        data.push(lowerByte(c))?;
+    }
+    data.push(0x3d)?;
+    for (c in domain) {
+        data.push(lowerByte(c))?;
+    }
+    data.push(0x3d)?;
+    for (c in local) {
+        data.push(lowerByte(c))?;
+    }
+    let mac = HmacSha256.mac(secret, data.view());
+    // The first 40 bits: 8 base32 characters.
+    var bits: u64 = 0;
+    for (i in 0..5) {
+        bits = (bits << 8) | (mac[i] as u64);
+    }
+    let alphabet = BASE32.bytes();
+    var shift: u64 = 35;
+    loop {
+        out.push(alphabet[((bits >> shift) & 31) as usize])?;
+        if (shift == 0) {
+            break;
+        }
+        shift -= 5;
+    }
+    return Ok();
+}
+
+fn dayText(day: i64, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    let alphabet = BASE32.bytes();
+    let d = truncate<usize>(day % 1024);
+    out.push(alphabet[d / 32])?;
+    return out.push(alphabet[d % 32]);
+}
+
+fn dayOf(text: Slice<u8>) -> i64? {
+    if (text.length != 2) {
+        return null;
+    }
+    var n: i64 = 0;
+    for (c in text) {
+        let u = if (c >= 0x61 && c <= 0x7a) c - 0x20 else c;
+        let v: i64 =
+            if (u >= 0x41 &&
+                u <= 0x5a) (u - 0x41) as i64 else (if (u >= 0x32 && u <= 0x37) (u - 0x32 + 26) as i64 else -1);
+        if (v < 0) {
+            return null;
+        }
+        n = n * 32 + v;
+    }
+    return n;
+}
+
+/// Rewrites `sender` for forwarding on `today` (days since 1970) into `out`. False, and nothing written, for the null
+/// sender, an address without a domain, or one too long to rewrite (the result must stay under 256 bytes).
+public fn srsForward(
+    secret: Slice<u8>,
+    srsDomain: Slice<u8>,
+    sender: Slice<u8>,
+    today: i64,
+    out: borrow mut Vector<u8>,
+) -> Result<bool, AllocError> {
+    out.clear();
+    let at = match (sender.lastIndexOf("@".bytes())) {
+        Some(a) => a,
+        null => { return Ok(false); }
+    };
+    if (at == 0 || at + 1 >= sender.length || secret.length == 0) {
+        return Ok(false);
+    }
+    let local = sender[0..at];
+    let domain = sender[at + 1..];
+    // Already one of ours: forwarded twice through this server; keep it, it still reverses.
+    if (domain.equalsIgnoreAsciiCase(srsDomain) && local.length > 5 && local[0..5].equalsIgnoreAsciiCase(
+        "SRS0=".bytes(),
+    )) {
+        out.extend(sender)?;
+        return Ok(true);
+    }
+    var day = Vector<u8>.create();
+    dayText(today, mut day)?;
+    out.extend("SRS0=".bytes())?;
+    srsHash(secret, day.view(), domain, local, out)?;
+    out.push(0x3d)?;
+    out.extend(day.view())?;
+    out.push(0x3d)?;
+    out.extend(domain)?;
+    out.push(0x3d)?;
+    out.extend(local)?;
+    out.push(0x40)?;
+    out.extend(srsDomain)?;
+    if (out.length > 255) {
+        out.clear();
+        return Ok(false);
+    }
+    return Ok(true);
+}
+
+/// The original address of `address`, when it is one of our rewritten addresses, valid and not older than
+/// `SRS_MAX_DAYS` on `today`, into `out`. False otherwise (then it is an ordinary address, or a forgery).
+public fn srsReverse(
+    secret: Slice<u8>,
+    srsDomain: Slice<u8>,
+    address: Slice<u8>,
+    today: i64,
+    out: borrow mut Vector<u8>,
+) -> Result<bool, AllocError> {
+    out.clear();
+    let at = match (address.lastIndexOf("@".bytes())) {
+        Some(a) => a,
+        null => { return Ok(false); }
+    };
+    if (secret.length == 0 || !address[at + 1..].equalsIgnoreAsciiCase(srsDomain)) {
+        return Ok(false);
+    }
+    let local = address[0..at];
+    if (local.length < 5 || !local[0..5].equalsIgnoreAsciiCase("SRS0=".bytes())) {
+        return Ok(false);
+    }
+    // HHHHHHHH=TT=domain=local; the original local part may itself hold '='.
+    let rest = local[5..];
+    if (rest.length < 13 || rest[8] != 0x3d || rest[11] != 0x3d) {
+        return Ok(false);
+    }
+    let hash = rest[0..8];
+    let day = rest[9..11];
+    let tail = rest[12..];
+    let eq = match (tail.indexOfByte(0x3d)) {
+        Some(e) => e,
+        null => { return Ok(false); }
+    };
+    let domain = tail[0..eq];
+    let original = tail[eq + 1..];
+    if (domain.length == 0 || original.length == 0) {
+        return Ok(false);
+    }
+    let made = match (dayOf(day)) {
+        Some(d) => d,
+        null => { return Ok(false); }
+    };
+    let age = ((today % 1024) - made + 1024) % 1024;
+    if (age > SRS_MAX_DAYS) {
+        return Ok(false);
+    }
+    var expected = Vector<u8>.create();
+    srsHash(secret, day, domain, original, mut expected)?;
+    if (!expected.view().equalsIgnoreAsciiCase(hash)) {
+        return Ok(false);
+    }
+    out.extend(original)?;
+    out.push(0x40)?;
+    out.extend(domain)?;
+    return Ok(true);
+}

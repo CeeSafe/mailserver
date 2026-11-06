@@ -1,0 +1,40 @@
+size 3297
+envelope ("Sat, 01 Jun 1996 19:00:49 -0700" "multipart/alternative 2" (("Jamie Zawinski" NIL "jwz" "netscape.com")) (("Jamie Zawinski" NIL "jwz" "netscape.com")) (("Jamie Zawinski" NIL "jwz" "netscape.com")) (("Jamie Zawinski" NIL "jwz" "netscape.com")) NIL NIL NIL "<31B0F5D1.41C6@netscape.com>")
+bodystructure (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 64 1 NIL NIL NIL NIL) (("text" "plain" ("charset" "iso-8859-1") NIL NIL "8bit" 83 3 NIL ("inline" NIL) NIL NIL) ("text" "richtext" ("charset" "iso-8859-1") NIL NIL "8bit" 162 4 NIL ("inline" NIL) NIL NIL) ("text" "enriched" ("charset" "iso-8859-1") NIL NIL "8bit" 173 10 NIL ("inline" NIL) NIL NIL) ("text" "html" ("charset" "iso-8859-1") NIL NIL "8bit" 164 3 NIL ("inline" NIL) NIL NIL) ("text" "something-you-dont-know" ("charset" "iso-8859-1") NIL NIL "8bit" 433 6 NIL ("inline" NIL) NIL NIL) "alternative" ("boundary" "------------167E2781446B") NIL NIL NIL) ("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 169 4 NIL NIL NIL NIL) (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 54 1 NIL NIL NIL NIL) (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 54 1 NIL NIL NIL NIL) ("text" "html" ("charset" "us-ascii") NIL NIL "7bit" 51 1 NIL NIL NIL NIL) ("text" "x-barf" ("charset" "us-ascii") NIL NIL "7bit" 55 1 NIL NIL NIL NIL) "alternative" ("boundary" "M2") NIL NIL NIL) ("application" "spankme" NIL NIL "you shouldn't be seeing this either" "7bit" 16 NIL NIL NIL NIL) "alternative" ("boundary" "M1") NIL NIL NIL) ("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 10 1 NIL NIL NIL NIL) "mixed" ("boundary" "------------outer") NIL NIL NIL)
+body (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 64 1) (("text" "plain" ("charset" "iso-8859-1") NIL NIL "8bit" 83 3) ("text" "richtext" ("charset" "iso-8859-1") NIL NIL "8bit" 162 4) ("text" "enriched" ("charset" "iso-8859-1") NIL NIL "8bit" 173 10) ("text" "html" ("charset" "iso-8859-1") NIL NIL "8bit" 164 3) ("text" "something-you-dont-know" ("charset" "iso-8859-1") NIL NIL "8bit" 433 6) "alternative") ("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 169 4) (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 54 1) (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 54 1) ("text" "html" ("charset" "us-ascii") NIL NIL "7bit" 51 1) ("text" "x-barf" ("charset" "us-ascii") NIL NIL "7bit" 55 1) "alternative") ("application" "spankme" NIL NIL "you shouldn't be seeing this either" "7bit" 16) "alternative") ("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 10 1) "mixed")
+section HEADER 417 247cfbd697ad74510bd9fdda6dee85bf6ab0c3f108e5e4b25f854d543bbe3fff
+section TEXT 2880 96ed5f1c837f880ffbb70e5a5251b2f9409638254acc5a47a140558b2a78b58b
+section HEADER.FIELDS 258 c4f83b408175a77a2d751d919226cf0c9df00115dc83ef45143b8d84085182fc
+section HEADER.FIELDS.NOT 161 31a8f96a1967fd53aed8ab405d81f32c8c361f9da6ea4c0a676a738334333e71
+section 1 64 e4a56f91e6b073cd0d3a1783938c33d95f32c0358c16327ffe80a8a9614226e0
+section 1.MIME 2 7eb70257593da06f682a3ddda54a9d260d4fc514f645237f5ca74b08f8da61a6
+section 2 1768 b1bb6097edd8044e2d2a9a64aecf5532714921c7f62b370f16e98e51dd2cf329
+section 2.MIME 76 36b8629e3fc8884f38584bf197b23b2d22496ac97fa9ab09c7b546478665d7bf
+section 2.1 83 c5a17bde9f7f56462870596dd0b8555738ebcc093d3e5632bb5bbb2ac3cab939
+section 2.1.MIME 110 c9b1e0b48dd6d8e4f7d780ea9cdac350d580fbd00665f1c22b79f9e955aaf41c
+section 2.2 162 8d8fa333f64e19a0ae0c035f863e04ea62c20da500bb5bdb24b989b3c2ef9d11
+section 2.2.MIME 113 4069e6ce7db736e6fd1de814646348461fcc06fd542ed6d0522e5a4413e711f4
+section 2.3 173 9249cc9c5f16ca88669734060a0ebd2c1feaac7ff1921f5b8f7472d8f898ad15
+section 2.3.MIME 113 a613584d6aa820fb6c7aa075851546bd9bada31c837fc582b21ecf68bf6a4fe8
+section 2.4 164 c10cf7f78611ba337d76a1f7761d85040bcc0867348a9ffe6721ed627ea83526
+section 2.4.MIME 109 6ef994d8561a318c774d16f26d5fa3d233b9ead1b01ece7781fa22c3c1cfbd6c
+section 2.5 433 4b7db873eaa747b3adb76b436b84694473fca409981f89766bcf41b5949a90c0
+section 2.5.MIME 128 fada032da78581e5ad2ebdc331b66f3fb2f2d8c6ffd9ef27bceb2cf153d37fc0
+section 3 169 bcfe02fa363e8b00952459a301771793abdb4ce2345ffd6e5bd3e33b50de3bb1
+section 3.MIME 2 7eb70257593da06f682a3ddda54a9d260d4fc514f645237f5ca74b08f8da61a6
+section 4 553 81e9c739b7d568263132064a7cf0767b70b667cb172094b00019b0de9708e04d
+section 4.MIME 52 f74bcf419965fb4fb15b823a9f301cf63766f154e1457fe2853c5fa0980bde14
+section 4.1 54 d45aad664359712177218a24239aa2d2f78e73234bf6ca4f637a734ab10a1609
+section 4.1.MIME 28 c3204dd99ab0f23ec6029433de09a5ae168a2daab5b5352645a32379e329b040
+section 4.2 276 10407a92653b88730dbdfce2677d1bc56f252aba8112de1d24c2f4084301fd47
+section 4.2.MIME 52 c3a3d818ddfc03dfc809ed0e3b78c9d7bd5922e5c54362c52c3473e156269b92
+section 4.2.1 54 23972f8b4cd538acc3dbb9019979f40026f72f203bc6bca78302c9c21468791f
+section 4.2.1.MIME 28 c3204dd99ab0f23ec6029433de09a5ae168a2daab5b5352645a32379e329b040
+section 4.2.2 51 8e8f6792464b5bf3b48d69cecf498114f17b8934c8879762ae14f0042ca19edf
+section 4.2.2.MIME 27 638f2911b98fbd693b1391af2d14947e6561677da6e7123a0ab4131bf9c91760
+section 4.2.3 55 221b36bcd64a735cb92399ded854ab1f42f97053598946aaa057aa190437d45c
+section 4.2.3.MIME 29 462385cb659ed4b7c3cf8b7128f652c8e30c025a7b82c6b02cbb781dcefd899d
+section 4.3 16 579de681add9f8c686fa791c49d1222a63c236febff37769b5fb50659b007491
+section 4.3.MIME 95 4c70fb2b1b259a52258ff93b5834cf134c56dcb7509839e2c40058e14ad85259
+section 5 10 3f775e8100e26d1adf37e7876d18d1507a84cd47a24c1ce4ba151df394d3c41b
+section 5.MIME 2 7eb70257593da06f682a3ddda54a9d260d4fc514f645237f5ca74b08f8da61a6

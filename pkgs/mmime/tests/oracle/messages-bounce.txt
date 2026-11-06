@@ -1,0 +1,22 @@
+size 28238
+envelope ("Wed, 26 Jan 2022 04:06:48 -0500 (EST)" "Undelivered Mail Returned to Sender" (("Mail Delivery System" NIL "MAILER-DAEMON" "hmail.jitbit.com")) (("Mail Delivery System" NIL "MAILER-DAEMON" "hmail.jitbit.com")) (("Mail Delivery System" NIL "MAILER-DAEMON" "hmail.jitbit.com")) ((NIL NIL "helpdesk" "netecgc.com")) NIL NIL NIL "<20220126090648.12632412E9@hmail.jitbit.com>")
+bodystructure (("text" "plain" ("charset" "us-ascii") NIL "Notification" "base64" 1868 24 NIL NIL NIL NIL) ("message" "delivery-status" NIL NIL "Delivery report" "7bit" 953 NIL NIL NIL NIL) ("message" "rfc822" NIL NIL "Undelivered Message" "7bit" 17961 ("Wed, 26 Jan 2022 09:06:45 +0000" "FILE-SRV | FILE-SRV | Ellern Mede | eventlog | Security - Microsoft-Windows-Security-Auditing | Code: '4625' - Type: 'Critical, Error, Warning, , Information, Verbose' - Desc: '' {44565655}" (("Netec RMM" NIL "helpdesk" "netecgc.com")) (("Netec RMM" NIL "helpdesk" "netecgc.com")) ((NIL NIL "helpdesk" "netecgc.com")) ((NIL NIL "netec.test" "netecgc.com")) NIL NIL NIL "<44565655.JitbitHelpdesk.13439.691a0afc-a0a0-457c-8208-f20b7c4a4cb1@jitbit.com>") (("text" "plain" ("charset" "utf-8") NIL NIL "base64" 5452 88 NIL NIL NIL NIL) ("text" "html" ("charset" "utf-8") NIL NIL "base64" 11254 145 NIL NIL NIL NIL) "alternative" ("boundary" "=-JG9iIL0Fmro08hOsLcfbiQ==") NIL NIL NIL) 266 NIL NIL NIL NIL) "report" ("report-type" "delivery-status" "boundary" "630A242E63.1643188008/hmail.jitbit.com") NIL NIL NIL)
+body (("text" "plain" ("charset" "us-ascii") NIL "Notification" "base64" 1868 24) ("message" "delivery-status" NIL NIL "Delivery report" "7bit" 953) ("message" "rfc822" NIL NIL "Undelivered Message" "7bit" 17961 ("Wed, 26 Jan 2022 09:06:45 +0000" "FILE-SRV | FILE-SRV | Ellern Mede | eventlog | Security - Microsoft-Windows-Security-Auditing | Code: '4625' - Type: 'Critical, Error, Warning, , Information, Verbose' - Desc: '' {44565655}" (("Netec RMM" NIL "helpdesk" "netecgc.com")) (("Netec RMM" NIL "helpdesk" "netecgc.com")) ((NIL NIL "helpdesk" "netecgc.com")) ((NIL NIL "netec.test" "netecgc.com")) NIL NIL NIL "<44565655.JitbitHelpdesk.13439.691a0afc-a0a0-457c-8208-f20b7c4a4cb1@jitbit.com>") (("text" "plain" ("charset" "utf-8") NIL NIL "base64" 5452 88) ("text" "html" ("charset" "utf-8") NIL NIL "base64" 11254 145) "alternative") 266) "report")
+section HEADER 6947 85ad66d2d61c164195f41d7c351e6dc96ddfd699fdd0797b78d3f8b80f9435d2
+section TEXT 21291 f3a452d5766e36c0aec3f1eb447e6fac1a83d9e4c88fc5823d7f838de27f77e4
+section HEADER.FIELDS 352 6e03e8af88c62cdd316856ebb971f30c5df2bd72c655902c39f05cc0629036c6
+section HEADER.FIELDS.NOT 6597 95cb7cdd74b87c173d5d93b6e440ae26e3b92a33aada259c85e6f609b6757351
+section 1 1868 39636412b754ad8dac5741ae713ed926e6745ece27050070fefe59b4b4045d63
+section 1.MIME 138 5e722a46447784d48b6beed5ff9a85bdb1166a3f6a644c0e63edc280c38cb4fb
+section 2 953 46e48d0624c729a964163aa648e3c97d00fbd91c8d723eb2b4cbaf42cb5284c8
+section 2.MIME 100 36c3a9daf2b85a4f5f14a907fddd7b2ddae7576e1a27ccaea1faf78e36dae936
+section 3 17961 a47822e7efd9a932e1cdacd1522817612d8cd264555c179eca594b9cb3e7d9b2
+section 3.MIME 97 25427b63590336c775fd292cd89230b5355b1d50e931eb2c9ae70c6686d22237
+section 3.HEADER 959 9a2ad1e5fc9c7a35eda0d19526a9b757bd44d8f7dfc5d14ed71e10152bbcbb6f
+section 3.TEXT 17002 ff15ad5a8ab5230c297b9ce71bd56c2ef6685d13aec1e33cef73030f37af62e7
+section 3.HEADER.FIELDS 482 551cb56b5ee57bb5acce5171d490373411224f3b9f79e6714eff129a30d09c9b
+section 3.HEADER.FIELDS.NOT 479 a9a8f3cda1b78eaffc1221bab60c717de1b441f3b9e1ceaa452d0b2c3a1a157e
+section 3.1 5452 4f1cdbd4b8aa57e909df7cf92ec05907459a967983d1b58a9b62339f6333c08c
+section 3.1.MIME 100 91dadb8104714864584c3c6ed8229c4cd8136704671f4a11a8c929b6e518ccb3
+section 3.2 11254 b5f6d75ee2e50de529843df5a132dc4dd0ffbdad298d039e4bde1add911bd713
+section 3.2.MIME 100 d5745168ab70b945b6c163a7c27ba699d1f04b07c31b1258aa1c61d46b4ed063

@@ -1,0 +1,156 @@
+// Where a domain's mail goes (RFC 5321 §5.1): its MX hosts by preference, equal preferences in random order; the
+// domain itself when it has no MX (the implicit MX); nowhere for a null MX (RFC 7505) or a domain that does not
+// exist. Each host's addresses are looked up as it is tried, IPv4 first.
+
+import mdns.DnsAnswer;
+import mdns.IpAddress;
+import mdns.Resolver;
+import mdns.TYPE_A;
+import mdns.TYPE_AAAA;
+import mdns.TYPE_MX;
+
+/// The hosts to try are in the route.
+const ROUTE_OK: u8 = 0;
+/// No such domain (NXDOMAIN): bounce, 5.1.2.
+const ROUTE_NO_DOMAIN: u8 = 1;
+/// The domain says it takes no mail (RFC 7505): bounce, 5.1.10.
+const ROUTE_NULL_MX: u8 = 2;
+/// DNS failed for now: retry, 4.4.3.
+const ROUTE_TEMPORARY: u8 = 3;
+
+/// The most MX hosts, and addresses in all, tried for one domain in one attempt.
+const MAX_HOSTS: usize = 10;
+const MAX_ADDRESSES: usize = 20;
+
+@noncopy
+struct Hop {
+    name: String;
+    preference: u16;
+}
+
+/// The MX hosts of `domain`, in the order to try them, into `hops`. `secure` says whether the resolver validated
+/// the MX answer (or its absence) with DNSSEC: DANE applies to the hosts only then (RFC 7672 §2.2.1).
+async fn routeOf(
+    resolver: borrow Resolver,
+    domain: StringView,
+    hops: borrow mut Vector<Hop>,
+    secure: borrow mut bool,
+) -> Result<u8, AllocError> {
+    hops.clear();
+    secure = false;
+    var answer = DnsAnswer.create();
+    match (await resolver.query(domain, TYPE_MX, mut answer)) {
+        Ok() => {}
+        Err(_) => { return Ok(ROUTE_TEMPORARY); }
+    }
+    secure = answer.authenticated;
+    if (answer.isNxDomain()) {
+        return Ok(ROUTE_NO_DOMAIN);
+    }
+    if (answer.rcode != 0) {
+        return Ok(ROUTE_TEMPORARY);
+    }
+    for (i in 0..answer.count()) {
+        if (answer.kind(i) != TYPE_MX) {
+            continue;
+        }
+        let name = answer.dataText(i);
+        if (name.length == 0 || name == ".") {
+            // A null MX means no mail at all, whatever other records say (RFC 7505 §3).
+            hops.clear();
+            return Ok(ROUTE_NULL_MX);
+        }
+        if (hops.length < MAX_HOSTS) {
+            var n = String.create();
+            n.append(name)?;
+            hops.push(Hop { name: n, preference: answer.preference(i) })?;
+        }
+    }
+    if (hops.length == 0) {
+        // No MX: the domain is its own mail host (RFC 5321 §5.1).
+        var n = String.create();
+        n.append(domain)?;
+        hops.push(Hop { name: n, preference: 0 })?;
+        return Ok(ROUTE_OK);
+    }
+    // By preference; equal preferences shuffled, to spread the load as RFC 5321 §5.1 asks.
+    var random = [0u8; 16];
+    match (Random.fill(mut random[..])) {
+        Ok() => {}
+        Err(_) => {}
+    }
+    var keys = Vector<u32>.create();
+    for (i in 0..hops.length) {
+        keys.push(((hops[i].preference as u32) << 8) | (random[i % 16] as u32))?;
+    }
+    // Insertion sort: at most MAX_HOSTS entries.
+    var i: usize = 1;
+    while (i < hops.length) {
+        var j = i;
+        while (j > 0 && keys[j - 1] > keys[j]) {
+            keys.swap(j - 1, j);
+            hops.swap(j - 1, j);
+            j -= 1;
+        }
+        i += 1;
+    }
+    return Ok(ROUTE_OK);
+}
+
+/// The addresses of `host`, IPv4 first, on `port`, appended to `into` up to `MAX_ADDRESSES` in all.
+async fn addressesOf(
+    resolver: borrow Resolver,
+    host: StringView,
+    port: u16,
+    into: borrow mut Vector<SocketAddress>,
+) -> Result<void, AllocError> {
+    var secure = false;
+    await secureAddressesOf(resolver, host, port, into, mut secure)?;
+    return Ok();
+}
+
+/// As `addressesOf`; `secure` says whether every address answer was validated with DNSSEC, which DANE needs before
+/// it looks for the host's TLSA records (RFC 7672 §2.2.2).
+async fn secureAddressesOf(
+    resolver: borrow Resolver,
+    host: StringView,
+    port: u16,
+    into: borrow mut Vector<SocketAddress>,
+    secure: borrow mut bool,
+) -> Result<void, AllocError> {
+    secure = true;
+    var answer = DnsAnswer.create();
+    let kinds = [TYPE_A, TYPE_AAAA];
+    for (k in 0..2) {
+        let kind = kinds[k];
+        match (await resolver.query(host, kind, mut answer)) {
+            Ok() => {}
+            Err(_) => {
+                secure = false;
+                continue;
+            }
+        }
+        if (!answer.authenticated) {
+            secure = false;
+        }
+        for (i in 0..answer.count()) {
+            if (into.length >= MAX_ADDRESSES || answer.kind(i) != kind) {
+                continue;
+            }
+            let data = answer.data(i);
+            if (kind == TYPE_A && data.length == 4) {
+                into.push(SocketAddress.V4([data[0], data[1], data[2], data[3]], port))?;
+            } else if (kind == TYPE_AAAA && data.length == 16) {
+                var bytes = [0u8; 16];
+                for (b in 0..16) {
+                    bytes[b] = data[b];
+                }
+                if (IpAddress { bytes: bytes }.isV4()) {
+                    continue; // a v4-mapped AAAA: the A record is the real one
+                }
+                into.push(SocketAddress.V6(bytes, port, 0))?;
+            }
+        }
+    }
+    return Ok();
+}

@@ -1,0 +1,361 @@
+// The pure parts of SMTP: the DATA decoder, command and path parsing, SASL decoding and dates. No I/O, so each is
+// unit-tested on its own.
+
+import encoding.Base64;
+
+// ---- DATA (RFC 5321 §4.5.2) ----
+
+const DOT_TEXT: u8 = 0;
+const DOT_LINE_START: u8 = 1;
+const DOT_DOT: u8 = 2;
+const DOT_DOT_CR: u8 = 3;
+const DOT_CR: u8 = 4;
+
+/// Turns the bytes after `354` into the message: leading dots unstuffed, the end found at `<CRLF>.<CRLF>`.
+///
+/// Only a CRLF starts a line. A bare LF is message data, so `<LF>.<CRLF>` or `<LF>.<LF>` never ends the message:
+/// a server that ended on them while the next hop did not could be made to accept a second, smuggled message (the
+/// 2023 "SMTP smuggling" attacks). Bytes are otherwise kept as sent.
+public struct DotDecoder {
+    state: u8;
+    finished: bool;
+
+    public fn create() -> DotDecoder => DotDecoder { state: DOT_LINE_START, finished: false };
+
+    /// Decodes `input` into `out`, and gives how many bytes of `input` it used: all of them, unless the end of the
+    /// message is in them, when it stops right after it (the rest is the client's next command).
+    public fn decode(borrow mut this, input: Slice<u8>, out: borrow mut Vector<u8>) -> Result<usize, AllocError> {
+        var at: usize = 0;
+        var runStart: usize = 0;
+        while (at < input.length && !this.finished) {
+            let c = input[at];
+            if (this.state == DOT_TEXT) {
+                // The common case: copy a run of text in one go, stopping at a CR.
+                if (c == 0x0d) {
+                    this.state = DOT_CR;
+                }
+                at += 1;
+                continue;
+            }
+            if (this.state == DOT_CR) {
+                this.state = if (c == 0x0a) DOT_LINE_START else (if (c == 0x0d) DOT_CR else DOT_TEXT);
+                at += 1;
+                continue;
+            }
+            if (this.state == DOT_LINE_START) {
+                if (c == 0x2e) {
+                    // A line starting with a dot: hold the dot back until the next byte says what it is.
+                    out.extend(input[runStart..at])?;
+                    this.state = DOT_DOT;
+                    at += 1;
+                    runStart = at;
+                    continue;
+                }
+                this.state = if (c == 0x0d) DOT_CR else DOT_TEXT;
+                at += 1;
+                continue;
+            }
+            if (this.state == DOT_DOT) {
+                if (c == 0x0d) {
+                    this.state = DOT_DOT_CR;
+                    at += 1;
+                    continue;
+                }
+                // A stuffed dot: dropped (it was held back), the line goes on.
+                this.state = DOT_TEXT;
+                continue;
+            }
+            // DOT_DOT_CR: "." then CR at the start of a line.
+            if (c == 0x0a) {
+                this.finished = true;
+                at += 1;
+                runStart = at;
+                return Ok(at);
+            }
+            // ".<CR>x": the dot was stuffing; the CR is data, and x is read again as text after a CR.
+            out.pushBE(0x0du8)?;
+            runStart = at;
+            this.state = DOT_CR;
+        }
+        if (this.state == DOT_DOT_CR) {
+            // The CR is held back too, in case the next byte is the LF that ends the message.
+            out.extend(input[runStart..at - 1])?;
+        } else if (this.state != DOT_DOT) {
+            out.extend(input[runStart..at])?;
+        }
+        return Ok(at);
+    }
+
+    /// Whether the end of the message has been read.
+    public fn isFinished(borrow this) -> bool => this.finished;
+}
+
+// ---- Commands ----
+
+/// A command line split into its verb and the rest.
+public struct Command {
+    /// The verb, uppercased, at most 8 bytes (`UNKNOWN` when longer).
+    public verb: [u8; 8];
+    public verbLength: usize;
+    /// Where the arguments start in the line (after one space).
+    public argsAt: usize;
+
+    public fn parse(line: Slice<u8>) -> Command {
+        var command = Command { verb: [0u8; 8], verbLength: 0, argsAt: line.length };
+        var i: usize = 0;
+        while (i < line.length && line[i] != 0x20) {
+            if (i < 8) {
+                let c = line[i];
+                command.verb[i] = if (c >= 0x61 && c <= 0x7a) c - 0x20 else c;
+            }
+            i += 1;
+        }
+        command.verbLength = if (i > 8) 0 else i;
+        if (i < line.length) {
+            command.argsAt = i + 1;
+        }
+        return command;
+    }
+
+    public fn is(borrow this, verb: StringView) -> bool =>
+        this.verbLength == verb.length && this.verb[0..this.verbLength].startsWith(verb.bytes());
+}
+
+/// A MAIL FROM or RCPT TO path and its ESMTP parameters.
+public struct PathArgs {
+    /// The address, `[at, at + length)` of the line; empty for the null path `<>`.
+    public at: usize;
+    public length: usize;
+    /// SIZE=, or 0.
+    public size: u64;
+    public smtputf8: bool;
+}
+
+/// Why a path was refused, as reply text.
+public enum PathError {
+    /// `501 5.5.4`: not `FROM:<…>` / `TO:<…>`.
+    Syntax,
+    /// `501 5.1.7` or `5.1.3`: the address itself is malformed.
+    Address,
+    /// `555 5.5.4`: a parameter this server does not support.
+    Parameter,
+}
+
+/// Parses `FROM:<address> params` (or `TO:`, with `keyword` "TO:") starting at `at` of `line`. Lenient about a
+/// space after the colon and missing angle brackets, as clients in the wild need.
+public fn parsePath(line: Slice<u8>, at: usize, keyword: StringView, allowNull: bool) -> Result<PathArgs, PathError> {
+    let rest = line[at..];
+    let k = keyword.bytes();
+    if (rest.length < k.length || !rest[0..k.length].equalsIgnoreAsciiCase(k)) {
+        return Err(PathError.Syntax);
+    }
+    var i = at + k.length;
+    while (i < line.length && line[i] == 0x20) {
+        i += 1;
+    }
+    var start = i;
+    var end = i;
+    if (i < line.length && line[i] == 0x3c) {
+        start = i + 1;
+        end = start;
+        while (end < line.length && line[end] != 0x3e) {
+            end += 1;
+        }
+        if (end >= line.length) {
+            return Err(PathError.Syntax);
+        }
+        i = end + 1;
+    } else {
+        while (end < line.length && line[end] != 0x20) {
+            end += 1;
+        }
+        i = end;
+    }
+    // A source route (`<@a,@b:user@c>`) is obsolete: its relays are ignored (RFC 5321 §4.1.2, §C).
+    var address = start;
+    if (address < end && line[address] == 0x40) {
+        match (line[address..end].indexOfByte(0x3a)) {
+            Some(colon) => { address = address + colon + 1; }
+            null => { return Err(PathError.Address); }
+        }
+    }
+    var args = PathArgs { at: address, length: end - address, size: 0, smtputf8: false };
+    if (args.length == 0) {
+        if (!allowNull) {
+            return Err(PathError.Address);
+        }
+    } else if (!isMailbox(line[address..end])) {
+        return Err(PathError.Address);
+    }
+    // ESMTP parameters.
+    while (i < line.length) {
+        while (i < line.length && line[i] == 0x20) {
+            i += 1;
+        }
+        if (i >= line.length) {
+            break;
+        }
+        var e = i;
+        while (e < line.length && line[e] != 0x20) {
+            e += 1;
+        }
+        let param = line[i..e];
+        let eq = match (param.indexOfByte(0x3d)) {
+            Some(q) => q,
+            null => param.length,
+        };
+        let name = param[0..eq];
+        let value = if (eq < param.length) param[eq + 1..] else param[param.length..];
+        if (name.equalsIgnoreAsciiCase("SIZE".bytes())) {
+            match (value.parseInt<u64>()) {
+                Some(n) => { args.size = n; }
+                null => { return Err(PathError.Syntax); }
+            }
+        } else if (name.equalsIgnoreAsciiCase("SMTPUTF8".bytes())) {
+            args.smtputf8 = true;
+        } else if (name.equalsIgnoreAsciiCase("BODY".bytes()) || name.equalsIgnoreAsciiCase("AUTH".bytes())) {
+            // BODY=7BIT/8BITMIME is advertised; AUTH= (RFC 4954 §5) is accepted and ignored.
+        } else {
+            return Err(PathError.Parameter);
+        }
+        i = e;
+    }
+    return Ok(args);
+}
+
+/// Whether `address` is `local@domain` with sane limits: 64-byte local part, 255-byte domain, no spaces, controls,
+/// or brackets. Quoted local parts and UTF-8 (SMTPUTF8) pass.
+public fn isMailbox(address: Slice<u8>) -> bool {
+    if (address.length > 320) {
+        return false;
+    }
+    let at = match (address.lastIndexOf("@".bytes())) {
+        Some(a) => a,
+        null => { return false; }
+    };
+    if (at == 0 || at > 64 || address.length - at - 1 == 0 || address.length - at - 1 > 255) {
+        return false;
+    }
+    for (c in address) {
+        if (c <= 0x20 || c == 0x7f || c == 0x3c || c == 0x3e) {
+            return false;
+        }
+    }
+    let domain = address[at + 1..];
+    for (c in domain) {
+        if (c == 0x40 || c == 0x22 || c == 0x2c || c == 0x3b) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// ---- SASL (RFC 4616, and LOGIN) ----
+
+/// Decodes an AUTH PLAIN response (`[authzid] NUL authcid NUL password`, base64) into `user` and `password`. An
+/// authzid other than empty or the user itself is refused: this server does not let one user act as another.
+public fn decodePlain(
+    text: Slice<u8>,
+    user: borrow mut Vector<u8>,
+    password: borrow mut Vector<u8>,
+) -> Result<bool, AllocError> {
+    var raw = Vector<u8>.create();
+    match (Base64.decode(text, mut raw)) {
+        Ok() => {}
+        Err(_) => { return Ok(false); }
+    }
+    let bytes = raw.view();
+    let first = match (bytes.indexOfByte(0)) {
+        Some(f) => f,
+        null => { return Ok(false); }
+    };
+    let second = match (bytes[first + 1..].indexOfByte(0)) {
+        Some(s) => first + 1 + s,
+        null => { return Ok(false); }
+    };
+    let authz = bytes[0..first];
+    let authc = bytes[first + 1..second];
+    if (authz.length > 0 && !authz.equalsIgnoreAsciiCase(authc)) {
+        return Ok(false);
+    }
+    user.clear();
+    password.clear();
+    user.extend(authc)?;
+    password.extend(bytes[second + 1..])?;
+    return Ok(authc.length > 0);
+}
+
+/// Decodes one base64 line of AUTH LOGIN into `out`; false if it is not base64.
+public fn decodeLoginLine(text: Slice<u8>, out: borrow mut Vector<u8>) -> Result<bool, AllocError> {
+    out.clear();
+    match (Base64.decode(text, out)) {
+        Ok() => { return Ok(true); }
+        Err(DecodeError.OutOfMemory) => { return Err(AllocError.OutOfMemory); }
+        Err(DecodeError.Invalid) => { return Ok(false); }
+    }
+}
+
+// ---- Dates (RFC 5322 §3.3) ----
+
+/// Appends `Wed, 05 Nov 2026 12:34:56 +0000` for `unixSeconds`.
+public fn appendDate(out: borrow mut Vector<u8>, unixSeconds: i64) -> Result<void, AllocError> {
+    let days = floorDiv(unixSeconds, 86400);
+    let secs = unixSeconds - days * 86400;
+    // Civil from days (Howard Hinnant's algorithm).
+    let z = days + 719468;
+    let era = floorDiv(z, 146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if (mp < 10) mp + 3 else mp - 9;
+    let year = yoe + era * 400 + (if (month <= 2) 1i64 else 0i64);
+    let weekday = floorMod(days + 4, 7); // 1970-01-01 was a Thursday
+    let names = "SunMonTueWedThuFriSat".bytes();
+    let months = "JanFebMarAprMayJunJulAugSepOctNovDec".bytes();
+    let w = truncate<usize>(weekday) * 3;
+    out.extend(names[w..w + 3])?;
+    out.extend(", ".bytes())?;
+    twoDigits(out, day)?;
+    out.pushBE(0x20u8)?;
+    let m = truncate<usize>(month - 1) * 3;
+    out.extend(months[m..m + 3])?;
+    out.pushBE(0x20u8)?;
+    appendDecimal(out, truncate<u64>(year))?;
+    out.pushBE(0x20u8)?;
+    twoDigits(out, secs / 3600)?;
+    out.pushBE(0x3au8)?;
+    twoDigits(out, (secs / 60) % 60)?;
+    out.pushBE(0x3au8)?;
+    twoDigits(out, secs % 60)?;
+    return out.extend(" +0000".bytes());
+}
+
+fn floorDiv(a: i64, b: i64) -> i64 {
+    let q = a / b;
+    return if ((a % b != 0) && ((a < 0) != (b < 0))) q - 1 else q;
+}
+
+fn floorMod(a: i64, b: i64) -> i64 => a - floorDiv(a, b) * b;
+
+fn twoDigits(out: borrow mut Vector<u8>, n: i64) -> Result<void, AllocError> {
+    out.pushBE(0x30u8 + truncate<u8>(n / 10))?;
+    return out.pushBE(0x30u8 + truncate<u8>(n % 10));
+}
+
+/// Appends `value` in decimal.
+public fn appendDecimal(out: borrow mut Vector<u8>, value: u64) -> Result<void, AllocError> {
+    var digits = [0u8; 20];
+    var n = value;
+    var at: usize = 20;
+    loop {
+        at -= 1;
+        digits[at] = 0x30u8 + truncate<u8>(n % 10);
+        n = n / 10;
+        if (n == 0) {
+            break;
+        }
+    }
+    return out.extend(digits[at..]);
+}

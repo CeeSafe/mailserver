@@ -1,0 +1,229 @@
+// Content-addressed message files: <root>/<h0h1>/<h2h3>/<hex of the SHA-256>, written to <root>/tmp first, synced,
+// then renamed into place, so a file at its final name is always complete. Identical content is stored once.
+//
+// The rename into place happens inside the delivering transaction, after the blob's row is locked (see
+// `MailStore.deliver`), and the collector removes a file only while it holds that row's lock, so a delivery can
+// never lose its file to a concurrent collection of an earlier copy.
+
+import encoding.Hex;
+import diskio.FileError;
+import diskio.Files;
+import diskio.RawFile;
+import sha256.Sha256;
+
+/// The length of a blob's hash.
+public const HASH_LENGTH: usize = 32;
+
+/// Where blob files live.
+@noncopy
+public struct BlobStore {
+    private directory: String;
+
+    /// A store under `root`, creating it and its `tmp` directory if needed.
+    public fn create(root: StringView) -> Result<BlobStore, StoreError> {
+        var store = BlobStore { directory: String.create() };
+        var end = root.length;
+        while (end > 1 && root.bytes()[end - 1] == '/') {
+            end -= 1;
+        }
+        grown(store.directory.append(root[0..end]))?;
+        var tmp = String.create();
+        grown(tmp.append(store.directory.view()))?;
+        grown(tmp.append("/tmp"))?;
+        filed(Files.makeDirectories(tmp.view()))?;
+        return Ok(store);
+    }
+
+    /// The directory blobs live under.
+    public fn root(borrow this) -> StringView => this.directory.view();
+
+    /// Starts writing a new blob.
+    public fn begin(borrow this) -> Result<BlobWriter, StoreError> {
+        var name = [0u8; 12];
+        match (Random.fill(mut name[..])) {
+            Ok() => {}
+            Err(_) => { return Err(StoreError.Invalid); }
+        }
+        var temp = Vector<u8>.create();
+        grown(temp.extend(this.directory.view().bytes()))?;
+        grown(temp.extend("/tmp/".bytes()))?;
+        grown(Hex.encode(name[..], mut temp))?;
+        grown(temp.extend(".part".bytes()))?;
+        var path = String.create();
+        grown(path.append(StringView.fromUtf8(temp.view())!))?;
+        let file = match (RawFile.createNew(path.view())) {
+            Ok(f) => f,
+            Err(e) => { return Err(StoreError.File(e)); }
+        };
+        return Ok(BlobWriter {
+            file: file,
+            temp: path,
+            hasher: Sha256.create(),
+            length: 0,
+            digest: [0u8; 32],
+            state: 0,
+        });
+    }
+
+    /// Writes the path of the blob `hash` into `out`, which is cleared first; with `directory`, only its directory.
+    public fn pathOf(
+        borrow this,
+        hash: Slice<u8>,
+        directory: bool,
+        out: borrow mut String,
+    ) -> Result<void, StoreError> {
+        if (hash.length != HASH_LENGTH) {
+            return Err(StoreError.Invalid);
+        }
+        var bytes = Vector<u8>.create();
+        grown(bytes.extend(this.directory.view().bytes()))?;
+        grown(bytes.pushBE(0x2fu8))?; // '/'
+        grown(Hex.encode(hash[0..1], mut bytes))?;
+        grown(bytes.pushBE(0x2fu8))?;
+        grown(Hex.encode(hash[1..2], mut bytes))?;
+        if (!directory) {
+            grown(bytes.pushBE(0x2fu8))?;
+            grown(Hex.encode(hash, mut bytes))?;
+        }
+        out.clear();
+        return grown(out.append(StringView.fromUtf8(bytes.view())!));
+    }
+
+    /// Opens the blob `hash` for reading.
+    public fn open(borrow this, hash: Slice<u8>) -> Result<RawFile, StoreError> {
+        var path = String.create();
+        this.pathOf(hash, false, mut path)?;
+        match (RawFile.open(path.view())) {
+            Ok(f) => { return Ok(f); }
+            Err(e) => { return Err(StoreError.File(e)); }
+        }
+    }
+
+    /// Removes temporary files older than `maxAgeSeconds`, left by writers that were dropped without being delivered
+    /// or by a crash, and gives how many. Run it at startup and now and then; an age of an hour is safe, since no
+    /// delivery takes that long.
+    public fn sweepTemporary(borrow this, maxAgeSeconds: i64) -> Result<usize, StoreError> {
+        var tmp = String.create();
+        grown(tmp.append(this.directory.view()))?;
+        grown(tmp.append("/tmp"))?;
+        let names = match (Directory.list(tmp.view())) {
+            Ok(n) => n,
+            Err(_) => { return Err(StoreError.File(FileError.Denied)); }
+        };
+        let now = Clock.unixMillis() / 1000;
+        var removed: usize = 0;
+        var path = String.create();
+        for (i in 0..names.length) {
+            let name = names[i].view();
+            if (!name.endsWith(".part")) {
+                continue;
+            }
+            path.clear();
+            grown(path.append(tmp.view()))?;
+            grown(path.append("/"))?;
+            grown(path.append(name))?;
+            match (Files.modifiedSeconds(path.view())) {
+                Ok(when) => {
+                    if (now - when >= maxAgeSeconds) {
+                        match (Files.remove(path.view())) {
+                            Ok() => { removed += 1; }
+                            Err(_) => {}
+                        }
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+        return Ok(removed);
+    }
+
+    /// Removes the blob `hash`'s file; a missing one is not an error.
+    fn remove(borrow this, hash: Slice<u8>) -> Result<void, StoreError> {
+        var path = String.create();
+        this.pathOf(hash, false, mut path)?;
+        match (Files.remove(path.view())) {
+            Ok() => { return Ok(); }
+            Err(FileError.NotFound) => { return Ok(); }
+            Err(e) => { return Err(StoreError.File(e)); }
+        }
+    }
+}
+
+/// A blob being written: `write` the content, `finish` to sync it and learn its hash. It is moved to its final name
+/// by `MailStore.deliver`.
+///
+/// Dropping a writer only closes its file, so async code may drop one. A writer that was not delivered leaves its
+/// temporary file behind: call `discard` (through `Async.blocking`) to remove it at once, or let
+/// `BlobStore.sweepTemporary` remove it later.
+@noncopy
+public struct BlobWriter {
+    private file: RawFile;
+    private temp: String;
+    private hasher: Sha256;
+    private length: u64;
+    private digest: [u8; 32];
+    /// 0 writing, 1 finished, 2 placed.
+    private state: u8;
+
+    /// Appends `bytes` to the content.
+    public fn write(borrow mut this, bytes: Slice<u8>) -> Result<void, StoreError> {
+        if (this.state != 0) {
+            return Err(StoreError.Invalid);
+        }
+        this.hasher.update(bytes);
+        filed(this.file.write(bytes))?;
+        this.length += bytes.length as u64;
+        return Ok();
+    }
+
+    /// Syncs the content to the disk and fixes its hash. Blocks on the disk: async code calls it through
+    /// `Async.blocking`.
+    public fn finish(borrow mut this) -> Result<void, StoreError> {
+        if (this.state != 0) {
+            return Err(StoreError.Invalid);
+        }
+        filed(this.file.sync())?;
+        this.digest = this.hasher.finish();
+        this.state = 1;
+        return Ok();
+    }
+
+    /// The content's SHA-256, once finished.
+    public fn hash(borrow this) -> Slice<u8> => this.digest[..];
+
+    /// The content's length in bytes.
+    public fn size(borrow this) -> u64 => this.length;
+
+    /// Removes the temporary file of a writer that will not be delivered.
+    public fn discard(borrow mut this) {
+        if (this.state != 2) {
+            match (Files.remove(this.temp.view())) {
+                Ok() => {}
+                Err(_) => {}
+            }
+            this.state = 2;
+        }
+    }
+
+    /// Whether `finish` has run.
+    public fn isFinished(borrow this) -> bool => this.state >= 1;
+
+    /// Moves the finished file to its final name in `store` and syncs the directory. If a file with that content is
+    /// there already it is replaced by an identical one, which is harmless.
+    fn place(borrow mut this, store: borrow BlobStore) -> Result<void, StoreError> {
+        if (this.state == 2) {
+            return Ok();
+        }
+        if (this.state != 1) {
+            return Err(StoreError.Invalid);
+        }
+        var directory = String.create();
+        store.pathOf(this.digest[..], true, mut directory)?;
+        filed(Files.makeDirectories(directory.view()))?;
+        var path = String.create();
+        store.pathOf(this.digest[..], false, mut path)?;
+        filed(Files.rename(this.temp.view(), path.view()))?;
+        this.state = 2;
+        return filed(Files.syncDirectory(directory.view()));
+    }
+}

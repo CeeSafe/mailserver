@@ -1,0 +1,10 @@
+size 3331
+envelope ("Tue, 28 May 1996 12:24:23 cst" "Frontier Technologies testing, here's my cert" ((NIL NIL "Ray2" "frontiertech.com")) ((NIL NIL "Ray2" "frontiertech.com")) ((NIL NIL "Ray2" "frontiertech.com")) ((NIL NIL "smime-dev" "rsa.com")) NIL NIL NIL "<31AB36CC-00000001@rock106.FrontierTech.com>")
+bodystructure ("Application" "x-pkcs7-mime" NIL NIL NIL "Base64" 2152 NIL NIL NIL NIL)
+body ("Application" "x-pkcs7-mime" NIL NIL NIL "Base64" 2152)
+section HEADER 1179 0ed107fb8844176b5979a146eba0bbb696342cf785e70d96f53e25175638fa42
+section TEXT 2152 3a313f8b0b85b886a745408136e0625a0fd97eae1777d1d00c726dfdce142a09
+section HEADER.FIELDS 245 109d046d7db6b0f8e952d3e0ba4c2849f5c0c12e38103895a67534ae3921b2a6
+section HEADER.FIELDS.NOT 936 a228c5993a34f907f19d3c4ee547691f777b8409924494395854915d57a8444f
+section 1 2152 3a313f8b0b85b886a745408136e0625a0fd97eae1777d1d00c726dfdce142a09
+section 1.MIME 1179 0ed107fb8844176b5979a146eba0bbb696342cf785e70d96f53e25175638fa42

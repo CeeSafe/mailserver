@@ -1,0 +1,10 @@
+size 1770
+envelope ("Thu, 19 Dec 1996 09:38:50 -0800" "very cool" (("Lisa Repka" NIL "repka" "netscape.com")) ((NIL NIL "repka" "netscape.com")) (("Lisa Repka" NIL "repka" "netscape.com")) (("Jamie Zawinski" NIL "jwz" "netscape.com")) NIL NIL NIL "<32B97DAA.167E@netscape.com>")
+bodystructure ("application" "x-pkcs7-mime" ("name" "smime.p7m") NIL NIL "base64" 672 NIL ("attachment" ("filename" "smime.p7m")) NIL NIL)
+body ("application" "x-pkcs7-mime" ("name" "smime.p7m") NIL NIL "base64" 672)
+section HEADER 1098 739796aa2af46ba99d0ea433851cbabb9e9f0f886d7465b01b176c8d636afc92
+section TEXT 672 20f603d94f6f054a118775827027b5313990c654c3c688416f54e3f1fc0f7315
+section HEADER.FIELDS 239 6edeed37139470221a0294a1ed8348f5550f768deb2a11f745ddafeb28ab42a7
+section HEADER.FIELDS.NOT 861 770b053a7d0d3926c0973bc77898f6ce47f3b1c79515242c2d16d39bde8d481d
+section 1 672 20f603d94f6f054a118775827027b5313990c654c3c688416f54e3f1fc0f7315
+section 1.MIME 1098 739796aa2af46ba99d0ea433851cbabb9e9f0f886d7465b01b176c8d636afc92

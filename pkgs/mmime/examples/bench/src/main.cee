@@ -1,0 +1,85 @@
+// bench <dir> [rounds]: scans every .eml in <dir> `rounds` times from memory (fed in 64 KiB chunks, as SMTP DATA
+// would), then the same with the stored meta built too, and prints MB/s for each.
+
+import mmime.MessageIndex;
+import mmime.MimeScanner;
+import mmime.Renderer;
+import mmime.encodeMeta;
+
+fn main() {
+    let dir = match (Process.argument(1)) {
+        Some(d) => d,
+        null => {
+            Console.writeLine("usage: bench <dir> [rounds]");
+            Process.exit(2);
+        }
+    };
+    var rounds: usize = 20;
+    match (Process.argument(2)) {
+        Some(r) => { rounds = r.parseInt<usize>()!; }
+        null => {}
+    }
+    var messages = Vector<Vector<u8>>.create();
+    var total: u64 = 0;
+    let names = Directory.list(dir)!;
+    for (i in 0..names.length) {
+        let name = names[i].view();
+        if (!name.endsWith(".eml")) {
+            continue;
+        }
+        var path = String.create();
+        path.append(dir)!;
+        path.append("/")!;
+        path.append(name)!;
+        var file = File.open(path.view())!;
+        var bytes = Vector<u8>.create();
+        var buffer = [0u8; 65536];
+        loop {
+            let n = file.read(mut buffer[..])!;
+            if (n == 0) {
+                break;
+            }
+            bytes.extend(buffer[0..n])!;
+        }
+        total += bytes.length as u64;
+        messages.push(bytes)!;
+    }
+    var scanner = MimeScanner.create();
+    var index = MessageIndex.create();
+    var renderer = Renderer.create();
+    var meta = Vector<u8>.create();
+    for (pass in 0..2) {
+        let withMeta = pass == 1;
+        let start = Clock.unixMillis();
+        var parts: u64 = 0;
+        for (r in 0..rounds) {
+            for (m in 0..messages.length) {
+                let bytes = messages[m].view();
+                var at: usize = 0;
+                while (at < bytes.length) {
+                    let end = if (at + 65536 > bytes.length) bytes.length else at + 65536;
+                    scanner.feed(bytes[at..end])!;
+                    at = end;
+                }
+                scanner.finish(mut index)!;
+                parts += index.parts.length as u64;
+                if (withMeta) {
+                    encodeMeta(index, mut renderer, mut meta)!;
+                }
+            }
+        }
+        let millis = Clock.unixMillis() - start;
+        let bytes = total * (rounds as u64);
+        Console.write(if (withMeta) "scan + meta: " else "scan:        ");
+        Console.write(truncate<i64>(bytes / 1000) / (if (millis > 0) millis else 1));
+        Console.write(" MB/s, ");
+        Console.write(truncate<i64>((messages.length * rounds) as u64) * 1000 / (if (millis > 0) millis else 1));
+        Console.write(" messages/s (");
+        Console.write(messages.length);
+        Console.write(" messages, ");
+        Console.write(total);
+        Console.write(" bytes, ");
+        Console.write(parts / (rounds as u64));
+        Console.writeLine(" parts)");
+    }
+}

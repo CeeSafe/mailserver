@@ -1,0 +1,18 @@
+size 4215
+envelope ("Wed,  3 Jun 1992 13:20:01 -0400 (EDT)" "misdirected chinese mail" (("Tom Brinck" NIL "hammer" "MISSING_DOMAIN")) (("Tom Brinck" NIL "hammer" "MISSING_DOMAIN")) (("Tom Brinck" NIL "hammer" "MISSING_DOMAIN")) ((NIL NIL "msgs" "MISSING_DOMAIN")) NIL NIL NIL "<8e=Dx1S0M26IE17rlY@thumper.bellcore.com>")
+bodystructure (("text" "plain" ("charset" "US-ASCII") NIL NIL "7bit" 417 13 NIL NIL NIL NIL) (("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 229 4 NIL NIL NIL NIL) ("image" "x-xbm" NIL NIL "Push here to see your name" "quoted-printable" 1421 NIL NIL NIL NIL) ("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 157 9 NIL NIL NIL NIL) "mixed" ("boundary" "Alternative.Boundary.ge=Dx0m0M26II17rZy") NIL NIL NIL) "alternative" ("boundary" "Interpart.Boundary.ge=Dx0m0M26IQ17rd0") NIL NIL NIL)
+body (("text" "plain" ("charset" "US-ASCII") NIL NIL "7bit" 417 13) (("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 229 4) ("image" "x-xbm" NIL NIL "Push here to see your name" "quoted-printable" 1421) ("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 157 9) "mixed") "alternative")
+section HEADER 1079 29e47ed8d89fa6063ed7558d732bed26d0eb2ce5689c0b89ebccbce36dc885cd
+section TEXT 3136 57a20aa0a3f6a67492a8e6d0346b8861ea21e9d5ba7ed017b2b9818b7d8e195f
+section HEADER.FIELDS 264 a91aee3e2b6a6fffa604205db8c66b22fe2811f00d33cedab888e84acc343052
+section HEADER.FIELDS.NOT 817 fdf6dd5b114e2eb320c5496575731a06c868bf0c9f00ede5080f2584fcf25a1c
+section 1 417 998cc9171fb7263977758e5f2175daa8ed2b7becfe675416eaa5afa137afcac9
+section 1.MIME 46 b3532c649b28a23803c77a2acc4907f5048ea77b89e0c51dcf7f271f2db4bfa6
+section 2 2298 03252de46165ff1d94ef8ea82a2ad148a4d855888ea26bc077d069cdbb0fdc83
+section 2.MIME 88 0fd2862c72afd98f4f897aade5a609d495cf6a72f9927e6065e18b8ade8449c1
+section 2.1 229 6bd5aa7046c2e84b530e926262a2de6dbfc3b3c2a5a14216cd550924f8e80b0d
+section 2.1.MIME 94 7d35d8c48d3869c4391f6ff71123bfb4c8466e5b04f02d64c3961f23d7d8bf61
+section 2.2 1421 5ee66c92bfd899e18be6d5b153af04d07a9f7d45dd0a86f45777980143c417bf
+section 2.2.MIME 123 06b9e0acde571cea37d24b4cd2798dba0d837132ac192f0047ecb14d788526d6
+section 2.3 157 6d8340ef9c06f24a1099c9c93568425e3f03317729f425aec0dc41f241f9890b
+section 2.3.MIME 94 7d35d8c48d3869c4391f6ff71123bfb4c8466e5b04f02d64c3961f23d7d8bf61

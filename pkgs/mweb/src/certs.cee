@@ -1,0 +1,126 @@
+// The certificate on disk: the server's TLS configuration is built from it at start and rebuilt whenever the files
+// change (a renewal by this server's ACME client, or by certbot and the like), without a restart. Connections already
+// in TLS keep the certificate they started with.
+
+import msmtp.SmtpContext;
+import tls.TlsConfig;
+
+/// The certificate chain and key files, and what was loaded from them last.
+@noncopy
+public struct CertificateFiles {
+    chainPath: String;
+    keyPath: String;
+    chain: Vector<u8>;
+    key: Vector<u8>;
+
+    /// Watches `chainPath` and `keyPath`, whose contents `chain` and `key` are now in use.
+    public fn create(
+        chainPath: StringView,
+        keyPath: StringView,
+        chain: Vector<u8>,
+        key: Vector<u8>,
+    ) -> Result<CertificateFiles, AllocError> {
+        var files = CertificateFiles { chainPath: String.create(), keyPath: String.create(), chain: chain, key: key };
+        files.chainPath.append(chainPath)?;
+        files.keyPath.append(keyPath)?;
+        return Ok(files);
+    }
+
+    public fn chainFile(borrow this) -> StringView => this.chainPath.view();
+
+    public fn keyFile(borrow this) -> StringView => this.keyPath.view();
+
+    /// Reads both files again and, when either changed and together they make a working configuration, installs
+    /// it. A change that does not work (a half-written renewal, a key that does not match) keeps the old one, and is
+    /// tried again at the next poll.
+    public async fn reload(borrow mut this, mail: borrow SmtpContext) -> Reload {
+        var chain = Vector<u8>.create();
+        var key = Vector<u8>.create();
+        let chainPath = this.chainPath.view();
+        let keyPath = this.keyPath.view();
+        let read: bool = await Async.blocking(() => readInto(chainPath, mut chain) && readInto(keyPath, mut key));
+        if (!read) {
+            return Reload.Unreadable;
+        }
+        if (chain.view() == this.chain.view() && key.view() == this.key.view()) {
+            return Reload.Unchanged;
+        }
+        let config = match (TlsConfig.server(chain.view(), key.view())) {
+            Ok(c) => c,
+            Err(_) => { return Reload.Invalid; }
+        };
+        if (!mail.replaceTls(config)) {
+            return Reload.Invalid;
+        }
+        this.chain = chain;
+        this.key = key;
+        return Reload.Installed;
+    }
+}
+
+/// What a reload found.
+public enum Reload {
+    Unchanged,
+    Installed,
+    /// The files could not be read.
+    Unreadable,
+    /// They changed, but do not make a configuration (or TLS was not set up at start).
+    Invalid,
+}
+
+/// The whole file at `path`, into `into` (replacing it). False when it cannot be read.
+public fn readInto(path: StringView, into: borrow mut Vector<u8>) -> bool {
+    into.clear();
+    var file = match (File.open(path)) {
+        Ok(f) => f,
+        Err(_) => { return false; }
+    };
+    var buffer = [0u8; 8192];
+    loop {
+        let n = match (file.read(mut buffer[..])) {
+            Ok(n) => n,
+            Err(_) => { return false; }
+        };
+        if (n == 0) {
+            return true;
+        }
+        match (into.extend(buffer[0..n])) {
+            Ok() => {}
+            Err(_) => { return false; }
+        }
+    }
+}
+
+/// Polls the files every `intervalMs` until cancelled, installing each change; logs what it installs or refuses.
+public async fn watchCertificate(files: borrow mut CertificateFiles, mail: borrow SmtpContext, intervalMs: u64) {
+    var refused = false;
+    loop {
+        match (await Timer.sleep(intervalMs)) {
+            Ok() => {}
+            Err(_) => { return; }
+        }
+        match (await files.reload(mail)) {
+            Reload.Installed => {
+                refused = false;
+                await logLine("mailserver: installed the renewed TLS certificate\n");
+            }
+            Reload.Invalid => {
+                // Once per bad change, not every minute.
+                if (!refused) {
+                    await logLine(
+                        "mailserver: the changed TLS certificate or key could not be used; keeping the old one\n",
+                    );
+                }
+                refused = true;
+            }
+            _ => {}
+        }
+    }
+}
+
+async fn logLine(text: StringView) {
+    match (await AsyncConsole.writeError(text)) {
+        Ok() => {}
+        Err(_) => {}
+    }
+}

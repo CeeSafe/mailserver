@@ -1,0 +1,20 @@
+20120113._domainkey.gmail.com:
+- TXT:
+  - k=rsa; p=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA1Kd87/UeJjenpabgbFwh+eBCsSTrqmwIYYvywlbhbqoo2DymndFkbjOVIPIldNs/m40KF+yzMn1skyoxcTUGCQs8g3FgD2Ap3ZB5DekAo5wMmk4wimDO+U8QzI3SD07y2+07wlNWwIt8svnxgdxGkVbbhzY8i+RQ9DpSVpPbF7ykQxtKXkv/ahW3KjViiAH+ghvvI
+  - hkx4xYSIc9oSwVmAl5OctMEeWUwg8Istjqz8BZeTWbf41fbNhte7Y+YqZOwq1Sd0DbvYAD9NOZK9vlfuac0598HY+vtSBczUiKERHv1yRbcaQtZFh5wtiRrN04BLUTD21MycBX5jYchHjPY/wIDAQAB
+brisbane._domainkey.football.example.com:
+- TXT: v=DKIM1; k=ed25519; p=11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=
+ed._domainkey.example.org:
+- TXT:
+  - v=DKIM1; k=ed25519; p=UYg9y11ECr6FPdF7NMt5sv/5f1u2M7O4bmP7iXLOIf0=
+revoked._domainkey.example.org:
+- TXT: v=DKIM1; k=rsa; p=
+rsa1024._domainkey.example.org:
+- TXT:
+  - v=DKIM1; k=rsa; p=MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQC9mluFlD455A9wMkLKJsMbuYFgPFXlmjMuCbUP+KwXPRDeqMbrn7MhNPZKjq571j3q9nSaUhUmsupCaK+PGh5TuOvBxNYjvZ5+ljJm9vJ7j39cOZYjeaJDsg+JgxIuy4sgfI9DeWIzgX3MtQ7fJW483x5uu4izhJ6EWa2XZPxO5QIDAQAB
+rsa2048._domainkey.example.org:
+- TXT:
+  - v=DKIM1; k=rsa; p=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEApkaQA4j+EOZ4aC8oXN3vgE+q5rVn/YBswOoOqnW4tJqX4l+qfmfAQxN4+jXqlLQVGu1Mo3C824I+f23My4Q/lUMTvRUh2oX4nEVFFC/2E97F7+ILhoCXBsQpjA2ccKopB7L0VLLzerUbiCpjYSPGI8akVsAMnu/KWnQsbg0T05Ck2FrcAlU2ZJIuNxRm
+  - mFg8e0IG/jmCKxamUpR84QXse8yQVhnMrYKnTzC/3Du3yS1mahp4269e0kiFYGlV//l4/ijxPuEX4mIaRtJyEctsYOZccnOilI0vOZaT04V0h23+pD7s6yY2m1ttcbuwLavx0BgQ0x8RJTbvwQhE8dat9QIDAQAB
+test._domainkey.football.example.com:
+- TXT: v=DKIM1; k=rsa; p=MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDkHlOQoBTzWRiGs5V6NpP3idY6Wk08a5qhdR6wy5bdOKb2jLQiY/J16JYi0Qvx/byYzCNb3W91y3FutACDfzwQ/BC/e/8uBsCR+yz1Lxj+PL6lHvqMKrM3rG4hstT5QjvHO9PzoxZyVYLzBfO2EeC3Ip3G+2kryOTIKT+l/K4w3QIDAQAB

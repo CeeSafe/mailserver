@@ -1,0 +1,10 @@
+size 4781
+envelope ("Mon, 22 Apr 96 18:20:32 -0500" "Ready for interoperability testing." (("Arjun J Taneja" NIL "arjun" "connectsoft.com")) (("Arjun J Taneja" NIL "arjun" "connectsoft.com")) (("Arjun J Taneja" NIL "arjun" "connectsoft.com")) (("smime-dev@rsa.com" NIL "smime-dev" "rsa.com")) NIL NIL NIL "<199604230119.SAA12999@connectsoft.com>")
+bodystructure ("application" "x-pkcs7-mime" NIL NIL NIL "base64" 3550 NIL NIL NIL NIL)
+body ("application" "x-pkcs7-mime" NIL NIL NIL "base64" 3550)
+section HEADER 1231 31873a8923693169a8e04adf7c142985c44c97fecf8ee6b4c40b5dabb016cecf
+section TEXT 3550 09e9487d8fbb011c1dc4b8e0e68a1b709d1df1206ee320663df5594fb25248b3
+section HEADER.FIELDS 269 e757622e8ae67814bbaca3ac214ff95aa4df1a30f823698c11e540324bc32758
+section HEADER.FIELDS.NOT 964 7bfb3bf5218d36b4ba244ac3d90861cb553f6c608095e28b780e175cc841b3b4
+section 1 3550 09e9487d8fbb011c1dc4b8e0e68a1b709d1df1206ee320663df5594fb25248b3
+section 1.MIME 1231 31873a8923693169a8e04adf7c142985c44c97fecf8ee6b4c40b5dabb016cecf

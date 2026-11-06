@@ -1,0 +1,10 @@
+size 2411
+envelope ("Tue, 16 Jun 92 17:34:08 JST" "Re: transparent.el" (("Yutaka Sato =?ISO-2022-JP?B?GyRAOjRGI0stGyhK?=" NIL "ysato" "etl.go.jp")) (("Yutaka Sato =?ISO-2022-JP?B?GyRAOjRGI0stGyhK?=" NIL "ysato" "etl.go.jp")) (("Yutaka Sato =?ISO-2022-JP?B?GyRAOjRGI0stGyhK?=" NIL "ysato" "etl.go.jp")) ((NIL NIL "nsb" "thumper.bellcore.com")) NIL NIL NIL "<gFQJR.ysato@etl.go.jp>")
+bodystructure ("text" "plain" ("charset" "ISO-2022-JP") NIL NIL "7bit" 1414 32 NIL NIL NIL NIL)
+body ("text" "plain" ("charset" "ISO-2022-JP") NIL NIL "7bit" 1414 32)
+section HEADER 997 0317c858f1b95741bd3390e538b4fd3c782e809b6b7c5abaa5bf38ad8080f0c8
+section TEXT 1414 8e556197390f023e950d7e9b0e6085f71c35fa46bbcac13ea6a36e1d9093a354
+section HEADER.FIELDS 252 afe27e51b1d1f581ed0d183f052cbb5476a2a64825cbef28dbdd40fa8088c624
+section HEADER.FIELDS.NOT 747 f66be4cdd999291cb6dcb767d77dd6db6bb482409fe3e66881b6af44c885deee
+section 1 1414 8e556197390f023e950d7e9b0e6085f71c35fa46bbcac13ea6a36e1d9093a354
+section 1.MIME 997 0317c858f1b95741bd3390e538b4fd3c782e809b6b7c5abaa5bf38ad8080f0c8

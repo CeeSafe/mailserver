@@ -1,0 +1,17 @@
+[package]
+name = "meas"
+version = "0.1.0"
+kind = "library"
+tests = ["tests"]
+
+[dependencies]
+mpim = { path = "../mpim" }
+mxml = { path = "../mxml" }
+mhttp = { path = "../mhttp" }
+msmtp = { path = "../msmtp" }
+mstore = { path = "../mstore" }
+mmime = { path = "../mmime" }
+postgres = { path = "../../../PostgresClient" }
+encoding = { path = "../../../../CeeSafeLibs/encoding" }
+sha256 = { path = "../../../../CeeSafeLibs/sha256" }
+diskio = { path = "../../../../CeeSafeLibs/diskio" }

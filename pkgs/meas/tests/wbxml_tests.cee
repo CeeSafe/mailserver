@@ -1,0 +1,107 @@
+// WBXML: MS-ASWBXML's FolderSync example, page switches, opaque data, empty tags, and refusals.
+
+import mxml.XmlDocument;
+
+fn decoded(bytes: Slice<u8>) -> Result<XmlDocument, TestFailure> => match (decodeWbxml(bytes)) {
+    Ok(d) => Ok(d),
+    Err(_) => Err(TestFailure.create("the body decodes")),
+};
+
+fn need(found: usize?, what: StringView) -> Result<usize, TestFailure> => match (found) {
+    Some(n) => Ok(n),
+    null => Err(TestFailure.create(what)),
+};
+
+@test
+fn decodesTheSpecExample() -> Result<void, TestFailure> {
+    // <FolderSync xmlns="FolderHierarchy"><SyncKey>0</SyncKey></FolderSync>
+    let body = [0x03u8, 0x01, 0x6a, 0x00, 0x00, 0x07, 0x56, 0x52, 0x03, 0x30, 0x00, 0x01, 0x01];
+    let doc = decoded(body[..])?;
+    Check.isTrue(doc.is(doc.root(), NS_FOLDERS, "FolderSync"), "the root")?;
+    let key = need(doc.child(doc.root(), NS_FOLDERS, "SyncKey"), "SyncKey")?;
+    Check.isTrue(doc.textView(key) == "0", "its text")?;
+    return Ok();
+}
+
+@test
+fn roundTrips() -> Result<void, TestFailure> {
+    var w = WbxmlWriter.create();
+    w.start(PAGE_AIRSYNC, "Sync");
+    w.start(PAGE_AIRSYNC, "Collections");
+    w.start(PAGE_AIRSYNC, "Collection");
+    w.element(PAGE_AIRSYNC, "SyncKey", "12");
+    w.empty(PAGE_AIRSYNC, "MoreAvailable");
+    w.start(PAGE_AIRSYNC, "ApplicationData");
+    w.element(PAGE_EMAIL, "Subject", "Caf\u{E9}");
+    w.elementBytes(PAGE_EMAIL, "To", [0x61u8, 0x00, 0x62][..]);
+    w.start(PAGE_BASE, "Body");
+    w.number(PAGE_BASE, "Type", 2);
+    w.end();
+    w.element(PAGE_EMAIL, "Read", "1");
+    w.end();
+    w.end();
+    w.end();
+    w.end();
+    let bytes = w.finish()!;
+    let doc = decoded(bytes.view())?;
+    let collection = need(doc.find(doc.root(), NS_AIRSYNC, "Collection"), "Collection")?;
+    Check.isTrue(childValue(doc, collection, NS_AIRSYNC, "SyncKey") == "12", "SyncKey")?;
+    let more = need(doc.child(collection, NS_AIRSYNC, "MoreAvailable"), "an empty tag")?;
+    Check.isTrue(doc.text(more).length == 0, "empty")?;
+    let data = need(doc.child(collection, NS_AIRSYNC, "ApplicationData"), "ApplicationData")?;
+    let subject = need(doc.child(data, NS_EMAIL, "Subject"), "Subject")?;
+    Check.isTrue(doc.textView(subject) == "Caf\u{E9}", "UTF-8 text")?;
+    let to = need(doc.child(data, NS_EMAIL, "To"), "To")?;
+    Check.isTrue(doc.text(to) == [0x61u8, 0x00, 0x62][..], "opaque data with a NUL")?;
+    let body = need(doc.child(data, NS_BASE, "Body"), "a page switch")?;
+    Check.isTrue(childValue(doc, body, NS_BASE, "Type") == "2", "Type on AirSyncBase")?;
+    Check.isTrue(childValue(doc, data, NS_EMAIL, "Read") == "1", "back on Email")?;
+    return Ok();
+}
+
+@test
+fn knowsThePages() -> Result<void, TestFailure> {
+    // Tags the C# table had wrong, against MS-ASWBXML.
+    Check.isTrue((tagOf(PAGE_EMAIL, "InternetCPID".bytes()) ?? 0) == 0x39, "Email InternetCPID")?;
+    Check.isTrue((tagOf(PAGE_EMAIL, "Flag".bytes()) ?? 0) == 0x3a, "Email Flag")?;
+    Check.isTrue((tagOf(PAGE_CALENDAR, "Subject".bytes()) ?? 0) == 0x26, "Calendar Subject")?;
+    Check.isTrue((tagOf(PAGE_CALENDAR, "DisallowNewTimeProposal".bytes()) ?? 0) == 0x33, "Calendar 0x33")?;
+    Check.isTrue((tagOf(PAGE_CONTACTS, "CompanyName".bytes()) ?? 0) == 0x19, "Contacts CompanyName")?;
+    Check.isTrue((tagOf(PAGE_CONTACTS, "WeightedRank".bytes()) ?? 0) == 0x3e, "Contacts WeightedRank")?;
+    Check.isTrue((tagOf(PAGE_SETTINGS, "DeviceInformation".bytes()) ?? 0) == 0x16, "Settings DeviceInformation")?;
+    Check.isTrue((tagOf(PAGE_PROVISION, "AllowBluetooth".bytes()) ?? 0) == 0x24, "Provision AllowBluetooth")?;
+    Check.isTrue((tagOf(PAGE_MEETING, "Result".bytes()) ?? 0) == 0x0a, "MeetingResponse Result")?;
+    Check.isTrue((tagOf(PAGE_BASE, "Body".bytes()) ?? 0) == 0x0a, "AirSyncBase Body after the gap")?;
+    Check.isTrue((tagOf(PAGE_ITEMOPS, "Move".bytes()) ?? 0) == 0x16, "ItemOperations Move")?;
+    var name = Vector<u8>.create();
+    Check.isTrue(!tagName(PAGE_BASE, 0x09, mut name)!, "a gap has no name")?;
+    return Ok();
+}
+
+@test
+fn refusesBadInput() -> Result<void, TestFailure> {
+    let unclosed = [0x03u8, 0x01, 0x6a, 0x00, 0x00, 0x07, 0x56, 0x52];
+    Check.isTrue(match (decodeWbxml(unclosed[..])) {
+        Ok(_) => false,
+        Err(_) => true,
+    }, "unclosed")?;
+    let longOpaque = [0x03u8, 0x01, 0x6a, 0x00, 0x56, 0xc3, 0x7f, 0x41, 0x01];
+    Check.isTrue(match (decodeWbxml(longOpaque[..])) {
+        Ok(_) => false,
+        Err(_) => true,
+    }, "opaque past the end")?;
+    let attributes = [0x03u8, 0x01, 0x6a, 0x00, 0xc5, 0x01, 0x01];
+    Check.isTrue(match (decodeWbxml(attributes[..])) {
+        Ok(_) => false,
+        Err(_) => true,
+    }, "attributes")?;
+    var unknown = WbxmlWriter.create();
+    unknown.empty(PAGE_EMAIL, "NoSuchTag");
+    Check.isTrue(match (unknown.finish()) {
+        Ok(_) => false,
+        Err(_) => true,
+    }, "an unknown name")?;
+    return Ok();
+}
+
+fn textOr(t: StringView?) -> StringView => t ?? "<none>";

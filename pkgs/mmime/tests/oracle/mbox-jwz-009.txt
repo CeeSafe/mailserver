@@ -1,0 +1,14 @@
+size 32653
+envelope ("Fri, 29 Nov 91 07:13:34 EST" "A parallel test" NIL NIL NIL NIL NIL NIL NIL NIL)
+bodystructure ((("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 724 17 NIL NIL NIL NIL) ("audio" "basic" NIL NIL "He's dead, Jim" "base64" 31472 NIL NIL NIL NIL) "parallel" ("boundary" "Where_No_One_Has_Gone_Before") NIL NIL NIL) "mixed" ("boundary" "Outermost_Trek") NIL NIL NIL)
+body ((("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 724 17) ("audio" "basic" NIL NIL "He's dead, Jim" "base64" 31472) "parallel") "mixed")
+section HEADER 139 4d4752ceb102160a871c3b15a4af7d9e45e2ce1794b8a50af8f2747012a236d7
+section TEXT 32514 bf218719ee7a32057e7dfb9b3ee629e367f91653954920960145ef3f90021d62
+section HEADER.FIELDS 120 d88f1270d1135d6ccc13042ee07624b7ce608c238af2411784845cad91a9f974
+section HEADER.FIELDS.NOT 21 07a26ab8981ff3b1de28da29cf47f47e315b9c25685121dc5ebb60391005b2de
+section 1 32401 fb1fb5d56457a5648e207baf2c6abacc1ae74d65d7321255cd133aa002a91a57
+section 1.MIME 75 f248b2180f42b1a6ff39e446e50c92d3ea3fa552dfc20698d8459bdaf3d041b6
+section 1.1 724 6687f90934510327aa7571ad93eb70a41aa2f87af99c9d1b858b715c0549c443
+section 1.1.MIME 2 7eb70257593da06f682a3ddda54a9d260d4fc514f645237f5ca74b08f8da61a6
+section 1.2 31472 61c1e8ab0c939d4786dd0561dbd13b7657775cc41f15f742f4323729b1d00520
+section 1.2.MIME 101 5a37a835e2002b36da0c133fde859c559033537721ed0950b7848bd2495ad3ba

@@ -1,0 +1,523 @@
+// Messages as ActiveSync Email items (MS-ASEMAIL, MS-ASAIRS): the header fields, the body in the type the device
+// asked for (plain text, HTML or the whole MIME message), truncated as asked, and the attachments by reference
+// (`<folder>:<uid>:<part>`, fetched with ItemOperations or GetAttachment).
+
+import diskio.FileError;
+import diskio.RawFile;
+import mmime.AddressList;
+import mmime.MediaType;
+import mmime.MessageIndex;
+import mmime.MimeScanner;
+import mmime.PART_LEAF;
+import mmime.appendPartText;
+import mmime.decodeHeader;
+import mmime.decodeParam;
+import mmime.decodeTransfer;
+import mmime.headerOf;
+import mmime.parseAddressList;
+import mmime.parseDisposition;
+import mmime.parseMediaType;
+import mpim.civilFromDays;
+import mstore.BlobStore;
+import mstore.FLAG_ANSWERED;
+import mstore.FLAG_FLAGGED;
+import mstore.FLAG_SEEN;
+import mstore.MailStore;
+import mstore.StoreError;
+
+/// What the device asked for a body to be.
+struct BodyOptions {
+    /// 1 plain text, 2 HTML, 4 MIME.
+    bodyType: i32;
+    /// The most bytes of body data to send; -1: all.
+    truncation: i64;
+}
+
+/// A message read for rendering: its bytes and its parts.
+@noncopy
+struct LoadedMessage {
+    bytes: Vector<u8>;
+    index: MessageIndex;
+}
+
+fn readWhole(blobs: borrow BlobStore, hash: Slice<u8>, into: borrow mut Vector<u8>) -> bool {
+    let file = match (blobs.open(hash)) {
+        Ok(f) => f,
+        Err(_) => { return false; }
+    };
+    let size = match (file.size()) {
+        Ok(n) => n,
+        Err(_) => { return false; }
+    };
+    into.clear();
+    match (into.resize(truncate<usize>(size), 0)) {
+        Ok() => {}
+        Err(_) => { return false; }
+    }
+    if (size == 0) {
+        return true;
+    }
+    return match (file.readExactAt(mut into[..], 0)) {
+        Ok() => true,
+        Err(_) => false,
+    };
+}
+
+/// Reads blob `hash` and indexes it; false when the file is missing.
+async fn loadMessage(
+    store: borrow MailStore,
+    hash: Slice<u8>,
+    into: borrow mut LoadedMessage,
+) -> Result<bool, EasFail> {
+    let blobs = store.blobs();
+    var bytes = Vector<u8>.create();
+    let read: bool = await Async.blocking(() => readWhole(blobs, hash, mut bytes));
+    if (!read) {
+        return Ok(false);
+    }
+    var scanner = MimeScanner.create();
+    mem(scanner.feed(bytes.view()))?;
+    var index = MessageIndex.create();
+    mem(scanner.finish(mut index))?;
+    into.bytes = bytes;
+    into.index = index;
+    return Ok(true);
+}
+
+fn emptyMessage() -> LoadedMessage => LoadedMessage { bytes: Vector<u8>.create(), index: MessageIndex.create() };
+
+fn twoDigits(into: borrow mut String, v: i64) -> Result<void, EasFail> {
+    if (v < 10) {
+        mem(into.append("0"))?;
+    }
+    return mem(into.appendNumber(v));
+}
+
+/// `2026-11-06T09:30:00.000Z` for a time in milliseconds since the epoch.
+fn isoTime(millis: i64, into: borrow mut String) -> Result<void, EasFail> {
+    into.clear();
+    let seconds = (if (millis >= 0) millis else millis - 999) / 1000;
+    let days = (if (seconds >= 0) seconds else seconds - 86399) / 86400;
+    let rest = seconds - days * 86400;
+    let ymd = civilFromDays(days);
+    mem(into.appendNumber(ymd[0]))?;
+    mem(into.append("-"))?;
+    twoDigits(into, ymd[1])?;
+    mem(into.append("-"))?;
+    twoDigits(into, ymd[2])?;
+    mem(into.append("T"))?;
+    twoDigits(into, rest / 3600)?;
+    mem(into.append(":"))?;
+    twoDigits(into, rest / 60 % 60)?;
+    mem(into.append(":"))?;
+    twoDigits(into, rest % 60)?;
+    mem(into.append(".000Z"))?;
+    return Ok();
+}
+
+/// A header field of the message, decoded (RFC 2047) to UTF-8; empty when absent.
+fn decodedHeader(
+    m: borrow LoadedMessage,
+    part: usize,
+    name: StringView,
+    into: borrow mut Vector<u8>,
+) -> Result<void, EasFail> {
+    into.clear();
+    match (headerOf(m.index, part, name)) {
+        Some(v) => { mem(decodeHeader(v, into))?; }
+        null => {}
+    }
+    return Ok();
+}
+
+fn writeHeaderField(
+    w: borrow mut WbxmlWriter,
+    m: borrow LoadedMessage,
+    header: StringView,
+    page: u8,
+    element: StringView,
+) -> Result<void, EasFail> {
+    var value = Vector<u8>.create();
+    decodedHeader(m, 0, header, mut value)?;
+    if (value.length > 0) {
+        w.elementBytes(page, element, value.view());
+    }
+    return Ok();
+}
+
+/// The display names of the To addresses (their addresses when unnamed), separated by "; ".
+fn displayTo(m: borrow LoadedMessage, into: borrow mut Vector<u8>) -> Result<void, EasFail> {
+    into.clear();
+    let raw = match (headerOf(m.index, 0, "To")) {
+        Some(v) => v,
+        null => { return Ok(); }
+    };
+    var list = AddressList.create();
+    mem(parseAddressList(raw, mut list))?;
+    for (i in 0..list.count()) {
+        let mailbox = list.mailbox(i);
+        let host = list.host(i);
+        if (mailbox == null || host == null) {
+            continue; // a group's start or end
+        }
+        if (into.length > 0) {
+            mem(into.extend("; ".bytes()))?;
+        }
+        match (list.name(i)) {
+            Some(n) => { mem(decodeHeader(n, into))?; }
+            null => {
+                mem(into.extend(mailbox ?? "".bytes()))?;
+                mem(into.push(0x40))?;
+                mem(into.extend(host ?? "".bytes()))?;
+            }
+        }
+    }
+    return Ok();
+}
+
+/// 0 low, 1 normal, 2 high, from Importance or X-Priority.
+fn importanceOf(m: borrow LoadedMessage) -> StringView {
+    match (headerOf(m.index, 0, "Importance")) {
+        Some(v) => {
+            let t = v.trim();
+            if (t.equalsIgnoreAsciiCase("high".bytes())) {
+                return "2";
+            }
+            if (t.equalsIgnoreAsciiCase("low".bytes())) {
+                return "0";
+            }
+        }
+        null => {}
+    }
+    match (headerOf(m.index, 0, "X-Priority")) {
+        Some(v) => {
+            let t = v.trim();
+            if (t.length > 0 && (t[0] == 0x31 || t[0] == 0x32)) {
+                return "2";
+            }
+            if (t.length > 0 && (t[0] == 0x34 || t[0] == 0x35)) {
+                return "0";
+            }
+        }
+        null => {}
+    }
+    return "1";
+}
+
+/// What a leaf part is.
+struct PartInfo {
+    text: bool;
+    html: bool;
+    attachment: bool;
+    inline: bool;
+}
+
+fn partInfo(m: borrow LoadedMessage, part: usize) -> Result<PartInfo, EasFail> {
+    var media = MediaType.create();
+    let typed = match (headerOf(m.index, part, "Content-Type")) {
+        Some(v) => match (parseMediaType(v, mut media)) {
+            Ok(t) => t,
+            Err(_) => { return Err(EasFail.Memory); }
+        },
+        null => false,
+    };
+    var disposition = MediaType.create();
+    let disposed = match (headerOf(m.index, part, "Content-Disposition")) {
+        Some(v) => match (parseDisposition(v, mut disposition)) {
+            Ok(t) => t,
+            Err(_) => { return Err(EasFail.Memory); }
+        },
+        null => false,
+    };
+    let isText = !typed || media.isType("text");
+    let named = disposed && disposition.kind.view().equalsIgnoreAsciiCase("attachment".bytes());
+    let html = typed && media.isType("text") && media.isSubtype("html");
+    let plainText = !typed || (media.isType("text") && media.isSubtype("plain"));
+    let body = !named && (plainText || html);
+    let isInline = disposed && disposition.kind.view().equalsIgnoreAsciiCase("inline".bytes());
+    return Ok(PartInfo {
+        text: body && plainText,
+        html: body && html,
+        attachment: named || !isText || (isText && !body && !(typed && media.isSubtype("calendar"))),
+        inline: isInline,
+    });
+}
+
+/// The first plain-text and HTML body parts (`NO` when absent).
+fn bodyParts(m: borrow LoadedMessage) -> Result<[usize; 2], EasFail> {
+    var plainPart: usize = NO;
+    var htmlPart: usize = NO;
+    for (p in 0..m.index.parts.length) {
+        if (m.index.parts[p].kind != PART_LEAF) {
+            continue;
+        }
+        let info = partInfo(m, p)?;
+        if (info.text && plainPart == NO) {
+            plainPart = p;
+        }
+        if (info.html && htmlPart == NO) {
+            htmlPart = p;
+        }
+    }
+    return Ok([plainPart, htmlPart]);
+}
+
+const NO: usize = 0xffffffffffffffff;
+
+/// The decoded text of leaf `part` (HTML tags dropped with `strip`), as UTF-8.
+fn partText(m: borrow LoadedMessage, part: usize, strip: bool, into: borrow mut Vector<u8>) -> Result<void, EasFail> {
+    into.clear();
+    let p = m.index.parts[part];
+    let header = m.bytes.view()[truncate<usize>(p.headerStart)..truncate<usize>(p.bodyStart)];
+    let body = m.bytes.view()[truncate<usize>(p.bodyStart)..truncate<usize>(p.bodyEnd)];
+    match (appendPartText(header, body, strip, 64 * 1024 * 1024, into)) {
+        Ok(_) => {}
+        Err(_) => { return Err(EasFail.Memory); }
+    }
+    return Ok();
+}
+
+/// The cut point for `limit` bytes of UTF-8 `text`.
+fn cutAt(text: Slice<u8>, limit: i64) -> usize {
+    if (limit < 0 || limit >= truncate<i64>(text.length)) {
+        return text.length;
+    }
+    var cut = truncate<usize>(limit);
+    while (cut > 0 && (text[cut] & 0xc0) == 0x80) {
+        cut -= 1;
+    }
+    return cut;
+}
+
+/// The Body element (AirSyncBase) for `opts`.
+fn writeBody(w: borrow mut WbxmlWriter, m: borrow LoadedMessage, opts: BodyOptions) -> Result<void, EasFail> {
+    if (opts.bodyType == 4) {
+        let all = m.bytes.view();
+        let cut = if (opts.truncation >= 0 && opts.truncation < truncate<i64>(
+            all.length,
+        )) truncate<usize>(opts.truncation) else all.length;
+        w.start(PAGE_BASE, "Body");
+        w.element(PAGE_BASE, "Type", "4");
+        w.number(PAGE_BASE, "EstimatedDataSize", truncate<i64>(all.length));
+        if (cut < all.length) {
+            w.element(PAGE_BASE, "Truncated", "1");
+        }
+        if (cut > 0) {
+            w.start(PAGE_BASE, "Data");
+            w.opaque(all[0..cut]);
+            w.end();
+        }
+        w.end();
+        return Ok();
+    }
+    let parts = bodyParts(m)?;
+    var text = Vector<u8>.create();
+    var kind: i64 = 1;
+    if (opts.bodyType == 2 && parts[1] != NO) {
+        partText(m, parts[1], false, mut text)?;
+        kind = 2;
+    } else if (parts[0] != NO) {
+        partText(m, parts[0], false, mut text)?;
+    } else if (parts[1] != NO) {
+        // Only HTML, and plain text wanted: the HTML's text.
+        partText(m, parts[1], true, mut text)?;
+    }
+    let cut = cutAt(text.view(), opts.truncation);
+    w.start(PAGE_BASE, "Body");
+    w.number(PAGE_BASE, "Type", kind);
+    w.number(PAGE_BASE, "EstimatedDataSize", truncate<i64>(text.length));
+    if (cut < text.length) {
+        w.element(PAGE_BASE, "Truncated", "1");
+    }
+    if (cut > 0) {
+        w.elementBytes(PAGE_BASE, "Data", text.view()[0..cut]);
+    }
+    w.end();
+    return Ok();
+}
+
+/// An attachment's name: the disposition's filename, else the type's name parameter, else "attachment".
+fn attachmentName(m: borrow LoadedMessage, part: usize, into: borrow mut Vector<u8>) -> Result<void, EasFail> {
+    into.clear();
+    match (headerOf(m.index, part, "Content-Disposition")) {
+        Some(v) => {
+            var d = MediaType.create();
+            if (match (parseDisposition(v, mut d)) {
+                Ok(t) => t,
+                Err(_) => { return Err(EasFail.Memory); }
+            }) {
+                if (match (decodeParam(d.params, "filename", into)) {
+                    Ok(b) => b,
+                    Err(_) => { return Err(EasFail.Memory); }
+                }) {
+                    return Ok();
+                }
+            }
+        }
+        null => {}
+    }
+    match (headerOf(m.index, part, "Content-Type")) {
+        Some(v) => {
+            var t = MediaType.create();
+            if (match (parseMediaType(v, mut t)) {
+                Ok(b) => b,
+                Err(_) => { return Err(EasFail.Memory); }
+            }) {
+                if (match (decodeParam(t.params, "name", into)) {
+                    Ok(b) => b,
+                    Err(_) => { return Err(EasFail.Memory); }
+                }) {
+                    return Ok();
+                }
+            }
+        }
+        null => {}
+    }
+    return mem(into.extend("attachment".bytes()));
+}
+
+fn writeAttachments(w: borrow mut WbxmlWriter, m: borrow LoadedMessage, serverId: StringView) -> Result<void, EasFail> {
+    var any = false;
+    var name = Vector<u8>.create();
+    for (p in 0..m.index.parts.length) {
+        if (m.index.parts[p].kind != PART_LEAF) {
+            continue;
+        }
+        let info = partInfo(m, p)?;
+        if (!info.attachment) {
+            continue;
+        }
+        if (!any) {
+            w.start(PAGE_BASE, "Attachments");
+            any = true;
+        }
+        attachmentName(m, p, mut name)?;
+        var reference = String.create();
+        mem(reference.append(serverId))?;
+        mem(reference.append(":"))?;
+        mem(reference.appendNumber(truncate<i64>(p)))?;
+        let part = m.index.parts[p];
+        var size = truncate<i64>(part.bodyEnd - part.bodyStart);
+        let encoded = headerOf(m.index, p, "Content-Transfer-Encoding");
+        match (encoded) {
+            Some(e) => {
+                if (e.trim().equalsIgnoreAsciiCase("base64".bytes())) {
+                    size = size * 3 / 4;
+                }
+            }
+            null => {}
+        }
+        w.start(PAGE_BASE, "Attachment");
+        w.elementBytes(PAGE_BASE, "DisplayName", name.view());
+        w.element(PAGE_BASE, "FileReference", reference.view());
+        w.element(PAGE_BASE, "Method", "1");
+        w.number(PAGE_BASE, "EstimatedDataSize", size);
+        match (headerOf(m.index, p, "Content-ID")) {
+            Some(cid) => {
+                let id = cid.trim();
+                if (id.length >= 2 && id[0] == 0x3c && id[id.length - 1] == 0x3e) {
+                    w.elementBytes(PAGE_BASE, "ContentId", id[1..(id.length - 1)]);
+                } else {
+                    w.elementBytes(PAGE_BASE, "ContentId", id);
+                }
+            }
+            null => {}
+        }
+        if (info.inline) {
+            w.element(PAGE_BASE, "IsInline", "1");
+        }
+        w.end();
+    }
+    if (any) {
+        w.end();
+    }
+    return Ok();
+}
+
+fn writeFlags(w: borrow mut WbxmlWriter, flags: u16) {
+    w.element(PAGE_EMAIL, "Read", if ((flags & FLAG_SEEN) != 0) "1" else "0");
+    if ((flags & FLAG_FLAGGED) != 0) {
+        w.start(PAGE_EMAIL, "Flag");
+        w.element(PAGE_EMAIL, "FlagStatus", "2");
+        w.element(PAGE_EMAIL, "FlagType", "Flag for follow up");
+        w.end();
+    } else {
+        w.empty(PAGE_EMAIL, "Flag");
+    }
+}
+
+/// A message's ApplicationData (inside the element the caller opened).
+fn writeEmail(
+    w: borrow mut WbxmlWriter,
+    m: borrow LoadedMessage,
+    flags: u16,
+    internalDate: i64,
+    serverId: StringView,
+    opts: BodyOptions,
+    version: i32,
+) -> Result<void, EasFail> {
+    writeHeaderField(w, m, "To", PAGE_EMAIL, "To")?;
+    writeHeaderField(w, m, "Cc", PAGE_EMAIL, "Cc")?;
+    writeHeaderField(w, m, "From", PAGE_EMAIL, "From")?;
+    writeHeaderField(w, m, "Subject", PAGE_EMAIL, "Subject")?;
+    writeHeaderField(w, m, "Reply-To", PAGE_EMAIL, "ReplyTo")?;
+    var date = String.create();
+    isoTime(internalDate, mut date)?;
+    w.element(PAGE_EMAIL, "DateReceived", date.view());
+    var names = Vector<u8>.create();
+    displayTo(m, mut names)?;
+    if (names.length > 0) {
+        w.elementBytes(PAGE_EMAIL, "DisplayTo", names.view());
+    }
+    writeHeaderField(w, m, "Subject", PAGE_EMAIL, "ThreadTopic")?;
+    w.element(PAGE_EMAIL, "Importance", importanceOf(m));
+    writeFlags(w, flags);
+    writeBody(w, m, opts)?;
+    writeAttachments(w, m, serverId)?;
+    w.element(PAGE_EMAIL, "MessageClass", "IPM.Note");
+    w.element(PAGE_EMAIL, "InternetCPID", "65001");
+    w.element(PAGE_EMAIL, "ContentClass", "urn:content-classes:message");
+    let parts = bodyParts(m)?;
+    w.element(PAGE_BASE, "NativeBodyType", if (parts[1] != NO && parts[0] == NO) "2" else "1");
+    if (version >= 140 && (flags & FLAG_ANSWERED) != 0) {
+        w.element(PAGE_EMAIL2, "LastVerbExecuted", "1");
+    }
+    return Ok();
+}
+
+/// The decoded content of leaf `part` (an attachment), and its media type as text.
+fn attachmentContent(
+    m: borrow LoadedMessage,
+    part: usize,
+    into: borrow mut Vector<u8>,
+    kind: borrow mut String,
+) -> Result<bool, EasFail> {
+    into.clear();
+    kind.clear();
+    if (part >= m.index.parts.length || m.index.parts[part].kind != PART_LEAF) {
+        return Ok(false);
+    }
+    let p = m.index.parts[part];
+    let body = m.bytes.view()[truncate<usize>(p.bodyStart)..truncate<usize>(p.bodyEnd)];
+    let encoding = headerOf(m.index, part, "Content-Transfer-Encoding") ?? "7bit".bytes();
+    match (decodeTransfer(encoding.trim(), body, body.length + 16, into)) {
+        Ok(_) => {}
+        Err(_) => { return Err(EasFail.Memory); }
+    }
+    var media = MediaType.create();
+    let typed = match (headerOf(m.index, part, "Content-Type")) {
+        Some(v) => match (parseMediaType(v, mut media)) {
+            Ok(t) => t,
+            Err(_) => { return Err(EasFail.Memory); }
+        },
+        null => false,
+    };
+    if (typed) {
+        mem(kind.append(StringView.fromUtf8(media.kind.view()) ?? "application"))?;
+        mem(kind.append("/"))?;
+        mem(kind.append(StringView.fromUtf8(media.subtype.view()) ?? "octet-stream"))?;
+    } else {
+        mem(kind.append("text/plain"))?;
+    }
+    return Ok(true);
+}

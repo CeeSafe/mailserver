@@ -1,0 +1,827 @@
+// The command parser and the response writers: RFC 3501's sample session (§8) and command examples (§6), the formal
+// syntax's tricky cases (§9), LITERAL+ (RFC 7888), errors and limits.
+
+fn reader() -> CommandReader => CommandReader.create(Limits.defaults());
+
+/// Feeds a command as it comes off the wire: lines ending in CRLF, each literal's bytes after its line.
+fn feedAll(r: borrow mut CommandReader, wire: StringView) -> Result<void, ParseError> {
+    r.reset();
+    let bytes = wire.bytes();
+    var at: usize = 0;
+    loop {
+        var end = at;
+        while (end + 1 < bytes.length && !(bytes[end] == 0x0d && bytes[end + 1] == 0x0a)) {
+            end += 1;
+        }
+        if (end + 1 >= bytes.length) {
+            end = bytes.length;
+        }
+        let line = bytes[at..end];
+        at = if (end + 2 <= bytes.length) end + 2 else bytes.length;
+        match (r.feedLine(line)?) {
+            Feed.Complete => {
+                return Ok();
+            }
+            Feed.NeedLiteral(request) => {
+                let n = truncate<usize>(request.size);
+                if (at + n > bytes.length) {
+                    return Err(ParseError.NotExpected);
+                }
+                r.feedLiteral(bytes[at..at + n])?;
+                at += n;
+            }
+        }
+    }
+}
+
+fn textIs(r: borrow CommandReader, span: Span, want: StringView) -> bool => r.text(span) == want.bytes();
+
+fn errorIs(result: Result<void, ParseError>, want: ParseError) -> bool => match (result) {
+    Ok() => false,
+    Err(e) => e == want,
+};
+
+/// The tag and command of a fed command.
+fn head(r: borrow mut CommandReader, tag: StringView, command: Command, uid: bool) -> Result<bool, ParseError> {
+    let t = r.tag()?;
+    let c = r.command()?;
+    return Ok(textIs(r, t, tag) && c.command == command && c.uid == uid);
+}
+
+/// `tag FETCH set attributes`, read whole.
+fn fetch(
+    r: borrow mut CommandReader,
+    wire: StringView,
+    set: borrow mut SequenceSet,
+    into: borrow mut FetchRequest,
+) -> Result<void, ParseError> {
+    feedAll(r, wire)?;
+    r.tag()?;
+    r.command()?;
+    r.sequenceSet(set)?;
+    r.fetchAttributes(into)?;
+    return r.finish();
+}
+
+fn fetchError(wire: StringView, want: ParseError) -> bool {
+    var r = reader();
+    var set = SequenceSet.create();
+    var into = FetchRequest.create();
+    return errorIs(fetch(mut r, wire, mut set, mut into), want);
+}
+
+fn section(request: borrow FetchRequest, i: usize) -> Section => request.items[i].section;
+
+@test
+fn sampleSession() -> Result<void, TestFailure> {
+    // RFC 3501 §8, the client's side.
+    var r = reader();
+    feedAll(mut r, "a001 login mrc secret\r\n")!;
+    Check.isTrue(head(mut r, "a001", Command.Login, false)!, "login")?;
+    let user = r.astring()!;
+    let password = r.astring()!;
+    Check.isTrue(textIs(r, user, "mrc") && textIs(r, password, "secret"), "login's arguments")?;
+    Check.isTrue(ok(r.finish()), "nothing more")?;
+
+    feedAll(mut r, "a002 select inbox\r\n")!;
+    Check.isTrue(head(mut r, "a002", Command.Select, false)!, "select")?;
+    let box = r.mailbox()!;
+    Check.isTrue(box.isInbox && textIs(r, box.name, "inbox"), "inbox in any case")?;
+
+    var set = SequenceSet.create();
+    var f = FetchRequest.create();
+    fetch(mut r, "a003 fetch 12 full\r\n", mut set, mut f)!;
+    Check.isTrue(set.contains(12, 20) && !set.contains(11, 20), "message 12")?;
+    Check.isTrue(f.items.length == 5 && f.has(FetchKind.Flags) && f.has(FetchKind.InternalDate), "FULL expanded")?;
+    Check.isTrue(f.has(FetchKind.Rfc822Size) && f.has(FetchKind.Envelope) && f.has(FetchKind.Body), "FULL's rest")?;
+
+    fetch(mut r, "a004 fetch 12 body[header]\r\n", mut set, mut f)!;
+    Check.isTrue(f.items.length == 1 && f.items[0].kind == FetchKind.BodySection && !f.items[0].peek, "body[header]")?;
+    Check.isTrue(section(f, 0).text == SectionText.Header && section(f, 0).partsCount == 0, "the header section")?;
+
+    feedAll(mut r, "a005 store 12 +flags \\deleted\r\n")!;
+    Check.isTrue(head(mut r, "a005", Command.Store, false)!, "store")?;
+    r.sequenceSet(mut set)!;
+    let action = r.storeAction()!;
+    Check.isTrue(action.mode == StoreMode.Add && !action.silent, "+flags")?;
+    var flags = Vector<Flag>.create();
+    r.storeFlags(mut flags)!;
+    Check.isTrue(flags.length == 1 && flags[0].kind == FlagKind.Deleted, "\\deleted, without parentheses")?;
+    Check.isTrue(ok(r.finish()), "store read whole")?;
+
+    feedAll(mut r, "a006 logout\r\n")!;
+    Check.isTrue(head(mut r, "a006", Command.Logout, false)!, "logout")?;
+    return Check.isTrue(ok(r.finish()), "logout takes nothing");
+}
+
+@test
+fn commandExamples() -> Result<void, TestFailure> {
+    // RFC 3501 §6.
+    var r = reader();
+    var set = SequenceSet.create();
+    var f = FetchRequest.create();
+    fetch(mut r, "A654 FETCH 2:4 (FLAGS BODY[HEADER.FIELDS (DATE FROM)])", mut set, mut f)!;
+    Check.isTrue(f.items.length == 2 && f.items[0].kind == FetchKind.Flags, "two items")?;
+    let s = section(f, 1);
+    Check.isTrue(s.text == SectionText.HeaderFields && s.fieldsCount == 2, "header fields")?;
+    let fields = f.fieldsOf(f.items[1]);
+    Check.isTrue(textIs(r, fields[0], "DATE") && textIs(r, fields[1], "FROM"), "the field names")?;
+
+    feedAll(mut r, "A003 STORE 2:4 +FLAGS (\\Deleted)")!;
+    Check.isTrue(head(mut r, "A003", Command.Store, false)!, "STORE")?;
+    r.sequenceSet(mut set)!;
+    r.storeAction()!;
+    var flags = Vector<Flag>.create();
+    r.storeFlags(mut flags)!;
+    Check.isTrue(flags.length == 1 && flags[0].kind == FlagKind.Deleted && ok(r.finish()), "a flag list")?;
+
+    feedAll(mut r, "A042 STATUS blurdybloop (UIDNEXT MESSAGES)")!;
+    Check.isTrue(head(mut r, "A042", Command.Status, false)!, "STATUS")?;
+    let box = r.mailbox()!;
+    var items = Vector<StatusItem>.create();
+    r.statusItems(mut items)!;
+    Check.isTrue(
+        !box.isInbox && items.length == 2 && items[0] == StatusItem.UidNext && items[1] == StatusItem.Messages,
+        "items",
+    )?;
+
+    fetch(mut r, "A999 UID FETCH 4827313:4828442 FLAGS", mut set, mut f)!;
+    Check.isTrue(set.contains(4827400, 1) && !set.contains(4828443, 5000000), "a UID range")?;
+    feedAll(mut r, "A999 UID FETCH 1 FLAGS")!;
+    Check.isTrue(head(mut r, "A999", Command.Fetch, true)!, "the UID prefix")?;
+
+    feedAll(mut r, "A682 LIST \"\" *")!;
+    Check.isTrue(head(mut r, "A682", Command.List, false)!, "LIST")?;
+    let reference = r.mailbox()!;
+    let pattern = r.listMailbox()!;
+    Check.isTrue(reference.name.length == 0 && textIs(r, pattern, "*"), "an empty reference and a wildcard")?;
+    feedAll(mut r, "A202 LIST ~/Mail/ %")!;
+    r.tag()!;
+    r.command()!;
+    let home = r.mailbox()!;
+    let percent = r.listMailbox()!;
+    Check.isTrue(textIs(r, home.name, "~/Mail/") && textIs(r, percent, "%"), "% and a path")?;
+    feedAll(mut r, "A1 LIST \"\" foo[bar]*")!;
+    r.tag()!;
+    r.command()!;
+    r.mailbox()!;
+    let brackets = r.listMailbox()!;
+    Check.isTrue(textIs(r, brackets, "foo[bar]*"), "brackets in a pattern")?;
+    feedAll(mut r, "A1 SELECT %")!;
+    r.tag()!;
+    r.command()!;
+    Check.isTrue(!ok(voidOf(r.mailbox())), "a wildcard is not a mailbox name")?;
+
+    // Modified UTF-7 names are kept as sent.
+    feedAll(mut r, "A1 CREATE &ZeVnLIqe-")!;
+    r.tag()!;
+    r.command()!;
+    let japanese = r.mailbox()!;
+    Check.isTrue(textIs(r, japanese.name, "&ZeVnLIqe-"), "modified UTF-7")?;
+
+    // Commands in any case; UID only before the commands that take it.
+    feedAll(mut r, "x uId sToRe 1 FLAGS.SILENT ()")!;
+    Check.isTrue(head(mut r, "x", Command.Store, true)!, "uid store")?;
+    r.sequenceSet(mut set)!;
+    let silent = r.storeAction()!;
+    flags.clear();
+    r.storeFlags(mut flags)!;
+    Check.isTrue(silent.silent && silent.mode == StoreMode.Replace && flags.length == 0, "an empty flag list")?;
+    feedAll(mut r, "x UID LOGIN a b")!;
+    r.tag()!;
+    Check.isTrue(errorIs(voidOf(r.command()), ParseError.UnknownCommand), "UID LOGIN")?;
+    feedAll(mut r, "x FROB")!;
+    r.tag()!;
+    Check.isTrue(errorIs(voidOf(r.command()), ParseError.UnknownCommand), "an unknown command")?;
+    feedAll(mut r, "x UID EXPUNGE 1:3")!;
+    return Check.isTrue(head(mut r, "x", Command.Expunge, true)!, "UID EXPUNGE");
+}
+
+fn ok(result: Result<void, ParseError>) -> bool => match (result) {
+    Ok() => true,
+    Err(_) => false,
+};
+
+fn voidOf<T>(result: Result<T, ParseError>) -> Result<void, ParseError> => match (result) {
+    Ok(_) => Ok(),
+    Err(e) => Err(e),
+};
+
+@test
+fn quotedStrings() -> Result<void, TestFailure> {
+    var r = reader();
+    feedAll(mut r, "a LOGIN \"a\\\"b\" \"c\\\\d\"")!;
+    r.tag()!;
+    r.command()!;
+    let user = r.astring()!;
+    let password = r.astring()!;
+    Check.isTrue(textIs(r, user, "a\"b") && textIs(r, password, "c\\d"), "escapes undone")?;
+    feedAll(mut r, "a LOGIN \"\" \"two words\"")!;
+    r.tag()!;
+    r.command()!;
+    let empty = r.astring()!;
+    let spaced = r.astring()!;
+    Check.isTrue(empty.length == 0 && textIs(r, spaced, "two words"), "empty and spaced")?;
+    Check.isTrue(errorIs(feedAll(mut r, "a LOGIN \"a\\nb\" c"), ParseError.BadEscape), "\\n is not an escape")?;
+    Check.isTrue(errorIs(feedAll(mut r, "a LOGIN \"abc c"), ParseError.UnterminatedQuoted), "unterminated")?;
+    Check.isTrue(errorIs(feedAll(mut r, "a LOGIN \"abc\\"), ParseError.UnterminatedQuoted), "a final backslash")?;
+    Check.isTrue(errorIs(feedAll(mut r, "a LOGIN \"a\tb\" c"), ParseError.BadCharacter), "a control character")?;
+    // A string is not an atom.
+    feedAll(mut r, "a FETCH 1 \"FLAGS\"")!;
+    r.tag()!;
+    r.command()!;
+    var set = SequenceSet.create();
+    r.sequenceSet(mut set)!;
+    var f = FetchRequest.create();
+    return Check.isTrue(errorIs(r.fetchAttributes(mut f), ParseError.UnknownFetchAttribute), "a quoted attribute");
+}
+
+@test
+fn literals() -> Result<void, TestFailure> {
+    // RFC 3501 §4.3's example, and literals in the middle of a command.
+    var r = reader();
+    feedAll(mut r, "A001 LOGIN {11}\r\nFRED FOOBAR {7}\r\nfat man")!;
+    Check.isTrue(head(mut r, "A001", Command.Login, false)!, "login")?;
+    let user = r.astring()!;
+    let password = r.astring()!;
+    Check.isTrue(textIs(r, user, "FRED FOOBAR") && textIs(r, password, "fat man") && ok(r.finish()), "two literals")?;
+
+    // Step by step, as the session does it.
+    r.reset();
+    let first = r.feedLine("a LOGIN {4}\r\n".bytes())!;
+    let isSync = match (first) {
+        Feed.NeedLiteral(q) => q.size == 4 && q.synchronizing,
+        Feed.Complete => false,
+    };
+    Check.isTrue(isSync, "a synchronizing literal")?;
+    Check.isTrue(r.feedLiteral("us".bytes())! == 2 && r.literalRemaining() == 2, "in parts")?;
+    Check.isTrue(r.feedLiteral("er".bytes())! == 0, "the rest")?;
+    Check.isTrue(errorIs(voidOf(r.feedLiteral("x".bytes())), ParseError.NotExpected), "no more literal")?;
+    let second = r.feedLine(" {6+}".bytes())!;
+    let isPlus = match (second) {
+        Feed.NeedLiteral(q) => q.size == 6 && !q.synchronizing,
+        Feed.Complete => false,
+    };
+    Check.isTrue(isPlus, "LITERAL+")?;
+    Check.isTrue(errorIs(voidOf(r.feedLiteral("1234567".bytes())), ParseError.LiteralOverrun), "too many bytes")?;
+    r.feedLiteral("pa\r\ns\u{0}".bytes())!;
+    Check.isTrue(!r.isComplete() && errorIs(voidOf(r.next()), ParseError.NotExpected), "not complete yet")?;
+    let done = r.feedLine("".bytes())!;
+    let isDone = match (done) {
+        Feed.Complete => true,
+        Feed.NeedLiteral(_) => false,
+    };
+    Check.isTrue(isDone, "the last line")?;
+    Check.isTrue(r.isComplete(), "complete")?;
+    r.tag()!;
+    r.command()!;
+    let user2 = r.astring()!;
+    Check.isTrue(textIs(r, user2, "user"), "the user")?;
+    let pw = r.astring()!;
+    Check.isTrue(pw.length == 6 && r.text(pw)[2] == 0x0d && r.text(pw)[5] == 0, "any bytes in a literal")?;
+
+    // A literal can be empty, and can be a list element.
+    feedAll(mut r, "a ID ({0}\r\n {3}\r\nabc)")!;
+    r.tag()!;
+    r.command()!;
+    r.open()!;
+    let none = r.string()!;
+    let abc = r.string()!;
+    Check.isTrue(none.length == 0 && textIs(r, abc, "abc") && r.closeIfNext(), "literals in a list")?;
+
+    // APPEND (RFC 3501 §6.3.11), with its flag list, date and message.
+    feedAll(
+        mut r,
+        "A003 APPEND saved-messages (\\Seen) \" 7-Feb-1994 21:52:25 -0800\" {22+}\r\nFrom: Fred\r\n\r\nHi there",
+    )!;
+    Check.isTrue(head(mut r, "A003", Command.Append, false)!, "append")?;
+    let box = r.mailbox()!;
+    var flags = Vector<Flag>.create();
+    let args = r.appendArgs(mut flags)!;
+    Check.isTrue(
+        textIs(r, box.name, "saved-messages") && flags.length == 1 && flags[0].kind == FlagKind.Seen,
+        "box and flags",
+    )?;
+    Check.isTrue((args.internalDate ?? 0) == 760686745000, "the date, in UTC")?;
+    Check.isTrue(textIs(r, args.message, "From: Fred\r\n\r\nHi there") && ok(r.finish()), "the message")?;
+    feedAll(mut r, "A004 APPEND INBOX {2}\r\nhi")!;
+    r.tag()!;
+    r.command()!;
+    Check.isTrue(r.mailbox()!.isInbox, "INBOX")?;
+    flags.clear();
+    let plain = r.appendArgs(mut flags)!;
+    Check.isTrue(
+        plain.internalDate == null && flags.length == 0 && textIs(r, plain.message, "hi"),
+        "no flags or date",
+    )?;
+    feedAll(mut r, "A005 APPEND INBOX hi")!;
+    r.tag()!;
+    r.command()!;
+    r.mailbox()!;
+    return Check.isTrue(
+        errorIs(voidOf(r.appendArgs(mut flags)), ParseError.ExpectedLiteral),
+        "the message is a literal",
+    );
+}
+
+@test
+fn literalLimits() -> Result<void, TestFailure> {
+    var limits = Limits.defaults();
+    limits.maxLiteral = 100;
+    limits.maxAppendLiteral = 1000;
+    limits.maxBytes = 350;
+    var r = CommandReader.create(limits);
+    Check.isTrue(ok(voidOf(r.feedLine("a LOGIN {100}".bytes()))), "at the limit")?;
+    r.reset();
+    Check.isTrue(errorIs(voidOf(r.feedLine("a LOGIN {101}".bytes())), ParseError.LiteralTooLarge), "over it")?;
+    r.reset();
+    Check.isTrue(
+        errorIs(voidOf(r.feedLine("a LOGIN {101+}".bytes())), ParseError.LiteralTooLarge),
+        "non-synchronizing too",
+    )?;
+    r.reset();
+    Check.isTrue(ok(voidOf(r.feedLine("a append INBOX {1000+}".bytes()))), "APPEND's own limit")?;
+    r.reset();
+    Check.isTrue(errorIs(voidOf(r.feedLine("a APPEND INBOX {1001}".bytes())), ParseError.LiteralTooLarge), "over it")?;
+    r.reset();
+    Check.isTrue(
+        errorIs(voidOf(r.feedLine("a LOGIN {99999999999}".bytes())), ParseError.BadLiteral),
+        "beyond a number",
+    )?;
+    // Many literals within the limit still hit the command's total.
+    r.reset();
+    r.feedLine("a ID ({100}".bytes())!;
+    r.feedLiteral([0x41u8; 100][..])!;
+    r.feedLine(" {100}".bytes())!;
+    r.feedLiteral([0x41u8; 100][..])!;
+    r.feedLine(" {100}".bytes())!;
+    r.feedLiteral([0x41u8; 100][..])!;
+    Check.isTrue(errorIs(voidOf(r.feedLine(" {100}".bytes())), ParseError.LiteralTooLarge), "the total")?;
+    // APPEND's mailbox literal has the ordinary limit; only the message has APPEND's.
+    r.reset();
+    Check.isTrue(errorIs(voidOf(r.feedLine("a APPEND {101}".bytes())), ParseError.LiteralTooLarge), "mailbox")?;
+    r.reset();
+    Check.isTrue(ok(voidOf(r.feedLine("a APPEND {5}".bytes()))) && !r.isAppendMessage(), "a mailbox literal")?;
+    // A deferred message literal: the command is complete without its bytes, which the session streams itself.
+    r.reset();
+    r.feedLine("a APPEND {5}".bytes())!;
+    r.feedLiteral("INBOX".bytes())!;
+    Check.isTrue(ok(voidOf(r.feedLine(" (\\Seen) {900}".bytes()))) && r.isAppendMessage(), "the message")?;
+    r.deferLiteral();
+    Check.isTrue(r.isComplete() && r.deferredSize() == 900, "deferred")?;
+    r.tag()!;
+    r.command()!;
+    Check.isTrue(r.mailbox()!.isInbox, "INBOX by literal")?;
+    var appendFlags = Vector<Flag>.create();
+    let deferred = r.appendArgs(mut appendFlags)!;
+    Check.isTrue(
+        appendFlags.length == 1 && r.text(deferred.message).length == 0 && ok(r.finish()),
+        "the arguments without the message",
+    )?;
+    r.reset();
+    Check.isTrue(r.deferredSize() == 0, "reset")?;
+    // Too many tokens, too deep.
+    limits = Limits.defaults();
+    limits.maxTokens = 10;
+    limits.maxDepth = 3;
+    var small = CommandReader.create(limits);
+    Check.isTrue(errorIs(feedAll(mut small, "a ID (a b c d e f g h i j k)"), ParseError.TooManyTokens), "tokens")?;
+    Check.isTrue(errorIs(feedAll(mut small, "a ID ((((x))))"), ParseError.TooDeep), "depth")?;
+    Check.isTrue(ok(feedAll(mut small, "a ID (((x)))")), "depth at the limit")?;
+    // Every prefix of a valid command fails cleanly or parses.
+    let full = "a1 UID FETCH 1:*,3 (FLAGS BODY.PEEK[1.2.HEADER.FIELDS (\"DATE\" FROM)]<0.10> \"x\\\"\") {3}";
+    let bytes = full.bytes();
+    var r2 = reader();
+    for (n in 0..bytes.length) {
+        r2.reset();
+        let ignored = r2.feedLine(bytes[0..n]);
+    }
+    return Ok();
+}
+
+@test
+fn nestedLists() -> Result<void, TestFailure> {
+    var r = reader();
+    feedAll(mut r, "a ID (\"name\" \"x\" (NIL (deep \"er\")) ())")!;
+    Check.isTrue(head(mut r, "a", Command.Id, false)!, "ID")?;
+    let kinds = [
+        TokenKind.Open, TokenKind.Quoted, TokenKind.Quoted, TokenKind.Open, TokenKind.Nil, TokenKind.Open,
+        TokenKind.Atom, TokenKind.Quoted, TokenKind.Close, TokenKind.Close, TokenKind.Open, TokenKind.Close,
+        TokenKind.Close,
+    ];
+    for (k in kinds) {
+        let t = r.next()!;
+        Check.isTrue(t.kind == k, "the token kinds")?;
+    }
+    Check.isTrue(r.atEnd() && ok(r.finish()), "all read")?;
+    feedAll(mut r, "a ID NIL")!;
+    r.tag()!;
+    r.command()!;
+    Check.isTrue(r.nstring()! == null && r.atEnd(), "NIL")?;
+    // NIL is also an astring.
+    feedAll(mut r, "a SELECT nil")!;
+    r.tag()!;
+    r.command()!;
+    let nil = r.mailbox()!;
+    return Check.isTrue(textIs(r, nil.name, "nil"), "a mailbox called nil");
+}
+
+@test
+fn fetchAttributes() -> Result<void, TestFailure> {
+    var r = reader();
+    var set = SequenceSet.create();
+    var f = FetchRequest.create();
+    fetch(mut r, "a FETCH 1 BODY[HEADER.FIELDS (DATE FROM)]<0.2048>", mut set, mut f)!;
+    let a = f.items[0];
+    Check.isTrue(a.kind == FetchKind.BodySection && a.partial && a.origin == 0 && a.count == 2048, "the partial")?;
+    Check.isTrue(a.section.text == SectionText.HeaderFields && a.section.fieldsCount == 2, "the fields")?;
+
+    fetch(mut r, "a FETCH 1 (BODY.PEEK[1.2.MIME] BODY[1.2.3] BODY[] body[text]<10.20> RFC822.SIZE)", mut set, mut f)!;
+    Check.isTrue(f.items.length == 5, "five items")?;
+    Check.isTrue(
+        f.items[0].peek && section(f, 0).text == SectionText.Mime && f.partsOf(f.items[0]) == [1u32, 2][..],
+        "1.2.MIME",
+    )?;
+    Check.isTrue(section(f, 1).text == SectionText.Whole && f.partsOf(f.items[1]) == [1u32, 2, 3][..], "1.2.3")?;
+    Check.isTrue(
+        section(f, 2).text == SectionText.Whole && section(f, 2).partsCount == 0 && !f.items[2].partial,
+        "BODY[]",
+    )?;
+    Check.isTrue(section(f, 3).text == SectionText.Text && f.items[3].origin == 10 && f.items[3].count == 20, "TEXT")?;
+    Check.isTrue(f.items[4].kind == FetchKind.Rfc822Size, "RFC822.SIZE")?;
+
+    fetch(
+        mut r,
+        "a FETCH 1 (BODY[3.HEADER.FIELDS.NOT (Received \"X-Spam\")] BODY[2.HEADER] BODY[4.TEXT])",
+        mut set,
+        mut f,
+    )!;
+    Check.isTrue(
+        section(f, 0).text == SectionText.HeaderFieldsNot && f.partsOf(f.items[0]) == [3u32][..],
+        "FIELDS.NOT",
+    )?;
+    Check.isTrue(textIs(r, f.fieldsOf(f.items[0])[1], "X-Spam"), "a quoted field")?;
+    Check.isTrue(
+        section(f, 1).text == SectionText.Header && section(f, 2).text == SectionText.Text,
+        "part HEADER and TEXT",
+    )?;
+
+    fetch(
+        mut r,
+        "a FETCH 1 (ENVELOPE FLAGS INTERNALDATE RFC822 RFC822.HEADER RFC822.TEXT BODY BODYSTRUCTURE UID)",
+        mut set,
+        mut f,
+    )!;
+    let simple = [
+        FetchKind.Envelope, FetchKind.Flags, FetchKind.InternalDate, FetchKind.Rfc822, FetchKind.Rfc822Header,
+        FetchKind.Rfc822Text, FetchKind.Body, FetchKind.BodyStructure, FetchKind.Uid,
+    ];
+    for (i in 0..simple.length) {
+        Check.isTrue(f.items[i].kind == simple[i], "each simple attribute")?;
+    }
+    fetch(mut r, "a FETCH 1 all", mut set, mut f)!;
+    Check.isTrue(f.items.length == 4 && f.has(FetchKind.Envelope) && !f.has(FetchKind.Body), "ALL")?;
+    fetch(mut r, "a FETCH 1 FAST", mut set, mut f)!;
+    Check.isTrue(f.items.length == 3 && !f.has(FetchKind.Envelope), "FAST")?;
+
+    // The RFC's validity rules.
+    Check.isTrue(fetchError("a FETCH 1 BODY[MIME]", ParseError.MimeWithoutPart), "MIME at the top level")?;
+    Check.isTrue(fetchError("a FETCH 1 FROB", ParseError.UnknownFetchAttribute), "an unknown attribute")?;
+    Check.isTrue(fetchError("a FETCH 1 (FLAGS ALL)", ParseError.UnknownFetchAttribute), "a macro in a list")?;
+    Check.isTrue(fetchError("a FETCH 1 ()", ParseError.UnknownFetchAttribute), "an empty list")?;
+    Check.isTrue(fetchError("a FETCH 1 BODY.PEEK", ParseError.UnknownFetchAttribute), "PEEK needs a section")?;
+    Check.isTrue(fetchError("a FETCH 1 RFC822[]", ParseError.UnknownFetchAttribute), "only BODY has sections")?;
+    Check.isTrue(fetchError("a FETCH 1 BODY[0]", ParseError.BadSection), "part 0")?;
+    Check.isTrue(fetchError("a FETCH 1 BODY[1.]", ParseError.BadSection), "a dot with nothing after it")?;
+    Check.isTrue(fetchError("a FETCH 1 BODY[FOO]", ParseError.BadSection), "an unknown section")?;
+    Check.isTrue(fetchError("a FETCH 1 BODY[HEADER", ParseError.BadSection), "no ]")?;
+    Check.isTrue(fetchError("a FETCH 1 BODY[HEADER.FIELDS]", ParseError.BadSection), "fields need a list")?;
+    Check.isTrue(fetchError("a FETCH 1 BODY[HEADER.FIELDS ()]", ParseError.BadSection), "an empty field list")?;
+    Check.isTrue(fetchError("a FETCH 1 BODY[HEADER.FIELDS (A) ]", ParseError.BadSection), "a space before ]")?;
+    Check.isTrue(fetchError("a FETCH 1 BODY[TEXT]<5>", ParseError.BadPartial), "a partial needs a count")?;
+    Check.isTrue(fetchError("a FETCH 1 BODY[TEXT]<5.0>", ParseError.BadPartial), "a zero count")?;
+    Check.isTrue(fetchError("a FETCH 1 BODY[TEXT]<a.1>", ParseError.BadPartial), "a non-numeric origin")?;
+    Check.isTrue(fetchError("a FETCH 1 BODY[TEXT]x", ParseError.BadPartial), "junk after ]")?;
+    return Check.isTrue(
+        fetchError("a FETCH 1 FLAGS FLAGS", ParseError.ExtraArguments),
+        "two attributes without a list",
+    );
+}
+
+@test
+fn sequenceSets() -> Result<void, TestFailure> {
+    var r = reader();
+    var set = SequenceSet.create();
+    var ranges = Vector<SeqRange>.create();
+    feedAll(mut r, "a FETCH 1:* FLAGS")!;
+    r.tag()!;
+    r.command()!;
+    r.sequenceSet(mut set)!;
+    Check.isTrue(set.contains(1, 10) && set.contains(10, 10) && !set.contains(11, 10), "1:*")?;
+    set.resolve(10, mut ranges)!;
+    Check.isTrue(ranges.length == 1 && ranges[0].first == 1 && ranges[0].last == 10, "1:* resolved")?;
+    set.resolve(0, mut ranges)!;
+    Check.isTrue(ranges.length == 0, "an empty mailbox")?;
+
+    feedAll(mut r, "a FETCH *:4 FLAGS")!;
+    r.tag()!;
+    r.command()!;
+    r.sequenceSet(mut set)!;
+    Check.isTrue(set.contains(4, 9) && set.contains(9, 9) && !set.contains(3, 9), "*:4 is 4:*")?;
+    Check.isTrue(set.contains(3, 3) && set.contains(4, 3) && !set.contains(2, 3), "*:4 with * below 4")?;
+    set.resolve(3, mut ranges)!;
+    Check.isTrue(ranges.length == 1 && ranges[0].first == 3 && ranges[0].last == 3, "cut to the largest")?;
+
+    feedAll(mut r, "a FETCH 2,4:7,9,12:* FLAGS")!;
+    r.tag()!;
+    r.command()!;
+    r.sequenceSet(mut set)!;
+    Check.isTrue(set.ranges.length == 4, "four ranges")?;
+    let inside = [2u32, 4, 5, 6, 7, 9, 12, 15];
+    let outside = [1u32, 3, 8, 10, 11];
+    for (n in inside) {
+        Check.isTrue(set.contains(n, 15), "inside")?;
+    }
+    for (n in outside) {
+        Check.isTrue(!set.contains(n, 15), "outside")?;
+    }
+    Check.isTrue(!set.exceeds(15) && set.exceeds(8), "explicit numbers against the largest")?;
+    set.resolve(15, mut ranges)!;
+    Check.isTrue(ranges.length == 4 && ranges[3].first == 12 && ranges[3].last == 15, "resolved")?;
+
+    // Overlaps and adjacency merge; order does not matter.
+    feedAll(mut r, "a FETCH 9:7,1,3:2,5:6,6 FLAGS")!;
+    r.tag()!;
+    r.command()!;
+    r.sequenceSet(mut set)!;
+    set.resolve(100, mut ranges)!;
+    Check.isTrue(
+        ranges.length == 2 &&
+            ranges[0].first == 1 && ranges[0].last == 3 && ranges[1].first == 5 && ranges[1].last == 9,
+        "merged into 1:3,5:9",
+    )?;
+
+    let bad = [
+        "a FETCH 0 FLAGS", "a FETCH 1:0 FLAGS", "a FETCH 1,,2 FLAGS", "a FETCH 1: FLAGS", "a FETCH x FLAGS",
+        "a FETCH 4294967296 FLAGS", "a FETCH 1:2:3 FLAGS", "a FETCH 01 FLAGS", "a FETCH ** FLAGS",
+    ];
+    for (wire in bad) {
+        feedAll(mut r, wire)!;
+        r.tag()!;
+        r.command()!;
+        Check.isTrue(errorIs(r.sequenceSet(mut set), ParseError.BadSequenceSet), wire)?;
+    }
+    feedAll(mut r, "a FETCH 4294967295 FLAGS")!;
+    r.tag()!;
+    r.command()!;
+    r.sequenceSet(mut set)!;
+    return Check.isTrue(set.contains(4294967295, 4294967295), "the largest number");
+}
+
+@test
+fn syntaxErrors() -> Result<void, TestFailure> {
+    var r = reader();
+    Check.isTrue(errorIs(feedAll(mut r, "a FETCH 1 (FLAGS"), ParseError.UnbalancedParens), "an unclosed list")?;
+    Check.isTrue(errorIs(feedAll(mut r, "a FETCH 1 FLAGS)"), ParseError.UnbalancedParens), "a stray )")?;
+    Check.isTrue(errorIs(feedAll(mut r, "a FETCH 1(FLAGS)"), ParseError.MissingSpace), "a missing space")?;
+    Check.isTrue(errorIs(feedAll(mut r, "a LOGIN \"x\"\"y\""), ParseError.MissingSpace), "two strings together")?;
+    Check.isTrue(errorIs(feedAll(mut r, "a FETCH  1 FLAGS"), ParseError.UnexpectedSpace), "two spaces")?;
+    Check.isTrue(errorIs(feedAll(mut r, "a NOOP "), ParseError.UnexpectedSpace), "a trailing space")?;
+    Check.isTrue(errorIs(feedAll(mut r, " a NOOP"), ParseError.UnexpectedSpace), "a leading space")?;
+    Check.isTrue(errorIs(feedAll(mut r, "a FETCH 1 ( FLAGS)"), ParseError.UnexpectedSpace), "a space after (")?;
+    Check.isTrue(errorIs(feedAll(mut r, "a FETCH 1 (FLAGS )"), ParseError.UnexpectedSpace), "a space before )")?;
+    Check.isTrue(errorIs(feedAll(mut r, ""), ParseError.EmptyCommand), "an empty line")?;
+    Check.isTrue(errorIs(feedAll(mut r, "a LOGIN {3} x"), ParseError.LiteralNotAtEnd), "a literal mid-line")?;
+    Check.isTrue(errorIs(feedAll(mut r, "a LOGIN {x}"), ParseError.BadLiteral), "a bad literal")?;
+    Check.isTrue(errorIs(feedAll(mut r, "a LOGIN {3"), ParseError.BadLiteral), "an unclosed literal")?;
+    Check.isTrue(
+        errorIs(feedAll(mut r, "a LOGIN {3}\r\nabc{1}"), ParseError.MissingSpace),
+        "a literal right after one",
+    )?;
+    Check.isTrue(errorIs(feedAll(mut r, "a LOGIN b\u{e9} c"), ParseError.BadCharacter), "8-bit in an atom")?;
+    Check.isTrue(errorIs(feedAll(mut r, "a LOGIN b\rc d"), ParseError.BadCharacter), "a bare CR")?;
+    // Errors the helpers find, with the tag still available for the BAD.
+    feedAll(mut r, "a+b NOOP")!;
+    Check.isTrue(errorIs(voidOf(r.tag()), ParseError.BadTag) && r.tagForReply() == null, "+ in a tag")?;
+    Check.isTrue(errorIs(feedAll(mut r, "t1 FETCH 1 (FLAGS"), ParseError.UnbalancedParens), "a later error")?;
+    let tag = r.tagForReply();
+    Check.isTrue(tag != null && textIs(r, tag ?? Span { start: 0, length: 0 }, "t1"), "the tag for BAD")?;
+    feedAll(mut r, "a LOGIN x")!;
+    r.tag()!;
+    r.command()!;
+    r.astring()!;
+    Check.isTrue(errorIs(voidOf(r.astring()), ParseError.MissingArgument), "a missing argument")?;
+    feedAll(mut r, "a NOOP x")!;
+    r.tag()!;
+    r.command()!;
+    Check.isTrue(errorIs(r.finish(), ParseError.ExtraArguments), "an extra argument")?;
+    feedAll(mut r, "a STORE 1 FLAGS.LOUD (\\Seen)")!;
+    r.tag()!;
+    r.command()!;
+    var set = SequenceSet.create();
+    r.sequenceSet(mut set)!;
+    Check.isTrue(errorIs(voidOf(r.storeAction()), ParseError.BadStoreAction), "a bad STORE item")?;
+    feedAll(mut r, "a STORE 1 +FLAGS (\\Seen \\)")!;
+    r.tag()!;
+    r.command()!;
+    r.sequenceSet(mut set)!;
+    r.storeAction()!;
+    var flags = Vector<Flag>.create();
+    Check.isTrue(errorIs(r.storeFlags(mut flags), ParseError.BadFlag), "a lone backslash")?;
+    feedAll(mut r, "a STATUS INBOX (MESSAGES BOGUS)")!;
+    r.tag()!;
+    r.command()!;
+    r.mailbox()!;
+    var items = Vector<StatusItem>.create();
+    Check.isTrue(errorIs(r.statusItems(mut items), ParseError.UnknownStatusItem), "an unknown status item")?;
+    // Feeding out of order.
+    r.reset();
+    Check.isTrue(errorIs(voidOf(r.feedLiteral("x".bytes())), ParseError.NotExpected), "a literal nobody asked for")?;
+    feedAll(mut r, "a NOOP")!;
+    return Check.isTrue(errorIs(voidOf(r.feedLine("b NOOP".bytes())), ParseError.NotExpected), "a line after the end");
+}
+
+@test
+fn flagsAndDates() -> Result<void, TestFailure> {
+    var r = reader();
+    feedAll(mut r, "a STORE 1 FLAGS (\\Answered \\FLAGGED \\deleted \\Seen \\Draft \\Recent \\Custom $Junk work)")!;
+    r.tag()!;
+    r.command()!;
+    var set = SequenceSet.create();
+    r.sequenceSet(mut set)!;
+    r.storeAction()!;
+    var flags = Vector<Flag>.create();
+    r.storeFlags(mut flags)!;
+    let kinds = [
+        FlagKind.Answered, FlagKind.Flagged, FlagKind.Deleted, FlagKind.Seen, FlagKind.Draft, FlagKind.Recent,
+        FlagKind.Extension, FlagKind.Keyword, FlagKind.Keyword,
+    ];
+    Check.isTrue(flags.length == kinds.length, "nine flags")?;
+    for (i in 0..kinds.length) {
+        Check.isTrue(flags[i].kind == kinds[i], "each flag's kind")?;
+    }
+    Check.isTrue(textIs(r, flags[6].name, "\\Custom") && textIs(r, flags[7].name, "$Junk"), "names as sent")?;
+    // date-time: the day with a leading space, two digits, or (leniently) one.
+    Check.isTrue((parseDateTime(" 7-Feb-1994 21:52:25 -0800".bytes()) ?? 0) == 760686745000, "RFC 3501's example")?;
+    Check.isTrue((parseDateTime("07-Feb-1994 21:52:25 -0800".bytes()) ?? 0) == 760686745000, "two digits")?;
+    Check.isTrue((parseDateTime("7-feb-1994 21:52:25 -0800".bytes()) ?? 0) == 760686745000, "one digit, any case")?;
+    Check.isTrue((parseDateTime("05-Nov-2026 12:34:56 +0000".bytes()) ?? 0) == 1793882096000, "UTC")?;
+    Check.isTrue((parseDateTime("01-Jan-1970 01:00:00 +0100".bytes()) ?? 1) == 0, "a positive zone")?;
+    let badTimes = [
+        "30-Feb-2001 00:00:00 +0000", "29-Feb-2001 00:00:00 +0000", "01-Foo-2001 00:00:00 +0000",
+        "01-Jan-2001 24:00:00 +0000", "01-Jan-2001 00:60:00 +0000", "01-Jan-2001 00:00:00 +0060",
+        "01-Jan-2001 00:00:00 0000", "01-Jan-2001T00:00:00 +0000", "1-Jan-2001", "",
+    ];
+    for (t in badTimes) {
+        Check.isTrue(parseDateTime(t.bytes()) == null, t)?;
+    }
+    Check.isTrue(parseDateTime("29-Feb-2000 00:00:00 +0000".bytes()) != null, "a leap day")?;
+    feedAll(mut r, "a APPEND x \"bad date\" {1}\r\nx")!;
+    r.tag()!;
+    r.command()!;
+    r.mailbox()!;
+    flags.clear();
+    Check.isTrue(errorIs(voidOf(r.appendArgs(mut flags)), ParseError.BadDateTime), "a bad APPEND date")?;
+    // SEARCH dates.
+    feedAll(mut r, "a SEARCH SINCE 1-Feb-1994 BEFORE \"29-Feb-2000\" ON 31-Apr-2000")!;
+    r.tag()!;
+    r.command()!;
+    r.atom()!;
+    let since = r.date()!;
+    Check.isTrue(since.year == 1994 && since.month == 2 && since.day == 1 && since.daysSinceEpoch() == 8797, "SINCE")?;
+    r.atom()!;
+    Check.isTrue(r.date()!.daysSinceEpoch() == 11016, "a quoted date")?;
+    r.atom()!;
+    return Check.isTrue(errorIs(voidOf(r.date()), ParseError.BadDate), "no 31 April");
+}
+
+@test
+fn errorTexts() -> Result<void, TestFailure> {
+    Check.isTrue(describeError(ParseError.MimeWithoutPart) == "MIME needs a part number", "a reason")?;
+    return Check.isTrue(describeError(ParseError.BadEscape).length > 0, "every reason has a text");
+}
+
+// ---- Responses ----
+
+fn written(out: borrow Vector<u8>, want: StringView) -> bool => out.view() == want.bytes();
+
+@test
+fn stringOutput() -> Result<void, TestFailure> {
+    var out = Vector<u8>.create();
+    writeAstring(mut out, "INBOX.Sent".bytes())!;
+    Check.isTrue(written(out, "INBOX.Sent"), "an atom")?;
+    out.clear();
+    writeAstring(mut out, "two words".bytes())!;
+    Check.isTrue(written(out, "\"two words\""), "quoted for a space")?;
+    out.clear();
+    writeAstring(mut out, "".bytes())!;
+    Check.isTrue(written(out, "\"\""), "empty")?;
+    out.clear();
+    writeAstring(mut out, "nil".bytes())!;
+    Check.isTrue(written(out, "\"nil\""), "NIL is quoted")?;
+    out.clear();
+    writeAstring(mut out, "a%b*".bytes())!;
+    Check.isTrue(written(out, "\"a%b*\""), "wildcards are quoted")?;
+    out.clear();
+    writeAstring(mut out, "say \"hi\" \\o/".bytes())!;
+    Check.isTrue(written(out, "\"say \\\"hi\\\" \\\\o/\""), "escapes")?;
+    out.clear();
+    writeString(mut out, "atom".bytes())!;
+    Check.isTrue(written(out, "\"atom\""), "a string is never an atom")?;
+    out.clear();
+    writeString(mut out, "line\r\nbreak".bytes())!;
+    Check.isTrue(written(out, "{11}\r\nline\r\nbreak"), "a literal for CRLF")?;
+    out.clear();
+    writeAstring(mut out, "caf\u{e9}".bytes())!;
+    Check.isTrue(written(out, "{5}\r\ncaf\u{e9}"), "a literal for non-ASCII")?;
+    out.clear();
+    writeNString(mut out, null)!;
+    writeNString(mut out, "x".bytes())!;
+    Check.isTrue(written(out, "NIL\"x\""), "nstring")?;
+    out.clear();
+    writeMailbox(mut out, "inbox".bytes())!;
+    out.pushBE(0x20u8)!;
+    writeMailbox(mut out, "Sent Items".bytes())!;
+    out.pushBE(0x20u8)!;
+    writeMailbox(mut out, "&ZeVnLIqe-".bytes())!;
+    Check.isTrue(written(out, "INBOX \"Sent Items\" &ZeVnLIqe-"), "mailbox names")?;
+    // What is written parses back to the same bytes.
+    let values = ["plain", "with space", "q\"uote", "back\\slash", "", "NIL", "a]b", "x\r\ny", "\u{e9}t\u{e9}"];
+    var r = reader();
+    for (v in values) {
+        out.clear();
+        out.extend("a LOGIN ".bytes())!;
+        writeAstring(mut out, v.bytes())!;
+        out.extend(" x".bytes())!;
+        let wire = StringView.fromUtf8(out.view())!;
+        feedAll(mut r, wire)!;
+        r.tag()!;
+        r.command()!;
+        let s = r.astring()!;
+        Check.isTrue(textIs(r, s, v), v)?;
+    }
+    return Ok();
+}
+
+@test
+fn flagAndDateOutput() -> Result<void, TestFailure> {
+    var out = Vector<u8>.create();
+    let keywords = ["$Junk", "work"];
+    writeFlagList(mut out, FLAG_SEEN | FLAG_ANSWERED | FLAG_DRAFT, keywords[..])!;
+    Check.isTrue(written(out, "(\\Answered \\Seen \\Draft $Junk work)"), "a flag list")?;
+    out.clear();
+    let noKeywords = Vector<StringView>.create();
+    writeFlagList(mut out, 0, noKeywords.view())!;
+    Check.isTrue(written(out, "()"), "an empty flag list")?;
+    out.clear();
+    writeFlagList(mut out, FLAG_FLAGGED | FLAG_DELETED, noKeywords.view())!;
+    Check.isTrue(written(out, "(\\Flagged \\Deleted)"), "flagged and deleted")?;
+    out.clear();
+    writeInternalDate(mut out, 0)!;
+    Check.isTrue(written(out, "\"01-Jan-1970 00:00:00 +0000\""), "the epoch")?;
+    out.clear();
+    writeInternalDate(mut out, 1793882096789)!;
+    Check.isTrue(written(out, "\"05-Nov-2026 12:34:56 +0000\""), "a date, milliseconds dropped")?;
+    out.clear();
+    writeInternalDate(mut out, -1)!;
+    Check.isTrue(written(out, "\"31-Dec-1969 23:59:59 +0000\""), "before the epoch")?;
+    // Round trip.
+    out.clear();
+    writeInternalDate(mut out, 951782400000)!;
+    let quoted = out.view();
+    return Check.isTrue((parseDateTime(quoted[1..quoted.length - 1]) ?? 0) == 951782400000, "parses back");
+}
+
+@test
+fn setCompression() -> Result<void, TestFailure> {
+    var out = Vector<u8>.create();
+    writeNumberSet(mut out, [1u32, 2, 3, 5][..])!;
+    Check.isTrue(written(out, "1:3,5"), "1:3,5")?;
+    out.clear();
+    writeNumberSet(mut out, [7u32][..])!;
+    Check.isTrue(written(out, "7"), "one")?;
+    out.clear();
+    let empty = Vector<u32>.create();
+    writeNumberSet(mut out, empty.view())!;
+    Check.isTrue(out.length == 0, "none")?;
+    out.clear();
+    writeNumberSet(mut out, [1u32, 1, 2, 4, 4, 6, 7, 8, 10][..])!;
+    Check.isTrue(written(out, "1:2,4,6:8,10"), "repeats and runs")?;
+    out.clear();
+    writeNumberSet(mut out, [4294967294u32, 4294967295][..])!;
+    Check.isTrue(written(out, "4294967294:4294967295"), "at the top")?;
+    // A written set parses back to the same members.
+    out.clear();
+    out.extend("a UID COPY ".bytes())!;
+    writeNumberSet(mut out, [3u32, 4, 5, 9, 11, 12][..])!;
+    out.extend(" Trash".bytes())!;
+    var r = reader();
+    feedAll(mut r, StringView.fromUtf8(out.view())!)!;
+    r.tag()!;
+    r.command()!;
+    var set = SequenceSet.create();
+    r.sequenceSet(mut set)!;
+    var ranges = Vector<SeqRange>.create();
+    set.resolve(100, mut ranges)!;
+    return Check.isTrue(ranges.length == 3 && ranges[1].first == 9 && ranges[2].last == 12, "parses back");
+}

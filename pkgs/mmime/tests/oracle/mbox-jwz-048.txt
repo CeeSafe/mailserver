@@ -1,0 +1,42 @@
+size 218987
+envelope ("Fri, 11 Sep 1992 13:34:20 -0400 (EDT)" "Re: I'd like your opinion" (("Nathaniel Borenstein" NIL "nsb" "MISSING_DOMAIN")) (("Nathaniel Borenstein" NIL "nsb" "MISSING_DOMAIN")) (("Nathaniel Borenstein" NIL "nsb" "MISSING_DOMAIN")) (("Marshall Rose" NIL "mrose" "dbc.mtview.ca.us")) NIL NIL "<7821.715397074@dbc.mtview.ca.us>" "<8egBWQW0M2YtE1Y7Ea@thumper.bellcore.com>")
+bodystructure (("text" "plain" ("charset" "US-ASCII") NIL NIL "7bit" 1544 29 NIL NIL NIL NIL) (("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 920 13 NIL NIL NIL NIL) ("image" "gif" NIL NIL "snapshot 1" "base64" 35364 NIL NIL NIL NIL) ("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 12 2 NIL NIL NIL NIL) ("image" "gif" NIL NIL "snapshot 2" "base64" 21644 NIL NIL NIL NIL) ("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 12 2 NIL NIL NIL NIL) ("image" "gif" NIL NIL "snapshot 3" "base64" 32914 NIL NIL NIL NIL) ("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 12 2 NIL NIL NIL NIL) ("image" "gif" NIL NIL "snapshot 4" "base64" 33926 NIL NIL NIL NIL) ("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 12 2 NIL NIL NIL NIL) ("image" "gif" NIL NIL "snapshot 5" "base64" 28240 NIL NIL NIL NIL) ("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 12 2 NIL NIL NIL NIL) ("image" "gif" NIL NIL "snapshot 6" "base64" 33980 NIL NIL NIL NIL) ("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 12 2 NIL NIL NIL NIL) ("image" "gif" NIL NIL "snapshot 7" "base64" 27046 NIL NIL NIL NIL) ("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 77 3 NIL NIL NIL NIL) "mixed" ("boundary" "Alternative.Boundary.EegBWL:0M2Yt01Y75h") NIL NIL NIL) "alternative" ("boundary" "Interpart.Boundary.EegBWL:0M2YtE1Y78F") NIL NIL NIL)
+body (("text" "plain" ("charset" "US-ASCII") NIL NIL "7bit" 1544 29) (("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 920 13) ("image" "gif" NIL NIL "snapshot 1" "base64" 35364) ("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 12 2) ("image" "gif" NIL NIL "snapshot 2" "base64" 21644) ("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 12 2) ("image" "gif" NIL NIL "snapshot 3" "base64" 32914) ("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 12 2) ("image" "gif" NIL NIL "snapshot 4" "base64" 33926) ("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 12 2) ("image" "gif" NIL NIL "snapshot 5" "base64" 28240) ("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 12 2) ("image" "gif" NIL NIL "snapshot 6" "base64" 33980) ("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 12 2) ("image" "gif" NIL NIL "snapshot 7" "base64" 27046) ("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 77 3) "mixed") "alternative")
+section HEADER 702 21a4b45b58dbce697cb1ee053c8a72975b73189e2ee6f96a66b0ff45239db4e8
+section TEXT 218285 9df96a8bac66bbda43963ec327383c9c838c379887466938f29a2ac79f5dd952
+section HEADER.FIELDS 306 072215362dc1d308b54ca84ce02dad0abb647d5e54f9b16316c735f8ba902878
+section HEADER.FIELDS.NOT 398 e93d43b8053f6bdce18da2415de14925a5d7abfc686240233f9bdee274d3d4be
+section 1 1544 5e9673fa50cec629251062090e6b46e6e3ba3d7b9825a41abbd529e988bd8730
+section 1.MIME 46 b3532c649b28a23803c77a2acc4907f5048ea77b89e0c51dcf7f271f2db4bfa6
+section 2 216320 4d9a1d9937d4a6d2994bf5cb29638ff7a767339d571259de547ef44c372e6b5b
+section 2.MIME 88 121a9c0d987c28a72620df7bb8169a8bc304839b67f1994f2abd4ef0c8c7c540
+section 2.1 920 9b67f2a64674440c072cbc3c5ddc024823efa8c8cb87058f68d60eb3d8e996d1
+section 2.1.MIME 94 7d35d8c48d3869c4391f6ff71123bfb4c8466e5b04f02d64c3961f23d7d8bf61
+section 2.2 35364 6a1bef88430f23a8b224de9cc7d1131a9b876206fc2352d7411cded4bde31990
+section 2.2.MIME 95 32db45d35217f765800a44b24408008b60c09a8bfbf6f2e0919323966d1a0841
+section 2.3 12 c5b3f440dc8277c4959d27796d6aadb33a153bd2919367db52086c7cbf90f539
+section 2.3.MIME 94 7d35d8c48d3869c4391f6ff71123bfb4c8466e5b04f02d64c3961f23d7d8bf61
+section 2.4 21644 fafff33bdb87332c4b30db94aa29acc41de62ccdde23357461764e8347d01990
+section 2.4.MIME 95 659e4456bfd341deb5ce1a706761e92501855d2d10bbd000f859c3d0b770ac86
+section 2.5 12 c5b3f440dc8277c4959d27796d6aadb33a153bd2919367db52086c7cbf90f539
+section 2.5.MIME 94 7d35d8c48d3869c4391f6ff71123bfb4c8466e5b04f02d64c3961f23d7d8bf61
+section 2.6 32914 b279174ca8338c8684ed6f7bd64a9b080543add73d2ce216d535a2263f563e6d
+section 2.6.MIME 95 080dedfd3db35b94b19347070b49ee59c635b5223a77f26dcce1986c8f9b85b8
+section 2.7 12 c5b3f440dc8277c4959d27796d6aadb33a153bd2919367db52086c7cbf90f539
+section 2.7.MIME 94 7d35d8c48d3869c4391f6ff71123bfb4c8466e5b04f02d64c3961f23d7d8bf61
+section 2.8 33926 15c577027f65db36bd72fbf0d2a6700d95a6e90cea6e1907da891521de927d4a
+section 2.8.MIME 95 6a76cb187018323dacfcf9985e0390c5f96f8856526c0dede78d225ce582da74
+section 2.9 12 c5b3f440dc8277c4959d27796d6aadb33a153bd2919367db52086c7cbf90f539
+section 2.9.MIME 94 7d35d8c48d3869c4391f6ff71123bfb4c8466e5b04f02d64c3961f23d7d8bf61
+section 2.10 28240 0dd9e4778f27440e8e7a267feb15dfe30e482580e1abe6a7f2304482b0b1de13
+section 2.10.MIME 95 ca7a9fb2331dae3dd3249b1df482c235c4cdc91d3aaeff93bbcde5199f957506
+section 2.11 12 c5b3f440dc8277c4959d27796d6aadb33a153bd2919367db52086c7cbf90f539
+section 2.11.MIME 94 7d35d8c48d3869c4391f6ff71123bfb4c8466e5b04f02d64c3961f23d7d8bf61
+section 2.12 33980 4c60ccfd96125d6a84e69f70aa94d9a79442ab208f995695bc07620fea5b8ce9
+section 2.12.MIME 95 24ae5a852a02f0826fcaee9f205233a6339418fd2f73bf978a9d310fd5cc3293
+section 2.13 12 c5b3f440dc8277c4959d27796d6aadb33a153bd2919367db52086c7cbf90f539
+section 2.13.MIME 94 7d35d8c48d3869c4391f6ff71123bfb4c8466e5b04f02d64c3961f23d7d8bf61
+section 2.14 27046 1ffdb5b9e225c9482b4df2474b6d2a49ec4f99b6faa77b6638e81c12133fd509
+section 2.14.MIME 95 778892e07cab9138366e6f147cdbeed8f7da30a9fe49b45489a22e1ab386c568
+section 2.15 77 9c927cf67ae3fedfe7a71f0044818b03e916d0c6cf78b78452b31f570603efb9
+section 2.15.MIME 94 7d35d8c48d3869c4391f6ff71123bfb4c8466e5b04f02d64c3961f23d7d8bf61

@@ -1,0 +1,236 @@
+// The PROXY protocol (HAProxy, versions 1 and 2): a TCP proxy in front of the server (CosmoProxy, HAProxy, a load
+// balancer) sends the client's real address in a header before anything else. The header is read only from the
+// networks configured as proxies, and from them it is required, so no one else can claim another address.
+//
+// The header is read straight from the TCP stream, before TLS (SMTPS and IMAPS), in exact-length reads, so nothing
+// after it (a TLS ClientHello) is consumed.
+
+import mdns.IpAddress;
+import mdns.parseIp;
+
+/// The longest version-1 header, CRLF included (the specification's limit).
+const V1_MAX: usize = 107;
+/// The most address and TLV bytes taken from a version-2 header.
+const V2_MAX: usize = 4096;
+
+/// What starts a version-2 header: \r\n\r\n\0\r\nQUIT\n.
+const V2_SIGNATURE: [u8; 12] = [0x0d, 0x0a, 0x0d, 0x0a, 0x00, 0x0d, 0x0a, 0x51, 0x55, 0x49, 0x54, 0x0a];
+
+/// A network the server takes PROXY headers from.
+public struct ProxyNetwork {
+    public address: IpAddress;
+    public bits: u32;
+}
+
+/// `a.b.c.d/n`, `x:y::/n`, or a single address.
+public fn parseProxyNetwork(text: Slice<u8>) -> ProxyNetwork? {
+    match (text.indexOfByte(0x2f)) {
+        Some(slash) => {
+            let address = parseIp(text[..slash])?;
+            let limit: u32 = if (address.isV4()) 32 else 128;
+            var bits: u32 = 0;
+            let digits = text[slash + 1..];
+            if (digits.length == 0 || digits.length > 3) {
+                return null;
+            }
+            for (c in digits) {
+                if (c < 0x30 || c > 0x39) {
+                    return null;
+                }
+                bits = bits * 10 + ((c - 0x30) as u32);
+            }
+            if (bits > limit) {
+                return null;
+            }
+            return ProxyNetwork { address: address, bits: bits };
+        }
+        null => {
+            let address = parseIp(text)?;
+            return ProxyNetwork { address: address, bits: if (address.isV4()) 32 else 128 };
+        }
+    }
+}
+
+/// Whether `peer` is in one of `networks`: a proxy whose connections must start with a PROXY header.
+public fn fromProxy(networks: borrow Vector<ProxyNetwork>, peer: SocketAddress) -> bool {
+    let ip = IpAddress.fromSocket(peer);
+    for (n in networks) {
+        if (ip.inNetwork(n.address, n.bits)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Why a PROXY header could not be read: the connection is closed.
+public enum ProxyError {
+    Io,
+    Timeout,
+    Malformed,
+}
+
+/// Reads the PROXY header at the start of `stream`, within `timeoutMs`: the client's address, or null when the proxy
+/// says it has none to give (v2 LOCAL, its health checks; v1 UNKNOWN; a family other than TCP over IPv4 or IPv6), in
+/// which case the connection's own peer stands.
+public async fn readProxyHeader(stream: borrow AsyncTcpStream, timeoutMs: u64) -> Result<SocketAddress?, ProxyError> {
+    return await Async.timeout(timeoutMs, ProxyError.Timeout, async () => await readHeader(stream));
+}
+
+async fn readHeader(stream: borrow AsyncTcpStream) -> Result<SocketAddress?, ProxyError> {
+    var head = Vector<u8>.create();
+    await readExactly(stream, mut head, 6)?;
+    if (head.view() == "PROXY ".bytes()) {
+        // Version 1: text up to CRLF, read a byte at a time so as not to read past it.
+        loop {
+            if (head.length >= V1_MAX) {
+                return Err(ProxyError.Malformed);
+            }
+            await readExactly(stream, mut head, 1)?;
+            if (head[head.length - 1] == 0x0a) {
+                break;
+            }
+        }
+        return parseV1(head.view());
+    }
+    // Version 2: a 12-byte signature, then version and command, family, and the length of the rest.
+    let signature = V2_SIGNATURE;
+    if (head.view() != signature[..6]) {
+        return Err(ProxyError.Malformed);
+    }
+    await readExactly(stream, mut head, 10)?;
+    if (head[..12] != signature[..]) {
+        return Err(ProxyError.Malformed);
+    }
+    let versionCommand = head[12];
+    if ((versionCommand >> 4) != 2) {
+        return Err(ProxyError.Malformed);
+    }
+    let family = head[13];
+    let length = ((head[14] as usize) << 8) | (head[15] as usize);
+    if (length > V2_MAX) {
+        return Err(ProxyError.Malformed);
+    }
+    var rest = Vector<u8>.create();
+    await readExactly(stream, mut rest, length)?;
+    let command = versionCommand & 0x0f;
+    if (command == 0) {
+        return Ok(null); // LOCAL: the proxy's own connection
+    }
+    if (command != 1) {
+        return Err(ProxyError.Malformed);
+    }
+    if (family == 0x11) {
+        // TCP over IPv4: source, destination, source port, destination port.
+        if (rest.length < 12) {
+            return Err(ProxyError.Malformed);
+        }
+        let port = ((rest[8] as u16) << 8) | (rest[9] as u16);
+        return Ok(SocketAddress.V4([rest[0], rest[1], rest[2], rest[3]], port));
+    }
+    if (family == 0x21) {
+        if (rest.length < 36) {
+            return Err(ProxyError.Malformed);
+        }
+        var a = [0u8; 16];
+        for (i in 0..16) {
+            a[i] = rest[i];
+        }
+        let port = ((rest[32] as u16) << 8) | (rest[33] as u16);
+        return Ok(IpAddress { bytes: a }.socket(port));
+    }
+    return Ok(null); // UDP, unix sockets, or unspecified: no address to use
+}
+
+/// Appends exactly `n` bytes from `stream` to `into`.
+async fn readExactly(stream: borrow AsyncTcpStream, into: borrow mut Vector<u8>, n: usize) -> Result<void, ProxyError> {
+    let at = into.length;
+    match (into.resize(at + n, 0)) {
+        Ok() => {}
+        Err(_) => { return Err(ProxyError.Io); }
+    }
+    var have: usize = 0;
+    while (have < n) {
+        let got = match (await stream.read(mut into[at + have..at + n])) {
+            Ok(g) => g,
+            Err(_) => { return Err(ProxyError.Io); }
+        };
+        if (got == 0) {
+            return Err(ProxyError.Io);
+        }
+        have += got;
+    }
+    return Ok();
+}
+
+/// `PROXY TCP4 <source> <destination> <source port> <destination port>\r\n`, or `PROXY UNKNOWN ...\r\n`.
+public fn parseV1(line: Slice<u8>) -> Result<SocketAddress?, ProxyError> {
+    if (line.length < 8 || line[line.length - 2] != 0x0d || line[line.length - 1] != 0x0a) {
+        return Err(ProxyError.Malformed);
+    }
+    let text = line[6..line.length - 2];
+    var fields = [0usize; 10];
+    var count: usize = 0;
+    var start: usize = 0;
+    for (i in 0..text.length + 1) {
+        if (i == text.length || text[i] == 0x20) {
+            if (i == start || count == 5) {
+                return Err(ProxyError.Malformed);
+            }
+            fields[count * 2] = start;
+            fields[count * 2 + 1] = i;
+            count += 1;
+            start = i + 1;
+        }
+    }
+    let protocol = text[fields[0]..fields[1]];
+    if (protocol == "UNKNOWN".bytes()) {
+        return Ok(null);
+    }
+    if (count != 5 || (protocol != "TCP4".bytes() && protocol != "TCP6".bytes())) {
+        return Err(ProxyError.Malformed);
+    }
+    let address = match (parseIp(text[fields[2]..fields[3]])) {
+        Some(a) => a,
+        null => { return Err(ProxyError.Malformed); }
+    };
+    if (address.isV4() != (protocol == "TCP4".bytes())) {
+        return Err(ProxyError.Malformed);
+    }
+    let digits = text[fields[6]..fields[7]];
+    if (digits.length > 5) {
+        return Err(ProxyError.Malformed);
+    }
+    var port: u32 = 0;
+    for (c in digits) {
+        if (c < 0x30 || c > 0x39) {
+            return Err(ProxyError.Malformed);
+        }
+        port = port * 10 + ((c - 0x30) as u32);
+    }
+    if (port > 65535) {
+        return Err(ProxyError.Malformed);
+    }
+    return Ok(address.socket(truncate<u16>(port)));
+}
+
+/// How long a proxy has to send its header.
+const PROXY_TIMEOUT: u64 = 10 * 1000;
+
+/// The client's address from the PROXY header, when the connection comes from a configured proxy; null when it
+/// does not (or the proxy has no address to give). An error closes the connection.
+public async fn proxyPeer(
+    ctx: borrow SmtpContext,
+    stream: borrow AsyncTcpStream,
+) -> Result<SocketAddress?, ProxyError> {
+    if (ctx.settings.proxyFrom.length == 0) {
+        return Ok(null);
+    }
+    let peer = match (stream.peerAddress()) {
+        Ok(a) => a,
+        Err(_) => { return Err(ProxyError.Io); }
+    };
+    if (!fromProxy(ctx.settings.proxyFrom, peer)) {
+        return Ok(null);
+    }
+    return await readProxyHeader(stream, PROXY_TIMEOUT);
+}

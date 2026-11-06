@@ -1,0 +1,426 @@
+// Header text as people read it: RFC 2047 encoded words decoded, charsets converted to UTF-8, folding removed. For
+// SEARCH, Sieve and display; IMAP's ENVELOPE and BODYSTRUCTURE carry the raw text instead. Decoding never fails:
+// what cannot be read becomes U+FFFD.
+
+import encoding.Base64;
+
+extern "C" {
+    @effects()
+    fn mmc_to_utf8(name: *u8, nameLength: usize, input: *u8, inputLength: usize, out: *mut u8, capacity: usize) -> i64;
+}
+
+const REPLACEMENT: StringView = "\u{fffd}";
+
+fn lower(c: u8) -> u8 => if (c >= 0x41 && c <= 0x5a) c + 0x20 else c;
+
+/// Whether `name` is `want` ignoring case, `-` and `_` (`UTF8`, `utf-8`, `ISO_8859-1`, …).
+fn charsetIs(name: Slice<u8>, want: StringView) -> bool {
+    let w = want.bytes();
+    var i: usize = 0;
+    var j: usize = 0;
+    loop {
+        while (i < name.length && (name[i] == 0x2d || name[i] == 0x5f)) {
+            i += 1;
+        }
+        while (j < w.length && (w[j] == 0x2d || w[j] == 0x5f)) {
+            j += 1;
+        }
+        if (i == name.length || j == w.length) {
+            return i == name.length && j == w.length;
+        }
+        if (lower(name[i]) != lower(w[j])) {
+            return false;
+        }
+        i += 1;
+        j += 1;
+    }
+}
+
+/// Appends `bytes` as UTF-8, each malformed sequence replaced by U+FFFD.
+fn appendUtf8Lossy(bytes: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    var at: usize = 0;
+    while (at < bytes.length) {
+        let c = bytes[at];
+        if (c < 0x80) {
+            out.pushBE(c)?;
+            at += 1;
+            continue;
+        }
+        var need: usize = 0;
+        var min: u32 = 0;
+        var value: u32 = 0;
+        if (c >= 0xc2 && c <= 0xdf) {
+            need = 1;
+            min = 0x80;
+            value = (c & 0x1f) as u32;
+        } else if (c >= 0xe0 && c <= 0xef) {
+            need = 2;
+            min = 0x800;
+            value = (c & 0x0f) as u32;
+        } else if (c >= 0xf0 && c <= 0xf4) {
+            need = 3;
+            min = 0x10000;
+            value = (c & 0x07) as u32;
+        } else {
+            out.extend(REPLACEMENT.bytes())?;
+            at += 1;
+            continue;
+        }
+        var ok = true;
+        var k: usize = 1;
+        while (ok && k <= need) {
+            if (at + k >= bytes.length || (bytes[at + k] & 0xc0) != 0x80) {
+                ok = false;
+            } else {
+                value = (value << 6) | ((bytes[at + k] & 0x3f) as u32);
+            }
+            k += 1;
+        }
+        if (!ok || value < min || value > 0x10ffff || (value >= 0xd800 && value <= 0xdfff)) {
+            out.extend(REPLACEMENT.bytes())?;
+            at += 1;
+            continue;
+        }
+        out.extend(bytes[at..at + need + 1])?;
+        at += need + 1;
+    }
+    return Ok();
+}
+
+/// Appends Latin-1 bytes as UTF-8.
+fn appendLatin1(bytes: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    for (c in bytes) {
+        if (c < 0x80) {
+            out.pushBE(c)?;
+        } else {
+            out.pushBE(0xc0u8 | (c >> 6))?;
+            out.pushBE(0x80u8 | (c & 0x3f))?;
+        }
+    }
+    return Ok();
+}
+
+/// Appends `bytes`, in the charset `charset`, as UTF-8. An unknown charset reads as UTF-8 if it is, else as
+/// Latin-1, so nothing is lost silently. RFC 2231's language suffix (`utf-8*en`) is ignored.
+public fn convertToUtf8(charset: Slice<u8>, bytes: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    let star = match (charset.indexOfByte(0x2a)) {
+        Some(s) => s,
+        null => charset.length,
+    };
+    let name = charset[0..star];
+    if (charsetIs(name, "utf-8") || charsetIs(name, "us-ascii") || charsetIs(name, "ascii") || name.length == 0) {
+        return appendUtf8Lossy(bytes, out);
+    }
+    if (charsetIs(name, "iso-8859-1") || charsetIs(name, "latin1")) {
+        return appendLatin1(bytes, out);
+    }
+    // iconv, into room for the worst case (4 bytes out per byte in, plus a shift sequence).
+    let start = out.length;
+    let room = bytes.length * 4 + 16;
+    out.resize(start + room, 0)?;
+    let written = iconvInto(name, bytes, mut out[start..]);
+    if (written >= 0) {
+        out.truncate(start + truncate<usize>(written));
+        return Ok();
+    }
+    out.truncate(start);
+    match (StringView.fromUtf8(bytes)) {
+        Some(_) => { return out.extend(bytes); }
+        null => { return appendLatin1(bytes, out); }
+    }
+}
+
+/// Converts `bytes` from `name` into `room` through iconv: the bytes written, or a negative error.
+/// Safety: the shim reads `name` and `bytes` and writes at most `room.length` bytes into `room`.
+fn iconvInto(name: Slice<u8>, bytes: Slice<u8>, room: SliceMut<u8>) -> i64 =>
+    unsafe { mmc_to_utf8(name.ptr, name.length, bytes.ptr, bytes.length, room.ptr, room.length) };
+
+/// The value of `c` as a hex digit, or 16.
+fn hexValue(c: u8) -> u8 {
+    if (c >= 0x30 && c <= 0x39) {
+        return c - 0x30;
+    }
+    let l = lower(c);
+    if (l >= 0x61 && l <= 0x66) {
+        return l - 0x61 + 10;
+    }
+    return 16;
+}
+
+/// Decodes an encoded word's Q text (RFC 2047 §4.2): `_` is a space, `=XX` a byte; a malformed `=` stays as it is.
+fn decodeQ(text: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    var at: usize = 0;
+    while (at < text.length) {
+        let c = text[at];
+        if (c == 0x5f) {
+            out.pushBE(0x20u8)?;
+            at += 1;
+            continue;
+        }
+        if (c == 0x3d && at + 2 < text.length) {
+            let h = hexValue(text[at + 1]);
+            let l = hexValue(text[at + 2]);
+            if (h < 16 && l < 16) {
+                out.pushBE((h << 4) | l)?;
+                at += 3;
+                continue;
+            }
+        }
+        out.pushBE(c)?;
+        at += 1;
+    }
+    return Ok();
+}
+
+/// Decodes B text leniently: whitespace skipped, missing padding allowed, stray bytes stop it.
+fn decodeB(text: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    var clean = Vector<u8>.create();
+    for (c in text) {
+        let ok = (c >= 0x41 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a) || (c >= 0x30 && c <= 0x39) || c == 0x2b ||
+            c == 0x2f;
+        if (ok) {
+            clean.pushBE(c)?;
+        } else if (c != 0x3d && c != 0x20 && c != 0x09) {
+            break;
+        }
+    }
+    // A length of 1 mod 4 cannot be base64: drop the extra character.
+    if (clean.length % 4 == 1) {
+        clean.pop();
+    }
+    while (clean.length % 4 != 0) {
+        clean.pushBE(0x3du8)?;
+    }
+    match (Base64.decode(clean.view(), out)) {
+        Ok() => { return Ok(); }
+        Err(DecodeError.OutOfMemory) => { return Err(AllocError.OutOfMemory); }
+        Err(DecodeError.Invalid) => { return Ok(); }
+    }
+}
+
+/// An encoded word `=?charset?B|Q?text?=` starting at `at` in `value`: its end (after `?=`), or 0 if there is none.
+/// `parts` gets where the charset, the encoding letter and the text are.
+fn encodedWord(value: Slice<u8>, at: usize, parts: borrow mut [usize; 4]) -> usize {
+    if (at + 8 > value.length || value[at] != 0x3d || value[at + 1] != 0x3f) {
+        return 0;
+    }
+    let charsetStart = at + 2;
+    var i = charsetStart;
+    while (i < value.length && value[i] != 0x3f && value[i] > 0x20) {
+        i += 1;
+    }
+    if (i == charsetStart || i + 3 >= value.length || value[i] != 0x3f || value[i + 2] != 0x3f) {
+        return 0;
+    }
+    let letter = lower(value[i + 1]);
+    if (letter != 0x62 && letter != 0x71) {
+        return 0;
+    }
+    let textStart = i + 3;
+    var j = textStart;
+    while (j + 1 < value.length) {
+        if (value[j] == 0x3f && value[j + 1] == 0x3d) {
+            parts[0] = charsetStart;
+            parts[1] = i;
+            parts[2] = textStart;
+            parts[3] = j;
+            return j + 2;
+        }
+        if (value[j] == 0x20 || value[j] == 0x09 || value[j] == 0x0d || value[j] == 0x0a) {
+            return 0;
+        }
+        j += 1;
+    }
+    return 0;
+}
+
+/// Appends a header value decoded for people: line breaks removed, encoded words decoded (the whitespace between two
+/// of them dropped), raw 8-bit text read as UTF-8 if it is, else Latin-1, and the ends trimmed.
+public fn decodeHeader(value: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    var raw = Vector<u8>.create();
+    var decoded = Vector<u8>.create();
+    var pendingSpace = Vector<u8>.create();
+    var afterWord = false;
+    var parts = [0usize; 4];
+    var at: usize = 0;
+    // Skip the whitespace after the colon.
+    while (at < value.length && isSpace(value[at])) {
+        at += 1;
+    }
+    while (at < value.length) {
+        let c = value[at];
+        if (c == 0x0d || c == 0x0a) {
+            at += 1;
+            continue;
+        }
+        if (c == 0x20 || c == 0x09) {
+            pendingSpace.pushBE(c)?;
+            at += 1;
+            continue;
+        }
+        let end = encodedWord(value, at, mut parts);
+        if (end > 0) {
+            // Whitespace between two encoded words is dropped (RFC 2047 §6.2).
+            flushRaw(mut raw, out)?;
+            if (!afterWord) {
+                out.extend(pendingSpace.view())?;
+            }
+            pendingSpace.clear();
+            decoded.clear();
+            let text = value[parts[2]..parts[3]];
+            if (lower(value[parts[1] + 1]) == 0x62) {
+                decodeB(text, mut decoded)?;
+            } else {
+                decodeQ(text, mut decoded)?;
+            }
+            convertToUtf8(value[parts[0]..parts[1]], decoded.view(), out)?;
+            afterWord = true;
+            at = end;
+            continue;
+        }
+        if (pendingSpace.length > 0) {
+            raw.extend(pendingSpace.view())?;
+            pendingSpace.clear();
+        }
+        raw.pushBE(c)?;
+        afterWord = false;
+        at += 1;
+    }
+    flushRaw(mut raw, out)?;
+    // Trailing whitespace is dropped: pendingSpace is never flushed at the end.
+    return Ok();
+}
+
+/// Raw (not encoded) text: UTF-8 if it is valid, else Latin-1 (what such headers mostly are).
+fn flushRaw(raw: borrow mut Vector<u8>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    if (raw.length == 0) {
+        return Ok();
+    }
+    match (StringView.fromUtf8(raw.view())) {
+        Some(_) => { out.extend(raw.view())?; }
+        null => { appendLatin1(raw.view(), out)?; }
+    }
+    raw.clear();
+    return Ok();
+}
+
+/// Appends the decoded value of parameter `name` (a Content-Type or Content-Disposition parameter, such as
+/// `filename`) as UTF-8, and gives whether there was one. It merges RFC 2231 continuations (`name*0`, `name*1*`, …),
+/// decodes `name*=charset'lang'%XX` values, and decodes RFC 2047 encoded words in a plain value (which RFC 2047
+/// forbids there but mail clients write). A plain `name` is used when no RFC 2231 form is present.
+public fn decodeParam(
+    params: borrow ParamList,
+    name: StringView,
+    out: borrow mut Vector<u8>,
+) -> Result<bool, AllocError> {
+    let wanted = name.bytes();
+    // name*: one extended value.
+    for (i in 0..params.count()) {
+        let n = params.name(i);
+        if (n.length == wanted.length + 1 && n[n.length - 1] == 0x2a && n[0..wanted.length].equalsIgnoreAsciiCase(
+            wanted,
+        )) {
+            var single = CharsetState { name: Vector<u8>.create() };
+            var raw = Vector<u8>.create();
+            appendExtended(params.value(i), true, mut single, mut raw)?;
+            convertToUtf8(single.name.view(), raw.view(), out)?;
+            return Ok(true);
+        }
+    }
+    // name*0, name*1*, …: continuations, in numeric order whatever their order in the header.
+    var state = CharsetState { name: Vector<u8>.create() };
+    var found = false;
+    var bytes = Vector<u8>.create();
+    for (k in 0..100) {
+        var matched = false;
+        for (i in 0..params.count()) {
+            let n = params.name(i);
+            if (n.length <= wanted.length + 1 || n[wanted.length] != 0x2a || !n[0..wanted.length].equalsIgnoreAsciiCase(
+                wanted,
+            )) {
+                continue;
+            }
+            let suffix = n[wanted.length + 1..];
+            let extended = suffix.length > 0 && suffix[suffix.length - 1] == 0x2a;
+            let digits = if (extended) suffix[0..suffix.length - 1] else suffix;
+            let number = match (digits.parseInt<u32>()) {
+                Some(v) => v,
+                null => { continue; }
+            };
+            if (number != truncate<u32>(k)) {
+                continue;
+            }
+            matched = true;
+            if (extended) {
+                // Only the first section names the charset; later ones are percent-encoded in it.
+                if (k == 0) {
+                    appendExtended(params.value(i), true, mut state, mut bytes)?;
+                } else {
+                    appendExtended(params.value(i), false, mut state, mut bytes)?;
+                }
+            } else {
+                bytes.extend(params.value(i))?;
+            }
+        }
+        if (!matched) {
+            break;
+        }
+        found = true;
+    }
+    if (found) {
+        convertToUtf8(state.name.view(), bytes.view(), out)?;
+        return Ok(true);
+    }
+    for (i in 0..params.count()) {
+        if (params.name(i).equalsIgnoreAsciiCase(wanted)) {
+            decodeHeader(params.value(i), out)?;
+            return Ok(true);
+        }
+    }
+    return Ok(false);
+}
+
+@noncopy
+struct CharsetState {
+    name: Vector<u8>;
+}
+
+/// Appends an RFC 2231 extended value's bytes, percent-decoded. With `first`, it starts `charset'lang'`, and the
+/// charset is kept in `state` for the caller to convert with.
+fn appendExtended(
+    value: Slice<u8>,
+    first: bool,
+    state: borrow mut CharsetState,
+    out: borrow mut Vector<u8>,
+) -> Result<void, AllocError> {
+    var at: usize = 0;
+    if (first) {
+        match (value.indexOfByte(0x27)) {
+            Some(q1) => {
+                state.name.clear();
+                state.name.extend(value[0..q1])?;
+                match (value[q1 + 1..].indexOfByte(0x27)) {
+                    Some(q2) => { at = q1 + 1 + q2 + 1; }
+                    null => { at = q1 + 1; }
+                }
+            }
+            null => {}
+        }
+    }
+    var raw = Vector<u8>.create();
+    while (at < value.length) {
+        let c = value[at];
+        if (c == 0x25 && at + 2 < value.length) {
+            let h = hexValue(value[at + 1]);
+            let l = hexValue(value[at + 2]);
+            if (h < 16 && l < 16) {
+                raw.pushBE((h << 4) | l)?;
+                at += 3;
+                continue;
+            }
+        }
+        raw.pushBE(c)?;
+        at += 1;
+    }
+    return out.extend(raw.view());
+}

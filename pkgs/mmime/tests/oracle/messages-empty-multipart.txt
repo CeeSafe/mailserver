@@ -1,0 +1,14 @@
+size 715
+envelope ("Tue, 12 Nov 2013 09:12:42 -0500" "test of empty multipart/alternative" ((NIL NIL "mimekit" "example.com")) ((NIL NIL "mimekit" "example.com")) ((NIL NIL "mimekit" "example.com")) ((NIL NIL "mimekit" "example.com")) NIL NIL NIL "<54AD68C9E3B0184CAC6041320424FD1B5B81E74D@localhost.localdomain>")
+bodystructure ((("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 0 0 NIL NIL NIL NIL) "alternative" ("boundary" "----=_NextPart_001_0040_01CE98CE.6E826F90") NIL NIL NIL) ("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 85 1 NIL NIL NIL NIL) "mixed" ("boundary" "----=_NextPart_000_003F_01CE98CE.6E826F90") NIL NIL NIL)
+body ((("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 0 0) "alternative") ("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 85 1) "mixed")
+section HEADER 364 82d9fe0e2ea3df3665ce0fa19083faa388a659d70d641e71d9cde743cec40421
+section TEXT 351 54d66b3f9b75a220945da8f3e2250d3030e975ee88d780392c1a9798321555ec
+section HEADER.FIELDS 304 4c0bfbbf697e51918aae07a875042878b60ba23ae8bd5047cc088aad725f6aa0
+section HEADER.FIELDS.NOT 62 8d0ae3ff18a760dbb1cc2c639917d785bcdf38a0094ac02c43539fbf5a30d533
+section 1 0 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+section 1.MIME 95 b82401ba67dff01f3a20da9879f27de13e29ef46a9320f37e7dfad7078235f53
+section 1.1 0 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+section 1.1.MIME 0 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+section 2 85 b489022c4121e61f79236da99c972b700ffcfdf7be3e0a087628c6d7b1d0f07a
+section 2.MIME 28 c3204dd99ab0f23ec6029433de09a5ae168a2daab5b5352645a32379e329b040

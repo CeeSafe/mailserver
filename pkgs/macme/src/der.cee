@@ -1,0 +1,353 @@
+// ASN.1 DER (X.690), as much as ACME needs: writing a certificate request, and reading an RSA public key and a
+// certificate's validity and names.
+
+public const TAG_INTEGER: u8 = 0x02;
+public const TAG_BIT_STRING: u8 = 0x03;
+public const TAG_OCTET_STRING: u8 = 0x04;
+public const TAG_NULL: u8 = 0x05;
+public const TAG_OID: u8 = 0x06;
+public const TAG_UTF8_STRING: u8 = 0x0c;
+public const TAG_UTC_TIME: u8 = 0x17;
+public const TAG_GENERALIZED_TIME: u8 = 0x18;
+public const TAG_SEQUENCE: u8 = 0x30;
+public const TAG_SET: u8 = 0x31;
+
+/// Appends a DER length.
+fn appendLength(out: borrow mut Vector<u8>, n: usize) -> Result<void, AllocError> {
+    if (n < 0x80) {
+        return out.push(truncate<u8>(n));
+    }
+    var bytes = [0u8; 8];
+    var count: usize = 0;
+    var v = n;
+    while (v > 0) {
+        bytes[7 - count] = truncate<u8>(v & 0xff);
+        v = v >> 8;
+        count += 1;
+    }
+    out.push(0x80u8 | truncate<u8>(count))?;
+    return out.extend(bytes[8 - count..8]);
+}
+
+/// Appends `tag`, the length of `content`, and `content`.
+public fn appendTlv(out: borrow mut Vector<u8>, tag: u8, content: Slice<u8>) -> Result<void, AllocError> {
+    out.push(tag)?;
+    appendLength(out, content.length)?;
+    return out.extend(content);
+}
+
+/// A BIT STRING of whole bytes (no unused bits).
+public fn appendBitString(out: borrow mut Vector<u8>, content: Slice<u8>) -> Result<void, AllocError> {
+    out.push(TAG_BIT_STRING)?;
+    appendLength(out, content.length + 1)?;
+    out.push(0)?;
+    return out.extend(content);
+}
+
+/// One element read from DER: its tag and where its content lies in the input.
+public struct Tlv {
+    public tag: u8;
+    public start: usize;
+    public end: usize;
+}
+
+/// The element at `at` within `der[..limit]`, or null when malformed (indefinite lengths, multi-byte tags, or one
+/// running past the limit).
+public fn readTlv(der: Slice<u8>, at: usize, limit: usize) -> Tlv? {
+    if (at + 2 > limit || limit > der.length) {
+        return null;
+    }
+    let tag = der[at];
+    if ((tag & 0x1f) == 0x1f) {
+        return null;
+    }
+    let first = der[at + 1];
+    var length: usize = 0;
+    var start = at + 2;
+    if (first < 0x80) {
+        length = first as usize;
+    } else {
+        let count = (first & 0x7f) as usize;
+        if (count == 0 || count > 4 || start + count > limit) {
+            return null;
+        }
+        for (i in 0..count) {
+            length = (length << 8) | der[start + i] as usize;
+        }
+        start += count;
+    }
+    if (length > limit - start) {
+        return null;
+    }
+    return Tlv { tag: tag, start: start, end: start + length };
+}
+
+/// The RSA modulus and exponent of a SubjectPublicKeyInfo (`SEQUENCE { AlgorithmIdentifier, BIT STRING { SEQUENCE
+/// { INTEGER n, INTEGER e } } }`), without leading zero bytes, into `n` and `e`. False when it is not that shape.
+public fn rsaPublicNumbers(
+    spki: Slice<u8>,
+    n: borrow mut Vector<u8>,
+    e: borrow mut Vector<u8>,
+) -> Result<bool, AllocError> {
+    n.clear();
+    e.clear();
+    let outer = match (readTlv(spki, 0, spki.length)) {
+        Some(t) => t,
+        null => { return Ok(false); }
+    };
+    if (outer.tag != TAG_SEQUENCE) {
+        return Ok(false);
+    }
+    let algorithm = match (readTlv(spki, outer.start, outer.end)) {
+        Some(t) => t,
+        null => { return Ok(false); }
+    };
+    let bits = match (readTlv(spki, algorithm.end, outer.end)) {
+        Some(t) => t,
+        null => { return Ok(false); }
+    };
+    if (bits.tag != TAG_BIT_STRING || bits.end - bits.start < 2 || spki[bits.start] != 0) {
+        return Ok(false);
+    }
+    let key = match (readTlv(spki, bits.start + 1, bits.end)) {
+        Some(t) => t,
+        null => { return Ok(false); }
+    };
+    let modulus = match (readTlv(spki, key.start, key.end)) {
+        Some(t) => t,
+        null => { return Ok(false); }
+    };
+    let exponent = match (readTlv(spki, modulus.end, key.end)) {
+        Some(t) => t,
+        null => { return Ok(false); }
+    };
+    if (key.tag != TAG_SEQUENCE || modulus.tag != TAG_INTEGER || exponent.tag != TAG_INTEGER) {
+        return Ok(false);
+    }
+    n.extend(withoutLeadingZeros(spki[modulus.start..modulus.end]))?;
+    e.extend(withoutLeadingZeros(spki[exponent.start..exponent.end]))?;
+    return Ok(n.length > 0 && e.length > 0);
+}
+
+fn withoutLeadingZeros(b: Slice<u8>) -> Slice<u8> {
+    var i: usize = 0;
+    while (i + 1 < b.length && b[i] == 0) {
+        i += 1;
+    }
+    return b[i..];
+}
+
+/// What `readCertificate` finds in a certificate.
+@noncopy
+public struct CertificateInfo {
+    /// The end of its validity, in Unix seconds.
+    public notAfter: i64;
+    public notBefore: i64;
+    /// Its subjectAltName DNS names, lowercased.
+    public names: Vector<String>;
+
+    public fn create() -> CertificateInfo =>
+        CertificateInfo { notAfter: 0, notBefore: 0, names: Vector<String>.create() };
+
+    /// Whether it names `host` (exactly, any case; wildcards are not issued here).
+    public fn covers(borrow this, host: StringView) -> bool {
+        for (n in this.names.view()) {
+            if (n.view().equalsIgnoreAsciiCase(host)) {
+                return true;
+            }
+        }
+        return false;
+    }
+}
+
+/// Reads an X.509 certificate's validity and DNS names (RFC 5280 §4.1). False when it is not a certificate.
+public fn readCertificate(der: Slice<u8>, into: borrow mut CertificateInfo) -> Result<bool, AllocError> {
+    into.names.clear();
+    let certificate = match (readTlv(der, 0, der.length)) {
+        Some(t) => t,
+        null => { return Ok(false); }
+    };
+    let tbs = match (readTlv(der, certificate.start, certificate.end)) {
+        Some(t) => t,
+        null => { return Ok(false); }
+    };
+    if (certificate.tag != TAG_SEQUENCE || tbs.tag != TAG_SEQUENCE) {
+        return Ok(false);
+    }
+    var at = tbs.start;
+    var field = match (readTlv(der, at, tbs.end)) {
+        Some(t) => t,
+        null => { return Ok(false); }
+    };
+    // [0] version, then serial, signature algorithm, issuer, validity.
+    if (field.tag == 0xa0) {
+        at = field.end;
+    }
+    for (i in 0..3) {
+        let skipped = match (readTlv(der, at, tbs.end)) {
+            Some(t) => t,
+            null => { return Ok(false); }
+        };
+        at = skipped.end;
+    }
+    let validity = match (readTlv(der, at, tbs.end)) {
+        Some(t) => t,
+        null => { return Ok(false); }
+    };
+    if (validity.tag != TAG_SEQUENCE) {
+        return Ok(false);
+    }
+    let notBefore = match (readTlv(der, validity.start, validity.end)) {
+        Some(t) => t,
+        null => { return Ok(false); }
+    };
+    let notAfter = match (readTlv(der, notBefore.end, validity.end)) {
+        Some(t) => t,
+        null => { return Ok(false); }
+    };
+    into.notBefore = timeOf(der, notBefore) ?? 0;
+    into.notAfter = timeOf(der, notAfter) ?? 0;
+    if (into.notAfter == 0) {
+        return Ok(false);
+    }
+    at = validity.end;
+    // subject, subjectPublicKeyInfo, then optional [1] [2] and [3] extensions.
+    while (at < tbs.end) {
+        field = match (readTlv(der, at, tbs.end)) {
+            Some(t) => t,
+            null => { return Ok(false); }
+        };
+        at = field.end;
+        if (field.tag == 0xa3) {
+            readExtensions(der, field, into)?;
+        }
+    }
+    return Ok(true);
+}
+
+/// subjectAltName's dNSName entries, from the `[3]` extensions element.
+fn readExtensions(der: Slice<u8>, explicit: Tlv, into: borrow mut CertificateInfo) -> Result<void, AllocError> {
+    let list = match (readTlv(der, explicit.start, explicit.end)) {
+        Some(t) => t,
+        null => { return Ok(); }
+    };
+    var at = list.start;
+    while (at < list.end) {
+        let extension = match (readTlv(der, at, list.end)) {
+            Some(t) => t,
+            null => { return Ok(); }
+        };
+        at = extension.end;
+        let oid = match (readTlv(der, extension.start, extension.end)) {
+            Some(t) => t,
+            null => { continue; }
+        };
+        // 2.5.29.17, subjectAltName.
+        if (oid.tag != TAG_OID || der[oid.start..oid.end] != [0x55u8, 0x1d, 0x11][..]) {
+            continue;
+        }
+        var next = match (readTlv(der, oid.end, extension.end)) {
+            Some(t) => t,
+            null => { continue; }
+        };
+        if (next.tag == 0x01) {
+            // critical BOOLEAN
+            next = match (readTlv(der, next.end, extension.end)) {
+                Some(t) => t,
+                null => { continue; }
+            };
+        }
+        if (next.tag != TAG_OCTET_STRING) {
+            continue;
+        }
+        let names = match (readTlv(der, next.start, next.end)) {
+            Some(t) => t,
+            null => { continue; }
+        };
+        var n = names.start;
+        while (n < names.end) {
+            let name = match (readTlv(der, n, names.end)) {
+                Some(t) => t,
+                null => { break; }
+            };
+            n = name.end;
+            if (name.tag == 0x82) {
+                var s = String.create();
+                for (c in der[name.start..name.end]) {
+                    let lower: [u8; 1] = [if (c >= 0x41 && c <= 0x5a) c + 0x20 else c];
+                    s.append(StringView.fromUtf8(lower[..]) ?? "?")?;
+                }
+                into.names.push(s)?;
+            }
+        }
+    }
+    return Ok();
+}
+
+/// A UTCTime (`YYMMDDHHMMSSZ`, years 1950–2049) or GeneralizedTime (`YYYYMMDDHHMMSSZ`) in Unix seconds.
+fn timeOf(der: Slice<u8>, t: Tlv) -> i64? {
+    let b = der[t.start..t.end];
+    var year: i64 = 0;
+    var at: usize = 0;
+    if (t.tag == TAG_UTC_TIME && b.length == 13) {
+        year = digits2(b, 0)?;
+        year = if (year < 50) 2000 + year else 1900 + year;
+        at = 2;
+    } else if (t.tag == TAG_GENERALIZED_TIME && b.length == 15) {
+        year = digits2(b, 0)? * 100 + digits2(b, 2)?;
+        at = 4;
+    } else {
+        return null;
+    }
+    if (b[b.length - 1] != 0x5a) {
+        return null;
+    }
+    let month = digits2(b, at)?;
+    let day = digits2(b, at + 2)?;
+    let hour = digits2(b, at + 4)?;
+    let minute = digits2(b, at + 6)?;
+    let second = digits2(b, at + 8)?;
+    if (month < 1 || month > 12 || day < 1 || day > 31) {
+        return null;
+    }
+    let y = if (month <= 2) year - 1 else year;
+    let era = if (y >= 0) y / 400 else (y - 399) / 400;
+    let yoe = y - era * 400;
+    let mp = if (month > 2) month - 3 else month + 9;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    return days * 86400 + hour * 3600 + minute * 60 + second;
+}
+
+fn digits2(b: Slice<u8>, at: usize) -> i64? {
+    let a = b[at];
+    let c = b[at + 1];
+    if (a < 0x30 || a > 0x39 || c < 0x30 || c > 0x39) {
+        return null;
+    }
+    return ((a - 0x30) as i64) * 10 + (c - 0x30) as i64;
+}
+
+/// The SubjectPublicKeyInfo of an X.509 certificate, whole (tag and length included): what a DANE `3 1 x` TLSA
+/// record hashes. Null when it is not a certificate.
+public fn certificateSpki(der: Slice<u8>) -> Tlv? {
+    let certificate = readTlv(der, 0, der.length)?;
+    let tbs = readTlv(der, certificate.start, certificate.end)?;
+    var at = tbs.start;
+    let first = readTlv(der, at, tbs.end)?;
+    if (first.tag == 0xa0) {
+        at = first.end;
+    }
+    // serial, signature algorithm, issuer, validity, subject
+    for (i in 0..5) {
+        let skipped = readTlv(der, at, tbs.end)?;
+        at = skipped.end;
+    }
+    let spki = readTlv(der, at, tbs.end)?;
+    if (spki.tag != TAG_SEQUENCE) {
+        return null;
+    }
+    // The whole element: from its tag.
+    return Tlv { tag: spki.tag, start: at, end: spki.end };
+}

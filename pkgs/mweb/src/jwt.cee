@@ -1,0 +1,101 @@
+// JSON Web Tokens (RFC 7519) signed with HS256 (RFC 7518 §3.2): the admin API's bearer tokens. Only HS256 is
+// accepted, whatever the header says, so a token cannot choose `none` or another algorithm (RFC 8725 §2.1).
+
+import encoding.Base64;
+import macme.appendBase64Url;
+import mhttp.JsonDocument;
+import sha256.HmacSha256;
+import sha256.constantTimeEqual;
+
+/// The shortest secret accepted, in bytes (RFC 7518 §3.2: at least the hash's size).
+public const JWT_MIN_SECRET: usize = 32;
+
+/// `header.payload.signature` for the claims in `payload` (a JSON object), into `out`.
+public fn signJwt(secret: Slice<u8>, payload: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    out.clear();
+    appendBase64Url(out, "{\"alg\":\"HS256\",\"typ\":\"JWT\"}".bytes())?;
+    out.push(0x2e)?;
+    appendBase64Url(out, payload)?;
+    let mac = HmacSha256.mac(secret, out.view());
+    out.push(0x2e)?;
+    return appendBase64Url(out, mac[..]);
+}
+
+/// Why a token was refused.
+public enum JwtError {
+    Malformed,
+    BadSignature,
+    Expired,
+    OutOfMemory,
+}
+
+/// The claims of `token` when it is an HS256 JWT signed with `secret`, not expired at `nowSeconds` (and not before
+/// its `nbf`). `exp` is required.
+public fn verifyJwt(secret: Slice<u8>, token: Slice<u8>, nowSeconds: i64) -> Result<JsonDocument, JwtError> {
+    var dots: usize = 0;
+    var first: usize = 0;
+    var second: usize = 0;
+    for (i in 0..token.length) {
+        if (token[i] == 0x2e) {
+            dots += 1;
+            if (dots == 1) {
+                first = i;
+            } else if (dots == 2) {
+                second = i;
+            }
+        }
+    }
+    if (dots != 2 || first == 0 || second == first + 1 || second + 1 >= token.length) {
+        return Err(JwtError.Malformed);
+    }
+    var header = Vector<u8>.create();
+    match (Base64.decodeUrl(token[0..first], mut header)) {
+        Ok() => {}
+        Err(_) => { return Err(JwtError.Malformed); }
+    }
+    let h = match (JsonDocument.parse(header.view())) {
+        Ok(d) => d,
+        Err(_) => { return Err(JwtError.Malformed); }
+    };
+    let alg = match (h.member(h.root(), "alg")) {
+        Some(v) => h.plainString(v) ?? "",
+        null => "",
+    };
+    if (alg != "HS256") {
+        return Err(JwtError.Malformed);
+    }
+    let mac = HmacSha256.mac(secret, token[0..second]);
+    var expected = Vector<u8>.create();
+    match (appendBase64Url(mut expected, mac[..])) {
+        Ok() => {}
+        Err(_) => { return Err(JwtError.OutOfMemory); }
+    }
+    if (!constantTimeEqual(expected.view(), token[second + 1..])) {
+        return Err(JwtError.BadSignature);
+    }
+    var payload = Vector<u8>.create();
+    match (Base64.decodeUrl(token[first + 1..second], mut payload)) {
+        Ok() => {}
+        Err(_) => { return Err(JwtError.Malformed); }
+    }
+    let claims = match (JsonDocument.parse(payload.view())) {
+        Ok(d) => d,
+        Err(_) => { return Err(JwtError.Malformed); }
+    };
+    let exp = match (claims.member(claims.root(), "exp")) {
+        Some(v) => claims.integer(v) ?? 0,
+        null => 0,
+    };
+    if (exp <= nowSeconds) {
+        return Err(JwtError.Expired);
+    }
+    match (claims.member(claims.root(), "nbf")) {
+        Some(v) => {
+            if ((claims.integer(v) ?? 0) > nowSeconds + 60) {
+                return Err(JwtError.Expired);
+            }
+        }
+        null => {}
+    }
+    return Ok(claims);
+}

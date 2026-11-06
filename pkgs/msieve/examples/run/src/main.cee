@@ -1,0 +1,168 @@
+// run SCRIPT MESSAGE [FROM [TO]]: runs a Sieve script on a message and prints the actions, one per line, in the
+// form tests/compare.py also makes of Pigeonhole's sieve-test output:
+//
+//     store MAILBOX [flags]          keep, fileinto, and the implicit keep
+//     redirect ADDRESS
+//     vacation days=N subject=S from=F handle=H reason=R   (line ends in H and R as \\n)
+//     error LINE: MESSAGE            the script does not compile
+//     runtime-error MESSAGE
+
+import msieve.ACTION_DISCARD;
+import msieve.ACTION_FILEINTO;
+import msieve.ACTION_KEEP;
+import msieve.ACTION_REDIRECT;
+import msieve.ACTION_VACATION;
+import msieve.Script;
+import msieve.SieveMessage;
+import msieve.SieveResult;
+import msieve.parseScript;
+import msieve.runScript;
+
+fn readFile(path: StringView, into: borrow mut Vector<u8>) {
+    var file = File.open(path)!;
+    var buffer = Vector<u8>.create();
+    buffer.resize(65536, 0)!;
+    loop {
+        let n = file.read(mut buffer[..])!;
+        if (n == 0) {
+            break;
+        }
+        into.extend(buffer[0..n])!;
+    }
+}
+
+/// The header block: up to and including the blank line's first line end.
+fn headerLength(m: Slice<u8>) -> usize {
+    var i: usize = 0;
+    while (i < m.length) {
+        if (m[i] == 0x0a) {
+            if (i + 1 < m.length && m[i + 1] == 0x0a) {
+                return i + 1;
+            }
+            if (i + 2 < m.length && m[i + 1] == 0x0d && m[i + 2] == 0x0a) {
+                return i + 1;
+            }
+        }
+        i += 1;
+    }
+    return m.length;
+}
+
+fn decimal(n: u64) -> String {
+    var digits = Vector<u8>.create();
+    var v = n;
+    loop {
+        digits.push(0x30 + truncate<u8>(v % 10))!;
+        v = v / 10;
+        if (v == 0) {
+            break;
+        }
+    }
+    var text = String.create();
+    var i = digits.length;
+    while (i > 0) {
+        i -= 1;
+        let one = digits[i..i + 1];
+        text.append(StringView.fromUtf8(one)!)!;
+    }
+    return text;
+}
+
+/// Writes `text` with each line end (CRLF or LF) as `\\n`.
+fn escaped(text: StringView) {
+    let b = text.bytes();
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i < b.length) {
+        if (b[i] == 0x0a || b[i] == 0x0d) {
+            Console.write(StringView.fromUtf8(b[start..i])!);
+            Console.write("\\n");
+            if (b[i] == 0x0d && i + 1 < b.length && b[i + 1] == 0x0a) {
+                i += 1;
+            }
+            start = i + 1;
+        }
+        i += 1;
+    }
+    Console.write(StringView.fromUtf8(b[start..])!);
+}
+
+fn store(mailbox: StringView, flags: StringView) {
+    Console.write("store ");
+    Console.write(mailbox);
+    if (flags.length > 0) {
+        Console.write(" [");
+        Console.write(flags);
+        Console.write("]");
+    }
+    Console.writeLine("");
+}
+
+fn main() {
+    let scriptPath = Process.argument(1)!;
+    let messagePath = Process.argument(2)!;
+    var source = Vector<u8>.create();
+    readFile(scriptPath, mut source);
+    var message = Vector<u8>.create();
+    readFile(messagePath, mut message);
+    var from = Vector<u8>.create();
+    match (Process.argument(3)) {
+        Some(f) => { from.extend(f.bytes())!; }
+        null => {}
+    }
+    var to = Vector<u8>.create();
+    match (Process.argument(4)) {
+        Some(t) => { to.extend(t.bytes())!; }
+        null => { to.extend("recipient@example.com".bytes())!; }
+    }
+    var script = Script.create();
+    if (!parseScript(source.view(), mut script)!) {
+        Console.write("error ");
+        let line = decimal(script.errorLine as u64);
+        Console.write(line.view());
+        Console.write(": ");
+        Console.writeLine(script.error.view());
+        return;
+    }
+    let m = message.view();
+    let header = m[0..headerLength(m)];
+    let input = SieveMessage {
+        header: header,
+        envelopeFrom: from.view(),
+        envelopeTo: to.view(),
+        size: m.length as u64,
+    };
+    var result = SieveResult.create();
+    runScript(script, input, mut result)!;
+    if (result.error.length > 0) {
+        Console.write("runtime-error ");
+        Console.writeLine(result.error.view());
+    }
+    for (i in 0..result.actions.length) {
+        let a = borrow result.actions[i];
+        if (a.kind == ACTION_KEEP || a.kind == ACTION_FILEINTO) {
+            store(a.target.view(), a.flags.view());
+        } else if (a.kind == ACTION_REDIRECT) {
+            Console.write("redirect ");
+            Console.writeLine(a.target.view());
+        } else if (a.kind == ACTION_VACATION) {
+            Console.write("vacation days=");
+            let days = decimal(a.days);
+            Console.write(days.view());
+            Console.write(" subject=");
+            Console.write(a.subject.view());
+            Console.write(" from=");
+            Console.write(a.from.view());
+            Console.write(" handle=");
+            escaped(a.handle.view());
+            Console.write(" reason=");
+            escaped(a.reason.view());
+            Console.writeLine("");
+        } else if (a.kind == ACTION_DISCARD) {
+            Console.writeLine("discard");
+        }
+    }
+    if (result.implicitKeep) {
+        store("INBOX", result.implicitFlags.view());
+    }
+}

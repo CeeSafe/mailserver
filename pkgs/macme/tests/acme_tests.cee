@@ -1,0 +1,126 @@
+// Keys, JWS, certificate requests and certificates, checked against what they decode to; tools/check-der.sh has
+// OpenSSL check the same outputs.
+
+import pkey.Signatures;
+import pkey.isGood;
+
+fn namesOf(a: StringView, b: StringView) -> Vector<String> {
+    var names = Vector<String>.create();
+    var x = String.create();
+    x.append(a)!;
+    names.push(x)!;
+    var y = String.create();
+    y.append(b)!;
+    names.push(y)!;
+    return names;
+}
+
+@test
+fn selfSignedCertificates() -> Result<void, TestFailure> {
+    let key = generateKey()!;
+    let names = namesOf("mail.example.org", "MTA-STS.example.org");
+    var der = Vector<u8>.create();
+    selfSignedCertificate(key, names, 1800000000, 90, mut der)!;
+    var info = CertificateInfo.create();
+    Check.isTrue(readCertificate(der.view(), mut info)!, "it reads back")?;
+    Check.isTrue(info.notBefore == 1800000000 - 3600 && info.notAfter == 1800000000 + 90 * 86400, "its validity")?;
+    Check.isTrue(info.names.length == 2 && info.covers("mail.example.org") && info.covers("mta-sts.example.org"), "names")?;
+    Check.isTrue(!info.covers("example.org"), "nothing else")?;
+    // Past 2049: GeneralizedTime.
+    selfSignedCertificate(key, names, 2600000000, 1, mut der)!;
+    Check.isTrue(readCertificate(der.view(), mut info)! && info.notAfter == 2600000000 + 86400, "after 2049")?;
+    var pem = Vector<u8>.create();
+    appendPem(mut pem, "CERTIFICATE", der.view())!;
+    pem.extend("junk between\n".bytes())!;
+    appendPem(mut pem, "CERTIFICATE", der.view())!;
+    var blocks = Vector<Vector<u8>>.create();
+    pemBlocks(pem.view(), "CERTIFICATE", mut blocks)!;
+    return Check.isTrue(blocks.length == 2 && blocks[1].view() == der.view(), "PEM blocks round-trip");
+}
+
+@test
+fn certificateRequests() -> Result<void, TestFailure> {
+    let key = generateKey()!;
+    let names = namesOf("mail.example.org", "mta-sts.example.org");
+    var csr = Vector<u8>.create();
+    certificateRequest(key, names, mut csr)!;
+    // SEQUENCE { info, algorithm, BIT STRING signature }: the signature verifies over info.
+    let outer = readTlv(csr.view(), 0, csr.length)!;
+    let info = readTlv(csr.view(), outer.start, outer.end)!;
+    let algorithm = readTlv(csr.view(), info.end, outer.end)!;
+    let signature = readTlv(csr.view(), algorithm.end, outer.end)!;
+    Check.isTrue(outer.end == csr.length && signature.tag == TAG_BIT_STRING, "the shape")?;
+    var spki = Vector<u8>.create();
+    key.publicKey(mut spki)!;
+    let signed = csr[outer.start..info.end];
+    let sig = csr[signature.start + 1..signature.end];
+    Check.isTrue(isGood(Signatures.verifyRsaSha256(spki.view(), signed, sig)), "the signature verifies")?;
+    return Ok();
+}
+
+@test
+fn accountKeysAndJws() -> Result<void, TestFailure> {
+    let account = AccountKey.create(generateKey()!)!;
+    let jwk = StringView.fromUtf8(account.jwkJson())!;
+    Check.isTrue(jwk.startsWith("{\"e\":\"AQAB\",\"kty\":\"RSA\",\"n\":\"") && jwk.endsWith("\"}"), "the JWK")?;
+    Check.isTrue(account.thumbprintText().length == 43, "a 32-byte thumbprint in base64url")?;
+    var ka = String.create();
+    account.keyAuthorization("tok_EN-1", mut ka)!;
+    Check.isTrue(ka.view().startsWith("tok_EN-1.") && ka.length == 9 + 43, "a key authorization")?;
+    var jws = Vector<u8>.create();
+    account.sign("https://ca.test/new-acct", "nonce1", "", "{\"a\":1}".bytes(), mut jws)!;
+    let doc = mhttp.JsonDocument.parse(jws.view())!;
+    var protectedText = String.create();
+    Check.isTrue(doc.string(doc.member(0, "protected")!, mut protectedText)!, "protected")?;
+    var header = Vector<u8>.create();
+    encoding.Base64.decodeUrl(protectedText.bytes(), mut header)!;
+    let h = mhttp.JsonDocument.parse(header.view())!;
+    var s = String.create();
+    Check.isTrue(h.string(h.member(0, "alg")!, mut s)! && s.view() == "RS256", "alg")?;
+    Check.isTrue(h.member(0, "jwk") != null && h.member(0, "kid") == null, "a jwk before there is an account")?;
+    Check.isTrue(h.string(h.member(0, "url")!, mut s)! && s.view() == "https://ca.test/new-acct", "url")?;
+    var payloadText = String.create();
+    Check.isTrue(doc.string(doc.member(0, "payload")!, mut payloadText)! && payloadText.view() == "eyJhIjoxfQ", "payload")?;
+    // The signature is over protected.payload with the account key.
+    var signature = Vector<u8>.create();
+    var sigText = String.create();
+    doc.string(doc.member(0, "signature")!, mut sigText)!;
+    encoding.Base64.decodeUrl(sigText.bytes(), mut signature)!;
+    var input = String.create();
+    input.append(protectedText.view())!;
+    input.append(".")!;
+    input.append(payloadText.view())!;
+    var spki = Vector<u8>.create();
+    account.privateKey().publicKey(mut spki)!;
+    Check.isTrue(isGood(Signatures.verifyRsaSha256(spki.view(), input.bytes(), signature.view())), "it verifies")?;
+    account.sign("https://ca.test/order/1", "nonce2", "https://ca.test/acct/7", [0u8; 1][0..0], mut jws)!;
+    let post = mhttp.JsonDocument.parse(jws.view())!;
+    Check.isTrue(post.string(post.member(0, "payload")!, mut s)! && s.length == 0, "POST-as-GET has an empty payload")?;
+    return Ok();
+}
+
+@test
+fn readsTheFixtureCertificate() -> Result<void, TestFailure> {
+    var pem = Vector<u8>.create();
+    var file = File.open("../../../../CeeSafeLibs/tls/tests/fixtures/localhost.pem")!;
+    var buffer = [0u8; 4096];
+    loop {
+        let n = file.read(mut buffer[..])!;
+        if (n == 0) {
+            break;
+        }
+        pem.extend(buffer[0..n])!;
+    }
+    var blocks = Vector<Vector<u8>>.create();
+    pemBlocks(pem.view(), "CERTIFICATE", mut blocks)!;
+    Check.isTrue(blocks.length >= 1, "a certificate")?;
+    var info = CertificateInfo.create();
+    Check.isTrue(readCertificate(blocks[0].view(), mut info)!, "it parses")?;
+    return Check.isTrue(info.covers("localhost") && info.notAfter > info.notBefore, "localhost, and a validity");
+}
+
+@test
+fn tokens() -> Result<void, TestFailure> {
+    Check.isTrue(validToken("abc-DEF_123") && !validToken("") && !validToken("a/b") && !validToken("a.b"), "tokens")?;
+    return Ok();
+}

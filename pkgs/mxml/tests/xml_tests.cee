@@ -1,0 +1,153 @@
+// The XML reader and writer: namespaces as DAV and SOAP use them, entities, CDATA, and what must be refused.
+
+fn parsed(text: StringView) -> Result<XmlDocument, TestFailure> => match (parseXml(text.bytes())) {
+    Ok(d) => Ok(d),
+    Err(_) => Err(TestFailure.create("the document parses")),
+};
+
+fn refused(text: StringView) -> bool => match (parseXml(text.bytes())) {
+    Ok(_) => false,
+    Err(_) => true,
+};
+
+fn need(found: usize?, what: StringView) -> Result<usize, TestFailure> => match (found) {
+    Some(n) => Ok(n),
+    null => Err(TestFailure.create(what)),
+};
+
+@test
+fn readsNamespaces() -> Result<void, TestFailure> {
+    let doc = parsed(
+        "<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n<!-- a PROPFIND -->\n<D:propfind xmlns:D=\"DAV:\" xmlns=\"urn:ietf:params:xml:ns:caldav\">\n  <D:prop>\n    <D:displayname/>\n    <calendar-home-set/>\n    <x:getctag xmlns:x=\"http://calendarserver.org/ns/\"/>\n  </D:prop>\n</D:propfind>",
+    )?;
+    let root = doc.root();
+    Check.isTrue(doc.is(root, "DAV:", "propfind"), "the root")?;
+    let prop = need(doc.child(root, "DAV:", "prop"), "prop")?;
+    var kids = Vector<usize>.create();
+    doc.children(prop, mut kids)!;
+    Check.isTrue(kids.length == 3, "three properties")?;
+    Check.isTrue(doc.is(kids[0], "DAV:", "displayname"), "displayname")?;
+    Check.isTrue(doc.is(kids[1], "urn:ietf:params:xml:ns:caldav", "calendar-home-set"), "the default namespace")?;
+    Check.isTrue(doc.is(kids[2], "http://calendarserver.org/ns/", "getctag"), "a local declaration")?;
+    Check.isTrue(doc.nextSibling(kids[2]) == null, "no sibling after the last")?;
+    Check.isTrue((doc.find(root, "DAV:", "displayname") ?? 99) == kids[0], "find")?;
+    return Ok();
+}
+
+@test
+fn readsTextAndAttributes() -> Result<void, TestFailure> {
+    let doc = parsed(
+        "<s:Envelope xmlns:s='http://schemas.xmlsoap.org/soap/envelope/' xmlns:t=\"T\"><s:Body><t:FolderId Id=\"a&amp;b\" t:Change='x'/><t:Subject>Fish &lt;&amp;&gt; chips &#233;&#x1F600;<![CDATA[ <raw> & ]]>!</t:Subject><t:Empty></t:Empty></s:Body></s:Envelope>",
+    )?;
+    let body = need(doc.child(doc.root(), "http://schemas.xmlsoap.org/soap/envelope/", "Body"), "Body")?;
+    let folder = need(doc.child(body, "T", "FolderId"), "FolderId")?;
+    let id = need(doc.attribute(folder, "Id"), "Id")?;
+    Check.isTrue(doc.valueText(id) == "a&b", "an attribute's entities")?;
+    Check.isTrue(doc.attribute(folder, "Change") == null, "a prefixed attribute is not unqualified")?;
+    let subject = need(doc.child(body, "T", "Subject"), "Subject")?;
+    Check.isTrue(doc.textView(subject) == "Fish <&> chips \u{E9}\u{1F600} <raw> & !", "text, references and CDATA")?;
+    let empty = need(doc.child(body, "T", "Empty"), "Empty")?;
+    Check.isTrue(doc.text(empty).length == 0, "an empty element")?;
+    Check.isTrue(doc.attributeIs(folder, "Id", "a&b"), "attributeIs")?;
+    return Ok();
+}
+
+@test
+fn refusesMalformed() -> Result<void, TestFailure> {
+    Check.isTrue(refused("<a><b></a></b>"), "crossed tags")?;
+    Check.isTrue(refused("<a>"), "unclosed")?;
+    Check.isTrue(refused("<a/><b/>"), "two roots")?;
+    Check.isTrue(refused("<p:a/>"), "an unbound prefix")?;
+    Check.isTrue(refused("<a>&nbsp;</a>"), "an unknown entity")?;
+    Check.isTrue(refused("<a>&#0;</a>"), "a NUL reference")?;
+    Check.isTrue(refused("<a x=1/>"), "an unquoted attribute")?;
+    Check.isTrue(refused("<a x='1'y='2'/>"), "attributes without space")?;
+    Check.isTrue(refused("<!DOCTYPE a [<!ENTITY e 'x'>]><a>&e;</a>"), "a DOCTYPE")?;
+    Check.isTrue(refused("text<a/>"), "text before the root")?;
+    Check.isTrue(refused(""), "empty")?;
+    var bad = Vector<u8>.create();
+    bad.extend("<a>".bytes())!;
+    bad.push(0xff)!;
+    bad.extend("</a>".bytes())!;
+    Check.isTrue(match (parseXml(bad.view())) {
+        Ok(_) => false,
+        Err(_) => true,
+    }, "not UTF-8")?;
+    var deep = String.create();
+    for (i in 0..200) {
+        deep.append("<a>")!;
+    }
+    for (i in 0..200) {
+        deep.append("</a>")!;
+    }
+    Check.isTrue(refused(deep.view()), "too deep")?;
+    return Ok();
+}
+
+@test
+fn buildsLikeWbxml() -> Result<void, TestFailure> {
+    var doc = XmlDocument.create()!;
+    match (doc.openElement("AirSync".bytes(), "Sync".bytes())) {
+        Ok() => {}
+        Err(_) => { return Err(TestFailure.create("open")); }
+    }
+    match (doc.openElement("AirSync".bytes(), "SyncKey".bytes())) {
+        Ok() => {}
+        Err(_) => { return Err(TestFailure.create("open key")); }
+    }
+    match (doc.addText("1".bytes())) {
+        Ok() => {}
+        Err(_) => { return Err(TestFailure.create("text")); }
+    }
+    match (doc.addText("2".bytes())) {
+        Ok() => {}
+        Err(_) => { return Err(TestFailure.create("more text")); }
+    }
+    match (doc.closeElement()) {
+        Ok() => {}
+        Err(_) => { return Err(TestFailure.create("close key")); }
+    }
+    match (doc.closeElement()) {
+        Ok() => {}
+        Err(_) => { return Err(TestFailure.create("close")); }
+    }
+    Check.isTrue(match (doc.finish()) {
+        Ok() => true,
+        Err(_) => false,
+    }, "complete")?;
+    let key = need(doc.child(doc.root(), "AirSync", "SyncKey"), "SyncKey")?;
+    Check.isTrue(doc.textView(key) == "12", "joined text")?;
+    return Ok();
+}
+
+@test
+fn writesXml() -> Result<void, TestFailure> {
+    var w = XmlWriter.document();
+    w.start("D:multistatus");
+    w.attribute("xmlns:D", "DAV:");
+    w.start("D:response");
+    w.element("D:href", "/dav/a&b <c>/");
+    w.empty("D:collection");
+    w.number("D:n", -12);
+    w.start("x");
+    w.attribute("q", "say \"hi\"\n");
+    w.text("cr\r");
+    w.end();
+    w.end();
+    w.end();
+    let bytes = w.finish()!;
+    let text = StringView.fromUtf8(bytes.view()) ?? "";
+    let want =
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<D:multistatus xmlns:D=\"DAV:\"><D:response><D:href>/dav/a&amp;b &lt;c&gt;/</D:href><D:collection/><D:n>-12</D:n><x q=\"say &quot;hi&quot;&#10;\">cr&#13;</x></D:response></D:multistatus>";
+    Check.isTrue(text == want, "the document")?;
+    let back = parsed(text)?;
+    let x = need(back.find(back.root(), "", "x"), "x")?;
+    Check.isTrue(back.textView(x) == "cr\r", "CR survives")?;
+    var open = XmlWriter.create();
+    open.start("a");
+    Check.isTrue(match (open.finish()) {
+        Ok(_) => false,
+        Err(_) => true,
+    }, "an open element is an error")?;
+    return Ok();
+}

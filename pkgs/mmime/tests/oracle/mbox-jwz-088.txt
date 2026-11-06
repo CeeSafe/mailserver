@@ -1,0 +1,10 @@
+size 1651
+envelope ("26 Apr 1995 18:13:32 GMT" "Re: Netscape1.1" (("zxc" NIL "zxc" "uiuc.edu")) (("zxc" NIL "zxc" "uiuc.edu")) (("zxc" NIL "zxc" "uiuc.edu")) ((NIL NIL "crobinso" "clam.rutgers.edu")) NIL NIL NIL "<3nm2gc$m6l@vixen.cso.uiuc.edu>")
+bodystructure ("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 1001 27 NIL NIL NIL NIL)
+body ("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 1001 27)
+section HEADER 650 5efd946c132ec8eab7aa7a3904d6958055a99937442ce7b5330ee7cd9a48acc4
+section TEXT 1001 c3a46ab766398fc9ccd7e04d33335987ec76c29747913a46d9d0a76f1ffea873
+section HEADER.FIELDS 206 d30fcd16bed1f00943dc2aa16de9783d921f1a7680fb5fb98970624ac12ecf80
+section HEADER.FIELDS.NOT 446 7ca693733372ba8ef0fe5e5b7bf22ce5c5a4408006495a6d91128ab39f07b10f
+section 1 1001 c3a46ab766398fc9ccd7e04d33335987ec76c29747913a46d9d0a76f1ffea873
+section 1.MIME 650 5efd946c132ec8eab7aa7a3904d6958055a99937442ce7b5330ee7cd9a48acc4

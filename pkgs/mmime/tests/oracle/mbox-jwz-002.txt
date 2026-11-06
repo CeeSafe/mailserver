@@ -1,0 +1,10 @@
+size 593
+envelope ("Thu,  6 Feb 1992 11:51:37 -0500 (EST)" "test of =?iso-8859-8?q?=FA=E9=F8=E1=F2?= in mail headers" (("Nathaniel Borenstein" NIL "nsb" "MISSING_DOMAIN")) (("Nathaniel Borenstein" NIL "nsb" "MISSING_DOMAIN")) (("Nathaniel Borenstein" NIL "nsb" "thumper.bellcore.com")) (("Nathaniel Borenstein" NIL "nsb" "MISSING_DOMAIN")) NIL NIL NIL NIL)
+bodystructure ("text" "plain" ("charset" "iso-8859-8") NIL NIL "quoted-printable" 206 4 NIL NIL NIL NIL)
+body ("text" "plain" ("charset" "iso-8859-8") NIL NIL "quoted-printable" 206 4)
+section HEADER 387 086ccf6682daa7e52bc63d694fd1ba036a9ca5da7e0d8d8117f7444d03ef3565
+section TEXT 206 1d240e275135e459c73a3ab3a2c15b3c4f60b97f0f35e9fca4936ea62a3e2aec
+section HEADER.FIELDS 227 7b1463b43eaaca95e9960edbbb90684e9350537ce1ea74203c8ab29d5959f038
+section HEADER.FIELDS.NOT 162 a77b5c010b2ab497e00c14792af54da3dbb3bfa877b5916dbed7bbb51322d9fe
+section 1 206 1d240e275135e459c73a3ab3a2c15b3c4f60b97f0f35e9fca4936ea62a3e2aec
+section 1.MIME 387 086ccf6682daa7e52bc63d694fd1ba036a9ca5da7e0d8d8117f7444d03ef3565

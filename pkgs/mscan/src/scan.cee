@@ -1,0 +1,377 @@
+// Clients for the two content scanners mail servers use: ClamAV's clamd (zINSTREAM) and SpamAssassin's spamd (the
+// SPAMC protocol). Both stream: the caller sends the message in pieces of any size, as it holds them, and nothing is
+// copied whole. Every step is under the caller's timeout (`Async.timeout`).
+
+/// clamd's verdict.
+public enum VirusVerdict {
+    Clean,
+    /// Infected: the signature's name is in `ClamdScan.signature`.
+    Infected,
+    /// clamd could not say: unreachable, timed out, or an error reply (such as its size limit).
+    Unavailable,
+}
+
+/// The most of a clamd or spamd reply kept.
+const MAX_REPLY: usize = 4096;
+
+/// A zINSTREAM scan in progress: `send` the message, then `finish`.
+@noncopy
+public struct ClamdScan {
+    stream: AsyncTcpStream;
+    frame: Vector<u8>;
+    /// The infected file's signature, after `finish` gave Infected.
+    public signature: String;
+    /// clamd's reply when it gave Unavailable, for the log.
+    public detail: String;
+
+    /// Connects to clamd and starts a scan.
+    public async fn open(address: SocketAddress) -> Result<ClamdScan, AsyncError> {
+        let stream = await AsyncTcpStream.connectTo(address)?;
+        await stream.write("zINSTREAM\u{0}".bytes())?;
+        return Ok(
+            ClamdScan {
+                stream: stream,
+                frame: Vector<u8>.create(),
+                signature: String.create(),
+                detail: String.create(),
+            },
+        );
+    }
+
+    /// Sends the next piece of the message: one chunk, its length first (4 bytes, big-endian).
+    public async fn send(borrow mut this, bytes: Slice<u8>) -> Result<void, AsyncError> {
+        var at: usize = 0;
+        while (at < bytes.length) {
+            // clamd's chunks are at most its StreamMaxLength; 64 KiB keeps each well within any setting.
+            let n = if (bytes.length - at > 65536) 65536 else bytes.length - at;
+            this.frame.clear();
+            match (this.frame.pushBE(truncate<u32>(n))) {
+                Ok() => {}
+                Err(_) => { return Err(AsyncError.Cancelled); }
+            }
+            await this.stream.write(this.frame.view())?;
+            await this.stream.write(bytes[at..at + n])?;
+            at += n;
+        }
+        return Ok();
+    }
+
+    /// Ends the stream (a zero-length chunk) and reads the verdict: `stream: OK`, `stream: <name> FOUND`, or an
+    /// error such as `INSTREAM size limit exceeded. ERROR`.
+    public async fn finish(borrow mut this) -> Result<VirusVerdict, AsyncError> {
+        let end = [0u8; 4];
+        await this.stream.write(end[..])?;
+        var reply = Vector<u8>.create();
+        if (!(await readReply(this.stream, mut reply, 0)?)) {
+            return Ok(VirusVerdict.Unavailable);
+        }
+        let text = reply.view();
+        // The reply runs to its NUL.
+        let stop = match (text.indexOfByte(0)) {
+            Some(z) => z,
+            null => text.length,
+        };
+        let line = trimEnd(text[0..stop]);
+        let body = match (line.indexOf(": ".bytes())) {
+            Some(colon) => line[colon + 2..],
+            null => line,
+        };
+        if (body.length == 2 && body.startsWith("OK".bytes())) {
+            return Ok(VirusVerdict.Clean);
+        }
+        if (body.endsWith(" FOUND".bytes())) {
+            appendText(mut this.signature, body[0..body.length - 6]);
+            return Ok(VirusVerdict.Infected);
+        }
+        appendText(mut this.detail, line);
+        return Ok(VirusVerdict.Unavailable);
+    }
+}
+
+/// Reads a reply until `terminator` (or the end of the stream, for spamd), at most `MAX_REPLY` bytes; false on an
+/// empty reply.
+async fn readReply(
+    stream: borrow AsyncTcpStream,
+    reply: borrow mut Vector<u8>,
+    terminator: u8,
+) -> Result<bool, AsyncError> {
+    var buffer = [0u8; 1024];
+    loop {
+        let n = await stream.read(mut buffer[..])?;
+        if (n == 0) {
+            return Ok(reply.length > 0);
+        }
+        let room = MAX_REPLY - reply.length;
+        let take = if (n < room) n else room;
+        match (reply.extend(buffer[0..take])) {
+            Ok() => {}
+            Err(_) => { return Ok(false); }
+        }
+        if (terminator == 0 && reply.view().indexOfByte(0) != null) {
+            return Ok(true);
+        }
+        if (reply.length >= MAX_REPLY) {
+            return Ok(true);
+        }
+    }
+}
+
+fn trimEnd(s: Slice<u8>) -> Slice<u8> {
+    var end = s.length;
+    while (end > 0 && (s[end - 1] == 0x0a || s[end - 1] == 0x0d || s[end - 1] == 0x20)) {
+        end -= 1;
+    }
+    return s[0..end];
+}
+
+fn appendText(into: borrow mut String, bytes: Slice<u8>) {
+    // Only printable ASCII: these names end up in replies and logs.
+    var clean = Vector<u8>.create();
+    for (c in bytes) {
+        match (clean.push(if (c >= 0x20 && c < 0x7f) c else 0x3f)) {
+            Ok() => {}
+            Err(_) => { return; }
+        }
+    }
+    match (into.append(StringView.fromUtf8(clean.view())!)) {
+        Ok() => {}
+        Err(_) => {}
+    }
+}
+
+/// spamd's verdict on a message.
+public struct SpamScore {
+    /// Whether spamd could score it.
+    public scored: bool;
+    /// Whether spamd itself judged it spam (score at or over its own threshold).
+    public spam: bool;
+    /// The score and spamd's threshold, in tenths (6.9 is 69), to keep integers.
+    public tenths: i64;
+    public thresholdTenths: i64;
+}
+
+/// A SPAMC CHECK in progress: `send` exactly `length` bytes, then `finish`.
+@noncopy
+public struct SpamdScan {
+    stream: AsyncTcpStream;
+
+    /// Connects to spamd and sends the request for a message of `length` bytes. `user` names whose preferences to
+    /// use (spamd's `User:`), or is empty.
+    public async fn open(address: SocketAddress, length: u64, user: StringView) -> Result<SpamdScan, AsyncError> {
+        let stream = await AsyncTcpStream.connectTo(address)?;
+        var request = Vector<u8>.create();
+        match (headerOf(mut request, length, user)) {
+            Ok() => {}
+            Err(_) => { return Err(AsyncError.Cancelled); }
+        }
+        await stream.write(request.view())?;
+        return Ok(SpamdScan { stream: stream });
+    }
+
+    public async fn send(borrow mut this, bytes: Slice<u8>) -> Result<void, AsyncError> {
+        return await this.stream.write(bytes);
+    }
+
+    /// Ends the request and reads the score: `SPAMD/1.1 0 EX_OK`, then `Spam: True ; 15.0 / 5.0`.
+    public async fn finish(borrow mut this) -> Result<SpamScore, AsyncError> {
+        match (this.stream.shutdownWrite()) {
+            Ok() => {}
+            Err(_) => {}
+        }
+        var reply = Vector<u8>.create();
+        var none = SpamScore { scored: false, spam: false, tenths: 0, thresholdTenths: 0 };
+        if (!(await readReply(this.stream, mut reply, 0x0a)?)) {
+            return Ok(none);
+        }
+        return Ok(parseSpamdReply(reply.view()));
+    }
+}
+
+fn headerOf(out: borrow mut Vector<u8>, length: u64, user: StringView) -> Result<void, AllocError> {
+    out.extend("CHECK SPAMC/1.5\r\nContent-length: ".bytes())?;
+    var digits = Vector<u8>.create();
+    var n = length;
+    loop {
+        digits.push(0x30 + truncate<u8>(n % 10))?;
+        n = n / 10;
+        if (n == 0) {
+            break;
+        }
+    }
+    var k = digits.length;
+    while (k > 0) {
+        k -= 1;
+        out.push(digits[k])?;
+    }
+    out.extend("\r\n".bytes())?;
+    if (user.length > 0) {
+        out.extend("User: ".bytes())?;
+        for (c in user.bytes()) {
+            out.push(if (c > 0x20 && c < 0x7f) c else 0x5f)?;
+        }
+        out.extend("\r\n".bytes())?;
+    }
+    return out.extend("\r\n".bytes());
+}
+
+/// A decimal like `-1.5` or `15` as tenths (`6.9` is 69); `null` when malformed.
+public fn tenthsOf(text: Slice<u8>) -> i64? {
+    var negative = false;
+    var start: usize = 0;
+    while (start < text.length && text[start] == 0x20) {
+        start += 1;
+    }
+    var end = text.length;
+    while (end > start && text[end - 1] == 0x20) {
+        end -= 1;
+    }
+    let t = text[start..end];
+    var i: usize = 0;
+    if (i < t.length && t[i] == 0x2d) {
+        negative = true;
+        i += 1;
+    }
+    var whole: i64 = 0;
+    var digits = 0u32;
+    while (i < t.length && t[i] >= 0x30 && t[i] <= 0x39) {
+        whole = whole * 10 + ((t[i] - 0x30) as i64);
+        digits += 1;
+        i += 1;
+        if (whole > 1000000000) {
+            return null;
+        }
+    }
+    var tenth: i64 = 0;
+    if (i < t.length && t[i] == 0x2e) {
+        i += 1;
+        if (i < t.length && t[i] >= 0x30 && t[i] <= 0x39) {
+            tenth = (t[i] - 0x30) as i64;
+            digits += 1;
+            i += 1;
+        }
+        while (i < t.length && t[i] >= 0x30 && t[i] <= 0x39) {
+            i += 1; // further digits are dropped
+        }
+    }
+    if (i != t.length || digits == 0) {
+        return null;
+    }
+    let value = whole * 10 + tenth;
+    return if (negative) -value else value;
+}
+
+/// Reads spamd's reply.
+fn parseSpamdReply(reply: Slice<u8>) -> SpamScore {
+    var result = SpamScore { scored: false, spam: false, tenths: 0, thresholdTenths: 0 };
+    if (!reply.startsWith("SPAMD/".bytes())) {
+        return result;
+    }
+    // The status line: "SPAMD/1.1 0 EX_OK"; a code other than 0 is an error.
+    let firstEnd = match (reply.indexOfByte(0x0a)) {
+        Some(e) => e,
+        null => reply.length,
+    };
+    let status = trimEnd(reply[0..firstEnd]);
+    match (status.indexOfByte(0x20)) {
+        Some(sp) => {
+            let rest = status[sp + 1..];
+            if (!rest.startsWith("0 ".bytes())) {
+                return result;
+            }
+        }
+        null => { return result; }
+    }
+    var at = firstEnd + 1;
+    while (at < reply.length) {
+        var end = at;
+        while (end < reply.length && reply[end] != 0x0a) {
+            end += 1;
+        }
+        let line = trimEnd(reply[at..end]);
+        at = end + 1;
+        if (line.length >= 5 && line[0..5].equalsIgnoreAsciiCase("Spam:".bytes())) {
+            // "Spam: True ; 15.0 / 5.0"
+            let value = line[5..];
+            let semicolon = match (value.indexOfByte(0x3b)) {
+                Some(s) => s,
+                null => { return result; }
+            };
+            let slash = match (value.indexOfByte(0x2f)) {
+                Some(s) => s,
+                null => { return result; }
+            };
+            if (slash < semicolon) {
+                return result;
+            }
+            let flag = value[0..semicolon];
+            let score = match (tenthsOf(value[semicolon + 1..slash])) {
+                Some(v) => v,
+                null => { return result; }
+            };
+            let threshold = match (tenthsOf(value[slash + 1..])) {
+                Some(v) => v,
+                null => { return result; }
+            };
+            result.scored = true;
+            result.spam = flag.contains("True".bytes()) || flag.contains("Yes".bytes());
+            result.tenths = score;
+            result.thresholdTenths = threshold;
+            return result;
+        }
+    }
+    return result;
+}
+
+/// Writes `tenths` as a decimal: 69 as "6.9", -15 as "-1.5".
+public fn appendTenths(out: borrow mut Vector<u8>, tenths: i64) -> Result<void, AllocError> {
+    var n = tenths;
+    if (n < 0) {
+        out.push(0x2d)?;
+        n = -n;
+    }
+    let whole = n / 10;
+    var digits = Vector<u8>.create();
+    var w = whole;
+    loop {
+        digits.push(0x30 + truncate<u8>(w % 10))?;
+        w = w / 10;
+        if (w == 0) {
+            break;
+        }
+    }
+    var k = digits.length;
+    while (k > 0) {
+        k -= 1;
+        out.push(digits[k])?;
+    }
+    out.push(0x2e)?;
+    return out.push(0x30 + truncate<u8>(n % 10));
+}
+
+/// A circuit breaker for a scanner: after `LIMIT` failures in a row, the scanner is not tried for `PAUSE` ms, so a
+/// dead clamd costs each message nothing rather than a full timeout. One success closes it again.
+const BREAKER_LIMIT: usize = 3;
+const BREAKER_PAUSE: usize = 30000;
+
+@noncopy
+public struct Breaker {
+    failures: AtomicUSize;
+    openUntil: AtomicU64;
+
+    public fn create() -> Breaker => Breaker { failures: AtomicUSize.create(0), openUntil: AtomicU64.create(0) };
+
+    /// Whether to try the scanner now.
+    public fn allows(borrow this, now: i64) -> bool => truncate<u64>(now) >= this.openUntil.load();
+
+    public fn succeeded(borrow this) {
+        this.failures.store(0);
+    }
+
+    public fn failed(borrow this, now: i64) {
+        let n = this.failures.fetchAdd(1) + 1;
+        if (n >= BREAKER_LIMIT) {
+            this.openUntil.store(truncate<u64>(now) + (BREAKER_PAUSE as u64));
+            this.failures.store(0);
+        }
+    }
+}

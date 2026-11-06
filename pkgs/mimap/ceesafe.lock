@@ -1,0 +1,57 @@
+# Written by ceesafec fetch (spec/tooling.md §4.3). Commit it with ceesafe.toml.
+
+[[package]]
+name = "bcrypt"
+source = "path+../../../../CeeSafeLibs/bcrypt"
+
+[[package]]
+name = "diskio"
+source = "path+../../../../CeeSafeLibs/diskio"
+
+[[package]]
+name = "encoding"
+source = "path+../../../../CeeSafeLibs/encoding"
+
+[[package]]
+name = "mauth"
+source = "path+../mauth"
+
+[[package]]
+name = "mdns"
+source = "path+../mdns"
+
+[[package]]
+name = "mmime"
+source = "path+../mmime"
+
+[[package]]
+name = "mscan"
+source = "path+../mscan"
+
+[[package]]
+name = "msieve"
+source = "path+../msieve"
+
+[[package]]
+name = "msmtp"
+source = "path+../msmtp"
+
+[[package]]
+name = "mstore"
+source = "path+../mstore"
+
+[[package]]
+name = "pkey"
+source = "path+../../../../CeeSafeLibs/pkey"
+
+[[package]]
+name = "postgres"
+source = "path+../../../PostgresClient"
+
+[[package]]
+name = "sha256"
+source = "path+../../../../CeeSafeLibs/sha256"
+
+[[package]]
+name = "tls"
+source = "path+../../../../CeeSafeLibs/tls"

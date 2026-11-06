@@ -1,0 +1,12 @@
+size 4267
+envelope ("Tue, 15 Apr 1997 08:05:56 -0400" "Re: Obtaining other people's certificates" (("Dan Werbel" NIL "danw" "ayce.com")) (("Dan Werbel" NIL "danw" "ayce.com")) ((NIL NIL "danw" "ayce.com")) (("Jamie Zawinski" NIL "jwz" "netscape.com")) NIL NIL NIL "<33536F24.BBDEA09D@ayce.com>")
+bodystructure (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 627 16 NIL NIL NIL NIL) ("application" "x-pkcs7-signature" ("name" "smime.p7s") NIL NIL "base64" 1812 NIL ("attachment" ("filename" "smime.p7s")) NIL NIL) "signed" ("protocol" "application/x-pkcs7-signature" "micalg" "sha1" "boundary" "------------ms1FB3ACBABA2E8DEE155566A8") NIL NIL NIL)
+body (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 627 16) ("application" "x-pkcs7-signature" ("name" "smime.p7s") NIL NIL "base64" 1812) "signed")
+section HEADER 1400 76c5d98a15de4fc850cf1575e9ff57ef9d2c3b4e51741ba28f9593b3fa164ecf
+section TEXT 2867 97256b6d288ed9fdb8143c18369e1199b33b3cdbcfb7e81866e930af6c47f9c4
+section HEADER.FIELDS 346 0f9697c1451952769c5fe18a3d8e3fbc740837b652f8be42171ce543512dc4e6
+section HEADER.FIELDS.NOT 1056 73ce172baf37c4e7c9a401faf26d8ba7fc12ff297a04645adbb1f5d9238b7a66
+section 1 627 5d3870f44d3bc6fd5a5026593795eba4def2a918bb8b9dbd27489a6a8fff81da
+section 1.MIME 79 0c7232bcecc3ffb84bb1ae647f2ba1256591d4391f0f1b8a41938a97660cddcb
+section 2 1812 f900ba9cec917813d6d5270f1727befca6f43f48b4b285b7fc8fb0c590b1e51a
+section 2.MIME 155 3f494fd607c17db262e344f14322972ba00d06304621f71328434bf52fff5389

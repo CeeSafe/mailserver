@@ -1,0 +1,49 @@
+# Where our FETCH knowingly differs from Dovecot 2.4.5's (tools/fetch-differential.py allows these). A line is
+# `item | message | tag`: the item as Dovecot names it (upper case, field names unquoted), or the request for a
+# refusal; `*` for every message, or `*` for every item of a message. `= tag: reason` defines a tag.
+
+= missing-part: a part number past the last part is NIL (no such part: tests/conformance/imap_test.py checks it); Dovecot sends an empty string. Both are valid nstrings (RFC 3501 §7.4.2)
+BODY[a part past the last] | * | missing-part
+
+= zero-partial: `<5.0>` is BAD: RFC 3501's grammar takes a non-zero length (`section-partial = "<" number "." nz-number ">"`); Dovecot accepts it and sends an empty string
+BODY.PEEK[]<5.0> | * | zero-partial
+
+= keyword-order: keywords are listed in the order the store keeps them; Dovecot lists them in the order the mailbox first saw them. A flag list is a set (RFC 3501 §2.3.2)
+FLAGS | compliance-unexpected-null-bytes-in-headers | keyword-order
+FLAGS | mbox-jwz-001 | keyword-order
+FLAGS | mbox-jwz-037 | keyword-order
+FLAGS | mbox-jwz-073 | keyword-order
+FLAGS | mbox-jwz-109 | keyword-order
+FLAGS | mbox-jwz-145 | keyword-order
+FLAGS | partial-message-partial.0 | keyword-order
+
+= stored-bytes: Dovecot rewrites stored bytes (a NUL becomes 0x80; a bare CR becomes CRLF); we serve the bytes as delivered (mmime's tests/deviations.txt)
+* | compliance-unexpected-null-bytes-in-body | stored-bytes
+* | compliance-unexpected-null-bytes-in-headers | stored-bytes
+
+= empty-parameter: `multipart/mixed;; boundary=…`: Dovecot drops every parameter after the empty one and shows one empty part; mmime finds the parts, as MimeKit and Thunderbird do (mmime's tests/deviations.txt)
+* | mbox-content-length-000 | empty-parameter
+* | mbox-jwz-021 | empty-parameter
+
+= charset-case: Dovecot lower-cases `charset=US-ASCII` in this one message only (it keeps the case 132 times in the corpus); mmime keeps the header's spelling (mmime's tests/deviations.txt)
+BODY | mbox-jwz-015 | charset-case
+BODYSTRUCTURE | mbox-jwz-015 | charset-case
+
+= bad-address: malformed addresses that Dovecot and mmime recover from differently, neither reading right (mmime's tests/deviations.txt)
+ENVELOPE | mbox-jwz-087 | bad-address
+ENVELOPE | messages-stack-overflow | bad-address
+BODY | mbox-jwz-051 | bad-address
+BODYSTRUCTURE | mbox-jwz-051 | bad-address
+
+= all-header: a message that is all header, with no blank line: Dovecot adds a blank line to HEADER.FIELDS (even when no field matches) and leaves an unterminated last line of HEADER.FIELDS.NOT as it is; we give the blank line only when the block has one, as HEADER does, and end each field with CRLF (mmime's tests/deviations.txt)
+BODY[HEADER.FIELDS (FROM TO CC SUBJECT DATE MESSAGE-ID CONTENT-TYPE)] | compliance-incomplete-header | all-header
+BODY[HEADER.FIELDS (SUBJECT X-NO-SUCH-FIELD)] | compliance-incomplete-header | all-header
+BODY[HEADER.FIELDS (X-NO-SUCH-FIELD)] | compliance-incomplete-header | all-header
+BODY[HEADER.FIELDS.NOT (RECEIVED RETURN-PATH)] | compliance-incomplete-header | all-header
+BODY[HEADER.FIELDS (FROM SUBJECT)] | compliance-incomplete-header | all-header
+BODY[HEADER.FIELDS (MESSAGE-ID DATE)] | compliance-incomplete-header | all-header
+BODY[HEADER.FIELDS (FROM TO CC SUBJECT DATE MESSAGE-ID CONTENT-TYPE)] | compliance-missing-body-separator | all-header
+BODY[HEADER.FIELDS (SUBJECT X-NO-SUCH-FIELD)] | compliance-missing-body-separator | all-header
+BODY[HEADER.FIELDS (X-NO-SUCH-FIELD)] | compliance-missing-body-separator | all-header
+BODY[HEADER.FIELDS (FROM SUBJECT)] | compliance-missing-body-separator | all-header
+BODY[HEADER.FIELDS (MESSAGE-ID DATE)] | compliance-missing-body-separator | all-header

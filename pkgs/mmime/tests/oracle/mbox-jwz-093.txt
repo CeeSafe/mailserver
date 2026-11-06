@@ -1,0 +1,18 @@
+size 11583
+envelope ("Thu, 22 Oct 1992 09:15:31 -0400 (EDT)" "Re: Could you translate (=?iso-8859-8?b?7eXs+SDv4SDp7Oj08A==?=) for me?" (("Nathaniel Borenstein" NIL "nsb" "MISSING_DOMAIN")) (("Nathaniel Borenstein" NIL "nsb" "MISSING_DOMAIN")) (("Nathaniel Borenstein" NIL "nsb" "MISSING_DOMAIN")) (("Joe Wells" NIL "jbw" "bigbird.bu.edu")) NIL NIL "<9210220105.AA19399@bigbird.bu.edu>" "<keteZn20M2YtJ3sZ5q@thumper.bellcore.com>")
+bodystructure (("text" "plain" ("charset" "US-ASCII") NIL NIL "7bit" 639 12 NIL NIL NIL NIL) (("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 541 8 NIL NIL NIL NIL) ("image" "gif" NIL NIL "My screen reading your mail" "base64" 8710 NIL NIL NIL NIL) ("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 48 3 NIL NIL NIL NIL) "mixed" ("boundary" "Alternative.Boundary.geteZma0M2Yt13sYs1") NIL NIL NIL) "alternative" ("boundary" "Interpart.Boundary.geteZma0M2Yt93sYwo") NIL NIL NIL)
+body (("text" "plain" ("charset" "US-ASCII") NIL NIL "7bit" 639 12) (("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 541 8) ("image" "gif" NIL NIL "My screen reading your mail" "base64" 8710) ("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 48 3) "mixed") "alternative")
+section HEADER 744 6a4207c642e70e0d9d21b331fc696489bc265b097ebab09ee76a5eccabd84f3c
+section TEXT 10839 2bb08c70d3406a9d0a54237c691a9aa63339ed15037f3cabec91425e61eb3040
+section HEADER.FIELDS 344 de3277701672adf9127e41edf68e361480aa88ff7e7d63f5319e38f2404c3d57
+section HEADER.FIELDS.NOT 402 d5a47dd0e7fac89c5610929689da5532b09bbcd80e2e931bb5460b92c15c3e66
+section 1 639 8bb5ac41e5243d40b47db31adfda9ce0780f7bd5d55cdc5f3fb309402fa10c08
+section 1.MIME 46 b3532c649b28a23803c77a2acc4907f5048ea77b89e0c51dcf7f271f2db4bfa6
+section 2 9779 7e504cbe0f1990e348b2e23903a506339d6d8c4149152b86283bafecad150b3a
+section 2.MIME 88 61ec066a644a682a82713136125a9e1ecd90d9c1429d95003ab94aaa06226799
+section 2.1 541 7137c84ae18a93e0f545eebc292d900bc2c35dab4f8c3979ae3ade8a98c47974
+section 2.1.MIME 94 7d35d8c48d3869c4391f6ff71123bfb4c8466e5b04f02d64c3961f23d7d8bf61
+section 2.2 8710 92bb4d69695cf077b5bfcf162ce8493ecbc33ebd70c90e58bc3a89172ac90743
+section 2.2.MIME 112 13762067d2cfc4284cbc41b438328695bc5de8cdbc8421bef524663d184c4213
+section 2.3 48 8773f77888feeb4045f24e61f0e859618e698782f80f25d2575895d5ca74562b
+section 2.3.MIME 94 7d35d8c48d3869c4391f6ff71123bfb4c8466e5b04f02d64c3961f23d7d8bf61

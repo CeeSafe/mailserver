@@ -1,0 +1,10 @@
+size 428
+envelope ("Tue, 12 Nov 2013 09:12:42 -0500" "test of a message containing unexpected null bytes in the headers" ((NIL NIL "mimekit" "example.com")) ((NIL NIL "mimekit" "example.com")) ((NIL NIL "mimekit" "example.com")) ((NIL NIL "mimekit" "example.com")) NIL NIL NIL "<54AD68C9E3B0184CAC6041320424FD1B5B81E74D@localhost.localdomain>")
+bodystructure ("text" "plain" ("charset" "utf-8") NIL NIL "7bit" 78 1 NIL NIL NIL NIL)
+body ("text" "plain" ("charset" "utf-8") NIL NIL "7bit" 78 1)
+section HEADER 350 d0fa193c87ac04f5f5cced53210c0e1f5531ea772c8b48274cc39e8cf6907c17
+section TEXT 78 2e452936f606cf887215c00f05db8b92cb0ffb0c3f758682bc74921c43a7fd76
+section HEADER.FIELDS 288 d47ecf84640c077e867c83b7a63e2d6a35d14a63160a9cca1d16eec01ba3f54a
+section HEADER.FIELDS.NOT 64 ada8baf7804f0091044a12d095dd8d78ca8a6d323201655e8b84dd38c6afd5fa
+section 1 78 2e452936f606cf887215c00f05db8b92cb0ffb0c3f758682bc74921c43a7fd76
+section 1.MIME 350 d0fa193c87ac04f5f5cced53210c0e1f5531ea772c8b48274cc39e8cf6907c17

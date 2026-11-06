@@ -1,0 +1,1082 @@
+// The selected state: bringing the snapshot up to date (sync), FETCH, STORE, COPY and MOVE, EXPUNGE, CLOSE and
+// UNSELECT, and IDLE.
+
+import diskio.FileError;
+import diskio.RawFile;
+import mmime.MessageMeta;
+import mmime.NO_PART;
+import mmime.PART_MESSAGE;
+import mmime.appendHeaderFields;
+import mmime.metaBody;
+import mmime.metaBodyStructure;
+import mmime.metaEnvelope;
+import msmtp.SmtpContext;
+import msmtp.Wire;
+import msmtp.WireError;
+import mstore.CopyResult;
+import mstore.FlagChange;
+import mstore.MailboxList;
+import mstore.MessageList;
+import mstore.StoreError;
+import mstore.UidSet;
+import mstore.Watch;
+
+/// How often IDLE looks for changes when nothing woke it. The notify bus wakes it at once for every change this
+/// server makes, so this only catches a missed event, or a change made by another server on the same database.
+const IDLE_REFRESH: u64 = 60000;
+const NONE: usize = 0xffffffffffffffff;
+/// Responses are flushed once this much is queued, so a large FETCH does not sit in memory.
+const FLUSH_AT: usize = 256 * 1024;
+/// Section bytes are read from the blob and sent in pieces of this size (over TLS; plaintext uses `sendfile`).
+const STREAM_CHUNK: usize = 64 * 1024;
+/// A literal up to this size is read into the response; a larger one is streamed from the blob.
+const INLINE_LITERAL: u64 = 64 * 1024;
+/// The most of a header block HEADER.FIELDS and HEADER.FIELDS.NOT read (in memory, to filter it): a field past it is
+/// not found.
+const HEADER_FIELDS_LIMIT: u64 = 1024 * 1024;
+
+// ---- Updates ----
+
+/// Brings the snapshot up to date with the store and tells the client: flag changes made elsewhere as
+/// `* n FETCH (FLAGS …)`, then (when `allowExpunge`) expunges as `* n EXPUNGE`, then new messages as `* n EXISTS`.
+/// HIGHESTMODSEQ says whether anything changed; then only the rows changed since are read, and the whole UID list
+/// only when the count says something was expunged. A store failure leaves the update for next time.
+async fn sync(
+    ctx: borrow SmtpContext,
+    wire: borrow mut Wire,
+    s: borrow mut Session,
+    allowExpunge: bool,
+) -> Result<void, WireError> {
+    var out = Vector<u8>.create();
+    let built: Result<void, AllocError> = await catchUp(ctx, s, allowExpunge, mut out);
+    match (built) {
+        Ok() => {}
+        Err(_) => { return Err(WireError.OutOfMemory); }
+    }
+    return wire.send(out.view());
+}
+
+async fn catchUp(
+    ctx: borrow SmtpContext,
+    s: borrow mut Session,
+    allowExpunge: bool,
+    out: borrow mut Vector<u8>,
+) -> Result<void, AllocError> {
+    var boxes = MailboxList.create();
+    let found = match (await ctx.store.mailboxById(s.userId, s.mailboxId, mut boxes)) {
+        Ok(f) => f,
+        Err(_) => false,
+    };
+    if (found && boxes.highestModseq(0) != s.snapshot.highestModseq) {
+        let highest = boxes.highestModseq(0);
+        var changed = MessageList.create();
+        var read = match (await ctx.store.messages(s.userId, s.mailboxId, s.snapshot.highestModseq, mut changed)) {
+            Ok() => true,
+            Err(_) => false,
+        };
+        if (read) {
+            for (i in 0..changed.count()) {
+                let uid = checkedTruncate<u32>(changed.uid(i)) ?? 0;
+                if (uid == 0) {
+                    continue;
+                }
+                match (s.snapshot.seqOf(uid)) {
+                    Some(seq) => {
+                        if (!s.snapshot.isGone(seq) && changed.modseq(i) > s.snapshot.modseqAt(seq)) {
+                            s.snapshot.setModseq(seq, changed.modseq(i));
+                            announceKeywords(s, changed.keywords(i).bytes(), out)?;
+                            flagsLine(out, seq, changed.flags(i), changed.keywords(i).bytes(), 0)?;
+                        }
+                    }
+                    null => { s.snapshot.push(uid, changed.modseq(i))?; }
+                }
+            }
+            // Expunges leave no row: the count shows them.
+            var live: i64 = 0;
+            for (q in 1..(s.snapshot.count() as usize) + 1) {
+                if (!s.snapshot.isGone(truncate<u32>(q))) {
+                    live += 1;
+                }
+            }
+            if (live != boxes.messages(0)) {
+                var all = MessageList.create();
+                match (await ctx.store.messages(s.userId, s.mailboxId, 0, mut all)) {
+                    Ok() => {
+                        var present = Vector<u32>.create();
+                        for (i in 0..all.count()) {
+                            present.push(checkedTruncate<u32>(all.uid(i)) ?? 0)?;
+                        }
+                        s.snapshot.keepOnly(present.view(), 0xffffffff);
+                    }
+                    Err(_) => { read = false; }
+                }
+            }
+            if (read) {
+                s.snapshot.highestModseq = highest;
+            }
+        }
+    }
+    if (allowExpunge && s.snapshot.hasGone()) {
+        var seqs = Vector<u32>.create();
+        s.snapshot.takeGone(mut seqs)?;
+        expungeLines(out, seqs)?;
+    }
+    if (s.snapshot.count() > s.snapshot.announced) {
+        s.snapshot.announced = s.snapshot.count();
+        out.extend("* ".bytes())?;
+        writeNumber(out, s.snapshot.announced as u64)?;
+        out.extend(" EXISTS\r\n".bytes())?;
+    }
+    return Ok();
+}
+
+/// `* seq FETCH (FLAGS (…))`, with ` UID n` when `uid` is not 0.
+fn flagsLine(
+    out: borrow mut Vector<u8>,
+    seq: u32,
+    flags: u16,
+    keywords: Slice<u8>,
+    uid: u32,
+) -> Result<void, AllocError> {
+    out.extend("* ".bytes())?;
+    writeNumber(out, seq as u64)?;
+    out.extend(" FETCH (FLAGS ".bytes())?;
+    writeStoredFlags(out, flags, keywords)?;
+    if (uid != 0) {
+        out.extend(" UID ".bytes())?;
+        writeNumber(out, uid as u64)?;
+    }
+    return out.extend(")\r\n".bytes());
+}
+
+fn expungeLines(out: borrow mut Vector<u8>, seqs: borrow Vector<u32>) -> Result<void, AllocError> {
+    for (seq in seqs.view()) {
+        out.extend("* ".bytes())?;
+        writeNumber(out, seq as u64)?;
+        out.extend(" EXPUNGE\r\n".bytes())?;
+    }
+    return Ok();
+}
+
+/// Announces the snapshot's expunges now (EXPUNGE, MOVE).
+fn announceGone(s: borrow mut Session, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    var seqs = Vector<u32>.create();
+    s.snapshot.takeGone(mut seqs)?;
+    return expungeLines(out, seqs);
+}
+
+// ---- Choosing messages ----
+
+fn added(r: Result<void, StoreError>) -> Result<void, AllocError> => match (r) {
+    Ok() => Ok(),
+    Err(_) => Err(AllocError.OutOfMemory),
+};
+
+/// The UIDs a set names, into `uids`. Sequence numbers must name messages (else false, a `BAD`); UIDs need not, and
+/// `*` is the highest UID the session knows. Messages expunged but not yet announced are left out.
+fn selectUids(
+    s: borrow Session,
+    set: borrow SequenceSet,
+    byUid: bool,
+    uids: borrow mut UidSet,
+) -> Result<bool, AllocError> {
+    uids.clear();
+    var ranges = Vector<SeqRange>.create();
+    if (byUid) {
+        set.resolve(s.snapshot.lastUid(), mut ranges)?;
+        for (range in ranges.view()) {
+            added(uids.addRange(range.first as i64, range.last as i64))?;
+        }
+        return Ok(true);
+    }
+    let count = s.snapshot.count();
+    if (count == 0 || set.exceeds(count)) {
+        return Ok(false);
+    }
+    set.resolve(count, mut ranges)?;
+    var runStart: u32 = 0;
+    var runEnd: u32 = 0;
+    for (range in ranges.view()) {
+        var seq = range.first;
+        while (seq <= range.last) {
+            if (!s.snapshot.isGone(seq)) {
+                let uid = s.snapshot.uidAt(seq);
+                if (runStart != 0 && uid == runEnd + 1) {
+                    runEnd = uid;
+                } else {
+                    if (runStart != 0) {
+                        added(uids.addRange(runStart as i64, runEnd as i64))?;
+                    }
+                    runStart = uid;
+                    runEnd = uid;
+                }
+            }
+            if (seq == range.last) {
+                break;
+            }
+            seq += 1;
+        }
+    }
+    if (runStart != 0) {
+        added(uids.addRange(runStart as i64, runEnd as i64))?;
+    }
+    return Ok(true);
+}
+
+/// A row's sequence number when the client knows the message (not new to it, not expunged).
+fn knownSeq(s: borrow Session, uid: i64) -> u32? {
+    let u = checkedTruncate<u32>(uid) ?? 0;
+    let seq = s.snapshot.seqOf(u)?;
+    if (s.snapshot.isGone(seq) || seq > s.snapshot.announced) {
+        return null;
+    }
+    return seq;
+}
+
+// ---- FETCH ----
+
+/// Byte offsets of a section in the message; `found` false when the part does not exist (NIL).
+struct Range {
+    found: bool;
+    start: u64;
+    end: u64;
+}
+
+fn rangeOf(start: u64, end: u64) -> Range => Range { found: true, start: start, end: end };
+
+/// Where a section is: the message's (no part numbers) or a part's. HEADER and TEXT of a part are its
+/// encapsulated message's, so they exist only for a message/rfc822 part (and are empty for others).
+fn sectionRange(meta: borrow MessageMeta, parts: Slice<u32>, text: SectionText) -> Result<Range, AllocError> {
+    if (meta.parts.length == 0) {
+        return Ok(Range { found: false, start: 0, end: 0 });
+    }
+    if (parts.length == 0) {
+        let top = meta.parts[0];
+        return Ok(match (text) {
+            SectionText.Whole => rangeOf(0, meta.size),
+            SectionText.Text => rangeOf(top.bodyStart, top.bodyEnd),
+            _ => rangeOf(top.headerStart, top.bodyStart),
+        });
+    }
+    let index = meta.partAt(parts)?;
+    if (index == NO_PART) {
+        return Ok(Range { found: false, start: 0, end: 0 });
+    }
+    let part = meta.parts[index];
+    match (text) {
+        SectionText.Whole => { return Ok(rangeOf(part.bodyStart, part.bodyEnd)); }
+        SectionText.Mime => { return Ok(rangeOf(part.headerStart, part.bodyStart)); }
+        _ => {}
+    }
+    if (part.kind != PART_MESSAGE || index + 1 >= meta.parts.length) {
+        return Ok(rangeOf(part.bodyStart, part.bodyStart));
+    }
+    let inner = meta.parts[index + 1];
+    return Ok(match (text) {
+        SectionText.Text => rangeOf(inner.bodyStart, inner.bodyEnd),
+        _ => rangeOf(inner.headerStart, inner.bodyStart),
+    });
+}
+
+fn readRange(file: borrow RawFile, start: u64, end: u64, into: borrow mut Vector<u8>) -> Result<void, FileError> {
+    into.clear();
+    let n = truncate<usize>(end - start);
+    match (into.resize(n, 0)) {
+        Ok() => {}
+        Err(_) => { return Err(FileError.NoSpace); }
+    }
+    if (n == 0) {
+        return Ok();
+    }
+    return file.readExactAt(mut into[..], start);
+}
+
+fn readPiece(file: borrow RawFile, chunk: borrow mut Vector<u8>, n: usize, at: u64) -> Result<void, FileError> =>
+    file.readExactAt(mut chunk[0..n], at);
+
+/// Sends `length` bytes of the blob from `from` (after what is queued): with `sendfile` on plaintext, from the blob
+/// opened by `path` as std's `File` (once per message, kept in `plain`); over TLS (or when that open fails), read in
+/// pieces of STREAM_CHUNK into `chunk` and written. Any failure leaves the literal short, so it ends the session.
+async fn sendRange(
+    wire: borrow mut Wire,
+    file: borrow RawFile,
+    path: StringView,
+    plain: borrow mut Vector<File>,
+    chunk: borrow mut Vector<u8>,
+    from: u64,
+    length: u64,
+) -> Result<void, WireError> {
+    if (!wire.isTls() && path.length > 0) {
+        if (plain.length == 0) {
+            let opened: Result<File, IoError> = await Async.blocking(() => File.open(path));
+            match (opened) {
+                Ok(f) => {
+                    match (plain.push(f)) {
+                        Ok() => {}
+                        Err(_) => { return Err(WireError.OutOfMemory); }
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+        if (plain.length > 0) {
+            return await wire.sendFile(plain[0], from, length);
+        }
+    }
+    if (chunk.length < STREAM_CHUNK) {
+        match (chunk.resize(STREAM_CHUNK, 0)) {
+            Ok() => {}
+            Err(_) => { return Err(WireError.OutOfMemory); }
+        }
+    }
+    var at = from;
+    let end = from + length;
+    while (at < end) {
+        let n = if (end - at > (STREAM_CHUNK as u64)) STREAM_CHUNK else truncate<usize>(end - at);
+        let offset = at;
+        let got: Result<void, FileError> = await Async.blocking(() => readPiece(file, chunk, n, offset));
+        match (got) {
+            Ok() => {}
+            Err(_) => { return Err(WireError.Io); }
+        }
+        await wire.sendNow(chunk[0..n])?;
+        at += n as u64;
+    }
+    return Ok();
+}
+
+/// `BODY[1.2.HEADER.FIELDS (FROM TO)]<0>`, as the response names a section.
+fn writeSectionName(
+    out: borrow mut Vector<u8>,
+    r: borrow CommandReader,
+    request: borrow FetchRequest,
+    att: FetchAtt,
+) -> Result<void, AllocError> {
+    out.extend("BODY[".bytes())?;
+    let parts = request.partsOf(att);
+    for (i in 0..parts.length) {
+        if (i > 0) {
+            out.push(0x2e)?;
+        }
+        writeNumber(out, parts[i] as u64)?;
+    }
+    let word = match (att.section.text) {
+        SectionText.Whole => "",
+        SectionText.Header => "HEADER",
+        SectionText.HeaderFields => "HEADER.FIELDS",
+        SectionText.HeaderFieldsNot => "HEADER.FIELDS.NOT",
+        SectionText.Text => "TEXT",
+        SectionText.Mime => "MIME",
+    };
+    if (parts.length > 0 && word.length > 0) {
+        out.push(0x2e)?;
+    }
+    out.extend(word.bytes())?;
+    let fields = request.fieldsOf(att);
+    if (fields.length > 0) {
+        out.extend(" (".bytes())?;
+        for (i in 0..fields.length) {
+            if (i > 0) {
+                out.push(0x20)?;
+            }
+            writeAstring(out, r.text(fields[i]))?;
+        }
+        out.push(0x29)?;
+    }
+    out.push(0x5d)?;
+    if (att.partial) {
+        out.push(0x3c)?;
+        writeNumber(out, att.origin as u64)?;
+        out.push(0x3e)?;
+    }
+    return Ok();
+}
+
+/// What a FETCH needs per message.
+struct Needs {
+    meta: bool;
+    blob: bool;
+    seen: bool;
+}
+
+fn needsOf(request: borrow FetchRequest) -> Needs {
+    var n = Needs { meta: false, blob: false, seen: false };
+    for (a in request.items.view()) {
+        match (a.kind) {
+            FetchKind.Envelope => { n.meta = true; }
+            FetchKind.Body => { n.meta = true; }
+            FetchKind.BodyStructure => { n.meta = true; }
+            FetchKind.Rfc822 => {
+                n.blob = true;
+                n.seen = true;
+            }
+            FetchKind.Rfc822Header => {
+                n.blob = true;
+                n.meta = true;
+            }
+            FetchKind.Rfc822Text => {
+                n.blob = true;
+                n.meta = true;
+                n.seen = true;
+            }
+            FetchKind.BodySection => {
+                n.blob = true;
+                n.meta = true;
+                if (!a.peek) {
+                    n.seen = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    return n;
+}
+
+/// The position of `uid` among `list`'s rows (ascending), or NONE.
+fn rowOf(list: borrow MessageList, uid: i64) -> usize {
+    var lo: usize = 0;
+    var hi = list.count();
+    while (lo < hi) {
+        let mid = lo + (hi - lo) / 2;
+        let u = list.uid(mid);
+        if (u == uid) {
+            return mid;
+        }
+        if (u < uid) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return NONE;
+}
+
+async fn fetchCommand(
+    ctx: borrow SmtpContext,
+    wire: borrow mut Wire,
+    s: borrow mut Session,
+    r: borrow mut CommandReader,
+    byUid: bool,
+) -> Result<u8, Problem> {
+    var set = SequenceSet.create();
+    parsed(r.sequenceSet(mut set))?;
+    var request = FetchRequest.create();
+    parsed(r.fetchAttributes(mut request))?;
+    parsed(r.finish())?;
+    let done = if (byUid) "UID FETCH completed" else "FETCH completed";
+    var uids = UidSet.create();
+    if (!mem(selectUids(s, set, byUid, mut uids))?) {
+        return tagged(s, "BAD", "Invalid message sequence number");
+    }
+    if (uids.isEmpty()) {
+        return tagged(s, "OK", done);
+    }
+    var needs = needsOf(request);
+    if (s.readOnly) {
+        needs.seen = false;
+    }
+    var list = MessageList.create();
+    match (await ctx.store.fetchMessages(s.userId, s.mailboxId, uids, needs.meta, mut list)) {
+        Ok() => {}
+        Err(_) => { return unavailable(s); }
+    }
+    // \Seen first (RFC 3501 §6.4.5), so each message's response carries its new FLAGS.
+    var seen = MessageList.create();
+    var seenAt = Vector<usize>.create();
+    mem(seenAt.resize(list.count(), NONE))?;
+    if (needs.seen) {
+        var unseen = UidSet.create();
+        for (i in 0..list.count()) {
+            if (list.flags(i) & STORED_SEEN == 0 && knownSeq(s, list.uid(i)) != null) {
+                mem(added(unseen.add(list.uid(i))))?;
+            }
+        }
+        if (!unseen.isEmpty()) {
+            var change = FlagChange.create();
+            change.add = STORED_SEEN;
+            match (await ctx.store.setFlags(s.userId, s.mailboxId, unseen, change, mut seen)) {
+                Ok() => {}
+                Err(_) => { return unavailable(s); }
+            }
+            for (c in 0..seen.count()) {
+                let at = rowOf(list, seen.uid(c));
+                if (at != NONE) {
+                    seenAt[at] = c;
+                }
+            }
+        }
+    }
+    let blobs = ctx.store.blobs();
+    var failed = false;
+    var out = Vector<u8>.create();
+    var metaBytes = Vector<u8>.create();
+    var meta = MessageMeta.create();
+    var hash = Vector<u8>.create();
+    var data = Vector<u8>.create();
+    var filtered = Vector<u8>.create();
+    var files = Vector<RawFile>.create();
+    // The blob's size, and on plaintext its path and the blob opened as std's `File` (for `sendfile`), once a literal
+    // is streamed.
+    var fileSize: u64 = 0;
+    var path = String.create();
+    var plain = Vector<File>.create();
+    var chunk = Vector<u8>.create();
+    for (i in 0..list.count()) {
+        let seq = match (knownSeq(s, list.uid(i))) {
+            Some(q) => q,
+            null => { continue; }
+        };
+        let uid = truncate<u32>(list.uid(i));
+        let c = seenAt[i];
+        let flags = if (c != NONE) seen.flags(c) else list.flags(i);
+        let keywords = if (c != NONE) seen.keywords(c) else list.keywords(i);
+        if (c != NONE) {
+            s.snapshot.setModseq(seq, seen.modseq(c));
+        }
+        var haveMeta = false;
+        if (needs.meta) {
+            haveMeta = match (list.meta(i, mut metaBytes)) {
+                Ok(f) => f,
+                Err(_) => false,
+            };
+            if (haveMeta) {
+                haveMeta = mem(meta.read(metaBytes.view()))?;
+            }
+        }
+        files.clear();
+        plain.clear();
+        path.clear();
+        if (needs.blob || (needs.meta && !haveMeta)) {
+            match (list.blob(i, mut hash)) {
+                Ok() => {}
+                Err(_) => {
+                    failed = true;
+                    continue;
+                }
+            }
+            let h = hash.view();
+            let opened: Result<RawFile, StoreError> = await Async.blocking(() => blobs.open(h));
+            match (opened) {
+                Ok(f) => { mem(files.push(f))?; }
+                Err(_) => {
+                    failed = true;
+                    continue;
+                }
+            }
+            let f = borrow files[0];
+            let sized: Result<u64, FileError> = await Async.blocking(() => f.size());
+            fileSize = match (sized) {
+                Ok(n) => n,
+                Err(_) => {
+                    failed = true;
+                    continue;
+                }
+            };
+            if (!wire.isTls()) {
+                match (blobs.pathOf(h, false, mut path)) {
+                    Ok() => {}
+                    Err(_) => { path.clear(); }
+                }
+            }
+        }
+        if (needs.meta && !haveMeta) {
+            // No stored meta (or a damaged one): index the message now, reading it in pieces.
+            let f = borrow files[0];
+            let size = truncate<u64>(list.size(i));
+            metaBytes.clear();
+            let indexed: Result<void, FileError> = await Async.blocking(() => indexFile(f, size, mut metaBytes));
+            match (indexed) {
+                Ok() => {}
+                Err(_) => {
+                    failed = true;
+                    continue;
+                }
+            }
+            if (!mem(meta.read(metaBytes.view()))?) {
+                failed = true;
+                continue;
+            }
+        }
+        out.clear();
+        if (c != NONE || request.has(FetchKind.Flags)) {
+            mem(announceKeywords(s, keywords.bytes(), mut out))?;
+        }
+        mem(out.extend("* ".bytes()))?;
+        mem(writeNumber(mut out, seq as u64))?;
+        mem(out.extend(" FETCH (".bytes()))?;
+        var first = true;
+        if (byUid && !request.has(FetchKind.Uid)) {
+            mem(out.extend("UID ".bytes()))?;
+            mem(writeNumber(mut out, uid as u64))?;
+            first = false;
+        }
+        for (k in 0..request.items.length) {
+            let a = request.items[k];
+            if (!first) {
+                mem(out.push(0x20))?;
+            }
+            first = false;
+            match (a.kind) {
+                FetchKind.Uid => {
+                    mem(out.extend("UID ".bytes()))?;
+                    mem(writeNumber(mut out, uid as u64))?;
+                }
+                FetchKind.Flags => {
+                    mem(out.extend("FLAGS ".bytes()))?;
+                    mem(writeStoredFlags(mut out, flags, keywords.bytes()))?;
+                }
+                FetchKind.InternalDate => {
+                    mem(out.extend("INTERNALDATE ".bytes()))?;
+                    mem(writeInternalDate(mut out, list.internalDate(i)))?;
+                }
+                FetchKind.Rfc822Size => {
+                    mem(out.extend("RFC822.SIZE ".bytes()))?;
+                    mem(writeNumber(mut out, truncate<u64>(list.size(i))))?;
+                }
+                FetchKind.Envelope => {
+                    mem(out.extend("ENVELOPE ".bytes()))?;
+                    mem(out.extend(metaEnvelope(meta, metaBytes.view())))?;
+                }
+                FetchKind.Body => {
+                    mem(out.extend("BODY ".bytes()))?;
+                    mem(out.extend(metaBody(meta, metaBytes.view())))?;
+                }
+                FetchKind.BodyStructure => {
+                    mem(out.extend("BODYSTRUCTURE ".bytes()))?;
+                    mem(out.extend(metaBodyStructure(meta, metaBytes.view())))?;
+                }
+                _ => {
+                    // The items with content: RFC822, RFC822.HEADER, RFC822.TEXT and BODY[…].
+                    var text = SectionText.Whole;
+                    var range = Range { found: true, start: 0, end: truncate<u64>(list.size(i)) };
+                    if (a.kind == FetchKind.Rfc822) {
+                        mem(out.extend("RFC822 ".bytes()))?;
+                    } else if (a.kind == FetchKind.Rfc822Header) {
+                        mem(out.extend("RFC822.HEADER ".bytes()))?;
+                        text = SectionText.Header;
+                        range = mem(sectionRange(meta, request.partsOf(a), text))?;
+                    } else if (a.kind == FetchKind.Rfc822Text) {
+                        mem(out.extend("RFC822.TEXT ".bytes()))?;
+                        text = SectionText.Text;
+                        range = mem(sectionRange(meta, request.partsOf(a), text))?;
+                    } else {
+                        mem(writeSectionName(mut out, r, request, a))?;
+                        mem(out.push(0x20))?;
+                        text = a.section.text;
+                        range = mem(sectionRange(meta, request.partsOf(a), text))?;
+                    }
+                    if (!range.found) {
+                        mem(out.extend("NIL".bytes()))?;
+                        continue;
+                    }
+                    let f = borrow files[0];
+                    if (text == SectionText.HeaderFields || text == SectionText.HeaderFieldsNot) {
+                        // A header block, filtered in memory (at most HEADER_FIELDS_LIMIT of it is read).
+                        let start = range.start;
+                        let end =
+                            if (range.end -
+                                range.start > HEADER_FIELDS_LIMIT) range.start + HEADER_FIELDS_LIMIT else range.end;
+                        let got: Result<void, FileError> = await Async.blocking(
+                            () => readRange(f, start, end, mut data),
+                        );
+                        match (got) {
+                            Ok() => {}
+                            Err(_) => {
+                                failed = true;
+                                data.clear();
+                            }
+                        }
+                        var names = Vector<Vector<u8>>.create();
+                        for (span in request.fieldsOf(a)) {
+                            var name = Vector<u8>.create();
+                            mem(name.extend(r.text(span)))?;
+                            mem(names.push(name))?;
+                        }
+                        filtered.clear();
+                        mem(appendHeaderFields(data.view(), names, text == SectionText.HeaderFieldsNot, mut filtered))?;
+                        let whole = filtered.view();
+                        var from: u64 = 0;
+                        var to = whole.length as u64;
+                        if (a.partial) {
+                            let length = whole.length as u64;
+                            from = if ((a.origin as u64) < length) a.origin as u64 else length;
+                            to = if (from + (a.count as u64) < length) from + (a.count as u64) else length;
+                        }
+                        mem(writeLiteral(mut out, whole[truncate<usize>(from)..truncate<usize>(to)]))?;
+                        continue;
+                    }
+                    // Any other section is a byte range of the blob, sent as it is: a partial is a range within it.
+                    var from = range.start;
+                    var to = range.end;
+                    if (a.partial) {
+                        let length = range.end - range.start;
+                        let o = if ((a.origin as u64) < length) a.origin as u64 else length;
+                        let e = if (o + (a.count as u64) < length) o + (a.count as u64) else length;
+                        from = range.start + o;
+                        to = range.start + e;
+                    }
+                    if (to > fileSize) {
+                        // The blob is shorter than its meta says: an empty literal, and NO at the end.
+                        failed = true;
+                        mem(out.extend("{0}\r\n".bytes()))?;
+                        continue;
+                    }
+                    if (to - from <= INLINE_LITERAL) {
+                        let start = from;
+                        let end = to;
+                        let got: Result<void, FileError> = await Async.blocking(
+                            () => readRange(f, start, end, mut data),
+                        );
+                        match (got) {
+                            Ok() => {}
+                            Err(_) => {
+                                failed = true;
+                                data.clear();
+                            }
+                        }
+                        mem(writeLiteral(mut out, data.view()))?;
+                        continue;
+                    }
+                    // Streamed: the response so far and the literal's length, then its bytes from the blob, in
+                    // pieces (or by the kernel), never held whole.
+                    mem(out.push(0x7b))?;
+                    mem(writeNumber(mut out, to - from))?;
+                    mem(out.extend("}\r\n".bytes()))?;
+                    io(wire.send(out.view()))?;
+                    out.clear();
+                    io(await sendRange(wire, f, path.view(), mut plain, mut chunk, from, to - from))?;
+                }
+            }
+        }
+        if (c != NONE && !request.has(FetchKind.Flags)) {
+            mem(out.extend(" FLAGS ".bytes()))?;
+            mem(writeStoredFlags(mut out, flags, keywords.bytes()))?;
+        }
+        mem(out.extend(")\r\n".bytes()))?;
+        io(wire.send(out.view()))?;
+        if (out.length >= FLUSH_AT) {
+            io(await wire.flush())?;
+        }
+    }
+    if (failed) {
+        return tagged(s, "NO", "[UNAVAILABLE] Some messages could not be read");
+    }
+    return tagged(s, "OK", done);
+}
+
+// ---- STORE ----
+
+async fn storeCommand(
+    ctx: borrow SmtpContext,
+    wire: borrow mut Wire,
+    s: borrow mut Session,
+    r: borrow mut CommandReader,
+    byUid: bool,
+) -> Result<u8, Problem> {
+    var set = SequenceSet.create();
+    parsed(r.sequenceSet(mut set))?;
+    let action = parsed(r.storeAction())?;
+    var flags = Vector<Flag>.create();
+    parsed(r.storeFlags(mut flags))?;
+    parsed(r.finish())?;
+    if (s.readOnly) {
+        return tagged(s, "NO", "[READ-ONLY] The mailbox is read-only");
+    }
+    var change = FlagChange.create();
+    var bits: u16 = 0;
+    var keywords = String.create();
+    if (!mem(storedFlags(r, flags, mut bits, mut keywords))?) {
+        return tagged(s, "BAD", "Unknown system flag");
+    }
+    match (action.mode) {
+        StoreMode.Replace => {
+            change.replace = true;
+            change.add = bits;
+            mem(change.addKeywords.append(keywords.view()))?;
+        }
+        StoreMode.Add => {
+            change.add = bits;
+            mem(change.addKeywords.append(keywords.view()))?;
+        }
+        StoreMode.Remove => {
+            change.remove = bits;
+            mem(change.removeKeywords.append(keywords.view()))?;
+        }
+    }
+    let done = if (byUid) "UID STORE completed" else "STORE completed";
+    var uids = UidSet.create();
+    if (!mem(selectUids(s, set, byUid, mut uids))?) {
+        return tagged(s, "BAD", "Invalid message sequence number");
+    }
+    if (uids.isEmpty()) {
+        return tagged(s, "OK", done);
+    }
+    var changed = MessageList.create();
+    match (await ctx.store.setFlags(s.userId, s.mailboxId, uids, change, mut changed)) {
+        Ok() => {}
+        Err(_) => { return unavailable(s); }
+    }
+    for (i in 0..changed.count()) {
+        match (knownSeq(s, changed.uid(i))) {
+            Some(seq) => { s.snapshot.setModseq(seq, changed.modseq(i)); }
+            null => {}
+        }
+    }
+    // Every statement that changes a mailbox raises its HIGHESTMODSEQ by one, and this one gave every row it changed
+    // the new value: when that is one past the snapshot's, nothing else changed the mailbox meanwhile, so the
+    // snapshot is current and the `sync` after the command has no rows to read (one round trip fewer).
+    if (changed.count() > 0 && changed.modseq(0) == s.snapshot.highestModseq + 1) {
+        s.snapshot.highestModseq = changed.modseq(0);
+    }
+    if (action.silent) {
+        return tagged(s, "OK", done);
+    }
+    // Every message of the set, changed or not, with its flags now.
+    var now = MessageList.create();
+    match (await ctx.store.fetchMessages(s.userId, s.mailboxId, uids, false, mut now)) {
+        Ok() => {}
+        Err(_) => { return unavailable(s); }
+    }
+    var out = Vector<u8>.create();
+    for (i in 0..now.count()) {
+        match (knownSeq(s, now.uid(i))) {
+            Some(seq) => {
+                if (now.modseq(i) > s.snapshot.modseqAt(seq)) {
+                    s.snapshot.setModseq(seq, now.modseq(i));
+                }
+                let uid = if (byUid) truncate<u32>(now.uid(i)) else 0u32;
+                mem(announceKeywords(s, now.keywords(i).bytes(), mut out))?;
+                mem(flagsLine(mut out, seq, now.flags(i), now.keywords(i).bytes(), uid))?;
+            }
+            null => {}
+        }
+    }
+    io(wire.send(out.view()))?;
+    return tagged(s, "OK", done);
+}
+
+// ---- COPY and MOVE ----
+
+async fn copy(
+    ctx: borrow SmtpContext,
+    wire: borrow mut Wire,
+    s: borrow mut Session,
+    r: borrow mut CommandReader,
+    byUid: bool,
+    moving: bool,
+) -> Result<u8, Problem> {
+    var set = SequenceSet.create();
+    parsed(r.sequenceSet(mut set))?;
+    let m = parsed(r.mailbox())?;
+    parsed(r.finish())?;
+    if (moving && s.readOnly) {
+        return tagged(s, "NO", "[READ-ONLY] The mailbox is read-only");
+    }
+    let done = if (moving) "MOVE completed" else "COPY completed";
+    var uids = UidSet.create();
+    if (!mem(selectUids(s, set, byUid, mut uids))?) {
+        return tagged(s, "BAD", "Invalid message sequence number");
+    }
+    var name = String.create();
+    if (!nameOf(r, m, mut name)?) {
+        return tagged(s, "NO", "[TRYCREATE] No such mailbox");
+    }
+    var boxes = MailboxList.create();
+    match (await ctx.store.findMailbox(s.userId, name.view(), mut boxes)) {
+        Ok(true) => {}
+        Ok(false) => { return tagged(s, "NO", "[TRYCREATE] No such mailbox"); }
+        Err(_) => { return unavailable(s); }
+    }
+    // A MOVE to the selected mailbox itself gives the messages new UIDs (RFC 6851 does not forbid it; Dovecot does
+    // the same): COPYUID, the old ones' EXPUNGE, and the new ones' EXISTS.
+    let target = boxes.id(0);
+    if (uids.isEmpty()) {
+        return tagged(s, "OK", done);
+    }
+    var result = CopyResult.create();
+    match (await ctx.store.copy(s.userId, s.mailboxId, target, uids, moving, mut result)) {
+        Ok() => {}
+        Err(_) => { return unavailable(s); }
+    }
+    var code = Vector<u8>.create();
+    mem(copyUid(result, mut code))?;
+    if (!moving) {
+        mem(startTagged(s, "OK"))?;
+        mem(s.tail.extend(code.view()))?;
+        mem(endTagged(s, done))?;
+        return Ok(CONTINUE);
+    }
+    // RFC 6851: COPYUID in an untagged OK, then the expunges, then the tagged OK.
+    var out = Vector<u8>.create();
+    if (code.length > 0) {
+        mem(out.extend("* OK ".bytes()))?;
+        mem(out.extend(code.view()))?;
+        mem(out.extend("Moved\r\n".bytes()))?;
+    }
+    for (u in result.source.view()) {
+        s.snapshot.markGone(checkedTruncate<u32>(u) ?? 0);
+    }
+    mem(announceGone(s, mut out))?;
+    io(wire.send(out.view()))?;
+    return tagged(s, "OK", done);
+}
+
+/// `[COPYUID uidvalidity source target] ` (RFC 4315), or nothing when nothing was copied.
+fn copyUid(result: borrow CopyResult, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    if (result.source.length == 0) {
+        return Ok();
+    }
+    var source = Vector<u32>.create();
+    var target = Vector<u32>.create();
+    for (i in 0..result.source.length) {
+        source.push(checkedTruncate<u32>(result.source[i]) ?? 0)?;
+        target.push(checkedTruncate<u32>(result.target[i]) ?? 0)?;
+    }
+    out.extend("[COPYUID ".bytes())?;
+    writeNumber(out, truncate<u64>(result.uidValidity))?;
+    out.push(0x20)?;
+    writeNumberSet(out, source.view())?;
+    out.push(0x20)?;
+    writeNumberSet(out, target.view())?;
+    return out.extend("] ".bytes());
+}
+
+// ---- EXPUNGE, CLOSE, UNSELECT ----
+
+async fn expunge(
+    ctx: borrow SmtpContext,
+    wire: borrow mut Wire,
+    s: borrow mut Session,
+    r: borrow mut CommandReader,
+    byUid: bool,
+) -> Result<u8, Problem> {
+    var uids = UidSet.create();
+    if (byUid) {
+        var set = SequenceSet.create();
+        parsed(r.sequenceSet(mut set))?;
+        parsed(r.finish())?;
+        mem(selectUids(s, set, true, mut uids))?;
+    } else {
+        parsed(r.finish())?;
+    }
+    if (s.readOnly) {
+        return tagged(s, "NO", "[READ-ONLY] The mailbox is read-only");
+    }
+    var gone = Vector<i64>.create();
+    if (byUid) {
+        match (await ctx.store.expungeUids(s.userId, s.mailboxId, uids, mut gone)) {
+            Ok() => {}
+            Err(_) => { return unavailable(s); }
+        }
+    } else {
+        match (await ctx.store.expunge(s.userId, s.mailboxId, mut gone)) {
+            Ok() => {}
+            Err(_) => { return unavailable(s); }
+        }
+    }
+    for (u in gone.view()) {
+        s.snapshot.markGone(checkedTruncate<u32>(u) ?? 0);
+    }
+    var out = Vector<u8>.create();
+    mem(announceGone(s, mut out))?;
+    io(wire.send(out.view()))?;
+    return tagged(s, "OK", if (byUid) "UID EXPUNGE completed" else "EXPUNGE completed");
+}
+
+/// CLOSE (expunging silently when read-write) or UNSELECT (RFC 3691).
+async fn close(
+    ctx: borrow SmtpContext,
+    s: borrow mut Session,
+    r: borrow mut CommandReader,
+    expunging: bool,
+) -> Result<u8, Problem> {
+    parsed(r.finish())?;
+    if (expunging && !s.readOnly) {
+        var gone = Vector<i64>.create();
+        match (await ctx.store.expunge(s.userId, s.mailboxId, mut gone)) {
+            Ok() => {}
+            Err(_) => {}
+        }
+    }
+    deselect(s);
+    return tagged(s, "OK", if (expunging) "CLOSE completed" else "UNSELECT completed");
+}
+
+// ---- IDLE ----
+
+/// IDLE (RFC 2177): `+ idling`, changes as they happen, until `DONE`. It waits for whichever comes first: the client's
+/// line, or the notify bus's raise for the selected mailbox; a raise runs `sync`, which sends what the client has not
+/// been told. Every `IDLE_REFRESH` it syncs anyway. The autologout timer starts again with each IDLE.
+async fn idle(
+    ctx: borrow SmtpContext,
+    wire: borrow mut Wire,
+    s: borrow mut Session,
+    r: borrow mut CommandReader,
+) -> Result<u8, Problem> {
+    parsed(r.finish())?;
+    io(wire.send("+ idling\r\n".bytes()))?;
+    let started = Clock.unixMillis();
+    var line = Vector<u8>.create();
+    loop {
+        if (s.state == SELECTED) {
+            io(await sync(ctx, wire, s, true))?;
+        }
+        // Everything out before waiting, so a raise never stops the read in the middle of a write.
+        io(await wire.flush())?;
+        let woke = match (borrow s.watch) {
+            Some(w) => await waitIdle(wire, mut line, w),
+            null => await readIdle(wire, mut line),
+        };
+        match (woke) {
+            Ok(true) => {
+                if (line.view().equalsIgnoreAsciiCase("DONE".bytes())) {
+                    return tagged(s, "OK", "IDLE terminated");
+                }
+                return tagged(s, "BAD", "Expected DONE");
+            }
+            Ok(false) => {}
+            Err(WireError.Timeout) => {
+                if (Clock.unixMillis() - started >= truncate<i64>(AUTOLOGOUT)) {
+                    s.tail.clear();
+                    mem(s.tail.extend("* BYE Autologout; idle for too long\r\n".bytes()))?;
+                    return Ok(ENDED);
+                }
+            }
+            Err(WireError.TooLong) => {
+                s.tail.clear();
+                mem(s.tail.extend("* BYE Line too long\r\n".bytes()))?;
+                return Ok(ENDED);
+            }
+            Err(e) => { return Err(Problem.Wire(e)); }
+        }
+    }
+}
+
+/// A line from the client within `IDLE_REFRESH` (true), as a read with no watch.
+async fn readIdle(wire: borrow mut Wire, line: borrow mut Vector<u8>) -> Result<bool, WireError> {
+    await wire.readLineWithin(line, 1024, IDLE_REFRESH)?;
+    return Ok(true);
+}
+
+/// The client's line (true) or the watch's raise (false), whichever comes first; `Timeout` after `IDLE_REFRESH` with
+/// neither. The loser is cancelled: a read stopped that way, plain or TLS, consumed nothing it did not keep (as a
+/// timed-out one), and a line it finished as the raise came is still taken.
+async fn waitIdle(wire: borrow mut Wire, line: borrow mut Vector<u8>, watch: borrow Watch) -> Result<bool, WireError> {
+    let raced: Result<Raced<bool>, WireError> = await Async.race(
+        async () => await readIdle(wire, line),
+        async () => {
+            match (await watch.changed()) {
+                Ok() => { return Ok(false); }
+                Err(_) => { return Err(WireError.Io); }
+            }
+        },
+    );
+    let r = raced?;
+    if (r.value) {
+        return Ok(true);
+    }
+    return match (r.other) {
+        Some(read) => Ok(read),
+        null => Ok(false),
+    };
+}

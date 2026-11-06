@@ -1,0 +1,25 @@
+[package]
+name = "mailserver"
+version = "0.1.0"
+kind = "executable"
+
+[dependencies]
+msmtp = { path = "pkgs/msmtp" }
+mimap = { path = "pkgs/mimap" }
+mstore = { path = "pkgs/mstore" }
+mdns = { path = "pkgs/mdns" }
+mscan = { path = "pkgs/mscan" }
+msieve = { path = "pkgs/msieve" }
+mqueue = { path = "pkgs/mqueue" }
+mweb = { path = "pkgs/mweb" }
+mhttp = { path = "pkgs/mhttp" }
+mmime = { path = "pkgs/mmime" }
+mpim = { path = "pkgs/mpim" }
+mxml = { path = "pkgs/mxml" }
+macme = { path = "pkgs/macme" }
+sha256 = { path = "../../CeeSafeLibs/sha256" }
+postgres = { path = "../PostgresClient" }
+tls = { path = "../../CeeSafeLibs/tls" }
+bcrypt = { path = "../../CeeSafeLibs/bcrypt" }
+pkey = { path = "../../CeeSafeLibs/pkey" }
+encoding = { path = "../../CeeSafeLibs/encoding" }

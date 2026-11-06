@@ -1,0 +1,218 @@
+// Body text for SEARCH: transfer decoding, charsets, HTML, the cap, the walk over parts and the matcher. Expected
+// values come from Python (base64.b64decode, binascii.a2b_qp, bytes.decode, html.unescape) unless a comment says the
+// behaviour is a documented choice of ours. The corpus differential is tools/body-differential.py.
+
+fn text(bytes: Slice<u8>) -> String {
+    var s = String.create();
+    s.append(StringView.fromUtf8(bytes)!)!;
+    return s;
+}
+
+fn isText(got: Slice<u8>, want: StringView) -> Result<void, TestFailure> {
+    let same = match (StringView.fromUtf8(got)) {
+        Some(g) => g == want,
+        null => false,
+    };
+    if (!same) {
+        Console.writeErrorLine(text(got).view());
+    }
+    return Check.isTrue(same, want);
+}
+
+/// A leaf part's text, from its header block and body.
+fn partText(header: StringView, body: Slice<u8>, limit: usize) -> Vector<u8> {
+    var out = Vector<u8>.create();
+    appendPartText(header.bytes(), body, true, limit, mut out)!;
+    return out;
+}
+
+fn transfer(encoding: StringView, body: StringView) -> Vector<u8> {
+    var out = Vector<u8>.create();
+    decodeTransfer(encoding.bytes(), body.bytes(), SEARCH_TEXT_LIMIT, mut out)!;
+    return out;
+}
+
+@test
+fn decodesBase64Leniently() -> Result<void, TestFailure> {
+    // Line breaks and garbage are skipped (Python: b'Hello, world').
+    isText(transfer("base64", "SGVs\r\nbG8s!!IHdv*cmxk\r\n").view(), "Hello, world")?;
+    isText(transfer("BASE64", "  SGVsbG8=\r\n").view(), "Hello")?;
+    // Missing padding, and a last lone digit dropped.
+    isText(transfer("base64", "YWI").view(), "ab")?;
+    isText(transfer("base64", "YWJjZ").view(), "abc")?;
+    // Ours, as Dovecot: decoding goes on after padding (Python 3.9 stops at it and gives "ab").
+    return isText(transfer("base64", "YWI=YWJj").view(), "ababc");
+}
+
+@test
+fn decodesQuotedPrintable() -> Result<void, TestFailure> {
+    // Lower-case hex and soft breaks (Python a2b_qp: "café au lait==fin").
+    isText(transfer("quoted-printable", "caf=c3=a9 au=\r\n lait=3D=3d=\r\nfin=").view(), "café au lait==fin")?;
+    // RFC 2045 §6.7: whitespace at the end of a line is dropped, also before a soft break (a2b_qp keeps it).
+    isText(transfer("Quoted-Printable", "a  \r\nb =  \r\nc\t\nd").view(), "a\r\nb c\nd")?;
+    // A malformed `=` stays.
+    isText(transfer("quoted-printable", "50=% =ZZ =4").view(), "50=% =ZZ =4")?;
+    // Other encodings are copied.
+    return isText(transfer("8bit", "as =3D is").view(), "as =3D is");
+}
+
+@test
+fn convertsCharsets() -> Result<void, TestFailure> {
+    let latin = [0x63u8, 0x61, 0x66, 0xe9];
+    isText(partText("Content-Type: text/plain; charset=ISO-8859-1\r\n\r\n", latin[..], 100).view(), "café")?;
+    // Python: b'\x93hi\x94 \x80'.decode('windows-1252') == '“hi” €'.
+    let cp1252 = [0x93u8, 0x68, 0x69, 0x94, 0x20, 0x80];
+    isText(
+        partText("Content-Type: text/plain; charset=\"windows-1252\"\r\n\r\n", cp1252[..], 100).view(),
+        "\u{201c}hi\u{201d} \u{20ac}",
+    )?;
+    isText(partText("Content-Type: text/plain; charset=utf-8\r\n\r\n", "été".bytes(), 100).view(), "été")?;
+    // Base64 of Latin-1 (Python: base64.b64encode('Grüße aus Köln\n'.encode('iso-8859-1'))).
+    isText(
+        partText(
+            "Content-Type: TEXT/PLAIN;\r\n charset=iso-8859-1\r\nContent-Transfer-Encoding: Base64\r\n\r\n",
+            "R3L832Ug\r\nYXVzIEv2bG4K".bytes(),
+            100,
+        ).view(),
+        "Grüße aus Köln\n",
+    )?;
+    // An unknown charset: UTF-8 if the bytes are, else Latin-1. No charset is US-ASCII, read as UTF-8 with
+    // U+FFFD for what is not.
+    isText(partText("Content-Type: text/plain; charset=x-unknown\r\n\r\n", latin[..], 100).view(), "café")?;
+    isText(partText("Content-Type: text/plain; charset=x-unknown\r\n\r\n", "été".bytes(), 100).view(), "été")?;
+    return isText(partText("Subject: no type\r\n\r\n", latin[..], 100).view(), "caf\u{fffd}");
+}
+
+@test
+fn skipsPartsThatAreNotText() -> Result<void, TestFailure> {
+    var out = Vector<u8>.create();
+    let r = appendPartText(
+        "Content-Type: image/png\r\nContent-Transfer-Encoding: base64\r\n\r\n".bytes(),
+        "iVBORw0KGgo=".bytes(),
+        true,
+        100,
+        mut out,
+    )!;
+    let skipped = match (r) {
+        PartText.Skipped => true,
+        _ => false,
+    };
+    return Check.isTrue(skipped && out.length == 0, "an image is skipped");
+}
+
+@test
+fn stripsHtml() -> Result<void, TestFailure> {
+    var out = Vector<u8>.create();
+    let page =
+        "<p>Fish &amp; chips</p><p>&lt;b&gt; &quot;x&quot;&nbsp;y &#233;&#x20AC;</p><style>p{}</style><!-- c -->end";
+    appendHtmlText(page.bytes(), mut out)!;
+    // html.unescape gives the same text but U+00A0 for &nbsp;, which we make a plain space.
+    isText(out.view(), "Fish & chips <b> \"x\" y é€ end")?;
+    out.clear();
+    appendHtmlText("a < b &unknown; &#0; <b>bo</b>ld<br>x<SCRIPT>if (a<b) x();</script>y".bytes(), mut out)!;
+    isText(out.view(), "a < b &unknown; \u{fffd} bold xy")?;
+    // A text/html part is stripped after its transfer encoding and charset are undone.
+    return isText(
+        partText(
+            "Content-Type: text/html; charset=iso-8859-1\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n",
+            "<div>Caf=E9 &amp;=\r\n th=E9</div>".bytes(),
+            100,
+        ).view(),
+        "Café & thé ",
+    );
+}
+
+@test
+fn capsTheText() -> Result<void, TestFailure> {
+    // 50 é: 100 bytes of UTF-8. A cap of 9 bytes keeps four é (a character is never split).
+    var body = Vector<u8>.create();
+    for (k in 0..50) {
+        body.extend("é".bytes())!;
+    }
+    var out = Vector<u8>.create();
+    let r = appendPartText("Content-Type: text/plain; charset=utf-8\r\n\r\n".bytes(), body.view(), true, 9, mut out)!;
+    let cut = match (r) {
+        PartText.Cut => true,
+        _ => false,
+    };
+    Check.isTrue(cut && out.length == 8, "cut at a character boundary")?;
+    // Exactly at the cap is whole.
+    out.clear();
+    let w = appendPartText("\r\n".bytes(), body.view(), true, 100, mut out)!;
+    let whole = match (w) {
+        PartText.Whole => true,
+        _ => false,
+    };
+    Check.isTrue(whole && out.length == 100, "exactly the cap")?;
+    // Base64 is decoded only up to the cap, and the walk stops there.
+    let message = "Content-Transfer-Encoding: base64\r\n\r\nYWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXo=\r\n";
+    var meta = metaOf(message);
+    out.clear();
+    let all = appendSearchText(message.bytes(), meta, false, 10, mut out)!;
+    Check.isTrue(!all, "the walk says it was cut")?;
+    return isText(out.view(), "abcdefghij");
+}
+
+fn metaOf(message: StringView) -> MessageMeta {
+    var scanner = MimeScanner.create();
+    scanner.feed(message.bytes())!;
+    var index = MessageIndex.create();
+    scanner.finish(mut index)!;
+    var renderer = Renderer.create();
+    var stored = Vector<u8>.create();
+    encodeMeta(index, mut renderer, mut stored)!;
+    var meta = MessageMeta.create();
+    if (!meta.read(stored.view())!) {
+        Console.writeErrorLine("the meta value did not read back");
+        Process.exit(1);
+    }
+    return meta;
+}
+
+@test
+fn walksEveryTextPart() -> Result<void, TestFailure> {
+    let message =
+        "Subject: =?utf-8?q?outer_=C3=A9?=\r\nContent-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\nfirst=20part\r\n--b\r\nContent-Type: image/gif\r\nContent-Transfer-Encoding: base64\r\n\r\nR0lGODlh\r\n--b\r\nContent-Type: message/rfc822\r\n\r\nFrom: =?iso-8859-1?q?Andr=E9?= <a@b.example>\r\nSubject: inner\r\nContent-Type: text/html\r\n\r\n<p>inner &amp; body</p>\r\n--b--\r\n";
+    var meta = metaOf(message);
+    var out = Vector<u8>.create();
+    Check.isTrue(appendSearchText(message.bytes(), meta, false, SEARCH_TEXT_LIMIT, mut out)!, "all fit")?;
+    isText(out.view(), "first part\nFrom: André <a@b.example>\nSubject: inner\nContent-Type: text/html\ninner & body \n")?;
+    out.clear();
+    appendSearchText(message.bytes(), meta, true, SEARCH_TEXT_LIMIT, mut out)!;
+    Check.isTrue(out.view().startsWith("Subject: outer é\nContent-Type: multipart/mixed; boundary=b\nfirst part\n".bytes()), "TEXT")?;
+    // One part by its index: the image is skipped.
+    out.clear();
+    let r = appendLeafText(message.bytes(), meta, 2, SEARCH_TEXT_LIMIT, mut out)!;
+    let skipped = match (r) {
+        PartText.Skipped => true,
+        _ => false,
+    };
+    return Check.isTrue(skipped && out.length == 0, "the image");
+}
+
+@test
+fn decodesNamedFields() -> Result<void, TestFailure> {
+    let block = "To: a@b.example\r\nSubject: =?utf-8?b?w6l0w6k=?=\r\nTO: =?iso-8859-1?q?Andr=E9?=\r\n <c@d.example>\r\n\r\n";
+    var out = Vector<u8>.create();
+    let n = appendHeaderValues(block.bytes(), "to", mut out)!;
+    Check.isTrue(n == 2, "two To fields")?;
+    isText(out.view(), "a@b.example\nAndré <c@d.example>")?;
+    out.clear();
+    Check.isTrue(appendHeaderValues(block.bytes(), "Cc", mut out)! == 0 && out.length == 0, "no Cc")?;
+    appendHeaderValues(block.bytes(), "SUBJECT", mut out)!;
+    return isText(out.view(), "été");
+}
+
+@test
+fn matchesIgnoringCase() -> Result<void, TestFailure> {
+    let hay = "Grüße aus KÖLN, été À Paris".bytes();
+    Check.isTrue(containsFolded(hay, "köln".bytes()), "Latin-1 capitals")?;
+    Check.isTrue(containsFolded(hay, "ÉTÉ à".bytes()), "Latin-1 small to capital")?;
+    Check.isTrue(containsFolded(hay, "GRÜSSE".bytes()) == false, "no ß folding")?;
+    Check.isTrue(containsFolded(hay, "paris".bytes()), "ASCII")?;
+    Check.isTrue(containsFolded(hay, "".bytes()), "empty")?;
+    Check.isTrue(!containsFolded(hay, "Pariss".bytes()), "longer")?;
+    // × (U+00D7) and ÷ (U+00F7) are not letters.
+    Check.isTrue(!containsFolded("×".bytes(), "÷".bytes()), "not letters")?;
+    return Check.isTrue(!containsFolded("ete".bytes(), "été".bytes()), "accents count");
+}

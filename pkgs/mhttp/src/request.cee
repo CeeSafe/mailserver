@@ -1,0 +1,567 @@
+// HTTP/1.1 requests (RFC 9112): the request line, header fields, and a body by Content-Length or chunked, with
+// limits on each. Parsing a line is a pure function; `readRequest` drives it from a connection.
+
+import msmtp.Wire;
+import msmtp.WireError;
+
+/// The longest request line or header line.
+const MAX_HEAD_LINE: usize = 8192;
+/// The most header fields, and the most bytes of them in all.
+const MAX_HEADERS: usize = 100;
+const MAX_HEAD_BYTES: usize = 65536;
+
+/// Why a request could not be read. Each but `Closed` and `Wire` has a status to answer with before closing.
+public enum HttpError {
+    /// The connection ended (or idled out) between requests: nothing to answer.
+    Closed,
+    /// 400
+    BadRequest,
+    /// 413
+    TooLarge,
+    /// 431
+    HeadersTooLarge,
+    /// 501: a transfer coding other than chunked.
+    NotImplemented,
+    /// 505
+    BadVersion,
+    /// The connection failed mid-request.
+    Wire(WireError),
+    OutOfMemory,
+}
+
+/// The status a reading error is answered with, or 0 when there is nothing to answer.
+public fn statusOf(e: HttpError) -> u16 => match (e) {
+    HttpError.BadRequest => 400,
+    HttpError.TooLarge => 413,
+    HttpError.HeadersTooLarge => 431,
+    HttpError.NotImplemented => 501,
+    HttpError.BadVersion => 505,
+    HttpError.Wire(WireError.TooLong) => 431,
+    _ => 0,
+};
+
+@noncopy
+public struct Header {
+    name: String;
+    value: String;
+}
+
+/// Limits for reading requests.
+public struct RequestLimits {
+    /// The largest body.
+    public maxBody: usize;
+    /// The largest body for the groupware protocols, which upload messages and attachments (ActiveSync's SendMail,
+    /// EWS's CreateItem, a DAV PUT): paths under `/Microsoft-Server-ActiveSync`, `/EWS/` and `/dav/`.
+    public uploadBody: usize;
+    /// How long a connection may idle before its next request, and how long each read within a request may wait.
+    public idleMs: u64;
+    public readMs: u64;
+
+    public fn defaults() -> RequestLimits =>
+        RequestLimits { maxBody: 1048576, uploadBody: 52428800, idleMs: 30000, readMs: 15000 };
+
+    /// The largest body for a request to `path`.
+    public fn bodyFor(borrow this, path: StringView) -> usize =>
+        if (isUploadPath(path) && this.uploadBody > this.maxBody) this.uploadBody else this.maxBody;
+}
+
+/// Whether `path` is one where `RequestLimits.uploadBody` applies.
+public fn isUploadPath(path: StringView) -> bool {
+    let p = path.bytes();
+    return startsIgnoringCase(p, "/microsoft-server-activesync") || startsIgnoringCase(p, "/ews/") ||
+        startsIgnoringCase(p, "/dav/");
+}
+
+fn startsIgnoringCase(text: Slice<u8>, prefix: StringView) -> bool {
+    let b = prefix.bytes();
+    return text.length >= b.length && text[0..b.length].equalsIgnoreAsciiCase(b);
+}
+
+/// A request: method, target split into path and query, version, header fields and body.
+@noncopy
+public struct Request {
+    public method: String;
+    /// The target's path, still percent-encoded.
+    public path: String;
+    /// The target's query, without its `?`.
+    public query: String;
+    /// 10 or 11.
+    public version: u8;
+    headers: Vector<Header>;
+    headBytes: usize;
+    public body: Vector<u8>;
+    /// The client's address, as msmtp's `peerBytes` gives it (zeros when unknown); set by the listener, for the
+    /// failed-login guard.
+    public peer: [u8; 16];
+
+    public fn create() -> Request => Request {
+        method: String.create(),
+        path: String.create(),
+        query: String.create(),
+        version: 11,
+        headers: Vector<Header>.create(),
+        headBytes: 0,
+        body: Vector<u8>.create(),
+        peer: [0u8; 16],
+    };
+
+    public fn reset(borrow mut this) {
+        this.method.clear();
+        this.path.clear();
+        this.query.clear();
+        this.version = 11;
+        this.headers.clear();
+        this.headBytes = 0;
+        this.body.clear();
+    }
+
+    /// The first field named `name` (any case), with surrounding white space removed.
+    public fn header(borrow this, name: StringView) -> borrow(this) String? {
+        for (i in 0..this.headers.length) {
+            if (this.headers[i].name.view().equalsIgnoreAsciiCase(name)) {
+                return borrow this.headers[i].value;
+            }
+        }
+        return null;
+    }
+
+    /// Whether the field `name` is present and its value is `value` (any case).
+    public fn headerIs(borrow this, name: StringView, value: StringView) -> bool => match (this.header(name)) {
+        Some(v) => v.view().equalsIgnoreAsciiCase(value),
+        null => false,
+    };
+
+    /// Whether the comma-separated field `name` lists `token` (any case).
+    public fn headerHas(borrow this, name: StringView, token: StringView) -> bool => match (this.header(name)) {
+        Some(v) => hasToken(v.view(), token),
+        null => false,
+    };
+
+    /// Whether the connection stays open after the response (RFC 9112 §9.3).
+    public fn keepAlive(borrow this) -> bool {
+        if (this.version == 10) {
+            return this.headerHas("Connection", "keep-alive");
+        }
+        return !this.headerHas("Connection", "close");
+    }
+
+    /// The Host field without a port, lowercased into `into`, and without a final dot.
+    public fn host(borrow this, into: borrow mut String) -> Result<void, AllocError> {
+        into.clear();
+        let found = match (this.header("Host")) {
+            Some(v) => v.view(),
+            null => "",
+        };
+        let field = found.trim();
+        if (field.startsWith("[")) {
+            // An IPv6 literal: keep it whole.
+            return into.append(field);
+        }
+        let colon = field.indexOf(":") ?? field.length;
+        let named = field[0..colon];
+        let h = if (named.endsWith(".")) named[0..named.length - 1] else named;
+        for (c in h.bytes()) {
+            let lower: [u8; 1] = [if (c >= 0x41 && c <= 0x5a) c + 0x20 else c];
+            into.append(StringView.fromUtf8(lower[..]) ?? "")?;
+        }
+        return Ok();
+    }
+
+    public fn isMethod(borrow this, method: StringView) -> bool => this.method.view() == method;
+
+    /// The query parameter `name`, decoded (`+` is a space), into `into`. False when it is absent.
+    public fn param(borrow this, name: StringView, into: borrow mut String) -> Result<bool, AllocError> {
+        into.clear();
+        for (pair in this.query.view().split("&")) {
+            let eq = pair.indexOf("=") ?? pair.length;
+            let key = pair[0..eq];
+            let value = if (eq < pair.length) pair[eq + 1..] else "";
+            var decodedKey = String.create();
+            percentDecode(key, true, mut decodedKey)?;
+            if (decodedKey.view() == name) {
+                percentDecode(value, true, into)?;
+                return Ok(true);
+            }
+        }
+        return Ok(false);
+    }
+
+    /// Parses the request line `GET /path?query HTTP/1.1`.
+    public fn parseRequestLine(borrow mut this, line: Slice<u8>) -> Result<void, HttpError> {
+        let text = match (StringView.fromUtf8(line)) {
+            Some(t) => t,
+            null => { return Err(HttpError.BadRequest); }
+        };
+        let sp1 = match (text.indexOf(" ")) {
+            Some(i) => i,
+            null => { return Err(HttpError.BadRequest); }
+        };
+        let rest = text[sp1 + 1..];
+        let sp2 = match (rest.lastIndexOf(" ")) {
+            Some(i) => i,
+            null => { return Err(HttpError.BadRequest); }
+        };
+        let method = text[0..sp1];
+        let target = rest[0..sp2];
+        let version = rest[sp2 + 1..];
+        if (method.length == 0 || !isToken(method) || target.length == 0) {
+            return Err(HttpError.BadRequest);
+        }
+        if (version == "HTTP/1.1") {
+            this.version = 11;
+        } else if (version == "HTTP/1.0") {
+            this.version = 10;
+        } else if (version.startsWith("HTTP/")) {
+            return Err(HttpError.BadVersion);
+        } else {
+            return Err(HttpError.BadRequest);
+        }
+        // Origin form; an absolute form (to a proxy) keeps only its path.
+        let absolute = target.startsWith("http://") || target.startsWith("https://");
+        let slashes = if (absolute) (target.indexOf("//") ?? 0) + 2 else 0;
+        let afterScheme = target[slashes..];
+        let pathStart = if (absolute) afterScheme.indexOf("/") ?? afterScheme.length else 0;
+        let whole = afterScheme[pathStart..];
+        let origin = if (whole.length == 0) "/" else whole;
+        if (!origin.startsWith("/") && !(origin == "*")) {
+            return Err(HttpError.BadRequest);
+        }
+        for (c in origin.bytes()) {
+            if (c <= 0x20 || c >= 0x7f) {
+                return Err(HttpError.BadRequest);
+            }
+        }
+        let fragment = origin.indexOf("#") ?? origin.length;
+        let t = origin[0..fragment];
+        let q = t.indexOf("?") ?? t.length;
+        let path = t[0..q];
+        let query = if (q < t.length) t[q + 1..] else "";
+        oom(this.method.append(method))?;
+        oom(this.path.append(path))?;
+        return oom(this.query.append(query));
+    }
+
+    /// Parses one header field line `Name: value`. Folded lines (obsolete) and white space before the colon are
+    /// refused (§5.1, §5.2).
+    public fn parseHeaderLine(borrow mut this, line: Slice<u8>) -> Result<void, HttpError> {
+        this.headBytes += line.length + 2;
+        if (this.headers.length >= MAX_HEADERS || this.headBytes > MAX_HEAD_BYTES) {
+            return Err(HttpError.HeadersTooLarge);
+        }
+        if (line.length > 0 && (line[0] == 0x20 || line[0] == 0x09)) {
+            return Err(HttpError.BadRequest);
+        }
+        let text = match (StringView.fromUtf8(line)) {
+            Some(t) => t,
+            null => { return Err(HttpError.BadRequest); }
+        };
+        let colon = match (text.indexOf(":")) {
+            Some(i) => i,
+            null => { return Err(HttpError.BadRequest); }
+        };
+        let name = text[0..colon];
+        if (name.length == 0 || !isToken(name)) {
+            return Err(HttpError.BadRequest);
+        }
+        let value = text[colon + 1..].trim();
+        for (c in value.bytes()) {
+            if ((c < 0x20 && c != 0x09) || c == 0x7f) {
+                return Err(HttpError.BadRequest);
+            }
+        }
+        var h = Header { name: String.create(), value: String.create() };
+        oom(h.name.append(name))?;
+        oom(h.value.append(value))?;
+        return oom(this.headers.push(h));
+    }
+
+    /// How the body is framed, from the header fields: by length, chunked, or none.
+    public fn framing(borrow this) -> Result<Framing, HttpError> {
+        var length: u64? = null;
+        var chunked = false;
+        for (h in this.headers.view()) {
+            let name = h.name.view();
+            if (name.equalsIgnoreAsciiCase("Transfer-Encoding")) {
+                // Only `chunked`, last and alone: anything else is a coding we do not do.
+                if (!h.value.view().equalsIgnoreAsciiCase("chunked") || chunked) {
+                    return Err(HttpError.NotImplemented);
+                }
+                chunked = true;
+            } else if (name.equalsIgnoreAsciiCase("Content-Length")) {
+                let v = h.value.view();
+                if (v.length == 0 || v.length > 18 || !allDigits(v)) {
+                    return Err(HttpError.BadRequest);
+                }
+                let n = v.parseInt<u64>() ?? 0;
+                match (length) {
+                    Some(old) => {
+                        if (old != n) {
+                            return Err(HttpError.BadRequest);
+                        }
+                    }
+                    null => {}
+                }
+                length = n;
+            }
+        }
+        if (chunked) {
+            // Both is a smuggling attempt (§6.1): refuse it rather than pick one.
+            if (length != null) {
+                return Err(HttpError.BadRequest);
+            }
+            return Ok(Framing.Chunked);
+        }
+        return match (length) {
+            Some(n) => Ok(Framing.Length(n)),
+            null => Ok(Framing.None),
+        };
+    }
+}
+
+/// How a message's body is delimited.
+public enum Framing {
+    None,
+    Length(u64),
+    Chunked,
+}
+
+/// Reads the next request from `wire` into `request`: `Closed` when the client ends the connection, or idles past
+/// `limits.idleMs`, before sending one. A client that sent `Expect: 100-continue` is told to go on before its body is
+/// read.
+public async fn readRequest(
+    wire: borrow mut Wire,
+    request: borrow mut Request,
+    limits: RequestLimits,
+) -> Result<void, HttpError> {
+    request.reset();
+    var line = Vector<u8>.create();
+    // RFC 9112 §2.2: empty lines before a request line are ignored (a few).
+    var blanks = 0;
+    loop {
+        match (await wire.readLineWithin(mut line, MAX_HEAD_LINE, limits.idleMs)) {
+            Ok() => {}
+            Err(WireError.TooLong) => { return Err(HttpError.HeadersTooLarge); }
+            Err(WireError.OutOfMemory) => { return Err(HttpError.OutOfMemory); }
+            Err(_) => { return Err(HttpError.Closed); }
+        }
+        if (line.length > 0) {
+            break;
+        }
+        blanks += 1;
+        if (blanks > 4) {
+            return Err(HttpError.BadRequest);
+        }
+    }
+    request.parseRequestLine(line.view())?;
+    loop {
+        match (await wire.readLineWithin(mut line, MAX_HEAD_LINE, limits.readMs)) {
+            Ok() => {}
+            Err(WireError.TooLong) => { return Err(HttpError.HeadersTooLarge); }
+            Err(WireError.OutOfMemory) => { return Err(HttpError.OutOfMemory); }
+            Err(e) => { return Err(HttpError.Wire(e)); }
+        }
+        if (line.length == 0) {
+            break;
+        }
+        request.parseHeaderLine(line.view())?;
+    }
+    if (request.version == 11 && request.header("Host") == null) {
+        return Err(HttpError.BadRequest);
+    }
+    let framing = request.framing()?;
+    let expects = request.headerIs("Expect", "100-continue");
+    match (framing) {
+        Framing.None => { return Ok(); }
+        Framing.Length(n) => {
+            if (n > limits.bodyFor(request.path.view()) as u64) {
+                return Err(HttpError.TooLarge);
+            }
+            if (expects) {
+                match (await continueBody(wire)) {
+                    Ok() => {}
+                    Err(e) => { return Err(e); }
+                }
+            }
+            return wireResult(await wire.readExact(truncate<usize>(n), mut request.body, limits.readMs));
+        }
+        Framing.Chunked => {
+            if (expects) {
+                match (await continueBody(wire)) {
+                    Ok() => {}
+                    Err(e) => { return Err(e); }
+                }
+            }
+            return await readChunked(wire, mut request.body, limits, limits.bodyFor(request.path.view()));
+        }
+    }
+}
+
+async fn continueBody(wire: borrow mut Wire) -> Result<void, HttpError> {
+    return wireResult(await wire.sendNow("HTTP/1.1 100 Continue\r\n\r\n".bytes()));
+}
+
+fn oom(r: Result<void, AllocError>) -> Result<void, HttpError> => match (r) {
+    Ok() => Ok(),
+    Err(_) => Err(HttpError.OutOfMemory),
+};
+
+fn wireResult(r: Result<void, WireError>) -> Result<void, HttpError> => match (r) {
+    Ok() => Ok(),
+    Err(WireError.OutOfMemory) => Err(HttpError.OutOfMemory),
+    Err(e) => Err(HttpError.Wire(e)),
+};
+
+/// A chunked body (§7.1): chunks of hex size, then trailer fields, which are read and dropped.
+async fn readChunked(
+    wire: borrow mut Wire,
+    body: borrow mut Vector<u8>,
+    limits: RequestLimits,
+    maxBody: usize,
+) -> Result<void, HttpError> {
+    var line = Vector<u8>.create();
+    loop {
+        wireResult(await wire.readLineWithin(mut line, MAX_HEAD_LINE, limits.readMs))?;
+        let size = match (chunkSize(line.view())) {
+            Some(n) => n,
+            null => { return Err(HttpError.BadRequest); }
+        };
+        if (size == 0) {
+            break;
+        }
+        if (body.length as u64 + size > maxBody as u64) {
+            return Err(HttpError.TooLarge);
+        }
+        wireResult(await wire.readExact(truncate<usize>(size), body, limits.readMs))?;
+        wireResult(await wire.readLineWithin(mut line, 0, limits.readMs))?;
+    }
+    var trailers: usize = 0;
+    loop {
+        wireResult(await wire.readLineWithin(mut line, MAX_HEAD_LINE, limits.readMs))?;
+        if (line.length == 0) {
+            return Ok();
+        }
+        trailers += 1;
+        if (trailers > MAX_HEADERS) {
+            return Err(HttpError.HeadersTooLarge);
+        }
+    }
+}
+
+/// A chunk-size line's size: hex digits, then perhaps `;` and extensions. Null when malformed or too big.
+public fn chunkSize(line: Slice<u8>) -> u64? {
+    var size: u64 = 0;
+    var digits = 0;
+    for (c in line) {
+        let d: u64 =
+            if (c >= 0x30 &&
+                c <= 0x39) (c - 0x30) as u64 else if (c >= 0x61 &&
+                c <= 0x66) (c - 0x57) as u64 else if (c >= 0x41 && c <= 0x46) (c - 0x37) as u64 else 16;
+        if (d == 16) {
+            if (c == 0x3b || c == 0x20 || c == 0x09) {
+                break;
+            }
+            return null;
+        }
+        digits += 1;
+        if (digits > 15) {
+            return null;
+        }
+        size = size * 16 + d;
+    }
+    if (digits == 0) {
+        return null;
+    }
+    return size;
+}
+
+/// RFC 9110 §5.6.2's token characters.
+fn isToken(text: StringView) -> bool {
+    for (c in text.bytes()) {
+        let ok = (c >= 0x30 && c <= 0x39) || (c >= 0x41 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a) || c == 0x21 ||
+            c == 0x23 || c == 0x24 || c == 0x25 || c == 0x26 || c == 0x27 || c == 0x2a || c == 0x2b || c == 0x2d ||
+            c == 0x2e || c == 0x5e || c == 0x5f || c == 0x60 || c == 0x7c || c == 0x7e;
+        if (!ok) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn allDigits(text: StringView) -> bool {
+    for (c in text.bytes()) {
+        if (c < 0x30 || c > 0x39) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Whether the comma-separated list `value` has `token` (any case).
+public fn hasToken(value: StringView, token: StringView) -> bool {
+    for (part in value.split(",")) {
+        if (part.trim().equalsIgnoreAsciiCase(token)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Percent-decodes `text` into `into`; with `plusIsSpace` (a query), `+` is a space. Bad escapes stay as they are,
+/// and so do decoded bytes that are not UTF-8 (as U+FFFD).
+public fn percentDecode(text: StringView, plusIsSpace: bool, into: borrow mut String) -> Result<void, AllocError> {
+    let bytes = text.bytes();
+    var out = Vector<u8>.create();
+    var at: usize = 0;
+    while (at < bytes.length) {
+        let c = bytes[at];
+        if (c == 0x25 && at + 2 < bytes.length) {
+            let hi = hexDigit(bytes[at + 1]);
+            let lo = hexDigit(bytes[at + 2]);
+            if (hi < 16 && lo < 16) {
+                out.push(hi * 16 + lo)?;
+                at += 3;
+                continue;
+            }
+        }
+        out.push(if (plusIsSpace && c == 0x2b) 0x20 else c)?;
+        at += 1;
+    }
+    return match (StringView.fromUtf8(out.view())) {
+        Some(t) => into.append(t),
+        null => into.append("\u{FFFD}"),
+    };
+}
+
+fn hexDigit(c: u8) -> u8 =>
+    if (c >= 0x30 &&
+        c <= 0x39) c - 0x30 else if (c >= 0x61 && c <= 0x66) c - 0x57 else if (c >= 0x41 && c <= 0x46) c - 0x37 else 16;
+
+/// The `index`th segment of a path (`/api/domains/7` has `api`, `domains` and `7`), or null past the end.
+public fn segment(path: StringView, index: usize) -> StringView? {
+    var i: usize = 0;
+    let trimmed = if (path.startsWith("/")) path[1..] else path;
+    if (trimmed.length == 0) {
+        return null;
+    }
+    for (part in trimmed.split("/")) {
+        if (i == index) {
+            return part;
+        }
+        i += 1;
+    }
+    return null;
+}
+
+/// How many segments a path has; a trailing slash does not add an empty one.
+public fn segmentCount(path: StringView) -> usize {
+    let rooted = if (path.startsWith("/")) path[1..] else path;
+    let trimmed = if (rooted.endsWith("/")) rooted[0..rooted.length - 1] else rooted;
+    if (trimmed.length == 0) {
+        return 0;
+    }
+    var n: usize = 0;
+    for (part in trimmed.split("/")) {
+        n += 1;
+    }
+    return n;
+}

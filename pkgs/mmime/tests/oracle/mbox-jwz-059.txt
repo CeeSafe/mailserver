@@ -1,0 +1,12 @@
+size 23515
+envelope ("25 Apr 1995 20:42:44 GMT" "Canninefate Settlements Dicovered: Aryan House Boats.....(Summer School)" (("Herr Professor dr S..........." NIL "heinwvm" "xs4all.nl")) (("Herr Professor dr S..........." NIL "heinwvm" "xs4all.nl")) (("Herr Professor dr S..........." NIL "heinwvm" "xs4all.nl")) NIL NIL NIL NIL "<3njms4$f42@news.xs4all.nl>")
+bodystructure (("text" "plain" ("charset" "iso-8859-1") NIL NIL "7bit" 35 1 NIL NIL NIL NIL) ("image" "gif" NIL NIL NIL "base64" 22454 NIL NIL NIL NIL) "mixed" ("boundary" "-------------------------------14692623421298") NIL NIL NIL)
+body (("text" "plain" ("charset" "iso-8859-1") NIL NIL "7bit" 35 1) ("image" "gif" NIL NIL NIL "base64" 22454) "mixed")
+section HEADER 682 bf71a4ff4bc5bba7eb1e9a4460053470ffebe4cabf4896345b3d9fcd12103152
+section TEXT 22833 72fef3a8c91b5f941b638509b0ef6224c45dca0dcaa5ba18f4d2a8d513719e75
+section HEADER.FIELDS 310 8552109402c9849c11cc0618e24717f09ea824e58d9d04aa97e963226f1a4e53
+section HEADER.FIELDS.NOT 374 05c932afe6a0208ea318f98f9ac69987db47962899289c53809426086a16f081
+section 1 35 6417feb0bc9e88c7eb9b8794a3169beefff28afdec5b9c0b305b4d596d35708f
+section 1.MIME 81 122427c2de98f2e5563bedd075747d7644f68007cd3e0c202dfb21259a1ee614
+section 2 22454 c30cfa6ed866b7a253a6946be255a23dae931651b959a793574efc5a1113e55b
+section 2.MIME 62 c43fed0f79b201666220c7589bed022f2901f2ca5390a4a67c38e9d7176746fc

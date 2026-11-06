@@ -1,0 +1,10 @@
+size 2293
+envelope ("Thu, 17 Apr 1997 15:03:44 -0700 (PDT)" "Re: Hey!" (("Jason Lawrence Weisberger" NIL "jweis" "why.bother.com")) (("Jason Lawrence Weisberger" NIL "jweis" "why.bother.com")) (("Jason Lawrence Weisberger" NIL "jweis" "why.bother.com")) (("Bob Lord" NIL "lord" "netscape.com")) NIL NIL "<3356A902.3F89787@netscape.com>" "<Pine.LNX.3.95.970417145937.5309P-100000@why.bother.com>")
+bodystructure (("TEXT" "PLAIN" ("charset" "US-ASCII") NIL NIL "7bit" 603 15 NIL NIL NIL NIL) "SIGNED" ("PROTOCOL" "application/x-pkcs7-signature" "MICALG" "sha1" "BOUNDARY" "------------ms2B7C383EE860EA977E7C30B4") NIL NIL NIL)
+body (("TEXT" "PLAIN" ("charset" "US-ASCII") NIL NIL "7bit" 603 15) "SIGNED")
+section HEADER 1336 24e9f096922b3a06ad067c690fe0d9bd57d96a43c3fd50791af989cd2c13bf8f
+section TEXT 957 99319f3bf8fe0c23133ba82981478c51267b9628f4f488df084bf8952f5f1fd7
+section HEADER.FIELDS 362 bfcbb50819311538b188b4c84a17fa9a876585b1f844e428d716c4c67c9e7571
+section HEADER.FIELDS.NOT 976 fa22e19b85e241397aba583720a124831ee8d226d8dc37762ff0457bae850035
+section 1 603 a44772ce68db80aa74309ba06568d5e0a990d5e06a584d483e99863dcca0abd4
+section 1.MIME 46 e0917e11d2e8bcd58d80ba1e647a49f0dbbf197d378a0dac0834b429bc70a802

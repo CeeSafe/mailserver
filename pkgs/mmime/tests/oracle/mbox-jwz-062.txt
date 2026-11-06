@@ -1,0 +1,12 @@
+size 100832
+envelope ("Sun, 02 Feb 92 19:38:26 EST" "Re: New richtext generation -- opinions?" (("Keith Moore" NIL "moore" "cs.utk.edu")) ((NIL NIL "moore" "cs.utk.edu")) (("Keith Moore" NIL "moore" "cs.utk.edu")) (("Nathaniel Borenstein" NIL "nsb" "thumper.bellcore.com")) ((NIL NIL "moore" "cs.utk.edu")) NIL "Your message of \"Sun, 02 Feb 92 11:36:45 EST.\"             <EdX1sRu0M2YtELdGAD@thumper.bellcore.com> " "<9202030038.AA22055@wilma.cs.utk.edu>")
+bodystructure (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 198 8 NIL NIL NIL NIL) ("image" "pbm" NIL NIL "picture of your message" "base64" 99522 NIL NIL NIL NIL) "mixed" ("boundary" "mumblefrotz") NIL NIL NIL)
+body (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 198 8) ("image" "pbm" NIL NIL "picture of your message" "base64" 99522) "mixed")
+section HEADER 871 0edf92ae61116a366664ed244e76f30829d6ee25e1a3ff4676fcf6e03b5da43d
+section TEXT 99961 1fd4df1f31721ca4d4298840f1fba6687a892bbb92eedb7dd4097a417ceca418
+section HEADER.FIELDS 306 716412c8268cc478bc7c02c95a3dff0cb4a8482aaf7c68d2a6ac63aaf60ce1c2
+section HEADER.FIELDS.NOT 567 4e37f6905d4abe17cd373f224a85dfade1be9210ec766dd2979efc89c35926ed
+section 1 198 e26812204b96402e37cc0d948f21c02617be5166aed8040754533870dd8bec04
+section 1.MIME 80 9ee7e840a008b1e201a8e09052163a0395802afef7464aa15c97d09aba4902a6
+section 2 99522 a5496359cfaaa88a79deac0f066cd41bb7b63c0b70e0e4b7ada4418d027db194
+section 2.MIME 108 bc1135abace39e8937220e976567742ce30a243749ad92d2dd5f8e82a1abd0a8

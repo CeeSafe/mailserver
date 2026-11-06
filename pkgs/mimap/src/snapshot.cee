@@ -1,0 +1,188 @@
+// The selected mailbox as this session knows it: its UIDs in sequence order, which is the mapping between sequence
+// numbers and UIDs, with the modseq of each message's flags as last reported. A message another session expunged
+// stays (marked gone) until the session may announce it with `* n EXPUNGE` (not during FETCH, STORE or SEARCH,
+// RFC 3501 §7.4.1).
+
+/// The system flags as mstore stores them (a different bit order from response.cee's `FLAG_*`).
+public const STORED_SEEN: u16 = 1;
+public const STORED_ANSWERED: u16 = 2;
+public const STORED_FLAGGED: u16 = 4;
+public const STORED_DELETED: u16 = 8;
+public const STORED_DRAFT: u16 = 16;
+
+/// Stored flag bits as response.cee's bits, for `writeFlagList`.
+public fn imapBits(stored: u16) -> u32 {
+    var bits: u32 = 0;
+    if (stored & STORED_ANSWERED != 0) {
+        bits = bits | FLAG_ANSWERED;
+    }
+    if (stored & STORED_FLAGGED != 0) {
+        bits = bits | FLAG_FLAGGED;
+    }
+    if (stored & STORED_DELETED != 0) {
+        bits = bits | FLAG_DELETED;
+    }
+    if (stored & STORED_SEEN != 0) {
+        bits = bits | FLAG_SEEN;
+    }
+    if (stored & STORED_DRAFT != 0) {
+        bits = bits | FLAG_DRAFT;
+    }
+    return bits;
+}
+
+/// A flag list from stored flags and space-separated keywords: `(\Seen $Label1)`.
+public fn writeStoredFlags(out: borrow mut Vector<u8>, stored: u16, keywords: Slice<u8>) -> Result<void, AllocError> {
+    let none = Vector<StringView>.create();
+    writeFlagList(out, imapBits(stored), none.view())?;
+    if (keywords.length == 0) {
+        return Ok();
+    }
+    // Put the keywords before the closing parenthesis.
+    out.pop();
+    if (out.length > 0 && out[out.length - 1] != 0x28) {
+        out.push(0x20)?;
+    }
+    out.extend(keywords)?;
+    return out.push(0x29);
+}
+
+@noncopy
+public struct Snapshot {
+    uids: Vector<u32>;
+    modseqs: Vector<i64>;
+    gone: Vector<bool>;
+    /// The mailbox's HIGHESTMODSEQ when the session last caught up.
+    public highestModseq: i64;
+    /// The message count the client was last told (EXISTS, less the EXPUNGEs since).
+    public announced: u32;
+
+    public fn create() -> Snapshot => Snapshot {
+        uids: Vector<u32>.create(),
+        modseqs: Vector<i64>.create(),
+        gone: Vector<bool>.create(),
+        highestModseq: 0,
+        announced: 0,
+    };
+
+    public fn clear(borrow mut this) {
+        this.uids.clear();
+        this.modseqs.clear();
+        this.gone.clear();
+        this.highestModseq = 0;
+        this.announced = 0;
+    }
+
+    /// Messages, the gone ones included: the highest sequence number.
+    public fn count(borrow this) -> u32 => truncate<u32>(this.uids.length);
+
+    /// The UID of sequence number `seq` (1-based, at most `count`).
+    public fn uidAt(borrow this, seq: u32) -> u32 => this.uids[(seq as usize) - 1];
+
+    public fn isGone(borrow this, seq: u32) -> bool => this.gone[(seq as usize) - 1];
+
+    public fn modseqAt(borrow this, seq: u32) -> i64 => this.modseqs[(seq as usize) - 1];
+
+    public fn setModseq(borrow mut this, seq: u32, modseq: i64) {
+        this.modseqs[(seq as usize) - 1] = modseq;
+    }
+
+    /// The highest UID, or 0.
+    public fn lastUid(borrow this) -> u32 => if (this.uids.length == 0) 0u32 else this.uids[this.uids.length - 1];
+
+    /// The sequence number of `uid`, gone or not.
+    public fn seqOf(borrow this, uid: u32) -> u32? {
+        var lo: usize = 0;
+        var hi = this.uids.length;
+        while (lo < hi) {
+            let mid = lo + (hi - lo) / 2;
+            let u = this.uids[mid];
+            if (u == uid) {
+                return truncate<u32>(mid + 1);
+            }
+            if (u < uid) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        return null;
+    }
+
+    /// Adds a new message at the end; false (and nothing added) unless its UID is above every other.
+    public fn push(borrow mut this, uid: u32, modseq: i64) -> Result<bool, AllocError> {
+        if (uid <= this.lastUid()) {
+            return Ok(false);
+        }
+        this.uids.push(uid)?;
+        this.modseqs.push(modseq)?;
+        this.gone.push(false)?;
+        return Ok(true);
+    }
+
+    /// Marks `uid` as expunged; false if it is not here.
+    public fn markGone(borrow mut this, uid: u32) -> bool {
+        match (this.seqOf(uid)) {
+            Some(seq) => {
+                this.gone[(seq as usize) - 1] = true;
+                return true;
+            }
+            null => { return false; }
+        }
+    }
+
+    /// Marks every message whose UID is not in `present` (ascending) as expunged, up to `upTo` (newer UIDs may be
+    /// missing from `present` only because they arrived after it was read).
+    public fn keepOnly(borrow mut this, present: Slice<u32>, upTo: u32) {
+        var j: usize = 0;
+        for (i in 0..this.uids.length) {
+            let uid = this.uids[i];
+            if (uid > upTo) {
+                break;
+            }
+            while (j < present.length && present[j] < uid) {
+                j += 1;
+            }
+            if (j >= present.length || present[j] != uid) {
+                this.gone[i] = true;
+            }
+        }
+    }
+
+    public fn hasGone(borrow this) -> bool {
+        for (g in this.gone.view()) {
+            if (g) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Removes the gone messages, giving the sequence numbers to announce in order: the highest first, so each
+    /// number is right when the client reads it.
+    public fn takeGone(borrow mut this, into: borrow mut Vector<u32>) -> Result<void, AllocError> {
+        into.clear();
+        var i = this.uids.length;
+        while (i > 0) {
+            i -= 1;
+            if (this.gone[i]) {
+                into.push(truncate<u32>(i + 1))?;
+            }
+        }
+        var out: usize = 0;
+        for (k in 0..this.uids.length) {
+            if (!this.gone[k]) {
+                this.uids[out] = this.uids[k];
+                this.modseqs[out] = this.modseqs[k];
+                this.gone[out] = false;
+                out += 1;
+            }
+        }
+        this.uids.truncate(out);
+        this.modseqs.truncate(out);
+        this.gone.truncate(out);
+        let n = truncate<u32>(into.length);
+        this.announced = if (this.announced > n) this.announced - n else 0;
+        return Ok();
+    }
+}

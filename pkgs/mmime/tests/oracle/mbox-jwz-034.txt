@@ -1,0 +1,10 @@
+size 12065
+envelope ("25 Apr 1995 23:25:47 GMT" "nylon feet by request - ind_111.jpg [1/1]" (("Ohm" NIL "ohm" "aksi.net")) (("Ohm" NIL "ohm" "aksi.net")) (("Ohm" NIL "ohm" "aksi.net")) NIL NIL NIL NIL "<3nk0dr$adp@wn.aksi.net>")
+bodystructure ("Image" "JPEG" NIL NIL NIL "x-uue" 11599 NIL NIL NIL NIL)
+body ("Image" "JPEG" NIL NIL NIL "x-uue" 11599)
+section HEADER 466 961bd76e1714332416e9a9f06543d493e9a3f0d76678b6000b2011f0f7892129
+section TEXT 11599 27488f705ab1dad22af8b1eb41e9321f6ad5a9594331f26b768823d6da076b44
+section HEADER.FIELDS 176 68469d864c1542267ea2496edbf64a1f6fa50af927896ced2a2a29fa382817df
+section HEADER.FIELDS.NOT 292 fe78f56849b42ffcaa47a6878af50566cbde586f867a7c33b59017e02f0bbc4f
+section 1 11599 27488f705ab1dad22af8b1eb41e9321f6ad5a9594331f26b768823d6da076b44
+section 1.MIME 466 961bd76e1714332416e9a9f06543d493e9a3f0d76678b6000b2011f0f7892129

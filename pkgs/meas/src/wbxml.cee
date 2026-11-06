@@ -1,0 +1,384 @@
+// WBXML 1.3 (WAP-192) as ActiveSync uses it (MS-ASWBXML): tags in code pages, inline strings and opaque data; no
+// attributes, no string table references other than STR_T. A request decodes into mxml's XmlDocument (namespaces are
+// the page names); responses are written with `WbxmlWriter`.
+
+import mxml.XmlDocument;
+import mxml.XmlError;
+
+const SWITCH_PAGE: u8 = 0x00;
+const END: u8 = 0x01;
+const ENTITY: u8 = 0x02;
+const STR_I: u8 = 0x03;
+const LITERAL: u8 = 0x04;
+const EXT_I_0: u8 = 0x40;
+const EXT_I_2: u8 = 0x42;
+const PI: u8 = 0x43;
+const LITERAL_C: u8 = 0x44;
+const EXT_T_0: u8 = 0x80;
+const EXT_T_2: u8 = 0x82;
+const STR_T: u8 = 0x83;
+const LITERAL_A: u8 = 0x84;
+const EXT_0: u8 = 0xc0;
+const EXT_2: u8 = 0xc2;
+const OPAQUE: u8 = 0xc3;
+const LITERAL_AC: u8 = 0xc4;
+
+/// The largest decoded request; bodies are bounded by the HTTP listener as well.
+const MAX_WBXML: usize = 64 * 1024 * 1024;
+
+struct WbxmlReader {
+    at: usize;
+}
+
+fn readMultiByte(data: Slice<u8>, r: borrow mut WbxmlReader) -> Result<u64, XmlError> {
+    var value: u64 = 0;
+    for (i in 0..5) {
+        if (r.at >= data.length) {
+            return Err(XmlError.Malformed);
+        }
+        let b = data[r.at];
+        r.at += 1;
+        value = (value << 7) | (b & 0x7f) as u64;
+        if ((b & 0x80) == 0) {
+            return Ok(value);
+        }
+    }
+    return Err(XmlError.Malformed);
+}
+
+fn takeString(data: Slice<u8>, r: borrow mut WbxmlReader) -> Result<[usize; 2], XmlError> {
+    let start = r.at;
+    while (r.at < data.length && data[r.at] != 0) {
+        r.at += 1;
+    }
+    if (r.at >= data.length) {
+        return Err(XmlError.Malformed);
+    }
+    let end = r.at;
+    r.at += 1;
+    return Ok([start, end]);
+}
+
+fn oomWbxml(r: Result<void, AllocError>) -> Result<void, XmlError> => match (r) {
+    Ok() => Ok(),
+    Err(_) => Err(XmlError.OutOfMemory),
+};
+
+/// Decodes an ActiveSync WBXML body into a document whose element namespaces are the code pages' names.
+public fn decodeWbxml(data: Slice<u8>) -> Result<XmlDocument, XmlError> {
+    if (data.length > MAX_WBXML || data.length < 4) {
+        return Err(XmlError.Malformed);
+    }
+    var doc = match (XmlDocument.create()) {
+        Ok(d) => d,
+        Err(_) => { return Err(XmlError.OutOfMemory); }
+    };
+    var r = WbxmlReader { at: 1 };
+    let publicId = readMultiByte(data, mut r)?;
+    if (publicId == 0) {
+        readMultiByte(data, mut r)?; // an index into the string table
+    }
+    readMultiByte(data, mut r)?; // charset: UTF-8 (106) in practice; read as UTF-8 regardless
+    let tableLength = readMultiByte(data, mut r)?;
+    if (tableLength > (data.length - r.at) as u64) {
+        return Err(XmlError.Malformed);
+    }
+    let tableStart = r.at;
+    let tableEnd = r.at + truncate<usize>(tableLength);
+    r.at = tableEnd;
+    var page: u8 = 0;
+    var depth: usize = 0;
+    var started = false;
+    var name = Vector<u8>.create();
+    var entity = Vector<u8>.create();
+    while (r.at < data.length) {
+        let b = data[r.at];
+        r.at += 1;
+        if (b == SWITCH_PAGE) {
+            if (r.at >= data.length) {
+                return Err(XmlError.Malformed);
+            }
+            page = data[r.at];
+            r.at += 1;
+            continue;
+        }
+        if (b == END) {
+            if (depth == 0) {
+                return Err(XmlError.Malformed);
+            }
+            doc.closeElement()?;
+            depth -= 1;
+            if (depth == 0) {
+                break;
+            }
+            continue;
+        }
+        if (b == STR_I) {
+            let s = takeString(data, mut r)?;
+            if (depth == 0) {
+                return Err(XmlError.Malformed);
+            }
+            doc.addText(data[s[0]..s[1]])?;
+            continue;
+        }
+        if (b == STR_T) {
+            let offset = readMultiByte(data, mut r)?;
+            var at = tableStart + truncate<usize>(offset);
+            if (offset >= tableLength || depth == 0) {
+                return Err(XmlError.Malformed);
+            }
+            let start = at;
+            while (at < tableEnd && data[at] != 0) {
+                at += 1;
+            }
+            doc.addText(data[start..at])?;
+            continue;
+        }
+        if (b == OPAQUE) {
+            let n = readMultiByte(data, mut r)?;
+            if (n > (data.length - r.at) as u64 || depth == 0) {
+                return Err(XmlError.Malformed);
+            }
+            let end = r.at + truncate<usize>(n);
+            doc.addText(data[r.at..end])?;
+            r.at = end;
+            continue;
+        }
+        if (b == ENTITY) {
+            let cp = readMultiByte(data, mut r)?;
+            if (cp > 0x10ffff || depth == 0) {
+                return Err(XmlError.Malformed);
+            }
+            entity.clear();
+            oomWbxml(appendCodePoint(mut entity, truncate<u32>(cp)))?;
+            doc.addText(entity.view())?;
+            continue;
+        }
+        if (b == LITERAL || b == LITERAL_A || b == LITERAL_C || b == LITERAL_AC || b == PI ||
+            (b >= EXT_I_0 && b <= EXT_I_2) ||
+            (b >= EXT_T_0 && b <= EXT_T_2) || (b >= EXT_0 && b <= EXT_2)) {
+            return Err(XmlError.Unsupported);
+        }
+        // A tag. Attributes (0x80) are not part of ActiveSync.
+        if ((b & 0x80) != 0) {
+            return Err(XmlError.Unsupported);
+        }
+        if (depth == 0 && started) {
+            return Err(XmlError.Malformed); // a second root
+        }
+        let tag = b & 0x3f;
+        name.clear();
+        let known = match (tagName(page, tag, mut name)) {
+            Ok(k) => k,
+            Err(_) => { return Err(XmlError.OutOfMemory); }
+        };
+        if (!known) {
+            oomWbxml(name.extend("Unknown".bytes()))?;
+            oomWbxml(appendHexByte(mut name, page))?;
+            oomWbxml(appendHexByte(mut name, tag))?;
+        }
+        doc.openElement(pageName(page).bytes(), name.view())?;
+        started = true;
+        if ((b & 0x40) != 0) {
+            depth += 1;
+        } else {
+            doc.closeElement()?;
+            if (depth == 0) {
+                break;
+            }
+        }
+    }
+    doc.finish()?;
+    return Ok(doc);
+}
+
+fn appendHexByte(out: borrow mut Vector<u8>, b: u8) -> Result<void, AllocError> {
+    let hex = "0123456789ABCDEF".bytes();
+    out.push(hex[truncate<usize>(b >> 4)])?;
+    return out.push(hex[truncate<usize>(b & 0x0f)]);
+}
+
+fn appendCodePoint(out: borrow mut Vector<u8>, cp: u32) -> Result<void, AllocError> {
+    if (cp < 0x80) {
+        return out.push(truncate<u8>(cp));
+    }
+    if (cp < 0x800) {
+        out.push(truncate<u8>(0xc0 | (cp >> 6)))?;
+        return out.push(truncate<u8>(0x80 | (cp & 0x3f)));
+    }
+    if (cp < 0x10000) {
+        out.push(truncate<u8>(0xe0 | (cp >> 12)))?;
+        out.push(truncate<u8>(0x80 | ((cp >> 6) & 0x3f)))?;
+        return out.push(truncate<u8>(0x80 | (cp & 0x3f)));
+    }
+    out.push(truncate<u8>(0xf0 | (cp >> 18)))?;
+    out.push(truncate<u8>(0x80 | ((cp >> 12) & 0x3f)))?;
+    out.push(truncate<u8>(0x80 | ((cp >> 6) & 0x3f)))?;
+    return out.push(truncate<u8>(0x80 | (cp & 0x3f)));
+}
+
+/// Builds an ActiveSync WBXML document: `start(page, name)`, content, `end()`. An element given no content is
+/// written as an empty tag. A name the page does not have, or an element left open, makes `finish` fail.
+@noncopy
+public struct WbxmlWriter {
+    out: Vector<u8>;
+    /// The page the stream is on; 255 before the first tag.
+    page: u8;
+    /// The positions of the open elements' tag bytes.
+    open: Vector<usize>;
+    bad: bool;
+
+    public fn create() -> WbxmlWriter {
+        var w = WbxmlWriter { out: Vector<u8>.create(), page: 255, open: Vector<usize>.create(), bad: false };
+        // Version 1.3, public id 1 (unknown), UTF-8 (106), no string table.
+        w.bytes([0x03u8, 0x01, 0x6a, 0x00][..]);
+        return w;
+    }
+
+    fn bytes(borrow mut this, b: Slice<u8>) {
+        match (this.out.extend(b)) {
+            Ok() => {}
+            Err(_) => { this.bad = true; }
+        }
+    }
+
+    fn byte(borrow mut this, b: u8) {
+        match (this.out.push(b)) {
+            Ok() => {}
+            Err(_) => { this.bad = true; }
+        }
+    }
+
+    fn multiByte(borrow mut this, value: u64) {
+        var groups = [0u8; 10];
+        var n: usize = 0;
+        var v = value;
+        loop {
+            groups[n] = truncate<u8>(v & 0x7f);
+            n += 1;
+            v = v >> 7;
+            if (v == 0) {
+                break;
+            }
+        }
+        while (n > 0) {
+            n -= 1;
+            this.byte(if (n > 0) groups[n] | 0x80 else groups[n]);
+        }
+    }
+
+    /// Opens element `name` of page `page`.
+    public fn start(borrow mut this, page: u8, name: StringView) {
+        let tag = match (tagOf(page, name.bytes())) {
+            Some(t) => t,
+            null => {
+                this.bad = true;
+                return;
+            }
+        };
+        if (page != this.page) {
+            this.byte(SWITCH_PAGE);
+            this.byte(page);
+            this.page = page;
+        }
+        match (this.open.push(this.out.length)) {
+            Ok() => {}
+            Err(_) => { this.bad = true; }
+        }
+        this.byte(tag | 0x40);
+    }
+
+    /// Closes the open element; one with nothing in it becomes an empty tag.
+    public fn end(borrow mut this) {
+        let at = match (this.open.pop()) {
+            Some(a) => a,
+            null => {
+                this.bad = true;
+                return;
+            }
+        };
+        if (at + 1 == this.out.length) {
+            this.out[at] = this.out[at] & 0xbf;
+        } else {
+            this.byte(END);
+        }
+    }
+
+    /// Text inside the open element: an inline string, or opaque data when it holds a NUL.
+    public fn textBytes(borrow mut this, value: Slice<u8>) {
+        if (value.length == 0) {
+            return;
+        }
+        var nul = false;
+        for (b in value) {
+            if (b == 0) {
+                nul = true;
+                break;
+            }
+        }
+        if (nul) {
+            this.opaque(value);
+            return;
+        }
+        this.byte(STR_I);
+        this.bytes(value);
+        this.byte(0);
+    }
+
+    public fn text(borrow mut this, value: StringView) { this.textBytes(value.bytes()); }
+
+    /// Opaque data inside the open element.
+    public fn opaque(borrow mut this, value: Slice<u8>) {
+        this.byte(OPAQUE);
+        this.multiByte(value.length as u64);
+        this.bytes(value);
+    }
+
+    /// `<name>value</name>` (an empty tag when `value` is empty).
+    public fn element(borrow mut this, page: u8, name: StringView, value: StringView) {
+        this.start(page, name);
+        this.text(value);
+        this.end();
+    }
+
+    public fn elementBytes(borrow mut this, page: u8, name: StringView, value: Slice<u8>) {
+        this.start(page, name);
+        this.textBytes(value);
+        this.end();
+    }
+
+    /// `<name>` and a decimal number.
+    public fn number(borrow mut this, page: u8, name: StringView, value: i64) {
+        var s = String.create();
+        match (s.appendNumber(value)) {
+            Ok() => {}
+            Err(_) => { this.bad = true; }
+        }
+        this.element(page, name, s.view());
+    }
+
+    public fn empty(borrow mut this, page: u8, name: StringView) {
+        this.start(page, name);
+        this.end();
+    }
+
+    /// `<name>` holding `value` as opaque data.
+    public fn opaqueElement(borrow mut this, page: u8, name: StringView, value: Slice<u8>) {
+        this.start(page, name);
+        if (value.length > 0) {
+            this.opaque(value);
+        }
+        this.end();
+    }
+
+    /// The bytes so far, for a caller that needs to measure.
+    public fn length(borrow this) -> usize => this.out.length;
+
+    /// The document; `OutOfMemory` when a write failed, a name was unknown, or an element is open.
+    public fn finish(this) -> Result<Vector<u8>, AllocError> {
+        if (this.bad || this.open.length > 0) {
+            return Err(AllocError.OutOfMemory);
+        }
+        return Ok(this.out);
+    }
+}

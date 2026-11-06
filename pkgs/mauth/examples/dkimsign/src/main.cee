@@ -1,0 +1,55 @@
+// dkimsign KEY.pem DOMAIN SELECTOR FILE: writes FILE with a DKIM-Signature added at the top, to standard output.
+// The file is fed in 7-byte pieces, to exercise the streaming. `dkimsign KEY.pem public` prints the key's p= value
+// instead. For tests/dkim/sign.py.
+
+import encoding.Base64;
+import mauth.DkimSigner;
+import pkey.PrivateKey;
+
+fn readAll(path: StringView) -> Vector<u8> {
+    var file = File.open(path)!;
+    var out = Vector<u8>.create();
+    var buffer = [0u8; 4096];
+    loop {
+        let n = file.read(mut buffer[..])!;
+        if (n == 0) {
+            return out;
+        }
+        out.extend(buffer[0..n])!;
+    }
+}
+
+fn main() {
+    let pem = readAll(Process.argument(1)!);
+    let key = PrivateKey.fromPem(pem.view())!;
+    let second = Process.argument(2)!;
+    if (second == "public") {
+        var p = Vector<u8>.create();
+        key.publicKey(mut p)!;
+        var text = Vector<u8>.create();
+        Base64.encode(p.view(), mut text)!;
+        Console.writeLine(StringView.fromUtf8(text.view())!);
+        return;
+    }
+    let message = readAll(Process.argument(4)!);
+    var signer = DkimSigner.create();
+    var at: usize = 0;
+    while (at < message.length) {
+        let end = if (at + 7 < message.length) at + 7 else message.length;
+        signer.feed(message[at..end])!;
+        at = end;
+    }
+    var field = Vector<u8>.create();
+    var domain = Vector<u8>.create();
+    let hasFrom = signer.fromDomain(mut domain)!;
+    if (!signer.sign(key, second, Process.argument(3)!, 1790000000, mut field)!) {
+        Console.writeErrorLine("dkimsign: not signed");
+        Process.exit(1);
+    }
+    Console.writeBytes(field.view());
+    Console.writeBytes(message.view());
+    if (hasFrom) {
+        Console.writeError("from-domain=");
+        Console.writeErrorLine(StringView.fromUtf8(domain.view())!);
+    }
+}

@@ -1,0 +1,10 @@
+size 1671
+envelope ("Wed, 15 Jan 92 16:24:40 EST" "An English/Hebrew test" (("Nathaniel S. Borenstein" NIL "nsb" "thumper.bellcore.com")) (("Nathaniel S. Borenstein" NIL "nsb" "thumper.bellcore.com")) (("Nathaniel S. Borenstein" NIL "nsb" "thumper.bellcore.com")) ((NIL NIL "shoshi" "MISSING_DOMAIN") (NIL NIL "mlittman" "MISSING_DOMAIN") (NIL NIL "yacov" "MISSING_DOMAIN") (NIL NIL "kraut" "MISSING_DOMAIN") (NIL NIL "nsb" "MISSING_DOMAIN") (NIL NIL "paul" "flash") (NIL NIL "mo" "gizmo") (NIL NIL "dana" "MISSING_DOMAIN") (NIL NIL "bianchi" "flash") (NIL NIL "abel" "MISSING_DOMAIN") (NIL NIL "sincos" "MISSING_DOMAIN")) NIL NIL NIL "<9201152124.AA19464@greenbush.bellcore.com>")
+bodystructure ("text" "plain" ("charset" "iso-8859-8") NIL NIL "quoted-printable" 1169 27 NIL NIL NIL NIL)
+body ("text" "plain" ("charset" "iso-8859-8") NIL NIL "quoted-printable" 1169 27)
+section HEADER 502 ea425bdafa47fa4f32d5347ff5d94b4ad18d935c877017097d11dd91908c39ec
+section TEXT 1169 879fb165e0dd4f8b21094e75f03df42d09f9c15df3e62a6eb84c89924afd73c2
+section HEADER.FIELDS 338 140d81f856fdbe1add64161cade6bb6372556452f52ff626c6351002d475393a
+section HEADER.FIELDS.NOT 166 d694ad6d4239efeae132309058caa3c888ef09d024530b40af2842b3455587e1
+section 1 1169 879fb165e0dd4f8b21094e75f03df42d09f9c15df3e62a6eb84c89924afd73c2
+section 1.MIME 502 ea425bdafa47fa4f32d5347ff5d94b4ad18d935c877017097d11dd91908c39ec

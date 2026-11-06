@@ -1,0 +1,196 @@
+// EWS's opaque ids, in the C# server's format (EwsIdEncoder): base64 of `f:<mailbox id>` for a folder,
+// `root:<user id>` for the virtual root (per user: Apple's accountsd takes it as the account's identity),
+// `<mailbox id>:<uid>` for a message, and `ck:<16 hex digits of a SHA-256>` for a change key. Mailbox ids are this
+// store's, so ids a client cached against the C# server are not found after the cutover and it syncs again.
+
+import encoding.Base64;
+import sha256.Sha256;
+
+/// Base64 of `text`, appended to `out` as a string.
+fn base64Of(text: Slice<u8>, out: borrow mut String) -> Result<void, AllocError> {
+    var bytes = Vector<u8>.create();
+    Base64.encode(text, mut bytes)?;
+    return out.append(StringView.fromUtf8(bytes.view()) ?? "");
+}
+
+/// The bytes base64 `text` stands for; false when it is not base64.
+fn unbase64(text: Slice<u8>, out: borrow mut Vector<u8>) -> bool {
+    out.clear();
+    return match (Base64.decode(text, out)) {
+        Ok() => true,
+        Err(_) => false,
+    };
+}
+
+fn decimal(out: borrow mut Vector<u8>, value: i64) -> Result<void, AllocError> {
+    var s = String.create();
+    s.appendNumber(value)?;
+    return out.extend(s.view().bytes());
+}
+
+/// A folder's id.
+public fn folderId(mailboxId: i64, out: borrow mut String) -> Result<void, AllocError> {
+    var raw = Vector<u8>.create();
+    raw.extend("f:".bytes())?;
+    decimal(mut raw, mailboxId)?;
+    out.clear();
+    return base64Of(raw.view(), out);
+}
+
+/// The user's virtual root folder's id.
+public fn rootFolderId(userId: i64, out: borrow mut String) -> Result<void, AllocError> {
+    var raw = Vector<u8>.create();
+    raw.extend("root:".bytes())?;
+    decimal(mut raw, userId)?;
+    out.clear();
+    return base64Of(raw.view(), out);
+}
+
+/// A message's id.
+public fn itemId(mailboxId: i64, uid: i64, out: borrow mut String) -> Result<void, AllocError> {
+    var raw = Vector<u8>.create();
+    decimal(mut raw, mailboxId)?;
+    raw.push(0x3a)?;
+    decimal(mut raw, uid)?;
+    out.clear();
+    return base64Of(raw.view(), out);
+}
+
+fn parseDecimal(text: Slice<u8>) -> i64? {
+    if (text.length > 1 && text[0] == 0x2d) {
+        return match (parseDecimal(text[1..])) {
+            Some(v) => 0 - v,
+            null => null,
+        };
+    }
+    if (text.length == 0 || text.length > 18) {
+        return null;
+    }
+    var v: i64 = 0;
+    for (c in text) {
+        if (c < 0x30 || c > 0x39) {
+            return null;
+        }
+        v = v * 10 + (c - 0x30) as i64;
+    }
+    return v;
+}
+
+/// The mailbox id of a folder id (negative: a virtual folder); null when it is not one.
+public fn parseFolderId(id: Slice<u8>) -> i64? {
+    var raw = Vector<u8>.create();
+    if (!unbase64(id, mut raw) || raw.length < 3 || raw[0] != 0x66 || raw[1] != 0x3a) {
+        return null;
+    }
+    return parseDecimal(raw.view()[2..]);
+}
+
+/// Whether `id` is a virtual root's id: any user's, or the C# server's old constant (base64 of `root`).
+public fn isRootFolderId(id: Slice<u8>) -> bool {
+    var raw = Vector<u8>.create();
+    if (!unbase64(id, mut raw)) {
+        return false;
+    }
+    let r = raw.view();
+    return r == "root".bytes() || (r.length > 5 && r[0..5] == "root:".bytes());
+}
+
+/// [mailbox id, uid] of a message id; null when it is not one.
+public fn parseItemId(id: Slice<u8>) -> [i64; 2]? {
+    var raw = Vector<u8>.create();
+    if (!unbase64(id, mut raw)) {
+        return null;
+    }
+    var colon = raw.length;
+    for (i in 0..raw.length) {
+        if (raw[i] == 0x3a) {
+            colon = i;
+            break;
+        }
+    }
+    if (colon == raw.length) {
+        return null;
+    }
+    let mailbox = parseDecimal(raw.view()[0..colon])?;
+    let uid = parseDecimal(raw.view()[(colon + 1)..])?;
+    if (uid == 0 || uid > 4294967295) {
+        return null;
+    }
+    return [mailbox, uid];
+}
+
+/// A change key for `state` (a message's flags as `flagState` gives them, or a folder's UIDVALIDITY).
+public fn changeKey(state: Slice<u8>, out: borrow mut String) -> Result<void, AllocError> {
+    let digest = Sha256.hash(state);
+    let hex = "0123456789ABCDEF".bytes();
+    var raw = Vector<u8>.create();
+    raw.extend("ck:".bytes())?;
+    for (k in 0..8) {
+        raw.push(hex[truncate<usize>(digest[k] >> 4)])?;
+        raw.push(hex[truncate<usize>(digest[k] & 0x0f)])?;
+    }
+    out.clear();
+    return base64Of(raw.view(), out);
+}
+
+fn lessBytes(a: Slice<u8>, b: Slice<u8>) -> bool {
+    let n = if (a.length < b.length) a.length else b.length;
+    for (i in 0..n) {
+        if (a[i] != b[i]) {
+            return a[i] < b[i];
+        }
+    }
+    return a.length < b.length;
+}
+
+/// A message's flags in the C# server's normalized form: `[` the flag names sorted, comma-separated `]`, so a
+/// change key changes exactly when the flags do.
+public fn flagState(flags: u16, keywords: StringView, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    var names = Vector<String>.create();
+    let system = ["\\Seen", "\\Answered", "\\Flagged", "\\Deleted", "\\Draft"];
+    for (i in 0..5) {
+        if ((flags & (1u16 << truncate<u16>(i))) != 0) {
+            var s = String.create();
+            s.append(system[i])?;
+            names.push(s)?;
+        }
+    }
+    for (k in keywords.split(" ")) {
+        if (k.length > 0) {
+            var s = String.create();
+            s.append(k)?;
+            names.push(s)?;
+        }
+    }
+    // Insertion sort, ordinal: a handful of names.
+    for (i in 1..names.length) {
+        var j = i;
+        while (j > 0 && lessBytes(names[j].view().bytes(), names[j - 1].view().bytes())) {
+            names.swap(j, j - 1);
+            j -= 1;
+        }
+    }
+    out.clear();
+    out.push(0x5b)?;
+    for (i in 0..names.length) {
+        if (i > 0) {
+            out.push(0x2c)?;
+        }
+        out.extend(names[i].view().bytes())?;
+    }
+    return out.push(0x5d);
+}
+
+/// The change key of a message with these flags.
+public fn messageChangeKey(flags: u16, keywords: StringView, out: borrow mut String) -> Result<void, AllocError> {
+    var state = Vector<u8>.create();
+    flagState(flags, keywords, mut state)?;
+    return changeKey(state.view(), out);
+}
+
+/// A folder's change key, from its UIDVALIDITY as the C# server made it.
+public fn folderChangeKey(uidValidity: i64, out: borrow mut String) -> Result<void, AllocError> {
+    var s = Vector<u8>.create();
+    decimal(mut s, uidValidity)?;
+    return changeKey(s.view(), out);
+}

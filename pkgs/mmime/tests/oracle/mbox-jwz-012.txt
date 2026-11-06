@@ -1,0 +1,22 @@
+size 5670
+envelope ("Fri, 7 Feb 92 14:33:38 +1100" "Test MIME message" ((NIL NIL "rhys" "cs.uq.oz.au")) ((NIL NIL "rhys" "cs.uq.oz.au")) ((NIL NIL "rhys" "cs.uq.oz.au")) ((NIL NIL "nsb" "thumper.bellcore.com")) NIL NIL NIL "<9202070333.AA25077@client>")
+bodystructure (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 848 27 NIL NIL NIL NIL) (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 142 5 NIL NIL NIL NIL) ("image" "x-xbitmap" NIL NIL NIL "base64" 1214 NIL NIL NIL NIL) ("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 68 0 NIL NIL NIL NIL) ("image" "x-xbitmap" NIL NIL NIL "base64" 1222 NIL NIL NIL NIL) ("text" "richtext" ("charset" "us-ascii") NIL NIL "7bit" 559 13 NIL NIL NIL NIL) "mixed" ("boundary" "New_MetaSend_Main_1292627053") NIL NIL NIL) "alternative" ("boundary" "New_MetaSend_Alt_220042694") NIL NIL NIL)
+body (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 848 27) (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 142 5) ("image" "x-xbitmap" NIL NIL NIL "base64" 1214) ("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 68 0) ("image" "x-xbitmap" NIL NIL NIL "base64" 1222) ("text" "richtext" ("charset" "us-ascii") NIL NIL "7bit" 559 13) "mixed") "alternative")
+section HEADER 669 6324163564824612f591322752cf6f7770b805599cf396a9e0070e0da4b8f694
+section TEXT 5001 d42f5a71dad8b2ffd9704eeec4863315f9f78c06ac1536ad7d33107362d53aa2
+section HEADER.FIELDS 239 f0f95c213f4ec5b60b5502df0b6401f40954a9ce2216b998ee4fde9c63859b3b
+section HEADER.FIELDS.NOT 432 a52fa10d193e97571bdf64059852f528a2fbcea1a1aff280f1160a4b21cea417
+section 1 848 587ea44465f47e0c1d2f6350b1dce74c7f6662f6b09123ca8bf89cc1c796c9b5
+section 1.MIME 2 7eb70257593da06f682a3ddda54a9d260d4fc514f645237f5ca74b08f8da61a6
+section 2 3632 257391721180e555f268bc777a30ebd830d1cae3bdcfe18c763a47c89259413b
+section 2.MIME 76 72f1c562df7f4d5a79707db276568643849c0b45226393322146b2155624c638
+section 2.1 142 9772cdc2cc0b490737486a92846b459df7aeba327dc7b09382a98362d9ae5d7b
+section 2.1.MIME 28 8647343b82154690e74d06e14d0df506d30752c4e45caf8c5e7766153d16d2e2
+section 2.2 1214 5afc6b6ac30be8a0eb70964d333f37cbe9b7285c38fe4a0247f84f6f22783551
+section 2.2.MIME 68 81eaa96ace12c23a9b671bc54b06f910f728fb30f7dd36f9804b505578aa5b21
+section 2.3 68 432f31483bb8d622d285784d49dbc9b0965682e4df6cc3a2035ea3b95007ceb5
+section 2.3.MIME 28 8647343b82154690e74d06e14d0df506d30752c4e45caf8c5e7766153d16d2e2
+section 2.4 1222 d117da40fdb8612bb2efe84c9ac2e334e21b9000acd5c468ba28e4a7a36eb013
+section 2.4.MIME 68 81eaa96ace12c23a9b671bc54b06f910f728fb30f7dd36f9804b505578aa5b21
+section 2.5 559 841c957a46f27da3bb6d1f218ed2b5d097a02ff78ee1e2d9dca522af8c7e4fe8
+section 2.5.MIME 31 59a28f8e035d255b48b8794b88413659da1ddbbadf2e9a241afd171cfa0379c3

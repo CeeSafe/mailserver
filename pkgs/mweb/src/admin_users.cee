@@ -1,0 +1,594 @@
+// The admin API's users, mailboxes and Sieve scripts (snake_case objects, as the C# server's). Mailbox and user
+// changes go through the store where IMAP sessions must hear of them (the notify bus).
+
+import mhttp.JsonDocument;
+import mhttp.Request;
+import mhttp.Response;
+import mhttp.segment;
+import mhttp.segmentCount;
+import msieve.Script;
+import msieve.parseScript;
+import mstore.StoreError;
+import postgres.PgParams;
+import postgres.PgRows;
+
+/// A User object of the row `u` (with `d` its domain). The password hash and TOTP secret are never sent; `domain`
+/// is only its id and name.
+const USER_JSON: StringView =
+    """
+    jsonb_build_object('id', u.id, 'email', u.email, 'domain_id', u.domain_id,
+        'domain', jsonb_build_object('id', d.id, 'name', d.name), 'role', u.role,
+        'status', CASE WHEN u.active THEN 'active' ELSE 'suspended' END, 'quota', u.quota, 'used_quota', u.used,
+        'language', u.language, 'totp_enabled', false, 'forward_to', u.forward_to,
+        'auto_reply_enabled', u.auto_reply_enabled, 'auto_reply_subject', u.auto_reply_subject,
+        'auto_reply_body', u.auto_reply_body, 'auth_method', 'password', 'last_login', u.last_login,
+        'created_at', u.created_at, 'updated_at', u.updated_at)
+    """;
+
+const MAILBOX_JSON: StringView =
+    """
+    jsonb_build_object('id', m.id, 'user_id', m.user_id, 'parent_id', NULL, 'name', m.name,
+        'subscribed', m.subscribed, 'special_use', m.special_use, 'uid_validity', m.uid_validity,
+        'uid_next', m.uid_next, 'max_size', m.max_size, 'current_size', m.size, 'message_count', m.messages,
+        'retention_days', m.retention_days, 'description', m.description, 'created_at', m.created_at)
+    """;
+
+/// `template` with USER_JSON and MAILBOX_JSON put in.
+fn withShapes(template: StringView, into: borrow mut String) -> Result<void, AllocError> {
+    into.clear();
+    var at: usize = 0;
+    while (at < template.length) {
+        let user = template[at..].indexOf("USER_JSON") ?? (template.length - at);
+        let mailbox = template[at..].indexOf("MAILBOX_JSON") ?? (template.length - at);
+        let next = if (user < mailbox) user else mailbox;
+        into.append(template[at..at + next])?;
+        at += next;
+        if (at == template.length) {
+            break;
+        }
+        if (user < mailbox) {
+            into.append(USER_JSON)?;
+            at += 9;
+        } else {
+            into.append(MAILBOX_JSON)?;
+            at += 12;
+        }
+    }
+    return Ok();
+}
+
+fn storeAnswer(e: StoreError, missing: StringView) -> Result<Response, AllocError> => match (e) {
+    StoreError.NotFound => Response.error(404, missing),
+    StoreError.Exists => Response.error(409, "It exists already."),
+    StoreError.Invalid => Response.error(400, "Invalid value."),
+    StoreError.OutOfMemory => Err(AllocError.OutOfMemory),
+    _ => Response.error(500, "The server could not answer."),
+};
+
+/// Whether the user `id` is in the caller's scope.
+async fn userInScope(ctx: borrow WebContext, caller: borrow Principal, id: i64) -> bool {
+    var params = PgParams.create();
+    if (!bindAll(mut params, caller.scope(), id)) {
+        return false;
+    }
+    var rows = PgRows.create();
+    return (await queryRows(
+        ctx,
+        "SELECT 1 FROM users WHERE id = $2 AND ($1 = 0 OR domain_id = $1)",
+        params,
+        mut rows,
+    )) &&
+        rows.rowCount() == 1;
+}
+
+async fn usersApi(
+    ctx: borrow WebContext,
+    request: borrow Request,
+    caller: borrow Principal,
+) -> Result<Response, AllocError> {
+    let path = request.path.view();
+    let n = segmentCount(path);
+    var sql = String.create();
+    var params = PgParams.create();
+    if (n == 2) {
+        if (request.isMethod("GET")) {
+            var filter = String.create();
+            let wanted = if (request.param("domainId", mut filter)?) filter.view().parseInt<i64>() ?? 0 else 0;
+            if (!bindAll(mut params, caller.scope(), wanted)) {
+                return Err(AllocError.OutOfMemory);
+            }
+            withShapes(
+                """
+                SELECT 200, coalesce(jsonb_agg(USER_JSON ORDER BY u.id), '[]')::text
+                FROM users u JOIN domains d ON d.id = u.domain_id
+                WHERE ($1 = 0 OR u.domain_id = $1) AND ($1 <> 0 OR $2 = 0 OR u.domain_id = $2)
+                """,
+                mut sql,
+            )?;
+            return await answer(ctx, sql.view(), params, "");
+        }
+        if (request.isMethod("POST")) {
+            return await createUser(ctx, request, caller);
+        }
+        return notAllowed("GET, POST");
+    }
+    let id = idOf(segment(path, 2));
+    if (!(await userInScope(ctx, caller, id))) {
+        return Response.error(404, "User not found");
+    }
+    var idText = String.create();
+    idText.appendNumber(id)?;
+    if (n == 3) {
+        if (!bindAll(mut params, caller.scope(), id)) {
+            return Err(AllocError.OutOfMemory);
+        }
+        if (request.isMethod("GET")) {
+            withShapes(
+                "SELECT 200, USER_JSON::text FROM users u JOIN domains d ON d.id = u.domain_id WHERE u.id = $2",
+                mut sql,
+            )?;
+            return await answer(ctx, sql.view(), params, "User not found");
+        }
+        if (request.isMethod("PUT")) {
+            let body = match (bodyObject(request)) {
+                Some(b) => b,
+                null => { return Response.error(400, "A JSON object is required."); }
+            };
+            if (!bound(params.text(body))) {
+                return Err(AllocError.OutOfMemory);
+            }
+            // Null keeps a value, as the C# server; an empty forwardTo clears forwarding (it could not, there).
+            let r = await answer(
+                ctx,
+                """
+                WITH b AS (SELECT $3::jsonb AS j)
+                UPDATE users u SET
+                    active = CASE WHEN j->>'status' IS NULL THEN u.active ELSE j->>'status' = 'active' END,
+                    role = CASE WHEN j->>'role' IN ('user', 'admin') THEN j->>'role' ELSE u.role END,
+                    quota = coalesce((j->>'quota')::int8, u.quota),
+                    language = coalesce(j->>'language', u.language),
+                    forward_to = CASE WHEN j ? 'forwardTo' AND j->>'forwardTo' = '' THEN NULL
+                        ELSE coalesce(btrim(j->>'forwardTo'), u.forward_to) END,
+                    auto_reply_enabled = coalesce((j->>'autoReplyEnabled')::boolean, u.auto_reply_enabled),
+                    auto_reply_subject = coalesce(j->>'autoReplySubject', u.auto_reply_subject),
+                    auto_reply_body = coalesce(j->>'autoReplyBody', u.auto_reply_body),
+                    updated_at = now()
+                FROM b WHERE u.id = $2
+                RETURNING 200, '{"success":true}'
+                """,
+                params,
+                "User not found",
+            )?;
+            if (r.status == 200) {
+                await audited(ctx, request, caller, "user.update", "user", idText.view());
+            }
+            return Ok(r);
+        }
+        if (request.isMethod("DELETE")) {
+            let r = await answer(
+                ctx,
+                "DELETE FROM users WHERE id = $2 RETURNING 200, '{\"success\":true}'",
+                params,
+                "User not found",
+            )?;
+            if (r.status == 200) {
+                // Its IMAP sessions see their mailboxes go.
+                await ctx.mail.get().store.notifications().raise(id, 0);
+                await audited(ctx, request, caller, "user.delete", "user", idText.view());
+            }
+            return Ok(r);
+        }
+        return notAllowed("GET, PUT, DELETE");
+    }
+    let action = segment(path, 3) ?? "";
+    if (n == 4 && action == "password" && request.isMethod("PUT")) {
+        let doc = match (JsonDocument.parse(request.body.view())) {
+            Ok(d) => d,
+            Err(_) => { return Response.error(400, "NewPassword is required"); }
+        };
+        var password = String.create();
+        match (doc.member(doc.root(), "newPassword")) {
+            Some(v) => { doc.string(v, mut password)?; }
+            null => {}
+        }
+        if (password.length == 0) {
+            return Response.error(400, "NewPassword is required");
+        }
+        return await setPassword(ctx, request, caller, id, password.bytes(), "user.password-reset");
+    }
+    if (n == 4 && action == "reset-totp" && request.isMethod("POST")) {
+        // There is no TOTP here: nothing to reset.
+        var body = Vector<u8>.create();
+        body.extend("{\"success\":true,\"userId\":".bytes())?;
+        body.extend(idText.bytes())?;
+        body.extend("}".bytes())?;
+        return Response.json(200, body);
+    }
+    if (n == 4 && action == "mailboxes") {
+        return await userMailboxes(ctx, request, caller, id);
+    }
+    if (n == 4 && action == "sieve-scripts") {
+        return await userScripts(ctx, request, caller, id);
+    }
+    if (n == 4 && action == "pgp-keys") {
+        return unsupported(request, "pgp-keys");
+    }
+    return Response.error(404, "No such endpoint.");
+}
+
+/// POST /api/users {email, password, domainId}: the address must be of that domain, in the caller's scope.
+async fn createUser(
+    ctx: borrow WebContext,
+    request: borrow Request,
+    caller: borrow Principal,
+) -> Result<Response, AllocError> {
+    let doc = match (JsonDocument.parse(request.body.view())) {
+        Ok(d) => d,
+        Err(_) => { return Response.error(400, "email, password and domainId are required"); }
+    };
+    var email = String.create();
+    var password = String.create();
+    var domainId: i64 = 0;
+    match (doc.member(doc.root(), "email")) {
+        Some(v) => { doc.string(v, mut email)?; }
+        null => {}
+    }
+    match (doc.member(doc.root(), "password")) {
+        Some(v) => { doc.string(v, mut password)?; }
+        null => {}
+    }
+    match (doc.member(doc.root(), "domainId")) {
+        Some(v) => { domainId = doc.integer(v) ?? 0; }
+        null => {}
+    }
+    if (email.length == 0 || password.length == 0 || domainId == 0) {
+        return Response.error(400, "email, password and domainId are required");
+    }
+    if (password.length < 8) {
+        return Response.error(400, "The password needs at least 8 characters.");
+    }
+    var name = String.create();
+    if (!(await domainName(ctx, caller, domainId, mut name))) {
+        return Response.error(404, "Domain not found");
+    }
+    let at = email.view().lastIndexOf("@") ?? email.length;
+    if (at == 0 || at >= email.length || !email.view()[at + 1..].trim().equalsIgnoreAsciiCase(name.view())) {
+        return Response.error(400, "The address must be of the domain.");
+    }
+    var quota: i64? = null;
+    match (doc.member(doc.root(), "quota")) {
+        Some(v) => { quota = doc.integer(v); }
+        null => {}
+    }
+    let userId = match (await createMailUser(ctx, email.view(), password.bytes(), quota)) {
+        Ok(u) => u,
+        Err(e) => { return storeAnswer(e, "Domain not found"); }
+    };
+    var idText = String.create();
+    idText.appendNumber(userId)?;
+    await audited(ctx, request, caller, "user.create", "user", idText.view());
+    var body = Vector<u8>.create();
+    body.extend("{\"success\":true,\"userId\":".bytes())?;
+    body.extend(idText.bytes())?;
+    body.extend(",\"mailboxes\":6}".bytes())?;
+    return Response.json(200, body);
+}
+
+// ---- Mailboxes ----
+
+/// GET and POST /api/users/{id}/mailboxes.
+async fn userMailboxes(
+    ctx: borrow WebContext,
+    request: borrow Request,
+    caller: borrow Principal,
+    userId: i64,
+) -> Result<Response, AllocError> {
+    var sql = String.create();
+    var params = PgParams.create();
+    if (!bound(params.int64(userId))) {
+        return Err(AllocError.OutOfMemory);
+    }
+    if (request.isMethod("GET")) {
+        withShapes(
+            "SELECT 200, coalesce(jsonb_agg(MAILBOX_JSON ORDER BY m.id), '[]')::text FROM mailboxes m WHERE m.user_id = $1",
+            mut sql,
+        )?;
+        return await answer(ctx, sql.view(), params, "");
+    }
+    if (!request.isMethod("POST")) {
+        return notAllowed("GET, POST");
+    }
+    let doc = match (JsonDocument.parse(request.body.view())) {
+        Ok(d) => d,
+        Err(_) => { return Response.error(400, "Name is required"); }
+    };
+    var name = String.create();
+    var special = String.create();
+    match (doc.member(doc.root(), "name")) {
+        Some(v) => { doc.string(v, mut name)?; }
+        null => {}
+    }
+    match (doc.member(doc.root(), "specialUse")) {
+        Some(v) => { doc.string(v, mut special)?; }
+        null => {}
+    }
+    if (name.view().trim().length == 0) {
+        return Response.error(400, "Name is required");
+    }
+    let id = match (await ctx.mail.get().store.createMailbox(userId, name.view().trim(), special.view())) {
+        Ok(i) => i,
+        Err(e) => { return storeAnswer(e, "User not found"); }
+    };
+    let body = bodyObject(request) ?? "{}";
+    if (!bound(params.int64(id)) || !bound(params.text(body))) {
+        return Err(AllocError.OutOfMemory);
+    }
+    withShapes(
+        """
+        WITH b AS (SELECT $3::jsonb AS j)
+        UPDATE mailboxes m SET max_size = coalesce((j->>'maxSize')::int8, 0),
+            retention_days = coalesce((j->>'retentionDays')::int4, 0), description = j->>'description'
+        FROM b WHERE m.id = $2 AND m.user_id = $1
+        RETURNING 200, MAILBOX_JSON::text
+        """,
+        mut sql,
+    )?;
+    return await answer(ctx, sql.view(), params, "Mailbox not found");
+}
+
+/// GET, PUT and DELETE /api/mailboxes/{id}.
+async fn mailboxesApi(
+    ctx: borrow WebContext,
+    request: borrow Request,
+    caller: borrow Principal,
+) -> Result<Response, AllocError> {
+    let path = request.path.view();
+    if (segmentCount(path) != 3) {
+        return Response.error(404, "No such endpoint.");
+    }
+    let id = idOf(segment(path, 2));
+    var params = PgParams.create();
+    if (!bindAll(mut params, caller.scope(), id)) {
+        return Err(AllocError.OutOfMemory);
+    }
+    var rows = PgRows.create();
+    if (!(await queryRows(
+        ctx,
+        "SELECT m.user_id, m.name FROM mailboxes m JOIN users u ON u.id = m.user_id WHERE m.id = $2 AND ($1 = 0 OR u.domain_id = $1)",
+        params,
+        mut rows,
+    )) || rows.rowCount() == 0) {
+        return Response.error(404, "Mailbox not found");
+    }
+    let userId = rows.int64(0, 0) ?? 0;
+    var sql = String.create();
+    if (request.isMethod("GET")) {
+        withShapes("SELECT 200, MAILBOX_JSON::text FROM mailboxes m WHERE m.id = $2", mut sql)?;
+        return await answer(ctx, sql.view(), params, "Mailbox not found");
+    }
+    if (request.isMethod("PUT")) {
+        let body = match (bodyObject(request)) {
+            Some(b) => b,
+            null => { return Response.error(400, "A JSON object is required."); }
+        };
+        if (!bound(params.text(body))) {
+            return Err(AllocError.OutOfMemory);
+        }
+        withShapes(
+            """
+            WITH b AS (SELECT $3::jsonb AS j)
+            UPDATE mailboxes m SET max_size = coalesce((j->>'maxSize')::int8, m.max_size),
+                retention_days = coalesce((j->>'retentionDays')::int4, m.retention_days),
+                description = CASE WHEN j ? 'description' THEN j->>'description' ELSE m.description END,
+                subscribed = coalesce((j->>'subscribed')::boolean, m.subscribed)
+            FROM b WHERE m.id = $2
+            RETURNING 200, MAILBOX_JSON::text
+            """,
+            mut sql,
+        )?;
+        return await answer(ctx, sql.view(), params, "Mailbox not found");
+    }
+    if (request.isMethod("DELETE")) {
+        if ((rows.text(0, 1) ?? "") == "INBOX") {
+            return Response.error(400, "Cannot delete INBOX");
+        }
+        match (await ctx.mail.get().store.deleteMailbox(userId, id)) {
+            Ok() => { return Ok(Response.create(204)); }
+            Err(e) => { return storeAnswer(e, "Mailbox not found"); }
+        }
+    }
+    return notAllowed("GET, PUT, DELETE");
+}
+
+// ---- Sieve scripts ----
+
+/// The script's compile error as {"error": ...}, or null when it compiles.
+fn sieveProblem(content: StringView) -> Result<Response?, AllocError> {
+    var compiled = Script.create();
+    if (parseScript(content.bytes(), mut compiled)?) {
+        return Ok(null);
+    }
+    var message = String.create();
+    message.append("The script does not compile: line ")?;
+    message.appendNumber(compiled.errorLine as i64)?;
+    message.append(": ")?;
+    message.append(compiled.error.view())?;
+    return Ok(Response.error(400, message.view())?);
+}
+
+fn sieveFields(
+    request: borrow Request,
+    name: borrow mut String,
+    content: borrow mut String,
+) -> Result<bool, AllocError> {
+    let doc = match (JsonDocument.parse(request.body.view())) {
+        Ok(d) => d,
+        Err(_) => { return Ok(false); }
+    };
+    match (doc.member(doc.root(), "name")) {
+        Some(v) => { doc.string(v, name)?; }
+        null => {}
+    }
+    match (doc.member(doc.root(), "content")) {
+        Some(v) => { doc.string(v, content)?; }
+        null => {}
+    }
+    return Ok(true);
+}
+
+const SIEVE_JSON: StringView =
+    """
+    jsonb_build_object('id', s.id, 'user_id', s.user_id, 'name', s.name, 'content', s.content,
+        'active', u.sieve_active IS NOT DISTINCT FROM s.name, 'created_at', s.created_at, 'updated_at', s.updated_at)
+    """;
+
+/// GET and POST /api/users/{id}/sieve-scripts. New scripts are inactive.
+async fn userScripts(
+    ctx: borrow WebContext,
+    request: borrow Request,
+    caller: borrow Principal,
+    userId: i64,
+) -> Result<Response, AllocError> {
+    var params = PgParams.create();
+    if (!bound(params.int64(userId))) {
+        return Err(AllocError.OutOfMemory);
+    }
+    if (request.isMethod("GET")) {
+        return await answer(
+            ctx,
+            """
+            SELECT 200, coalesce(jsonb_agg(jsonb_build_object('id', s.id, 'user_id', s.user_id, 'name', s.name,
+                'content', s.content, 'active', u.sieve_active IS NOT DISTINCT FROM s.name,
+                'created_at', s.created_at, 'updated_at', s.updated_at)
+                ORDER BY u.sieve_active IS NOT DISTINCT FROM s.name DESC, s.id DESC), '[]')::text
+            FROM sieve_scripts s JOIN users u ON u.id = s.user_id WHERE s.user_id = $1
+            """,
+            params,
+            "",
+        );
+    }
+    if (!request.isMethod("POST")) {
+        return notAllowed("GET, POST");
+    }
+    var name = String.create();
+    var content = String.create();
+    sieveFields(request, mut name, mut content)?;
+    if (name.view().trim().length == 0) {
+        return Response.error(400, "name is required");
+    }
+    match (sieveProblem(content.view())?) {
+        Some(r) => { return Ok(r); }
+        null => {}
+    }
+    if (!bound(params.text(name.view().trim())) || !bound(params.text(content.view()))) {
+        return Err(AllocError.OutOfMemory);
+    }
+    let r = await answer(
+        ctx,
+        "INSERT INTO sieve_scripts (user_id, name, content) VALUES ($1, $2, $3) RETURNING 200, '{\"success\":true}'",
+        params,
+        "",
+    )?;
+    if (r.status == 200) {
+        await audited(ctx, request, caller, "sieve.create", "sieve_script", name.view());
+    }
+    return Ok(r);
+}
+
+/// PUT, DELETE /api/sieve-scripts/{id}, and POST .../activate and .../deactivate. One script at most is active
+/// (users.sieve_active names it).
+async fn sieveApi(
+    ctx: borrow WebContext,
+    request: borrow Request,
+    caller: borrow Principal,
+) -> Result<Response, AllocError> {
+    let path = request.path.view();
+    let n = segmentCount(path);
+    let id = idOf(segment(path, 2));
+    var params = PgParams.create();
+    if (!bindAll(mut params, caller.scope(), id)) {
+        return Err(AllocError.OutOfMemory);
+    }
+    var rows = PgRows.create();
+    if (!(await queryRows(
+        ctx,
+        "SELECT s.user_id FROM sieve_scripts s JOIN users u ON u.id = s.user_id WHERE s.id = $2 AND ($1 = 0 OR u.domain_id = $1)",
+        params,
+        mut rows,
+    )) || rows.rowCount() == 0) {
+        return Response.error(404, "Script not found");
+    }
+    let idText = segment(path, 2) ?? "";
+    if (n == 3 && request.isMethod("PUT")) {
+        var name = String.create();
+        var content = String.create();
+        sieveFields(request, mut name, mut content)?;
+        if (name.view().trim().length == 0) {
+            return Response.error(400, "name is required");
+        }
+        match (sieveProblem(content.view())?) {
+            Some(r) => { return Ok(r); }
+            null => {}
+        }
+        if (!bound(params.text(name.view().trim())) || !bound(params.text(content.view()))) {
+            return Err(AllocError.OutOfMemory);
+        }
+        // Renaming the active script keeps it active.
+        let r = await answer(
+            ctx,
+            """
+            WITH old AS (SELECT user_id, name FROM sieve_scripts WHERE id = $2),
+            s AS (UPDATE sieve_scripts SET name = $3, content = $4, updated_at = now() WHERE id = $2 RETURNING user_id),
+            u AS (UPDATE users SET sieve_active = $3 FROM old WHERE users.id = old.user_id AND users.sieve_active = old.name)
+            SELECT 200, '{"success":true}' FROM s
+            """,
+            params,
+            "Script not found",
+        )?;
+        if (r.status == 200) {
+            await audited(ctx, request, caller, "sieve.update", "sieve_script", idText);
+        }
+        return Ok(r);
+    }
+    let kind: u8 = if (n == 3 && request.isMethod("DELETE")) 1 else if (n == 4 && (segment(
+        path,
+        3,
+    ) ?? "") == "activate" && request.isMethod("POST")) 2 else if (n == 4 && (segment(
+        path,
+        3,
+    ) ?? "") == "deactivate" && request.isMethod("POST")) 3 else 0;
+    if (kind == 0) {
+        return Response.error(404, "No such endpoint.");
+    }
+    let r = await answer(ctx, sieveSql(kind), params, "Script not found")?;
+    if (r.status == 200) {
+        await audited(ctx, request, caller, sieveAction(kind), "sieve_script", idText);
+    }
+    return Ok(r);
+}
+
+fn sieveAction(kind: u8) -> StringView =>
+    if (kind == 1) "sieve.delete" else if (kind == 2) "sieve.activate" else "sieve.deactivate";
+
+/// $2 the script's id: deleting it (and its activation), activating it, or deactivating it.
+fn sieveSql(kind: u8) -> StringView {
+    if (kind == 1) {
+        return """
+            WITH s AS (DELETE FROM sieve_scripts WHERE id = $2 RETURNING user_id, name),
+            u AS (UPDATE users SET sieve_active = NULL FROM s WHERE users.id = s.user_id AND users.sieve_active = s.name)
+            SELECT 200, '{"success":true}' FROM s
+            """;
+    }
+    if (kind == 2) {
+        return """
+            UPDATE users u SET sieve_active = s.name FROM sieve_scripts s WHERE s.id = $2 AND u.id = s.user_id
+                AND ($1 = $1)
+            RETURNING 200, '{"success":true}'
+            """;
+    }
+    return """
+        WITH s AS (SELECT user_id, name FROM sieve_scripts WHERE id = $2 AND ($1 = $1)),
+        u AS (UPDATE users SET sieve_active = NULL FROM s WHERE users.id = s.user_id AND users.sieve_active = s.name)
+        SELECT 200, '{"success":true}' FROM s
+        """;
+}

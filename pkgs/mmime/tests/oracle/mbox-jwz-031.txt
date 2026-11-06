@@ -1,0 +1,10 @@
+size 1689
+envelope ("Sun, 3 May 1992 23:07:57 GMT" "what's the use" (("Mark Crispin" NIL "mrc" "tomobiki-cho.cac.washington.edu")) (("USENET News System" NIL "news" "u.washington.edu")) (("Mark Crispin" NIL "mrc" "tomobiki-cho.cac.washington.edu")) NIL NIL NIL NIL "<MS-C.704934477.377401575.mrc@Tomobiki-Cho.CAC.Washington.EDU>")
+bodystructure ("TEXT" "PLAIN" ("charset" "ISO-2022-JP") NIL NIL "7bit" 1010 18 NIL NIL NIL NIL)
+body ("TEXT" "PLAIN" ("charset" "ISO-2022-JP") NIL NIL "7bit" 1010 18)
+section HEADER 679 f3d652b787c74c353864691591b2a962687f11fd95b49c5cddc7830a06d64182
+section TEXT 1010 3781bc1a476eee8ce651095439b4d6e6371feddc53f4f0f5b930c79404cf4972
+section HEADER.FIELDS 244 848ac8453719a05d536919e930d86c7d188f20a2933b77d9e49c0d21aa8542e5
+section HEADER.FIELDS.NOT 437 86264478139b4e854e2f01f68c021206bc8261c11febb41504e660bfdffd76c1
+section 1 1010 3781bc1a476eee8ce651095439b4d6e6371feddc53f4f0f5b930c79404cf4972
+section 1.MIME 679 f3d652b787c74c353864691591b2a962687f11fd95b49c5cddc7830a06d64182

@@ -1,0 +1,10 @@
+size 1932
+envelope ("Sun, 21 Jul 1996 17:02:55 -0800" "Re: mailusr1@navstar1 3.0b6gold #1" ((NIL NIL "mailusr1" "navstar1.mcom.com")) ((NIL NIL "mailusr1" "navstar1.mcom.com")) ((NIL NIL "mailusr1" "navstar1.mcom.com")) ((NIL NIL "atzet" "netscape.com")) NIL NIL NIL "<19960722000255.AAA26598@navstar1.mcom.com>")
+bodystructure (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 0 0 NIL NIL NIL NIL) "mixed" NIL NIL NIL NIL)
+body (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 0 0) "mixed")
+section HEADER 666 58a20b2100a5d34fb9ba89dab2a74b5bc8840c59db4cabba41b20dce2a79412a
+section TEXT 1266 e853e2a23bec6d41e79c53a8bf379db8fb73bb78262fc28b79589aec1c8034a1
+section HEADER.FIELDS 309 63ce6fc04e3da915f7a403b457a3f1bf61093f9849b205d93c7da9c943fed11f
+section HEADER.FIELDS.NOT 359 0285d98db41e86207385f68604d4dc9741290b337b7f6fa0f131556e945164b7
+section 1 0 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+section 1.MIME 0 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855

@@ -1,0 +1,272 @@
+// REPORT: calendar-multiget and calendar-query (RFC 4791 §7.8–7.9), addressbook-multiget and addressbook-query
+// (RFC 6352 §8.6–8.7), sync-collection (RFC 6578), and empty answers to the principal searches some clients send.
+
+import mhttp.Request;
+import mhttp.Response;
+import mhttp.percentDecode;
+import mpim.Collection;
+import mpim.PimError;
+import mpim.PimObject;
+import mpim.changes;
+import mpim.objectNamed;
+import mpim.objects;
+import mpim.objectsInRange;
+import mpim.parseCalTime;
+import msmtp.SmtpContext;
+import mxml.XmlDocument;
+import mxml.XmlWriter;
+
+async fn report(
+    mail: borrow SmtpContext,
+    request: borrow Request,
+    target: borrow DavPath,
+    email: StringView,
+    userId: i64,
+) -> Result<Response, AllocError> {
+    let doc = match (bodyXml(request)) {
+        Ok(Some(d)) => d,
+        Ok(null) => { return Response.text(400, "A REPORT needs a body."); }
+        Err(_) => { return Response.text(400, "The body is not well-formed XML."); }
+    };
+    let root = doc.root();
+    let viewer = makeViewer(email)?;
+    if (doc.is(root, NS_DAV, "principal-search-property-set")) {
+        var w = XmlWriter.document();
+        w.start("D:principal-search-property-set");
+        declareSpaces(mut w);
+        w.end();
+        return Response.of(200, "application/xml; charset=utf-8", w.finish()?);
+    }
+    if (doc.is(root, NS_DAV, "principal-property-search") || doc.is(root, NS_DAV, "expand-property")) {
+        // No directory: no other principals to find.
+        return finishMultistatus(multistatus());
+    }
+    let calendarReport = doc.is(root, NS_CAL, "calendar-multiget") || doc.is(root, NS_CAL, "calendar-query");
+    let bookReport = doc.is(root, NS_CARD, "addressbook-multiget") || doc.is(root, NS_CARD, "addressbook-query");
+    let sync = doc.is(root, NS_DAV, "sync-collection");
+    if (!calendarReport && !bookReport && !sync) {
+        return preconditionFailed(403, NS_DAV, "supported-report");
+    }
+    let onCalendar = target.kind == T_CALENDAR;
+    let onBook = target.kind == T_BOOK;
+    if ((calendarReport && !onCalendar) || (bookReport && !onBook) || (sync && !onCalendar && !onBook)) {
+        return preconditionFailed(403, NS_DAV, "supported-report");
+    }
+    var c = Collection.create();
+    match (await targetCollection(mail, userId, target, mut c)) {
+        Ok(true) => {}
+        Ok(false) => { return Response.text(404, "No such collection."); }
+        Err(e) => { return pimAnswer(e); }
+    }
+    var asked = PropRequest.create();
+    readPropRequest(doc, root, mut asked)?;
+    if (asked.mode != ASK_PROPS) {
+        // A report without DAV:prop: the etag, as clients that leave it out expect.
+        asked.mode = ASK_PROPS;
+        asked.add(NS_DAV, "getetag")?;
+    }
+    if (sync) {
+        return await syncCollection(mail, doc, viewer, c, asked);
+    }
+    let objectKind = if (onCalendar) T_CAL_OBJECT else T_CARD;
+    var w = multistatus();
+    let multiget = doc.is(root, NS_CAL, "calendar-multiget") || doc.is(root, NS_CARD, "addressbook-multiget");
+    if (multiget) {
+        var hrefs = Vector<usize>.create();
+        doc.findAll(root, NS_DAV, "href", mut hrefs)?;
+        for (h in hrefs.view()) {
+            let raw = doc.trimmed(h);
+            var name = String.create();
+            lastSegment(raw, mut name)?;
+            var o = PimObject.create();
+            let found = match (await objectNamed(mail.store, c.id, name.view(), mut o)) {
+                Ok(f) => f,
+                Err(e) => { return pimAnswer(e); }
+            };
+            if (!found) {
+                writeGone(mut w, raw);
+                continue;
+            }
+            var r = Resource { kind: objectKind, href: String.create() };
+            objectHref(onCalendar, email, c.name.view(), o.href.view(), mut r.href)?;
+            writeResource(mut w, viewer, r, c, o, asked)?;
+        }
+        return finishMultistatus(w);
+    }
+    // A query: calendars filtered by component and time range; address books in full.
+    var list = Vector<PimObject>.create();
+    var stored: Result<void, PimError> = Ok();
+    if (onCalendar) {
+        var component = String.create();
+        var range = TimeRange { start: null, end: null };
+        queryFilter(doc, mut component, mut range)?;
+        stored = await objectsInRange(
+            mail.store,
+            c.id,
+            range.start,
+            range.end,
+            component.view(),
+            asked.wantsData(),
+            mut list,
+        );
+    } else {
+        stored = await objects(mail.store, c.id, asked.wantsData(), mut list);
+    }
+    match (stored) {
+        Ok() => {}
+        Err(e) => { return pimAnswer(e); }
+    }
+    for (o in list.view()) {
+        var r = Resource { kind: objectKind, href: String.create() };
+        objectHref(onCalendar, email, c.name.view(), o.href.view(), mut r.href)?;
+        writeResource(mut w, viewer, r, c, o, asked)?;
+    }
+    return finishMultistatus(w);
+}
+
+/// The last segment of an href (a path or a full URL), percent-decoded.
+fn lastSegment(href: StringView, into: borrow mut String) -> Result<void, AllocError> {
+    let bytes = href.bytes();
+    var end = bytes.length;
+    while (end > 0 && bytes[end - 1] == 0x2f) {
+        end -= 1;
+    }
+    var start = end;
+    while (start > 0 && bytes[start - 1] != 0x2f) {
+        start -= 1;
+    }
+    into.clear();
+    return percentDecode(href[start..end], false, into);
+}
+
+struct TimeRange {
+    start: i64?;
+    end: i64?;
+}
+
+/// A calendar-query's filter: the component inside VCALENDAR's comp-filter (empty: any), and its time range.
+fn queryFilter(
+    doc: borrow XmlDocument,
+    component: borrow mut String,
+    range: borrow mut TimeRange,
+) -> Result<void, AllocError> {
+    var filters = Vector<usize>.create();
+    doc.findAll(doc.root(), NS_CAL, "comp-filter", mut filters)?;
+    for (f in filters.view()) {
+        let name = match (doc.attribute(f, "name")) {
+            Some(a) => doc.valueText(a),
+            null => "",
+        };
+        if (name.equalsIgnoreAsciiCase("VCALENDAR") || name.length == 0) {
+            continue;
+        }
+        component.clear();
+        lowerToUpper(name, component)?;
+        match (doc.child(f, NS_CAL, "time-range")) {
+            Some(timeRange) => {
+                match (doc.attribute(timeRange, "start")) {
+                    Some(a) => {
+                        match (parseCalTime(doc.value(a))) {
+                            Some(t) => { range.start = t.seconds; }
+                            null => {}
+                        }
+                    }
+                    null => {}
+                }
+                match (doc.attribute(timeRange, "end")) {
+                    Some(a) => {
+                        match (parseCalTime(doc.value(a))) {
+                            Some(t) => { range.end = t.seconds; }
+                            null => {}
+                        }
+                    }
+                    null => {}
+                }
+            }
+            null => {}
+        }
+        break;
+    }
+    return Ok();
+}
+
+fn lowerToUpper(text: StringView, into: borrow mut String) -> Result<void, AllocError> {
+    var bytes = Vector<u8>.create();
+    for (b in text.bytes()) {
+        bytes.push(if (b >= 0x61 && b <= 0x7a) b - 0x20 else b)?;
+    }
+    return into.append(StringView.fromUtf8(bytes.view()) ?? "");
+}
+
+/// sync-collection (RFC 6578 §3.2): with no token, every object; with a token, what changed since (deletions as
+/// 404 responses); then the new token. A token from elsewhere, or from the future, is refused.
+async fn syncCollection(
+    mail: borrow SmtpContext,
+    doc: borrow XmlDocument,
+    viewer: borrow Viewer,
+    c: borrow Collection,
+    asked: borrow PropRequest,
+) -> Result<Response, AllocError> {
+    let given = match (doc.child(doc.root(), NS_DAV, "sync-token")) {
+        Some(t) => doc.trimmed(t),
+        null => "",
+    };
+    var since: i64 = 0;
+    if (given.length > 0) {
+        if (!given.startsWith(SYNC_PREFIX)) {
+            return preconditionFailed(403, NS_DAV, "valid-sync-token");
+        }
+        since = match (given[SYNC_PREFIX.length..].parseInt<i64>()) {
+            Some(n) => n,
+            null => { return preconditionFailed(403, NS_DAV, "valid-sync-token"); }
+        };
+        if (since < 0 || since > c.modseq) {
+            return preconditionFailed(403, NS_DAV, "valid-sync-token");
+        }
+    }
+    let calendar = c.isCalendar();
+    let objectKind = if (calendar) T_CAL_OBJECT else T_CARD;
+    var w = multistatus();
+    let email = viewer.email.view();
+    var changed = Vector<PimObject>.create();
+    match (await changes(mail.store, c.id, since, mut changed)) {
+        Ok() => {}
+        Err(e) => { return pimAnswer(e); }
+    }
+    // The data, when asked for, comes from the live objects (`changes` leaves it out).
+    var live = Vector<PimObject>.create();
+    if (asked.wantsData()) {
+        match (await objects(mail.store, c.id, true, mut live)) {
+            Ok() => {}
+            Err(e) => { return pimAnswer(e); }
+        }
+    }
+    for (o in changed.view()) {
+        var href = String.create();
+        objectHref(calendar, email, c.name.view(), o.href.view(), mut href)?;
+        if (o.deleted) {
+            // A first sync does not list what is already gone.
+            if (since > 0) {
+                writeGone(mut w, href.view());
+            }
+            continue;
+        }
+        let r = Resource { kind: objectKind, href: href };
+        var withData = false;
+        for (l in live.view()) {
+            if (l.id == o.id) {
+                writeResource(mut w, viewer, r, c, l, asked)?;
+                withData = true;
+                break;
+            }
+        }
+        if (!withData) {
+            writeResource(mut w, viewer, r, c, o, asked)?;
+        }
+    }
+    var token = String.create();
+    token.append(SYNC_PREFIX)?;
+    token.appendNumber(c.modseq)?;
+    w.element("D:sync-token", token.view());
+    return finishMultistatus(w);
+}

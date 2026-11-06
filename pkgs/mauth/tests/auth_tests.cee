@@ -1,0 +1,176 @@
+// Organizational domains, alignment, DMARC records, and authentication end to end (tests/run.sh serves the zone).
+
+import mdns.IpAddress;
+import mdns.Resolver;
+import mdns.parseIp;
+
+fn orgIs(domain: StringView, want: StringView) -> Result<void, TestFailure> {
+    var out = Vector<u8>.create();
+    organizationalDomain(domain.bytes(), mut out)!;
+    let got = StringView.fromUtf8(out.view())!;
+    if (got != want) {
+        Console.writeErrorLine(got);
+    }
+    return Check.isTrue(got == want, domain);
+}
+
+@test
+fn findsOrganizationalDomains() -> Result<void, TestFailure> {
+    orgIs("mail.example.com", "example.com")?;
+    orgIs("Example.COM.", "example.com")?;
+    orgIs("a.b.c.example.co.uk", "example.co.uk")?;
+    orgIs("evil.co.uk", "evil.co.uk")?;
+    orgIs("co.uk", "co.uk")?;
+    orgIs("user.github.io", "user.github.io")?; // the private section: each user's own
+    orgIs("deep.user.github.io", "user.github.io")?;
+    orgIs("www.city.kawasaki.jp", "city.kawasaki.jp")?; // an exception to *.kawasaki.jp
+    orgIs("a.b.foo.kawasaki.jp", "b.foo.kawasaki.jp")?; // the wildcard
+    orgIs("x.y.unknowntld", "y.unknowntld")?;           // no rule: the top label is the suffix
+    return orgIs("mail.xn--p1ai", "mail.xn--p1ai");     // .рф, an IDN TLD
+}
+
+@test
+fn alignsDomains() -> Result<void, TestFailure> {
+    Check.isTrue(aligned("mail.example.com".bytes(), "example.com".bytes(), false)!, "relaxed: same org")?;
+    Check.isTrue(!aligned("mail.example.com".bytes(), "example.com".bytes(), true)!, "strict: not equal")?;
+    Check.isTrue(aligned("EXAMPLE.com".bytes(), "example.com.".bytes(), true)!, "case and final dot")?;
+    Check.isTrue(!aligned("evil.co.uk".bytes(), "victim.co.uk".bytes(), false)!, "co.uk is a public suffix")?;
+    return Check.isTrue(!aligned("a.github.io".bytes(), "b.github.io".bytes(), false)!, "github.io users differ");
+}
+
+@test
+fn parsesDmarcRecords() -> Result<void, TestFailure> {
+    let r = parseDmarc("v=DMARC1; p=quarantine; sp=reject; adkim=s; pct=20; rua=mailto:x@example.org".bytes())!;
+    Check.isTrue(
+        policyName(r.policy) == "quarantine" && r.hasSubdomainPolicy && r.strictDkim && !r.strictSpf && r.percent == 20,
+        "tags",
+    )?;
+    Check.isTrue(parseDmarc("p=reject; v=DMARC1".bytes()) == null, "v= must come first")?;
+    Check.isTrue(parseDmarc("v=DMARC1; p=bogus".bytes()) == null, "a bad policy")?;
+    return Check.isTrue(parseDmarc("v=DMARC1; sp=reject".bytes()) == null, "no p=");
+}
+
+fn testPort() -> u16? {
+    let text = Environment.variable("DNS_TEST_PORT")?;
+    return text.parseInt<u16>();
+}
+
+fn resolver(port: u16) -> Resolver {
+    var servers = Vector<IpAddress>.create();
+    servers.push(IpAddress.v4(127, 0, 0, 1))!;
+    var r = Resolver.create(servers, port)!;
+    r.timeout(500);
+    return r;
+}
+
+fn verifierFor(path: StringView) -> DkimVerifier {
+    var file = File.open(path)!;
+    var v = DkimVerifier.create();
+    var buffer = [0u8; 4096];
+    loop {
+        let n = file.read(mut buffer[..])!;
+        if (n == 0) {
+            return v;
+        }
+        v.feed(buffer[0..n])!;
+    }
+}
+
+async fn endToEnd(
+    port: u16,
+    signed: DkimVerifier,
+    tampered: DkimVerifier,
+    checks: borrow mut Vector<bool>,
+    header: borrow mut Vector<u8>,
+) -> Result<void, AllocError> {
+    let r = resolver(port);
+    var good = signed;
+    var bad = tampered;
+    var report = AuthReport.create();
+    // From the permitted address, correctly signed: all pass.
+    await authenticate(
+        r,
+        parseIp("192.0.2.1".bytes())!,
+        "bounce@example.org",
+        "mx.example.org",
+        mut good,
+        0,
+        mut report,
+    )?;
+    checks.push(spfName(report.spf.result) == "pass")?;
+    checks.push(report.dkim.length == 1 && dkimName(report.dkim[0].status) == "pass")?;
+    checks.push(dmarcName(report.dmarc.status) == "pass" && policyName(report.dmarc.disposition) == "none")?;
+    authenticationResults("mx.test.example", report, header)?;
+    // From another address, the body changed: all fail, and DMARC asks to reject.
+    await authenticate(
+        r,
+        parseIp("198.51.100.7".bytes())!,
+        "bounce@example.org",
+        "spoofer.test",
+        mut bad,
+        0,
+        mut report,
+    )?;
+    checks.push(spfName(report.spf.result) == "fail")?;
+    checks.push(dkimName(report.dkim[0].status) == "fail")?;
+    checks.push(dmarcName(report.dmarc.status) == "fail" && policyName(report.dmarc.disposition) == "reject")?;
+    // SPF alone can carry DMARC: an aligned SPF pass with no signature.
+    var unsigned = DkimVerifier.create();
+    unsigned.feed("From: x@example.org\r\nSubject: s\r\n\r\nbody\r\n".bytes())?;
+    await authenticate(r, parseIp("192.0.2.1".bytes())!, "x@example.org", "h", mut unsigned, 0, mut report)?;
+    checks.push(report.dkim.length == 0 && dmarcName(report.dmarc.status) == "pass")?;
+    // A subdomain without its own record takes the organizational domain's sp=.
+    var sub = DkimVerifier.create();
+    sub.feed("From: x@news.example.org\r\n\r\nbody\r\n".bytes())?;
+    await authenticate(r, parseIp("198.51.100.7".bytes())!, "x@news.example.org", "h", mut sub, 0, mut report)?;
+    checks.push(dmarcName(report.dmarc.status) == "fail" && policyName(report.dmarc.disposition) == "quarantine")?;
+    // No policy published; a broken one; two records: DMARC does not apply.
+    for (domain in ["nopolicy.test", "broken.test", "two.test"]) {
+        var none = DkimVerifier.create();
+        none.feed("From: x@".bytes())?;
+        none.feed(domain.bytes())?;
+        none.feed("\r\n\r\nbody\r\n".bytes())?;
+        await authenticate(r, parseIp("198.51.100.7".bytes())!, "", "h", mut none, 0, mut report)?;
+        checks.push(dmarcName(report.dmarc.status) == "none")?;
+    }
+    // Two From fields: DMARC cannot say whose message it is.
+    var two = DkimVerifier.create();
+    two.feed("From: a@example.org\r\nFrom: b@other.test\r\n\r\nbody\r\n".bytes())?;
+    await authenticate(r, parseIp("192.0.2.1".bytes())!, "a@example.org", "h", mut two, 0, mut report)?;
+    checks.push(dmarcName(report.dmarc.status) == "permerror")?;
+    return Ok();
+}
+
+@test
+fn authenticatesEndToEnd() -> Result<void, TestFailure> {
+    let port = match (testPort()) {
+        Some(p) => p,
+        null => { return Ok(); }
+    };
+    // A dkimpy-signed message from alice@example.org, and the same with its body changed.
+    let signed = verifierFor("tests/dkim/cases/065-oversigned.eml");
+    let tampered = verifierFor("tests/dkim/cases/069-tampered-body.eml");
+    var checks = Vector<bool>.create();
+    var header = Vector<u8>.create();
+    Async.run(endToEnd(port, signed, tampered, mut checks, mut header))!;
+    let text = StringView.fromUtf8(header.view())!;
+    Check.isTrue(
+        text.startsWith(
+            "Authentication-Results: mx.test.example;\r\n\tspf=pass smtp.mailfrom=example.org;\r\n\tdkim=pass header.d=example.org header.s=rsa2048 header.a=rsa-sha256 header.b=",
+        ),
+        text,
+    )?;
+    Check.isTrue(text.endsWith(";\r\n\tdmarc=pass (p=reject) header.from=example.org\r\n"), text)?;
+    Check.isTrue(checks.length == 12, "every check ran")?;
+    for (i in 0..checks.length) {
+        if (!checks[i]) {
+            var message = String.create();
+            message.append("check ")!;
+            let digit = [0x30u8 + truncate<u8>((i + 1) / 10), 0x30u8 + truncate<u8>((i + 1) % 10)];
+            message.append(StringView.fromUtf8(digit[..])!)!;
+            message.append(" failed")!;
+            return Check.fail(message.view());
+        }
+    }
+    return Ok();
+}

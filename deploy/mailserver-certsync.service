@@ -1,0 +1,9 @@
+[Unit]
+Description=Copy the proxy's certificate for the mail host to the mail server
+
+[Service]
+Type=oneshot
+# Set these for your host (see deploy/certsync.sh).
+Environment=CERT_SRC=/data/cosmoproxy/conf/certs/mail.example.com
+Environment=CERT_DST=/data/mailserver/tls
+ExecStart=/data/mailserver/certsync.sh

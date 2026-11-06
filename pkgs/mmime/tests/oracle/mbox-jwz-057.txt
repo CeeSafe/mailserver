@@ -1,0 +1,10 @@
+size 2871
+envelope ("Sat, 13 Jul 1996 16:58:55 +0200" "Re: Sending a Hebrew message with sendmail" (("=?ISO-8859-2?Q?Vladim=EDr_Solnick=FD?=" NIL "vs" "utia.cas.cz")) (("=?ISO-8859-2?Q?Vladim=EDr_Solnick=FD?=" NIL "vs" "utia.cas.cz")) (("=?ISO-8859-2?Q?Bc=2E_Vladim=EDr_Solnick=FD?=" NIL "vs" "utia.cas.cz")) (("Shlomi Fish" NIL "shlomi" "medusa.cortext.co.il")) NIL NIL "<4s36v9$gi0@news.NetVision.net.il>" "<Pine.HPP.3.94.1.960713165148.28138A-100000@visla.utia.cas.cz>")
+bodystructure ("TEXT" "PLAIN" ("charset" "ISO-8859-2") NIL NIL "8BIT" 1374 34 NIL NIL NIL NIL)
+body ("TEXT" "PLAIN" ("charset" "ISO-8859-2") NIL NIL "8BIT" 1374 34)
+section HEADER 1497 75805a16a38143d970098f576476c973667485baa2d49c19a364ee4ac351d630
+section TEXT 1374 608303504c8b4cd1db6c9209737a7d554c2fa85afe1ad6bc80946acbad510cb2
+section HEADER.FIELDS 326 264df6eed9e789463ab6bcfcc7ddbaaa2461290bf1fcf89bba1d9671160e9f4d
+section HEADER.FIELDS.NOT 1173 b1a37a84c1b0fe6dbe80c7f62272974c650ad3f5dbe14df23e166a580eb26364
+section 1 1374 608303504c8b4cd1db6c9209737a7d554c2fa85afe1ad6bc80946acbad510cb2
+section 1.MIME 1497 75805a16a38143d970098f576476c973667485baa2d49c19a364ee4ac351d630

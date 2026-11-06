@@ -1,0 +1,10 @@
+size 4155
+envelope ("Sat, 27 Apr 1996 01:08:58 -0700" "Deming Software -- ready to go!" (("Blake Ramsdell" NIL "BlakeR" "deming.com")) (("Blake Ramsdell" NIL "BlakeR" "deming.com")) (("Blake Ramsdell" NIL "BlakeR" "deming.com")) (("'smime-dev@rsa.com'" NIL "smime-dev" "rsa.com")) NIL NIL NIL "<c=US%a=_%p=Deming_Software%l=PAIN-960427080858Z-10@pain.deming.com>")
+bodystructure ("application" "x-pkcs7-mime" ("name" "deming.p7m") NIL NIL "base64" 2920 NIL NIL NIL NIL)
+body ("application" "x-pkcs7-mime" ("name" "deming.p7m") NIL NIL "base64" 2920)
+section HEADER 1235 604bb35f74a13e7a890f07d1541ce83c3b028fb0b3633aad48200ddd66adb4f6
+section TEXT 2920 71acf781527a908c234ff304a4b1f229202ce3eb3f726c50a9d7075665d63ddb
+section HEADER.FIELDS 313 62110414f83999b0b05ef546b532ee3ac039e101d073521326110d5aa3cad81d
+section HEADER.FIELDS.NOT 924 6f22f73ea37355cb00971986804d0bd59aaf91d888d55ffb665719ed97ceb51a
+section 1 2920 71acf781527a908c234ff304a4b1f229202ce3eb3f726c50a9d7075665d63ddb
+section 1.MIME 1235 604bb35f74a13e7a890f07d1541ce83c3b028fb0b3633aad48200ddd66adb4f6

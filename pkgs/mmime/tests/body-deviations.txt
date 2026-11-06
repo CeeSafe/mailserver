@@ -1,0 +1,43 @@
+# Where mmime's decoded body text knowingly differs from Python's email package (tools/body-differential.py allows
+# these). `<message> <part>`, the part's index in Python's depth-first walk. HTML is compared unstripped, so it
+# needs no entry; stripping is ours and has unit tests.
+
+# Quoted-printable: RFC 2045 §6.7 says whitespace at the end of an encoded line was added in transport and must be
+# deleted; mmime deletes it, as Dovecot does. Python's binascii.a2b_qp keeps it. Only whitespace differs.
+mbox-jwz-002 0
+mbox-jwz-011 3
+mbox-jwz-014 0
+mbox-jwz-020 3
+mbox-jwz-029 8
+mbox-jwz-039 2
+mbox-jwz-047 3
+mbox-jwz-047 5
+mbox-jwz-089 3
+mbox-jwz-089 9
+mbox-jwz-099 0
+mbox-jwz-149 3
+mbox-jwz-151 3
+mbox-jwz-151 5
+
+# Multiparts never closed: the last part runs to the end of the message. Its range is Dovecot's (checked by
+# tools/differential.py), with the last line break; Python drops that line break. Only whitespace differs.
+mbox-simple-000 3
+mbox-simple-001 3
+mbox-simple-002 3
+
+# A different structure, where mmime reads the message as Dovecot does (tools/differential.py checks it) and
+# Python ends the header early, so its first part is text holding what mmime reads as more header or other parts:
+# a header line without a colon or with a space in its name, a byte-order mark before the first field, a mbox
+# `From `-style line at the top of an embedded message.
+compliance-invalid-header-field-with-space 0
+messages-feedback-report 0
+messages-issue358 0
+mbox-jwz-004 3
+
+# A base64-encoded message/rfc822: Dovecot and mmime read the encapsulated message in place (whose header then never
+# ends, so its body is empty); Python decodes the base64 and finds the message inside.
+compliance-invalid-content-transfer-encoding-rfc822 1
+
+# Labelled ISO-2022-JP but in fact UTF-8: both decoders produce U+FFFD, in different places (iconv replaces one byte
+# and resynchronises; Python's codec replaces differently). Neither reading is right.
+mbox-jwz-013 0

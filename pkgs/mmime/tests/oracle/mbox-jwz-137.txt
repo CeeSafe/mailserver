@@ -1,0 +1,10 @@
+size 3767
+envelope ("Fri, 29 Nov 91 07:13:37 EST" "GIF image (3/3)" ((NIL NIL "nsb" "thumper.bellcore.com")) ((NIL NIL "nsb" "thumper.bellcore.com")) ((NIL NIL "nsb" "thumper.bellcore.com")) NIL NIL NIL NIL NIL)
+bodystructure ("message" "partial" ("number" "3" "total" "3" "id" "foobar") NIL NIL "7bit" 3610 NIL NIL NIL NIL)
+body ("message" "partial" ("number" "3" "total" "3" "id" "foobar") NIL NIL "7bit" 3610)
+section HEADER 157 914df50b9c61422cdcbf2d149d66393b97dfbd4d32bb277d038986d704fe92b1
+section TEXT 3610 84245d92768aea30a5da7e2e656358a8d797737e09dbfd60d9da068e1488d132
+section HEADER.FIELDS 157 914df50b9c61422cdcbf2d149d66393b97dfbd4d32bb277d038986d704fe92b1
+section HEADER.FIELDS.NOT 2 7eb70257593da06f682a3ddda54a9d260d4fc514f645237f5ca74b08f8da61a6
+section 1 3610 84245d92768aea30a5da7e2e656358a8d797737e09dbfd60d9da068e1488d132
+section 1.MIME 157 914df50b9c61422cdcbf2d149d66393b97dfbd4d32bb277d038986d704fe92b1

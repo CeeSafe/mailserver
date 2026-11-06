@@ -1,0 +1,187 @@
+// The XML writer: elements by qualified name (the caller declares its prefixes with `attribute("xmlns:d", ...)` on
+// the root), escaped text and attribute values, and empty elements written as `<name/>`. Like mhttp's JsonWriter, a
+// failed allocation is remembered and reported by `finish`.
+
+@noncopy
+public struct XmlWriter {
+    out: Vector<u8>;
+    /// The names of the open elements, end to end, and where each starts.
+    names: Vector<u8>;
+    starts: Vector<usize>;
+    /// The last start tag is not closed with `>` yet (so `end` can make it `/>`).
+    pending: bool;
+    oom: bool;
+
+    public fn create() -> XmlWriter =>
+        XmlWriter {
+            out: Vector<u8>.create(),
+            names: Vector<u8>.create(),
+            starts: Vector<usize>.create(),
+            pending: false,
+            oom: false,
+        };
+
+    /// A writer that begins with the XML declaration.
+    public fn document() -> XmlWriter {
+        var w = XmlWriter.create();
+        w.bytes("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n".bytes());
+        return w;
+    }
+
+    fn bytes(borrow mut this, b: Slice<u8>) {
+        match (this.out.extend(b)) {
+            Ok() => {}
+            Err(_) => { this.oom = true; }
+        }
+    }
+
+    fn byte(borrow mut this, b: u8) {
+        match (this.out.push(b)) {
+            Ok() => {}
+            Err(_) => { this.oom = true; }
+        }
+    }
+
+    fn closeStart(borrow mut this) {
+        if (this.pending) {
+            this.byte(0x3e);
+            this.pending = false;
+        }
+    }
+
+    /// Opens element `name` (with its prefix, if any).
+    public fn start(borrow mut this, name: StringView) {
+        this.closeStart();
+        this.byte(0x3c);
+        this.bytes(name.bytes());
+        match (this.starts.push(this.names.length)) {
+            Ok() => {}
+            Err(_) => { this.oom = true; }
+        }
+        match (this.names.extend(name.bytes())) {
+            Ok() => {}
+            Err(_) => { this.oom = true; }
+        }
+        this.pending = true;
+    }
+
+    /// An attribute of the element just started.
+    public fn attribute(borrow mut this, name: StringView, value: StringView) {
+        if (!this.pending) {
+            this.oom = true; // a misuse: reported as a failure rather than written wrong
+            return;
+        }
+        this.byte(0x20);
+        this.bytes(name.bytes());
+        this.bytes("=\"".bytes());
+        this.escaped(value.bytes(), true);
+        this.byte(0x22);
+    }
+
+    /// Text inside the open element.
+    public fn text(borrow mut this, value: StringView) { this.textBytes(value.bytes()); }
+
+    /// Text from bytes that should be UTF-8; others become U+FFFD, and characters XML cannot carry are dropped.
+    public fn textBytes(borrow mut this, value: Slice<u8>) {
+        this.closeStart();
+        match (StringView.fromUtf8(value)) {
+            Some(_) => { this.escaped(value, false); }
+            null => {
+                for (b in value) {
+                    if (b < 0x80) {
+                        this.escaped([b][..], false);
+                    } else {
+                        this.bytes("\u{FFFD}".bytes());
+                    }
+                }
+            }
+        }
+    }
+
+    fn escaped(borrow mut this, value: Slice<u8>, attribute: bool) {
+        for (b in value) {
+            if (b == 0x26) {
+                this.bytes("&amp;".bytes());
+            } else if (b == 0x3c) {
+                this.bytes("&lt;".bytes());
+            } else if (b == 0x3e) {
+                this.bytes("&gt;".bytes());
+            } else if (b == 0x22 && attribute) {
+                this.bytes("&quot;".bytes());
+            } else if (b == 0x0d) {
+                this.bytes("&#13;".bytes());
+            } else if (attribute && (b == 0x0a || b == 0x09)) {
+                this.bytes(if (b == 0x0a) "&#10;".bytes() else "&#9;".bytes());
+            } else if (b < 0x20 && b != 0x09 && b != 0x0a) {
+                // Not an XML character: dropped.
+            } else {
+                this.byte(b);
+            }
+        }
+    }
+
+    /// Closes the open element.
+    public fn end(borrow mut this) {
+        let start = match (this.starts.pop()) {
+            Some(s) => s,
+            null => {
+                this.oom = true;
+                return;
+            }
+        };
+        if (this.pending) {
+            this.bytes("/>".bytes());
+            this.pending = false;
+        } else {
+            this.bytes("</".bytes());
+            var name = Vector<u8>.create();
+            match (name.extend(this.names[start..])) {
+                Ok() => {}
+                Err(_) => { this.oom = true; }
+            }
+            this.bytes(name.view());
+            this.byte(0x3e);
+        }
+        this.names.truncate(start);
+    }
+
+    /// `<name>value</name>`.
+    public fn element(borrow mut this, name: StringView, value: StringView) {
+        this.start(name);
+        this.text(value);
+        this.end();
+    }
+
+    /// `<name/>`.
+    public fn empty(borrow mut this, name: StringView) {
+        this.start(name);
+        this.end();
+    }
+
+    /// `<name>` and a decimal number.
+    public fn number(borrow mut this, name: StringView, value: i64) {
+        this.start(name);
+        this.closeStart();
+        var s = String.create();
+        match (s.appendNumber(value)) {
+            Ok() => {}
+            Err(_) => { this.oom = true; }
+        }
+        this.bytes(s.view().bytes());
+        this.end();
+    }
+
+    /// Markup the caller has made well formed.
+    public fn raw(borrow mut this, markup: Slice<u8>) {
+        this.closeStart();
+        this.bytes(markup);
+    }
+
+    /// The document, or `OutOfMemory` if any write failed or an element is still open.
+    public fn finish(this) -> Result<Vector<u8>, AllocError> {
+        if (this.oom || this.starts.length > 0) {
+            return Err(AllocError.OutOfMemory);
+        }
+        return Ok(this.out);
+    }
+}

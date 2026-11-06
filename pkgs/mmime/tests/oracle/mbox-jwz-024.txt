@@ -1,0 +1,10 @@
+size 61351
+envelope ("5 May 1995 03:57:42 GMT" "M2 Screenshots from GO! - 3dom21.jpg [1/2]" (("Skywalker of the Jedi" NIL "skyojedi" "phoenix.net")) (("Skywalker of the Jedi" NIL "skyojedi" "phoenix.net")) (("Skywalker of the Jedi" NIL "skyojedi" "phoenix.net")) NIL NIL NIL NIL "<3oc7nm$edc@gryphon.phoenix.net>")
+bodystructure ("message" "partial" ("id" "799652823@Skywalker of the Jedi" "number" "1" "total" "2") NIL NIL "7bit" 60767 NIL NIL NIL NIL)
+body ("message" "partial" ("id" "799652823@Skywalker of the Jedi" "number" "1" "total" "2") NIL NIL "7bit" 60767)
+section HEADER 584 2f8345cff383f834b20d134caa4f487500316d906e00e6c0131d2dc043779297
+section TEXT 60767 73009023bd03ac8d07fc57c41d6f18d31500c2653ac5272e582c6895ffbd078c
+section HEADER.FIELDS 284 48deb803cdd8d507c43fa11dcfeac63eba599928a207ef6ddf672c884749f532
+section HEADER.FIELDS.NOT 302 6ab15eec42398818e7cc111403fc6b028e29a2a71afb0e6145e51ddceb008378
+section 1 60767 73009023bd03ac8d07fc57c41d6f18d31500c2653ac5272e582c6895ffbd078c
+section 1.MIME 584 2f8345cff383f834b20d134caa4f487500316d906e00e6c0131d2dc043779297

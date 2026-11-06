@@ -1,0 +1,12 @@
+size 80662
+envelope ("Fri, 5 Feb 93 09:44:55 EST" "Audio" (("Terry Crowley" NIL "tcrowley" "diamond.bbn.com")) (("Terry Crowley" NIL "tcrowley" "diamond.bbn.com")) (("Terry Crowley" NIL "tcrowley" "diamond.bbn.com")) ((NIL NIL "nsb" "thumper.bellcore.com")) NIL NIL NIL "<9302051445.AA10767@dilithium.bbn.com>")
+bodystructure (("text" "plain" ("charset" "ISO-8859-1") NIL NIL "Quoted-Printable" 103 6 NIL NIL NIL NIL) ("audio" "basic" NIL NIL "Remark by Terry Crowley on 02/05/93, 9:43 am" "Base64" 79516 NIL NIL NIL NIL) "mixed" ("boundary" "SlateBoundary_1_Fri_Feb_5_09:44:55_1993_E9C1BD") NIL NIL NIL)
+body (("text" "plain" ("charset" "ISO-8859-1") NIL NIL "Quoted-Printable" 103 6) ("audio" "basic" NIL NIL "Remark by Terry Crowley on 02/05/93, 9:43 am" "Base64" 79516) "mixed")
+section HEADER 661 dd02e30ee76dfb6a521477d5beb82d4a506a99e1171a5cd8722b34928ae2617a
+section TEXT 80001 bc64b3f58e579c6c3458bb883ee5eb8194364632aad138a44d3d91cb0f7bd2a7
+section HEADER.FIELDS 278 6abc2536d78ac6f085174781191346a6031c08ed0122d00b1c830fba02f044fb
+section HEADER.FIELDS.NOT 385 bf42724d65891c69e98eaece0ea9987e9f438d131b180a6d247a1f5c8f07e223
+section 1 103 ec47e3cb6a901f6b5f0348bc99ab1d6d96157e47ebb746ffdc5d84d013f5ac6c
+section 1.MIME 93 5f7993ad10e9a3733969204a922c133c9c68c291c5c265cbc2959e069c37c79e
+section 2 79516 69353ac3be8abcbcbc2bfb586e3b9937de988f46ab25d6d724a8f990cff7bda1
+section 2.MIME 131 0a2ee15acc0cbe4b279b6a883a3ea3c68332bb9700cc561456867b9db2dd3a55

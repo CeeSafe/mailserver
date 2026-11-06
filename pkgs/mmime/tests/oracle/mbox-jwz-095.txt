@@ -1,0 +1,22 @@
+size 188677
+envelope ("Fri,  5 Feb 1993 10:03:45 -0500 (EST)" "Re: Audio" (("Nathaniel Borenstein" NIL "nsb" "MISSING_DOMAIN")) (("Nathaniel Borenstein" NIL "nsb" "MISSING_DOMAIN")) (("Nathaniel Borenstein" NIL "nsb" "MISSING_DOMAIN")) (("Terry Crowley" NIL "tcrowley" "diamond.bbn.com")) (("Jonathan Rosenberg" NIL "jxr" "MISSING_DOMAIN") ("Robert E Kraut" NIL "kraut" "MISSING_DOMAIN") ("Al Buzzard" NIL "alb" "MISSING_DOMAIN")) NIL "<9302051445.AA10767@dilithium.bbn.com>" "<AfQc7Fu0M2YtM7NCws@thumper.bellcore.com>")
+bodystructure (("text" "plain" ("charset" "US-ASCII") NIL NIL "7bit" 1378 28 NIL NIL NIL NIL) (("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 1161 22 NIL NIL NIL NIL) ("audio" "basic" NIL NIL "I'm VERY happy!" "base64" 116822 NIL NIL NIL NIL) ("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 126 3 NIL NIL NIL NIL) ("image" "gif" NIL NIL "My daughter Miriam" "base64" 67242 NIL NIL NIL NIL) ("text" "plain" ("charset" "US-ASCII") NIL NIL "quoted-printable" 0 0 NIL NIL NIL NIL) "mixed" ("boundary" "Alternative.Boundary.4fQc7B:0M2Yt07NClY") NIL NIL NIL) "alternative" ("boundary" "Interpart.Boundary.8fQc7B:0M2Yt47NCon") NIL NIL NIL)
+body (("text" "plain" ("charset" "US-ASCII") NIL NIL "7bit" 1378 28) (("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 1161 22) ("audio" "basic" NIL NIL "I'm VERY happy!" "base64" 116822) ("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 126 3) ("image" "gif" NIL NIL "My daughter Miriam" "base64" 67242) ("text" "plain" ("charset" "US-ASCII") NIL NIL "quoted-printable" 0 0) "mixed") "alternative")
+section HEADER 773 b0341c5a4e719e196d891fc961c19927a64129a97e567fc7f19b158ff55db9ae
+section TEXT 187904 e4ca0579433b74e064223bae8f586dda897ef9efb9861a0d3e10bf06cc4f80f4
+section HEADER.FIELDS 366 155653c15c46dea4f1e0e91c72355c89890e58d4f9c88527ab16cd4110cb4bc5
+section HEADER.FIELDS.NOT 409 c2f303f3a69ad627f39adb3f6d80b466ced26c2632d80c69a80a9e7f90242bea
+section 1 1378 943ce720cc8ed1f609b158d3f913595241175ccd51e224e8a43d8690c5cec7c3
+section 1.MIME 46 b3532c649b28a23803c77a2acc4907f5048ea77b89e0c51dcf7f271f2db4bfa6
+section 2 186105 11d7a1de56dcb8beee90a107da6a23aee1006d7c609a3e1c66caf136ae1032b9
+section 2.MIME 88 d570b0553882f4b559b03cf295840a77e8b13f86e9e2951787a858f538618d6a
+section 2.1 1161 2a13297794c5e342c30f6cf0dcc9947e9660f65220701f45ad8308175966cede
+section 2.1.MIME 94 7d35d8c48d3869c4391f6ff71123bfb4c8466e5b04f02d64c3961f23d7d8bf61
+section 2.2 116822 387e8c521b2a0390820d2f7ce626a517c415c1f50416228e729675fd2d071c82
+section 2.2.MIME 102 8bc0fe0027d87a509d73c1abf20a4b45d7e787e6be29c6ce04f365994a887d64
+section 2.3 126 ec78cbba7bd3642d4129299011233dc4c1f462ec4ae15a03cdf06a6a3e4207f3
+section 2.3.MIME 94 7d35d8c48d3869c4391f6ff71123bfb4c8466e5b04f02d64c3961f23d7d8bf61
+section 2.4 67242 948100a91bc3c61cc11f2a7bf3e59397b5fe46ebd819a4136f4ff91ca8a42736
+section 2.4.MIME 103 b32ebecc6cde81f25c496f0e398b288f5f1dfdbb3b3cbae0e405ece0b2f2b21f
+section 2.5 0 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+section 2.5.MIME 91 d0bbf4c2077be2852d24687e83fdf099ead9f2ff1ea6251abc1c300a4aecefad

@@ -1,0 +1,433 @@
+// DNS messages (RFC 1035 §4, with EDNS0 from RFC 6891): building a query and reading a response.
+
+/// Record types this resolver asks for.
+public const TYPE_A: u16 = 1;
+public const TYPE_NS: u16 = 2;
+public const TYPE_CNAME: u16 = 5;
+public const TYPE_SOA: u16 = 6;
+public const TYPE_PTR: u16 = 12;
+public const TYPE_MX: u16 = 15;
+public const TYPE_TXT: u16 = 16;
+public const TYPE_AAAA: u16 = 28;
+public const TYPE_TLSA: u16 = 52;
+const TYPE_OPT: u16 = 41;
+
+/// Response codes.
+public const RCODE_NOERROR: u8 = 0;
+public const RCODE_SERVFAIL: u8 = 2;
+public const RCODE_NXDOMAIN: u8 = 3;
+
+/// The UDP payload size advertised with EDNS0: the 2020 DNS flag day's, which avoids IP fragmentation.
+const EDNS_SIZE: u16 = 1232;
+
+/// Writes `name` (dotted text, a final dot optional) in wire form; false if it is not a valid name: an empty label,
+/// a label over 63 bytes, or over 255 bytes in all.
+fn putName(out: borrow mut Vector<u8>, name: StringView) -> Result<bool, AllocError> {
+    let bytes = name.bytes();
+    var end = bytes.length;
+    if (end > 0 && bytes[end - 1] == 0x2e) {
+        end -= 1;
+    }
+    let start = out.length;
+    var label: usize = 0;
+    while (label < end) {
+        var stop = label;
+        while (stop < end && bytes[stop] != 0x2e) {
+            stop += 1;
+        }
+        let length = stop - label;
+        if (length == 0 || length > 63) {
+            return Ok(false);
+        }
+        out.pushBE(truncate<u8>(length))?;
+        out.extend(bytes[label..stop])?;
+        label = stop + 1;
+    }
+    out.pushBE(0u8)?;
+    return Ok(out.length - start <= 255);
+}
+
+/// A query for `name` and `kind` with id `id`, recursion desired, and an EDNS0 OPT record.
+fn buildQuery(out: borrow mut Vector<u8>, id: u16, name: StringView, kind: u16) -> Result<bool, AllocError> {
+    out.clear();
+    out.pushBE(id)?;
+    // RD, and AD (RFC 6840 §5.7): a validating resolver then says whether it validated the answer (DANE needs it).
+    out.pushBE(0x0120u16)?;
+    out.pushBE(1u16)?; // QDCOUNT
+    out.pushBE(0u16)?;
+    out.pushBE(0u16)?;
+    out.pushBE(1u16)?; // ARCOUNT: the OPT record
+    if (!putName(out, name)?) {
+        return Ok(false);
+    }
+    out.pushBE(kind)?;
+    out.pushBE(1u16)?; // IN
+    // OPT: root name, type 41, class = UDP size, TTL = extended rcode and flags (0), no options.
+    out.pushBE(0u8)?;
+    out.pushBE(TYPE_OPT)?;
+    out.pushBE(EDNS_SIZE)?;
+    out.pushBE(0u32)?;
+    out.pushBE(0u16)?;
+    return Ok(true);
+}
+
+/// A record of a response, its names already expanded into `DnsAnswer.text`.
+struct DnsRecord {
+    kind: u16;
+    ttl: u32;
+    ownerAt: usize;
+    ownerLength: usize;
+    /// The record's data: raw bytes for A, AAAA and TLSA; the joined strings for TXT; the target name for CNAME,
+    /// PTR, NS and MX.
+    dataAt: usize;
+    dataLength: usize;
+    /// MX preference.
+    preference: u16;
+}
+
+/// A response: its status and the records answering the question.
+@noncopy
+public struct DnsAnswer {
+    public rcode: u8;
+    /// The resolver set AD: it validated the answer with DNSSEC. Only meaningful from a trusted, validating resolver
+    /// (DANE needs it).
+    public authenticated: bool;
+    truncated: bool;
+    records: Vector<DnsRecord>;
+    text: Vector<u8>;
+    /// For a negative answer, how long it may be cached (the SOA's minimum, RFC 2308), in seconds.
+    negativeTtl: u32;
+
+    public fn create() -> DnsAnswer => DnsAnswer {
+        rcode: 0,
+        authenticated: false,
+        truncated: false,
+        records: Vector<DnsRecord>.create(),
+        text: Vector<u8>.create(),
+        negativeTtl: 0,
+    };
+
+    fn clear(borrow mut this) {
+        this.rcode = 0;
+        this.authenticated = false;
+        this.truncated = false;
+        this.records.clear();
+        this.text.clear();
+        this.negativeTtl = 0;
+    }
+
+    /// How many records answer the question (CNAMEs followed; the CNAMEs themselves not counted).
+    public fn count(borrow this) -> usize => this.records.length;
+
+    /// Whether the name does not exist (NXDOMAIN).
+    public fn isNxDomain(borrow this) -> bool => this.rcode == RCODE_NXDOMAIN;
+
+    public fn kind(borrow this, i: usize) -> u16 => this.records[i].kind;
+
+    public fn ttl(borrow this, i: usize) -> u32 => this.records[i].ttl;
+
+    /// MX preference.
+    public fn preference(borrow this, i: usize) -> u16 => this.records[i].preference;
+
+    /// A record's data: see `DnsRecord.dataAt`.
+    public fn data(borrow this, i: usize) -> Slice<u8> {
+        let r = this.records[i];
+        return this.text[r.dataAt..r.dataAt + r.dataLength];
+    }
+
+    /// The data of a name-bearing record (MX, PTR, CNAME, NS) or a TXT record, as text; empty if not UTF-8.
+    public fn dataText(borrow this, i: usize) -> StringView {
+        let r = this.records[i];
+        match (StringView.fromUtf8(this.text[r.dataAt..r.dataAt + r.dataLength])) {
+            Some(t) => { return t; }
+            null => { return ""; }
+        }
+    }
+
+    /// The owner name of record `i`.
+    public fn owner(borrow this, i: usize) -> Slice<u8> {
+        let r = this.records[i];
+        return this.text[r.ownerAt..r.ownerAt + r.ownerLength];
+    }
+
+    /// The smallest TTL of the records (or the negative TTL), for caching.
+    fn cacheTtl(borrow this) -> u32 {
+        if (this.records.length == 0) {
+            return this.negativeTtl;
+        }
+        var least: u32 = 0xffffffff;
+        for (i in 0..this.records.length) {
+            if (this.records[i].ttl < least) {
+                least = this.records[i].ttl;
+            }
+        }
+        return least;
+    }
+
+    /// A copy into `into`.
+    fn copyInto(borrow this, into: borrow mut DnsAnswer) -> Result<void, AllocError> {
+        into.clear();
+        into.rcode = this.rcode;
+        into.authenticated = this.authenticated;
+        into.negativeTtl = this.negativeTtl;
+        into.records.extend(this.records.view())?;
+        return into.text.extend(this.text.view());
+    }
+}
+
+/// Why a response was refused.
+enum ParseError {
+    Malformed,
+    /// Not the answer to our question: another id, or another name or type.
+    Mismatch,
+    OutOfMemory,
+}
+
+/// A cursor over a response.
+struct Reader {
+    at: usize;
+
+    fn u8(borrow mut this, m: Slice<u8>) -> Result<u8, ParseError> {
+        if (this.at + 1 > m.length) {
+            return Err(ParseError.Malformed);
+        }
+        this.at += 1;
+        return Ok(m[this.at - 1]);
+    }
+
+    fn u16(borrow mut this, m: Slice<u8>) -> Result<u16, ParseError> {
+        if (this.at + 2 > m.length) {
+            return Err(ParseError.Malformed);
+        }
+        let v = m.readBE<u16>(this.at);
+        this.at += 2;
+        return Ok(v);
+    }
+
+    fn u32(borrow mut this, m: Slice<u8>) -> Result<u32, ParseError> {
+        if (this.at + 4 > m.length) {
+            return Err(ParseError.Malformed);
+        }
+        let v = m.readBE<u32>(this.at);
+        this.at += 4;
+        return Ok(v);
+    }
+}
+
+fn oom(outcome: Result<void, AllocError>) -> Result<void, ParseError> {
+    match (outcome) {
+        Ok() => { return Ok(); }
+        Err(_) => { return Err(ParseError.OutOfMemory); }
+    }
+}
+
+/// Reads a (possibly compressed) name at `r` into `out` as dotted text, without the final dot. Compression
+/// pointers must point backwards, before the name being read, so a loop is impossible.
+fn readName(m: Slice<u8>, r: borrow mut Reader, out: borrow mut Vector<u8>) -> Result<void, ParseError> {
+    var at = r.at;
+    var jumped = false;
+    var limit = at; // a pointer must go below this
+    var length: usize = 0;
+    var first = true;
+    loop {
+        if (at >= m.length) {
+            return Err(ParseError.Malformed);
+        }
+        let c = m[at];
+        if (c == 0) {
+            if (!jumped) {
+                r.at = at + 1;
+            }
+            return Ok();
+        }
+        if ((c & 0xc0) == 0xc0) {
+            if (at + 1 >= m.length) {
+                return Err(ParseError.Malformed);
+            }
+            let target = (((c & 0x3f) as usize) << 8) | (m[at + 1] as usize);
+            if (target >= limit) {
+                return Err(ParseError.Malformed);
+            }
+            if (!jumped) {
+                r.at = at + 2;
+                jumped = true;
+            }
+            limit = target;
+            at = target;
+            continue;
+        }
+        if ((c & 0xc0) != 0) {
+            return Err(ParseError.Malformed); // the reserved label types
+        }
+        let n = c as usize;
+        if (at + 1 + n > m.length) {
+            return Err(ParseError.Malformed);
+        }
+        length += n + 1;
+        if (length > 255) {
+            return Err(ParseError.Malformed);
+        }
+        if (!first) {
+            oom(out.pushBE(0x2eu8))?;
+        }
+        first = false;
+        oom(out.extend(m[at + 1..at + 1 + n]))?;
+        at += 1 + n;
+    }
+}
+
+fn sameName(a: Slice<u8>, b: Slice<u8>) -> bool {
+    var x = a.length;
+    if (x > 0 && a[x - 1] == 0x2e) {
+        x -= 1;
+    }
+    var y = b.length;
+    if (y > 0 && b[y - 1] == 0x2e) {
+        y -= 1;
+    }
+    return x == y && a[0..x].equalsIgnoreAsciiCase(b[0..y]);
+}
+
+/// Reads `m`, the response to query `id` for `name` and `kind`, into `into`. Only records on the CNAME chain from
+/// `name` are kept, so a response cannot slip in records for other names (cache poisoning).
+fn parseResponse(
+    m: Slice<u8>,
+    id: u16,
+    name: StringView,
+    kind: u16,
+    into: borrow mut DnsAnswer,
+) -> Result<void, ParseError> {
+    into.clear();
+    var r = Reader { at: 0 };
+    if (r.u16(m)? != id) {
+        return Err(ParseError.Mismatch);
+    }
+    let flags = r.u16(m)?;
+    if ((flags & 0x8000) == 0) {
+        return Err(ParseError.Mismatch); // not a response
+    }
+    into.truncated = (flags & 0x0200) != 0;
+    into.authenticated = (flags & 0x0020) != 0;
+    into.rcode = truncate<u8>(flags & 0x000f);
+    let questions = r.u16(m)?;
+    let answers = r.u16(m)?;
+    let authorities = r.u16(m)?;
+    r.u16(m)?; // additional records: not needed
+    if (questions != 1) {
+        return Err(ParseError.Mismatch);
+    }
+    var scratch = Vector<u8>.create();
+    readName(m, mut r, mut scratch)?;
+    if (!sameName(scratch.view(), name.bytes()) || r.u16(m)? != kind || r.u16(m)? != 1) {
+        return Err(ParseError.Mismatch);
+    }
+    if (into.truncated) {
+        return Ok(); // the caller asks again over TCP
+    }
+    // The CNAME chain from the question's name, in `chain` (names separated by NUL).
+    var chain = Vector<u8>.create();
+    oom(chain.extend(name.bytes()))?;
+    var records = Vector<DnsRecord>.create();
+    for (section in 0..2) {
+        let count = if (section == 0) answers else authorities;
+        for (k in 0..count) {
+            var owner = Vector<u8>.create();
+            readName(m, mut r, mut owner)?;
+            let rtype = r.u16(m)?;
+            r.u16(m)?; // class
+            let ttl = r.u32(m)?;
+            let rdLength = r.u16(m)? as usize;
+            let rdStart = r.at;
+            if (rdStart + rdLength > m.length) {
+                return Err(ParseError.Malformed);
+            }
+            let rd = m[0..rdStart + rdLength];
+            if (section == 1) {
+                // The authority section only gives the negative TTL: an SOA's minimum, capped by its own TTL.
+                if (rtype == TYPE_SOA) {
+                    var s = Reader { at: rdStart };
+                    var skip = Vector<u8>.create();
+                    readName(rd, mut s, mut skip)?;
+                    skip.clear();
+                    readName(rd, mut s, mut skip)?;
+                    s.at += 16;
+                    let minimum = s.u32(rd)?;
+                    into.negativeTtl = if (minimum < ttl) minimum else ttl;
+                }
+                r.at = rdStart + rdLength;
+                continue;
+            }
+            if (!onChain(chain.view(), owner.view())) {
+                r.at = rdStart + rdLength;
+                continue;
+            }
+            if (rtype == TYPE_CNAME && kind != TYPE_CNAME) {
+                var s = Reader { at: rdStart };
+                var target = Vector<u8>.create();
+                readName(rd, mut s, mut target)?;
+                oom(chain.pushBE(0u8))?;
+                oom(chain.extend(target.view()))?;
+                r.at = rdStart + rdLength;
+                continue;
+            }
+            if (rtype != kind) {
+                r.at = rdStart + rdLength;
+                continue;
+            }
+            let ownerAt = into.text.length;
+            oom(into.text.extend(owner.view()))?;
+            var record = DnsRecord {
+                kind: rtype,
+                ttl: ttl,
+                ownerAt: ownerAt,
+                ownerLength: owner.length,
+                dataAt: into.text.length,
+                dataLength: 0,
+                preference: 0,
+            };
+            var s = Reader { at: rdStart };
+            if (rtype == TYPE_MX) {
+                record.preference = s.u16(rd)?;
+                readName(rd, mut s, mut into.text)?;
+            } else if (rtype == TYPE_PTR || rtype == TYPE_NS || rtype == TYPE_CNAME) {
+                readName(rd, mut s, mut into.text)?;
+            } else if (rtype == TYPE_TXT) {
+                // Character-strings, joined without separators (RFC 7208 §3.3).
+                while (s.at < rdStart + rdLength) {
+                    let n = s.u8(rd)? as usize;
+                    if (s.at + n > rdStart + rdLength) {
+                        return Err(ParseError.Malformed);
+                    }
+                    oom(into.text.extend(rd[s.at..s.at + n]))?;
+                    s.at += n;
+                }
+            } else {
+                if ((rtype == TYPE_A && rdLength != 4) || (rtype == TYPE_AAAA && rdLength != 16)) {
+                    return Err(ParseError.Malformed);
+                }
+                oom(into.text.extend(rd[rdStart..rdStart + rdLength]))?;
+            }
+            record.dataLength = into.text.length - record.dataAt;
+            oom(records.push(record))?;
+            r.at = rdStart + rdLength;
+        }
+    }
+    oom(into.records.extend(records.view()))?;
+    return Ok();
+}
+
+/// Whether `owner` is one of the NUL-separated names of `chain`.
+fn onChain(chain: Slice<u8>, owner: Slice<u8>) -> bool {
+    var start: usize = 0;
+    while (start <= chain.length) {
+        var end = start;
+        while (end < chain.length && chain[end] != 0) {
+            end += 1;
+        }
+        if (sameName(chain[start..end], owner)) {
+            return true;
+        }
+        start = end + 1;
+    }
+    return false;
+}

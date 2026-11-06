@@ -1,0 +1,658 @@
+// iCalendar (RFC 5545) and vCard (RFC 6350) content lines: unfolded, split into name, parameters and value, with
+// BEGIN and END kept as lines so components can be walked. Values are unescaped on request (TEXT's `\n`, `\,`, `\;`,
+// `\\`). Also the facts the store keeps about an object (its component, UID and time span), date-times, and etags.
+
+import sha256.Sha256;
+
+struct LineSpan {
+    start: usize;
+    end: usize;
+}
+
+struct ContentLine {
+    name: LineSpan;
+    /// From the first `;` after the name to the `:` (without either); empty when there are none.
+    params: LineSpan;
+    value: LineSpan;
+    /// How many components are open at this line (BEGIN counts inside its component, END outside).
+    depth: usize;
+}
+
+fn lowerByte(b: u8) -> u8 => if (b >= 0x41 && b <= 0x5a) b + 0x20 else b;
+
+fn sameIgnoringCase(a: Slice<u8>, b: Slice<u8>) -> bool => a.length == b.length && a.equalsIgnoreAsciiCase(b);
+
+/// An iCalendar or vCard text as content lines.
+@noncopy
+public struct ContentLines {
+    text: Vector<u8>;
+    lines: Vector<ContentLine>;
+
+    /// Splits `data` into content lines. Lenient as clients need: LF alone ends a line too, and lines without a
+    /// colon are skipped.
+    public fn parse(data: Slice<u8>) -> Result<ContentLines, AllocError> {
+        var text = Vector<u8>.create();
+        // Unfold: a line break followed by a space or tab continues the line.
+        var i: usize = 0;
+        while (i < data.length) {
+            let c = data[i];
+            if (c == 0x0d && i + 1 < data.length && data[i + 1] == 0x0a) {
+                if (i + 2 < data.length && (data[i + 2] == 0x20 || data[i + 2] == 0x09)) {
+                    i += 3;
+                    continue;
+                }
+                text.push(0x0a)?;
+                i += 2;
+                continue;
+            }
+            if (c == 0x0a) {
+                if (i + 1 < data.length && (data[i + 1] == 0x20 || data[i + 1] == 0x09)) {
+                    i += 2;
+                    continue;
+                }
+                text.push(0x0a)?;
+                i += 1;
+                continue;
+            }
+            text.push(c)?;
+            i += 1;
+        }
+        var doc = ContentLines { text: text, lines: Vector<ContentLine>.create() };
+        doc.split()?;
+        return Ok(doc);
+    }
+
+    fn split(borrow mut this) -> Result<void, AllocError> {
+        var depth: usize = 0;
+        var start: usize = 0;
+        let n = this.text.length;
+        while (start < n) {
+            var end = start;
+            while (end < n && this.text[end] != 0x0a) {
+                end += 1;
+            }
+            // The name runs to the first ';' or ':'; parameter values may be quoted and hold either.
+            var at = start;
+            while (at < end && this.text[at] != 0x3b && this.text[at] != 0x3a) {
+                at += 1;
+            }
+            let nameEnd = at;
+            var paramsStart = at;
+            var colon: usize? = null;
+            if (at < end && this.text[at] == 0x3b) {
+                paramsStart = at + 1;
+                var quoted = false;
+                while (at < end) {
+                    let c = this.text[at];
+                    if (c == 0x22) {
+                        quoted = !quoted;
+                    } else if (c == 0x3a && !quoted) {
+                        colon = at;
+                        break;
+                    }
+                    at += 1;
+                }
+            } else if (at < end) {
+                colon = at;
+            }
+            match (colon) {
+                Some(c) => {
+                    if (nameEnd > start) {
+                        let name = this.text[start..nameEnd];
+                        let isEnd = sameIgnoringCase(name, "END".bytes());
+                        if (isEnd && depth > 0) {
+                            depth -= 1;
+                        }
+                        let paramsEnd = if (paramsStart < c) c else paramsStart;
+                        this.lines.push(ContentLine {
+                            name: LineSpan { start: start, end: nameEnd },
+                            params: LineSpan { start: paramsStart, end: paramsEnd },
+                            value: LineSpan { start: c + 1, end: end },
+                            depth: depth,
+                        })?;
+                        if (sameIgnoringCase(name, "BEGIN".bytes())) {
+                            depth += 1;
+                            let last = this.lines.length - 1;
+                            this.lines[last].depth = depth;
+                        }
+                    }
+                }
+                null => {}
+            }
+            start = end + 1;
+        }
+        return Ok();
+    }
+
+    public fn count(borrow this) -> usize => this.lines.length;
+
+    /// Line `i`'s property name, as written.
+    public fn name(borrow this, i: usize) -> Slice<u8> {
+        let s = this.lines[i].name;
+        return this.text[s.start..s.end];
+    }
+
+    public fn nameIs(borrow this, i: usize, name: StringView) -> bool => sameIgnoringCase(this.name(i), name.bytes());
+
+    /// Line `i`'s value, still escaped.
+    public fn rawValue(borrow this, i: usize) -> Slice<u8> {
+        let s = this.lines[i].value;
+        return this.text[s.start..s.end];
+    }
+
+    /// Line `i`'s parameters, as written (`TZID=Europe/Paris;VALUE=DATE-TIME`).
+    public fn rawParams(borrow this, i: usize) -> Slice<u8> {
+        let s = this.lines[i].params;
+        return this.text[s.start..s.end];
+    }
+
+    /// The component depth at line `i`: 1 inside the outermost component.
+    public fn depth(borrow this, i: usize) -> usize => this.lines[i].depth;
+
+    /// Whether line `i` is `BEGIN:<component>`.
+    public fn begins(borrow this, i: usize, component: StringView) -> bool =>
+        this.nameIs(i, "BEGIN") && sameIgnoringCase(this.rawValue(i), component.bytes());
+
+    /// The line after the `END` of the component that line `begin` (a `BEGIN`) opens.
+    public fn componentEnd(borrow this, begin: usize) -> usize {
+        let d = this.lines[begin].depth;
+        var i = begin + 1;
+        while (i < this.lines.length) {
+            if (this.nameIs(i, "END") && this.lines[i].depth == d - 1) {
+                return i + 1;
+            }
+            i += 1;
+        }
+        return this.lines.length;
+    }
+
+    /// The first line in `from..to` named `name` directly inside the component open there (at depth `depth`).
+    public fn property(borrow this, from: usize, to: usize, depth: usize, name: StringView) -> usize? {
+        var i = from;
+        while (i < to && i < this.lines.length) {
+            if (this.lines[i].depth == depth && this.nameIs(i, name) && !this.nameIs(i, "BEGIN")) {
+                return i;
+            }
+            i += 1;
+        }
+        return null;
+    }
+
+    /// Line `i`'s value as TEXT, unescaped, appended to `into`.
+    public fn textValue(borrow this, i: usize, into: borrow mut Vector<u8>) -> Result<void, AllocError> =>
+        unescapeText(this.rawValue(i), into);
+
+    /// Line `i`'s parameter `name` (its first value, without quotes), into `into`; false when absent.
+    public fn param(borrow this, i: usize, name: StringView, into: borrow mut Vector<u8>) -> Result<bool, AllocError> {
+        into.clear();
+        let p = this.rawParams(i);
+        var at: usize = 0;
+        while (at < p.length) {
+            var eq = at;
+            while (eq < p.length && p[eq] != 0x3d && p[eq] != 0x3b) {
+                eq += 1;
+            }
+            let key = p[at..eq];
+            var end = eq;
+            var quoted = false;
+            if (eq < p.length && p[eq] == 0x3d) {
+                end = eq + 1;
+                while (end < p.length) {
+                    let c = p[end];
+                    if (c == 0x22) {
+                        quoted = !quoted;
+                    } else if (c == 0x3b && !quoted) {
+                        break;
+                    }
+                    end += 1;
+                }
+            }
+            if (sameIgnoringCase(key, name.bytes())) {
+                if (eq < p.length && p[eq] == 0x3d) {
+                    // Only the first of a list of values, without its quotes.
+                    var from = eq + 1;
+                    var inQuote = false;
+                    var cut = end;
+                    for (k in from..end) {
+                        if (p[k] == 0x22) {
+                            inQuote = !inQuote;
+                        } else if (p[k] == 0x2c && !inQuote) {
+                            cut = k;
+                            break;
+                        }
+                    }
+                    if (cut - from >= 2 && p[from] == 0x22 && p[cut - 1] == 0x22) {
+                        from += 1;
+                        cut -= 1;
+                    }
+                    into.extend(p[from..cut])?;
+                }
+                return Ok(true);
+            }
+            at = end + 1;
+        }
+        return Ok(false);
+    }
+
+    /// Whether line `i` has parameter `name` with a value equal (any case) to `value` among its values.
+    public fn paramHas(borrow this, i: usize, name: StringView, value: StringView) -> bool {
+        var v = Vector<u8>.create();
+        match (this.param(i, name, mut v)) {
+            Ok(true) => {}
+            _ => { return false; }
+        }
+        if (sameIgnoringCase(v.view(), value.bytes())) {
+            return true;
+        }
+        // TYPE=work,voice or TYPE=WORK;TYPE=VOICE: look at the raw parameters too.
+        let p = this.rawParams(i);
+        var at: usize = 0;
+        while (at < p.length) {
+            var end = at;
+            while (end < p.length && p[end] != 0x3b && p[end] != 0x2c && p[end] != 0x3d) {
+                end += 1;
+            }
+            var from = at;
+            var to = end;
+            if (to - from >= 1 && p[from] == 0x22) {
+                from += 1;
+            }
+            if (to > from && p[to - 1] == 0x22) {
+                to -= 1;
+            }
+            if (sameIgnoringCase(p[from..to], value.bytes())) {
+                return true;
+            }
+            at = end + 1;
+        }
+        return false;
+    }
+}
+
+/// TEXT unescaping: `\n` and `\N` are line breaks, `\,` `\;` `\\` the characters themselves.
+public fn unescapeText(raw: Slice<u8>, into: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    var i: usize = 0;
+    while (i < raw.length) {
+        let c = raw[i];
+        if (c == 0x5c && i + 1 < raw.length) {
+            let e = raw[i + 1];
+            if (e == 0x6e || e == 0x4e) {
+                into.push(0x0a)?;
+            } else {
+                into.push(e)?;
+            }
+            i += 2;
+            continue;
+        }
+        into.push(c)?;
+        i += 1;
+    }
+    return Ok();
+}
+
+/// TEXT escaping, for writing a value.
+public fn escapeText(text: Slice<u8>, into: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    for (c in text) {
+        if (c == 0x5c || c == 0x2c || c == 0x3b) {
+            into.push(0x5c)?;
+            into.push(c)?;
+        } else if (c == 0x0a) {
+            into.extend("\\n".bytes())?;
+        } else if (c != 0x0d) {
+            into.push(c)?;
+        }
+    }
+    return Ok();
+}
+
+/// Appends `NAME;PARAMS:value` folded at 75 octets (RFC 5545 §3.1, without splitting UTF-8 sequences) and CRLF.
+public fn appendLine(into: borrow mut Vector<u8>, nameAndParams: StringView, value: Slice<u8>) -> Result<void, AllocError> {
+    var line = Vector<u8>.create();
+    line.extend(nameAndParams.bytes())?;
+    line.push(0x3a)?;
+    line.extend(value)?;
+    var width: usize = 0;
+    for (k in 0..line.length) {
+        let b = line[k];
+        // A continuation byte never starts a fold.
+        if (width >= 75 && (b & 0xc0) != 0x80) {
+            into.extend("\r\n ".bytes())?;
+            width = 1;
+        }
+        into.push(b)?;
+        width += 1;
+    }
+    into.extend("\r\n".bytes())?;
+    return Ok();
+}
+
+// ---- Dates ----
+
+/// Days since 1970-01-01 of a proleptic Gregorian date (Howard Hinnant's days_from_civil).
+public fn daysFromCivil(year: i64, month: i64, day: i64) -> i64 {
+    let y = if (month <= 2) year - 1 else year;
+    let era = (if (y >= 0) y else y - 399) / 400;
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + doe - 719468;
+}
+
+/// The date of a day number: [year, month, day].
+public fn civilFromDays(days: i64) -> [i64; 3] {
+    let z = days + 719468;
+    let era = (if (z >= 0) z else z - 146096) / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if (mp < 10) mp + 3 else mp - 9;
+    return [if (m <= 2) y + 1 else y, m, d];
+}
+
+/// 0 for Sunday … 6 for Saturday.
+public fn weekday(days: i64) -> i64 {
+    let w = (days + 4) % 7;
+    return if (w < 0) w + 7 else w;
+}
+
+fn digitsAt(text: Slice<u8>, at: usize, count: usize) -> i64? {
+    if (at + count > text.length) {
+        return null;
+    }
+    var v: i64 = 0;
+    for (k in at..(at + count)) {
+        let c = text[k];
+        if (c < 0x30 || c > 0x39) {
+            return null;
+        }
+        v = v * 10 + (c - 0x30) as i64;
+    }
+    return v;
+}
+
+/// An iCalendar DATE or DATE-TIME value.
+public struct CalTime {
+    /// Seconds since the epoch, reading the wall-clock time as if it were UTC (true UTC when `utc`).
+    public seconds: i64;
+    /// A DATE (all day), not a DATE-TIME.
+    public date: bool;
+    /// Ends in `Z`.
+    public utc: bool;
+}
+
+/// Parses `YYYYMMDD` or `YYYYMMDDTHHMMSS[Z]`; null when malformed.
+public fn parseCalTime(value: Slice<u8>) -> CalTime? {
+    let v = value.trim();
+    let year = digitsAt(v, 0, 4)?;
+    let month = digitsAt(v, 4, 2)?;
+    let day = digitsAt(v, 6, 2)?;
+    if (month < 1 || month > 12 || day < 1 || day > 31) {
+        return null;
+    }
+    let days = daysFromCivil(year, month, day);
+    if (v.length == 8) {
+        return CalTime { seconds: days * 86400, date: true, utc: false };
+    }
+    if (v.length < 15 || (v[8] != 0x54 && v[8] != 0x74)) {
+        return null;
+    }
+    let hour = digitsAt(v, 9, 2)?;
+    let minute = digitsAt(v, 11, 2)?;
+    let second = digitsAt(v, 13, 2)?;
+    if (hour > 23 || minute > 59 || second > 60) {
+        return null;
+    }
+    let utc = v.length == 16 && (v[15] == 0x5a || v[15] == 0x7a);
+    if (v.length != 15 && !utc) {
+        return null;
+    }
+    return CalTime { seconds: days * 86400 + hour * 3600 + minute * 60 + second, date: false, utc: utc };
+}
+
+/// Appends `seconds` as `YYYYMMDDTHHMMSSZ`, or `YYYYMMDD` when `date`.
+public fn appendCalTime(into: borrow mut Vector<u8>, seconds: i64, date: bool) -> Result<void, AllocError> {
+    let days = (if (seconds >= 0) seconds else seconds - 86399) / 86400;
+    let rest = seconds - days * 86400;
+    let ymd = civilFromDays(days);
+    pad(into, ymd[0], 4)?;
+    pad(into, ymd[1], 2)?;
+    pad(into, ymd[2], 2)?;
+    if (date) {
+        return Ok();
+    }
+    into.push(0x54)?;
+    pad(into, rest / 3600, 2)?;
+    pad(into, rest / 60 % 60, 2)?;
+    pad(into, rest % 60, 2)?;
+    into.push(0x5a)?;
+    return Ok();
+}
+
+fn pad(into: borrow mut Vector<u8>, value: i64, width: usize) -> Result<void, AllocError> {
+    var digits = [0u8; 20];
+    var n: usize = 0;
+    var v = if (value < 0) 0 - value else value;
+    loop {
+        digits[n] = truncate<u8>(v % 10) + 0x30;
+        n += 1;
+        v = v / 10;
+        if (v == 0) {
+            break;
+        }
+    }
+    while (n < width) {
+        digits[n] = 0x30;
+        n += 1;
+    }
+    while (n > 0) {
+        n -= 1;
+        into.push(digits[n])?;
+    }
+    return Ok();
+}
+
+/// Parses an iCalendar DURATION (`P1D`, `-PT15M`, `P1W`, `PT1H30M`) as seconds.
+public fn parseDuration(value: Slice<u8>) -> i64? {
+    let v = value.trim();
+    var at: usize = 0;
+    var sign: i64 = 1;
+    if (at < v.length && (v[at] == 0x2b || v[at] == 0x2d)) {
+        if (v[at] == 0x2d) {
+            sign = -1;
+        }
+        at += 1;
+    }
+    if (at >= v.length || (v[at] != 0x50 && v[at] != 0x70)) {
+        return null;
+    }
+    at += 1;
+    var total: i64 = 0;
+    var number: i64 = 0;
+    var digits = false;
+    while (at < v.length) {
+        let c = v[at];
+        if (c >= 0x30 && c <= 0x39) {
+            number = number * 10 + (c - 0x30) as i64;
+            digits = true;
+        } else {
+            let u = lowerByte(c);
+            if (u == 0x74) {
+                // 'T'
+            } else if (!digits) {
+                return null;
+            } else if (u == 0x77) {
+                total += number * 604800;
+            } else if (u == 0x64) {
+                total += number * 86400;
+            } else if (u == 0x68) {
+                total += number * 3600;
+            } else if (u == 0x6d) {
+                total += number * 60;
+            } else if (u == 0x73) {
+                total += number;
+            } else {
+                return null;
+            }
+            number = 0;
+            digits = false;
+        }
+        at += 1;
+    }
+    if (digits) {
+        return null;
+    }
+    return sign * total;
+}
+
+// ---- What the store keeps ----
+
+/// The facts about a calendar or contact object the store indexes.
+public struct ObjectFacts {
+    /// VEVENT, VTODO, VJOURNAL or VCARD.
+    public component: String;
+    public uid: String;
+    /// The first instance's start, and the last one's end (null: open-ended, as a recurrence without an end), in
+    /// seconds since the epoch. Times with a TZID are read as UTC; queries widen their ranges by a day for that.
+    public start: i64?;
+    public end: i64?;
+
+    public fn create() -> ObjectFacts =>
+        ObjectFacts { component: String.create(), uid: String.create(), start: null, end: null };
+}
+
+/// The component, UID and time span of an iCalendar object (its first VEVENT, VTODO or VJOURNAL) or a vCard. False
+/// when `data` is neither, or has no UID.
+public fn objectFacts(data: Slice<u8>, facts: borrow mut ObjectFacts) -> Result<bool, AllocError> {
+    let lines = ContentLines.parse(data)?;
+    facts.component.clear();
+    facts.uid.clear();
+    facts.start = null;
+    facts.end = null;
+    if (lines.count() == 0) {
+        return Ok(false);
+    }
+    var value = Vector<u8>.create();
+    if (lines.begins(0, "VCARD")) {
+        facts.component.append("VCARD")?;
+        let end = lines.componentEnd(0);
+        match (lines.property(1, end, 1, "UID")) {
+            Some(u) => {
+                lines.textValue(u, mut value)?;
+                facts.uid.append(StringView.fromUtf8(value.view()) ?? "")?;
+            }
+            null => {}
+        }
+        return Ok(facts.uid.length > 0);
+    }
+    if (!lines.begins(0, "VCALENDAR")) {
+        return Ok(false);
+    }
+    var i: usize = 1;
+    while (i < lines.count()) {
+        if (lines.depth(i) == 2 && lines.nameIs(i, "BEGIN")) {
+            let kind = lines.rawValue(i);
+            if (sameIgnoringCase(kind, "VEVENT".bytes()) || sameIgnoringCase(kind, "VTODO".bytes())
+                || sameIgnoringCase(kind, "VJOURNAL".bytes())) {
+                break;
+            }
+            i = lines.componentEnd(i);
+            continue;
+        }
+        i += 1;
+    }
+    if (i >= lines.count()) {
+        return Ok(false);
+    }
+    let kind = lines.rawValue(i);
+    var upper = Vector<u8>.create();
+    for (b in kind) {
+        upper.push(if (b >= 0x61 && b <= 0x7a) b - 0x20 else b)?;
+    }
+    facts.component.append(StringView.fromUtf8(upper.view()) ?? "")?;
+    let end = lines.componentEnd(i);
+    match (lines.property(i + 1, end, 2, "UID")) {
+        Some(u) => {
+            lines.textValue(u, mut value)?;
+            facts.uid.append(StringView.fromUtf8(value.view()) ?? "")?;
+        }
+        null => {}
+    }
+    let startLine = lines.property(i + 1, end, 2, "DTSTART");
+    let start = match (startLine) {
+        Some(s) => parseCalTime(lines.rawValue(s)),
+        null => null,
+    };
+    match (start) {
+        Some(s) => {
+            facts.start = s.seconds;
+            var finish: i64? = null;
+            match (lines.property(i + 1, end, 2, "DTEND") ?? lines.property(i + 1, end, 2, "DUE")) {
+                Some(e) => {
+                    match (parseCalTime(lines.rawValue(e))) {
+                        Some(t) => { finish = t.seconds; }
+                        null => {}
+                    }
+                }
+                null => {
+                    match (lines.property(i + 1, end, 2, "DURATION")) {
+                        Some(d) => {
+                            match (parseDuration(lines.rawValue(d))) {
+                                Some(secs) => { finish = s.seconds + secs; }
+                                null => {}
+                            }
+                        }
+                        null => {}
+                    }
+                }
+            }
+            if (finish == null) {
+                finish = if (s.date) s.seconds + 86400 else s.seconds;
+            }
+            // A recurrence runs to its UNTIL, or (with COUNT, or neither) is taken as open-ended.
+            match (lines.property(i + 1, end, 2, "RRULE")) {
+                Some(r) => { finish = untilOf(lines.rawValue(r)); }
+                null => {}
+            }
+            facts.end = finish;
+        }
+        null => {}
+    }
+    return Ok(facts.uid.length > 0);
+}
+
+/// An RRULE's UNTIL as seconds (a day later for a DATE), or null when it has none.
+fn untilOf(rule: Slice<u8>) -> i64? {
+    var at: usize = 0;
+    while (at < rule.length) {
+        var end = at;
+        while (end < rule.length && rule[end] != 0x3b) {
+            end += 1;
+        }
+        let part = rule[at..end];
+        if (part.length > 6 && sameIgnoringCase(part[0..6], "UNTIL=".bytes())) {
+            return match (parseCalTime(part[6..])) {
+                Some(t) => if (t.date) t.seconds + 86400 else t.seconds,
+                null => null,
+            };
+        }
+        at = end + 1;
+    }
+    return null;
+}
+
+/// The etag of a stored object, as the C# server made them: the first 32 hex digits of its SHA-256.
+public fn etagOf(data: Slice<u8>, into: borrow mut String) -> Result<void, AllocError> {
+    let digest = Sha256.hash(data);
+    let hex = "0123456789abcdef".bytes();
+    into.clear();
+    for (k in 0..16) {
+        let b = digest[k];
+        into.append(StringView.fromUtf8(hex[truncate<usize>(b >> 4)..(truncate<usize>(b >> 4) + 1)]) ?? "")?;
+        into.append(StringView.fromUtf8(hex[truncate<usize>(b & 0x0f)..(truncate<usize>(b & 0x0f) + 1)]) ?? "")?;
+    }
+    return Ok();
+}

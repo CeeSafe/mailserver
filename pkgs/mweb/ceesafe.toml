@@ -1,0 +1,21 @@
+[package]
+name = "mweb"
+version = "0.1.0"
+kind = "library"
+tests = ["tests"]
+
+[dependencies]
+mhttp = { path = "../mhttp" }
+macme = { path = "../macme" }
+pkey = { path = "../../../../CeeSafeLibs/pkey" }
+diskio = { path = "../../../../CeeSafeLibs/diskio" }
+sha256 = { path = "../../../../CeeSafeLibs/sha256" }
+encoding = { path = "../../../../CeeSafeLibs/encoding" }
+msmtp = { path = "../msmtp" }
+msieve = { path = "../msieve" }
+mstore = { path = "../mstore" }
+postgres = { path = "../../../PostgresClient" }
+tls = { path = "../../../../CeeSafeLibs/tls" }
+mdav = { path = "../mdav" }
+meas = { path = "../meas" }
+mews = { path = "../mews" }

@@ -1,0 +1,24 @@
+# A host where another reverse proxy (CosmoProxy, Caddy, nginx) already owns ports 80 and 443: the mail ports stay
+# published straight to the server (it sees clients' real addresses and does its own TLS), and the proxy terminates
+# HTTPS for mail.<domain>, mta-sts.<domain>, autodiscover.<domain> and autoconfig.<domain>, forwarding plain HTTP to
+# the [http] proxied listener on 127.0.0.1:9185 (MTA-STS, autoconfig, autodiscover, ActiveSync, EWS, CalDAV/CardDAV).
+# The certificate is the proxy's: deploy/certsync.sh (from mailserver-certsync.timer) copies it to ./tls.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.https-proxy.yml up -d
+#
+# mailserver.toml for this layout: [http] http = "", https = "", proxied = "0.0.0.0:9185"; [tls] certificate =
+# "/etc/mailserver/tls/fullchain.pem", key = "/etc/mailserver/tls/key.pem"; [acme] directory = "".
+# PUBLIC_IP: bind the mail ports to the public address only, when something else (exim, postfix) holds
+# 127.0.0.1:25.
+
+services:
+  mailserver:
+    ports: !override
+      - "${PUBLIC_IP:-0.0.0.0}:25:2525"
+      - "${PUBLIC_IP:-0.0.0.0}:587:2587"
+      - "${PUBLIC_IP:-0.0.0.0}:465:2465"
+      - "${PUBLIC_IP:-0.0.0.0}:993:2993"
+      - "${PUBLIC_IP:-0.0.0.0}:143:2143"
+      - "127.0.0.1:9185:9185"
+    volumes:
+      - ./tls:/etc/mailserver/tls:ro

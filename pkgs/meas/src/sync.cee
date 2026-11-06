@@ -1,0 +1,1192 @@
+// Sync (MS-ASCMD §2.2.1.21). For each folder the device was given, eas_items records what the device holds: each
+// item (a uid, or a dav_objects id) and the version (modseq) it was sent. A Sync sends the deletes, changes and adds
+// since, a window at a time, and records them with the new sync key; the row keeps what it replaced, so a device
+// that repeats the previous key (it never got the response) is sent the same changes again, and one that sends the
+// new key confirms them. Client changes are applied first. One Sync of a folder at a time: the folder's row is
+// locked for the round.
+
+import mmime.PART_LEAF;
+import mpim.Collection;
+import mpim.PimError;
+import mpim.PimObject;
+import mpim.PutOutcome;
+import mpim.collectionById;
+import mpim.deleteObject;
+import mpim.objectById;
+import mpim.putObject;
+import mstore.CopyResult;
+import mstore.FLAG_DELETED;
+import mstore.FLAG_FLAGGED;
+import mstore.FLAG_SEEN;
+import mstore.FlagChange;
+import mstore.MailboxList;
+import mstore.MessageList;
+import mstore.UidSet;
+import mhttp.Response;
+import msmtp.SmtpContext;
+import mxml.XmlDocument;
+import postgres.PgConnection;
+import postgres.PgParams;
+import postgres.PgRows;
+
+/// The most items a response carries, whatever the device asks.
+const MAX_WINDOW: i64 = 512;
+const DEFAULT_WINDOW: i64 = 100;
+
+const OP_DELETE: i64 = 0;
+const OP_CHANGE: i64 = 1;
+const OP_ADD: i64 = 2;
+
+/// A folder's sync state.
+struct FolderState {
+    id: i64;
+    kind: u8;
+    sourceId: i64;
+    syncKey: i64;
+    filterType: i32;
+    bodyType: i32;
+    truncation: i64;
+    mimeSupport: i32;
+}
+
+fn sqlFolderState(lock: bool) -> StringView =>
+    if (lock) "SELECT id, kind, source_id, sync_key, filter_type, body_type, truncation, mime_support FROM eas_folders WHERE device_id = $1 AND collection_id = $2 FOR UPDATE" else "SELECT id, kind, source_id, sync_key, filter_type, body_type, truncation, mime_support FROM eas_folders WHERE device_id = $1 AND collection_id = $2";
+
+fn stateOf(rows: borrow PgRows) -> FolderState? {
+    if (rows.rowCount() == 0) {
+        return null;
+    }
+    return FolderState {
+        id: rows.int64(0, 0) ?? 0,
+        kind: kindOf(rows.text(0, 1) ?? ""),
+        sourceId: rows.int64(0, 2) ?? 0,
+        syncKey: rows.int64(0, 3) ?? 0,
+        filterType: rows.int32(0, 4) ?? 0,
+        bodyType: rows.int32(0, 5) ?? 1,
+        truncation: rows.int64(0, 6) ?? -1,
+        mimeSupport: rows.int32(0, 7) ?? 0,
+    };
+}
+
+/// The folder `collectionId` of the device, unlocked.
+async fn folderState(mail: borrow SmtpContext, device: i64, collectionId: StringView) -> Result<FolderState?, EasFail> {
+    var params = PgParams.create();
+    pg(params.int64(device))?;
+    pg(params.text(collectionId))?;
+    let rows = await query(borrow mail.store, sqlFolderState(false), params)?;
+    return Ok(stateOf(rows));
+}
+
+/// The earliest time a FilterType keeps (MS-ASCMD §2.2.3.69.2), in seconds; 0: everything.
+fn filterCutoff(filterType: i32, kind: u8) -> i64 {
+    let now = Clock.unixMillis() / 1000;
+    let day: i64 = 86400;
+    if (kind == KIND_CONTACTS) {
+        return 0;
+    }
+    if (filterType == 1) {
+        return now - day;
+    }
+    if (filterType == 2) {
+        return now - 3 * day;
+    }
+    if (filterType == 3) {
+        return now - 7 * day;
+    }
+    if (filterType == 4) {
+        return now - 14 * day;
+    }
+    if (filterType == 5) {
+        return now - 31 * day;
+    }
+    if (filterType == 6) {
+        return now - 92 * day;
+    }
+    if (filterType == 7) {
+        return now - 183 * day;
+    }
+    return 0;
+}
+
+/// The SQL of a folder's pending changes: $1 the folder, $2 its source, $3 the cutoff; with `limit`, $4 rows of
+/// (op, item, version), deletes first, then changes, then adds newest first; else their count.
+fn changeSql(kind: u8, limit: bool, into: borrow mut String) -> Result<void, EasFail> {
+    into.clear();
+    mem(into.append("WITH cur AS ("))?;
+    if (kind == KIND_MAILBOX) {
+        mem(into.append(
+            "SELECT uid AS item, modseq, extract(epoch FROM internal_date)::int8 AS ord FROM messages WHERE mailbox_id = $2 AND flags & 8 = 0 AND ($3::int8 = 0 OR internal_date >= to_timestamp($3::int8::float8))",
+        ))?;
+    } else if (kind == KIND_EVENTS) {
+        mem(into.append(
+            "SELECT id AS item, modseq, coalesce(extract(epoch FROM dtstart)::int8, 0) AS ord FROM dav_objects WHERE collection_id = $2 AND NOT deleted AND component = 'VEVENT' AND ($3::int8 = 0 OR dtend IS NULL OR dtend >= to_timestamp($3::int8::float8))",
+        ))?;
+    } else {
+        mem(into.append(
+            "SELECT id AS item, modseq, 0::int8 AS ord FROM dav_objects WHERE collection_id = $2 AND NOT deleted AND component = 'VCARD' AND $3::int8 >= 0",
+        ))?;
+    }
+    mem(into.append(
+        "), it AS (SELECT item, version FROM eas_items WHERE folder_id = $1 AND NOT gone), c AS (SELECT 0 AS op, it.item, 0::int8 AS version, 0::int8 AS ord FROM it LEFT JOIN cur ON cur.item = it.item WHERE cur.item IS NULL UNION ALL SELECT 1, cur.item, cur.modseq, cur.ord FROM cur JOIN it ON it.item = cur.item WHERE cur.modseq > it.version UNION ALL SELECT 2, cur.item, cur.modseq, cur.ord FROM cur LEFT JOIN it ON it.item = cur.item WHERE it.item IS NULL) ",
+    ))?;
+    if (limit) {
+        mem(into.append("SELECT op, item, version FROM c ORDER BY op, ord DESC, item DESC LIMIT $4"))?;
+    } else {
+        mem(into.append("SELECT count(*) FROM c"))?;
+    }
+    return Ok();
+}
+
+/// How many changes are waiting for folder `f`.
+async fn pendingCount(mail: borrow SmtpContext, f: borrow FolderState) -> Result<i64, EasFail> {
+    var sql = String.create();
+    changeSql(f.kind, false, mut sql)?;
+    var params = PgParams.create();
+    pg(params.int64(f.id))?;
+    pg(params.int64(f.sourceId))?;
+    pg(params.int64(filterCutoff(f.filterType, f.kind)))?;
+    let rows = await query(borrow mail.store, sql.view(), params)?;
+    return Ok(rows.int64(0, 0) ?? 0);
+}
+
+/// One change to send.
+struct Change {
+    op: i64;
+    item: i64;
+    version: i64;
+}
+
+const ANSWER_ADD: u8 = 0;
+const ANSWER_CHANGE: u8 = 1;
+const ANSWER_DELETE: u8 = 2;
+const ANSWER_FETCH: u8 = 3;
+
+fn answerName(command: u8) -> StringView =>
+    if (command ==
+        ANSWER_ADD) "Add" else if (command ==
+        ANSWER_CHANGE) "Change" else if (command == ANSWER_DELETE) "Delete" else "Fetch";
+
+/// The answer to one client command, written in Responses.
+struct ClientAnswer {
+    /// ANSWER_ADD, ANSWER_CHANGE, ANSWER_DELETE or ANSWER_FETCH.
+    command: u8;
+    clientId: String;
+    serverId: String;
+    status: i64;
+    /// For a Fetch: the uid or object id to send in full.
+    item: i64;
+}
+
+fn itemServerId(collectionId: StringView, item: i64, into: borrow mut String) -> Result<void, EasFail> {
+    into.clear();
+    mem(into.append(collectionId))?;
+    mem(into.append(":"))?;
+    return mem(into.appendNumber(item));
+}
+
+/// The item of a ServerId `<folder>:<item>` of folder `collectionId`; null when it is not one of the folder's.
+fn itemOf(collectionId: StringView, serverId: StringView) -> i64? {
+    let colon = serverId.lastIndexOf(":")?;
+    if (serverId[0..colon] != collectionId) {
+        return null;
+    }
+    return serverId[(colon + 1)..].parseInt<i64>();
+}
+
+fn readOptions(doc: borrow XmlDocument, collection: usize, f: borrow mut FolderState) -> bool {
+    var options = Vector<usize>.create();
+    match (doc.findAll(collection, NS_AIRSYNC, "Options", mut options)) {
+        Ok() => {}
+        Err(_) => { return false; }
+    }
+    var any = false;
+    for (o in options.view()) {
+        let itemClass = childValue(doc, o, NS_AIRSYNC, "Class");
+        if (itemClass.length > 0 && itemClass != classOf(f.kind)) {
+            continue; // SMS options, for example
+        }
+        any = true;
+        match (doc.child(o, NS_AIRSYNC, "FilterType")) {
+            Some(_) => { f.filterType = truncate<i32>(childNumber(doc, o, NS_AIRSYNC, "FilterType", 0)); }
+            null => { f.filterType = 0; }
+        }
+        f.mimeSupport = truncate<i32>(childNumber(doc, o, NS_AIRSYNC, "MIMESupport", 0));
+        var prefs = Vector<usize>.create();
+        match (doc.findAll(o, NS_BASE, "BodyPreference", mut prefs)) {
+            Ok() => {}
+            Err(_) => { return false; }
+        }
+        var chosen = false;
+        for (p in prefs.view()) {
+            let t = truncate<i32>(childNumber(doc, p, NS_BASE, "Type", 1));
+            if (!chosen && (t == 1 || t == 2 || t == 4)) {
+                f.bodyType = t;
+                f.truncation = childNumber(doc, p, NS_BASE, "TruncationSize", -1);
+                chosen = true;
+            }
+        }
+        if (!chosen) {
+            f.bodyType = 1;
+            // 12.x and later: no preference is plain text, truncated by MIMETruncation or Truncation if given.
+            f.truncation = -1;
+        }
+        if (f.mimeSupport == 2 && f.bodyType != 4 && prefs.length == 0) {
+            f.bodyType = 4;
+        }
+    }
+    return any;
+}
+
+async fn saveOptions(connection: borrow mut PgConnection, f: borrow FolderState) -> Result<void, EasFail> {
+    var params = PgParams.create();
+    pg(params.int64(f.id))?;
+    pg(params.int32(f.filterType))?;
+    pg(params.int32(f.bodyType))?;
+    pg(params.int64(f.truncation))?;
+    pg(params.int32(f.mimeSupport))?;
+    await queryOn(
+        connection,
+        "UPDATE eas_folders SET filter_type = $2, body_type = $3, truncation = $4, mime_support = $5, updated_at = now() WHERE id = $1",
+        params,
+    )?;
+    return Ok();
+}
+
+async fn setSyncKey(connection: borrow mut PgConnection, folder: i64, key: i64) -> Result<void, EasFail> {
+    var params = PgParams.create();
+    pg(params.int64(folder))?;
+    pg(params.int64(key))?;
+    await queryOn(connection, "UPDATE eas_folders SET sync_key = $2, updated_at = now() WHERE id = $1", params)?;
+    return Ok();
+}
+
+async fn folderSql(
+    connection: borrow mut PgConnection,
+    sql: StringView,
+    folder: i64,
+    key: i64,
+) -> Result<void, EasFail> {
+    var params = PgParams.create();
+    pg(params.int64(folder))?;
+    pg(params.int64(key))?;
+    await queryOn(connection, sql, params)?;
+    return Ok();
+}
+
+/// Records what the device now has of `item`: `version`, or nothing (`gone`), changed by the response `key`.
+async fn recordItem(
+    connection: borrow mut PgConnection,
+    folder: i64,
+    item: i64,
+    version: i64,
+    key: i64,
+) -> Result<void, EasFail> {
+    var params = PgParams.create();
+    pg(params.int64(folder))?;
+    pg(params.int64(item))?;
+    pg(params.int64(version))?;
+    pg(params.int64(key))?;
+    await queryOn(
+        connection,
+        "INSERT INTO eas_items (folder_id, item, version, sync_key) VALUES ($1, $2, $3, $4) ON CONFLICT (folder_id, item) DO UPDATE SET version = EXCLUDED.version",
+        params,
+    )?;
+    return Ok();
+}
+
+async fn forgetItem(connection: borrow mut PgConnection, folder: i64, item: i64) -> Result<void, EasFail> {
+    var params = PgParams.create();
+    pg(params.int64(folder))?;
+    pg(params.int64(item))?;
+    await queryOn(connection, "DELETE FROM eas_items WHERE folder_id = $1 AND item = $2", params)?;
+    return Ok();
+}
+
+async fn sync(mail: borrow SmtpContext, s: borrow Session, body: borrow Body) -> Result<Response, EasFail> {
+    if (!body.present) {
+        // An empty Sync repeats the last one; this server does not keep it (MS-ASCMD §2.2.3.177.16, status 13).
+        var w = WbxmlWriter.create();
+        w.start(PAGE_AIRSYNC, "Sync");
+        w.element(PAGE_AIRSYNC, "Status", "13");
+        w.end();
+        return written(w);
+    }
+    let doc = borrow body.doc;
+    let root = doc.root();
+    var collections = Vector<usize>.create();
+    mem(doc.findAll(root, NS_AIRSYNC, "Collection", mut collections))?;
+    var window = childNumber(doc, root, NS_AIRSYNC, "WindowSize", 0);
+    // A long poll (14.0): Wait in minutes, HeartbeatInterval in seconds. Only when nothing needs answering now.
+    var waitSeconds = childNumber(doc, root, NS_AIRSYNC, "Wait", 0) * 60;
+    if (waitSeconds == 0) {
+        waitSeconds = childNumber(doc, root, NS_AIRSYNC, "HeartbeatInterval", 0);
+    }
+    if (waitSeconds > 0) {
+        if (waitSeconds > 3540) {
+            waitSeconds = 3540;
+        }
+        var urgent = false;
+        for (c in collections.view()) {
+            if (doc.child(c, NS_AIRSYNC, "Commands") != null || childValue(doc, c, NS_AIRSYNC, "SyncKey") == "0") {
+                urgent = true;
+            }
+        }
+        if (!urgent && !(await anyPending(mail, s, doc, collections)?)) {
+            await waitForChange(mail, s, waitSeconds);
+            if (!(await anyPending(mail, s, doc, collections)?)) {
+                return emptyOk();
+            }
+        }
+    }
+    var w = WbxmlWriter.create();
+    w.start(PAGE_AIRSYNC, "Sync");
+    w.start(PAGE_AIRSYNC, "Collections");
+    for (c in collections.view()) {
+        let collectionWindow = childNumber(
+            doc,
+            c,
+            NS_AIRSYNC,
+            "WindowSize",
+            if (window > 0) window else DEFAULT_WINDOW,
+        );
+        await syncCollection(mail, s, doc, c, if (collectionWindow > 0) collectionWindow else DEFAULT_WINDOW, mut w)?;
+    }
+    w.end();
+    w.end();
+    return written(w);
+}
+
+/// Whether any of the request's folders has changes waiting.
+async fn anyPending(
+    mail: borrow SmtpContext,
+    s: borrow Session,
+    doc: borrow XmlDocument,
+    collections: borrow Vector<usize>,
+) -> Result<bool, EasFail> {
+    for (c in collections.view()) {
+        let id = childValue(doc, c, NS_AIRSYNC, "CollectionId");
+        match (await folderState(mail, s.device, id)?) {
+            Some(f) => {
+                if (await pendingCount(mail, f)? > 0) {
+                    return Ok(true);
+                }
+            }
+            null => { return Ok(true); } // answered at once, with status 12
+        }
+    }
+    return Ok(false);
+}
+
+/// Waits up to `seconds` for a change of anything of the user's.
+async fn waitForChange(mail: borrow SmtpContext, s: borrow Session, seconds: i64) {
+    let watch = match (await mail.store.notifications().watch(s.userId, 0)) {
+        Some(w) => w,
+        null => {
+            match (await Timer.sleep(truncate<u64>(seconds) * 1000)) {
+                Ok() => {}
+                Err(_) => {}
+            }
+            return;
+        }
+    };
+    let woke: Result<void, AsyncError> = await Async.timeout(
+        truncate<u64>(seconds) * 1000,
+        AsyncError.TimedOut,
+        async () => match (await watch.changed()) {
+            Ok() => Ok(),
+            Err(e) => Err(e),
+        },
+    );
+    match (woke) {
+        Ok() => {
+            // Changes come in bursts (a delivery to several folders, a client's batch): let them land.
+            match (await Timer.sleep(500)) {
+                Ok() => {}
+                Err(_) => {}
+            }
+        }
+        Err(_) => {}
+    }
+}
+
+fn collectionHead(
+    w: borrow mut WbxmlWriter,
+    s: borrow Session,
+    kind: u8,
+    key: i64,
+    collectionId: StringView,
+    status: StringView,
+) {
+    w.start(PAGE_AIRSYNC, "Collection");
+    if (s.version < 140) {
+        w.element(PAGE_AIRSYNC, "Class", classOf(kind));
+    }
+    w.number(PAGE_AIRSYNC, "SyncKey", key);
+    w.element(PAGE_AIRSYNC, "CollectionId", collectionId);
+    w.element(PAGE_AIRSYNC, "Status", status);
+}
+
+async fn syncCollection(
+    mail: borrow SmtpContext,
+    s: borrow Session,
+    doc: borrow XmlDocument,
+    collection: usize,
+    windowSize: i64,
+    w: borrow mut WbxmlWriter,
+) -> Result<void, EasFail> {
+    let collectionId = childValue(doc, collection, NS_AIRSYNC, "CollectionId");
+    let keyText = childValue(doc, collection, NS_AIRSYNC, "SyncKey");
+    let window = if (windowSize > MAX_WINDOW) MAX_WINDOW else windowSize;
+    var lease = match (await mail.store.connections().acquire()) {
+        Ok(l) => l,
+        Err(_) => { return Err(EasFail.Unavailable); }
+    };
+    let connection = lease.connection();
+    await batch(connection, "BEGIN")?;
+    var params = PgParams.create();
+    pg(params.int64(s.device))?;
+    pg(params.text(collectionId))?;
+    let rows = await queryOn(connection, sqlFolderState(true), params)?;
+    var f = match (stateOf(rows)) {
+        Some(f) => f,
+        null => {
+            await batch(connection, "ROLLBACK")?;
+            // Not in the hierarchy the device has: it must FolderSync.
+            w.start(PAGE_AIRSYNC, "Collection");
+            w.element(PAGE_AIRSYNC, "SyncKey", if (keyText.length > 0) keyText else "0");
+            w.element(PAGE_AIRSYNC, "CollectionId", collectionId);
+            w.element(PAGE_AIRSYNC, "Status", "12");
+            w.end();
+            return Ok();
+        }
+    };
+    let key = keyText.parseInt<i64>() ?? -1;
+    if (key == 0) {
+        // The initial sync: the device has nothing. It gets a key, and items from the next request on.
+        await folderSql(connection, "DELETE FROM eas_items WHERE folder_id = $1 AND $2::int8 >= 0", f.id, 0)?;
+        readOptions(doc, collection, mut f);
+        await saveOptions(connection, f)?;
+        await setSyncKey(connection, f.id, 1)?;
+        await batch(connection, "COMMIT")?;
+        collectionHead(w, s, f.kind, 1, collectionId, "1");
+        w.end();
+        return Ok();
+    }
+    if (key == f.syncKey) {
+        // The device got the last response: what it carried is confirmed.
+        await folderSql(
+            connection,
+            "DELETE FROM eas_items WHERE folder_id = $1 AND gone AND sync_key <= $2",
+            f.id,
+            key,
+        )?;
+        await folderSql(
+            connection,
+            "UPDATE eas_items SET previous = NULL WHERE folder_id = $1 AND previous IS NOT NULL AND sync_key <= $2",
+            f.id,
+            key,
+        )?;
+    } else if (key > 0 && key == f.syncKey - 1) {
+        // It did not: undo what the last response recorded, and answer again.
+        await folderSql(
+            connection,
+            "DELETE FROM eas_items WHERE folder_id = $1 AND sync_key = $2 AND previous IS NULL",
+            f.id,
+            f.syncKey,
+        )?;
+        await folderSql(
+            connection,
+            "UPDATE eas_items SET version = previous, previous = NULL, gone = FALSE WHERE folder_id = $1 AND sync_key = $2 AND previous IS NOT NULL",
+            f.id,
+            f.syncKey,
+        )?;
+        f.syncKey = key;
+    } else {
+        // Out of step: the device must start again from 0.
+        await folderSql(connection, "DELETE FROM eas_items WHERE folder_id = $1 AND $2::int8 >= 0", f.id, 0)?;
+        await setSyncKey(connection, f.id, 0)?;
+        await batch(connection, "COMMIT")?;
+        collectionHead(w, s, f.kind, 0, collectionId, "3");
+        w.end();
+        return Ok();
+    }
+    if (readOptions(doc, collection, mut f)) {
+        await saveOptions(connection, f)?;
+    }
+    let next = f.syncKey + 1;
+    // Client commands first.
+    var answers = Vector<ClientAnswer>.create();
+    var hadCommands = false;
+    match (doc.child(collection, NS_AIRSYNC, "Commands")) {
+        Some(commands) => {
+            hadCommands = true;
+            await clientCommands(mail, s, connection, doc, commands, f, collectionId, next, mut answers)?;
+        }
+        null => {}
+    }
+    let getChanges = match (doc.child(collection, NS_AIRSYNC, "GetChanges")) {
+        Some(g) => doc.trimmed(g) != "0",
+        null => true,
+    };
+    var changes = Vector<Change>.create();
+    var more = false;
+    if (getChanges) {
+        var sql = String.create();
+        changeSql(f.kind, true, mut sql)?;
+        var cp = PgParams.create();
+        pg(cp.int64(f.id))?;
+        pg(cp.int64(f.sourceId))?;
+        pg(cp.int64(filterCutoff(f.filterType, f.kind)))?;
+        pg(cp.int64(window + 1))?;
+        let found = await queryOn(connection, sql.view(), cp)?;
+        for (r in 0..found.rowCount()) {
+            if (truncate<i64>(r) >= window) {
+                more = true;
+                break;
+            }
+            mem(changes.push(Change {
+                op: found.int64(r, 0) ?? 0,
+                item: found.int64(r, 1) ?? 0,
+                version: found.int64(r, 2) ?? 0,
+            }))?;
+        }
+    }
+    let newKey = if (changes.length > 0 || hadCommands) next else f.syncKey;
+    collectionHead(w, s, f.kind, newKey, collectionId, "1");
+    if (answers.length > 0) {
+        w.start(PAGE_AIRSYNC, "Responses");
+        for (a in answers.view()) {
+            w.start(PAGE_AIRSYNC, answerName(a.command));
+            if (a.clientId.length > 0) {
+                w.element(PAGE_AIRSYNC, "ClientId", a.clientId.view());
+            }
+            if (a.serverId.length > 0) {
+                w.element(PAGE_AIRSYNC, "ServerId", a.serverId.view());
+            }
+            w.number(PAGE_AIRSYNC, "Status", a.status);
+            if (a.command == ANSWER_FETCH && a.status == 1) {
+                w.start(PAGE_AIRSYNC, "ApplicationData");
+                await writeItem(mail, s, f, collectionId, a.item, false, true, w)?;
+                w.end();
+            }
+            w.end();
+        }
+        w.end();
+    }
+    if (more) {
+        w.empty(PAGE_AIRSYNC, "MoreAvailable");
+    }
+    if (changes.length > 0) {
+        w.start(PAGE_AIRSYNC, "Commands");
+        for (c in changes.view()) {
+            var serverId = String.create();
+            itemServerId(collectionId, c.item, mut serverId)?;
+            if (c.op == OP_DELETE) {
+                w.start(PAGE_AIRSYNC, "Delete");
+                w.element(PAGE_AIRSYNC, "ServerId", serverId.view());
+                w.end();
+                var dp = PgParams.create();
+                pg(dp.int64(f.id))?;
+                pg(dp.int64(c.item))?;
+                pg(dp.int64(newKey))?;
+                await queryOn(
+                    connection,
+                    "UPDATE eas_items SET gone = TRUE, previous = version, sync_key = $3 WHERE folder_id = $1 AND item = $2",
+                    dp,
+                )?;
+                continue;
+            }
+            let isAdd = c.op == OP_ADD;
+            w.start(PAGE_AIRSYNC, if (isAdd) "Add" else "Change");
+            w.element(PAGE_AIRSYNC, "ServerId", serverId.view());
+            w.start(PAGE_AIRSYNC, "ApplicationData");
+            // A changed message changes only in its flags: they are all that is sent again.
+            await writeItem(mail, s, f, collectionId, c.item, !isAdd && f.kind == KIND_MAILBOX, false, w)?;
+            w.end();
+            w.end();
+            var ap = PgParams.create();
+            pg(ap.int64(f.id))?;
+            pg(ap.int64(c.item))?;
+            pg(ap.int64(c.version))?;
+            pg(ap.int64(newKey))?;
+            await queryOn(
+                connection,
+                if (isAdd) "INSERT INTO eas_items (folder_id, item, version, sync_key) VALUES ($1, $2, $3, $4) ON CONFLICT (folder_id, item) DO UPDATE SET version = EXCLUDED.version, sync_key = EXCLUDED.sync_key, previous = NULL, gone = FALSE" else "UPDATE eas_items SET previous = version, version = $3, sync_key = $4 WHERE folder_id = $1 AND item = $2",
+                ap,
+            )?;
+        }
+        w.end();
+    }
+    w.end();
+    if (newKey != f.syncKey) {
+        await setSyncKey(connection, f.id, newKey)?;
+    }
+    await batch(connection, "COMMIT")?;
+    return Ok();
+}
+
+/// Writes item `item` of folder `f` (inside ApplicationData): a message (only its flags with `flagsOnly`), an
+/// event or a contact. `fetch`: the whole body, untruncated.
+async fn writeItem(
+    mail: borrow SmtpContext,
+    s: borrow Session,
+    f: borrow FolderState,
+    collectionId: StringView,
+    item: i64,
+    flagsOnly: bool,
+    fetch: bool,
+    w: borrow mut WbxmlWriter,
+) -> Result<void, EasFail> {
+    if (f.kind == KIND_MAILBOX) {
+        var uids = UidSet.create();
+        match (uids.add(item)) {
+            Ok() => {}
+            Err(_) => { return Err(EasFail.Memory); }
+        }
+        var list = MessageList.create();
+        match (await mail.store.fetchMessages(s.userId, f.sourceId, uids, false, mut list)) {
+            Ok() => {}
+            Err(_) => { return Err(EasFail.Unavailable); }
+        }
+        if (list.count() == 0) {
+            return Ok(); // expunged meanwhile: the next Sync deletes it
+        }
+        if (flagsOnly) {
+            writeFlags(w, list.flags(0));
+            return Ok();
+        }
+        var hash = Vector<u8>.create();
+        match (list.blob(0, mut hash)) {
+            Ok() => {}
+            Err(_) => { return Err(EasFail.Memory); }
+        }
+        var m = emptyMessage();
+        if (!(await loadMessage(borrow mail.store, hash.view(), mut m)?)) {
+            return Ok();
+        }
+        var serverId = String.create();
+        itemServerId(collectionId, item, mut serverId)?;
+        let opts = BodyOptions {
+            bodyType: if (f.mimeSupport == 2 && f.bodyType == 4) 4 else if (f.bodyType == 4) 4 else f.bodyType,
+            truncation: if (fetch) -1 else f.truncation,
+        };
+        writeEmail(w, m, list.flags(0), list.internalDate(0), serverId.view(), opts, s.version)?;
+        return Ok();
+    }
+    var object = PimObject.create();
+    match (await objectById(borrow mail.store, s.userId, item, mut object)) {
+        Ok(true) => {}
+        Ok(false) => { return Ok(); }
+        Err(_) => { return Err(EasFail.Unavailable); }
+    }
+    let opts = BodyOptions { bodyType: if (f.bodyType == 2) 2 else 1, truncation: if (fetch) -1 else f.truncation };
+    if (f.kind == KIND_EVENTS) {
+        return writeEvent(w, object.data.view().bytes(), opts, s.version);
+    }
+    return writeContact(w, object.data.view().bytes(), opts);
+}
+
+async fn clientCommands(
+    mail: borrow SmtpContext,
+    s: borrow Session,
+    connection: borrow mut PgConnection,
+    doc: borrow XmlDocument,
+    commands: usize,
+    f: borrow FolderState,
+    collectionId: StringView,
+    key: i64,
+    answers: borrow mut Vector<ClientAnswer>,
+) -> Result<void, EasFail> {
+    let deletesAsMoves = match (doc.child(doc.parent(commands), NS_AIRSYNC, "DeletesAsMoves")) {
+        Some(d) => doc.trimmed(d) != "0",
+        null => true,
+    };
+    var list = Vector<usize>.create();
+    mem(doc.children(commands, mut list))?;
+    for (c in list.view()) {
+        let serverId = childValue(doc, c, NS_AIRSYNC, "ServerId");
+        let clientId = childValue(doc, c, NS_AIRSYNC, "ClientId");
+        var answer = ClientAnswer {
+            command: ANSWER_CHANGE,
+            clientId: String.create(),
+            serverId: String.create(),
+            status: 1,
+            item: 0,
+        };
+        mem(answer.clientId.append(clientId))?;
+        let item = itemOf(collectionId, serverId);
+        if (doc.is(c, NS_AIRSYNC, "Fetch")) {
+            answer.command = ANSWER_FETCH;
+            mem(answer.serverId.append(serverId))?;
+            match (item) {
+                Some(i) => { answer.item = i; }
+                null => { answer.status = 8; }
+            }
+            mem(answers.push(answer))?;
+            continue;
+        }
+        if (doc.is(c, NS_AIRSYNC, "Add")) {
+            answer.command = ANSWER_ADD;
+            let data = doc.child(c, NS_AIRSYNC, "ApplicationData");
+            match (data) {
+                Some(d) => {
+                    if (f.kind == KIND_MAILBOX) {
+                        answer.status = 6; // drafts from the device are not taken
+                    } else {
+                        match (await addObject(mail, s, doc, d, f)?) {
+                            Some(added) => {
+                                itemServerId(collectionId, added[0], mut answer.serverId)?;
+                                await recordItem(connection, f.id, added[0], added[1], key)?;
+                            }
+                            null => { answer.status = 6; }
+                        }
+                    }
+                }
+                null => { answer.status = 4; }
+            }
+            mem(answers.push(answer))?;
+            continue;
+        }
+        let known = match (item) {
+            Some(i) => i,
+            null => {
+                answer.command = if (doc.is(c, NS_AIRSYNC, "Delete")) ANSWER_DELETE else ANSWER_CHANGE;
+                mem(answer.serverId.append(serverId))?;
+                answer.status = 8;
+                mem(answers.push(answer))?;
+                continue;
+            }
+        };
+        if (doc.is(c, NS_AIRSYNC, "Change")) {
+            let data = doc.child(c, NS_AIRSYNC, "ApplicationData");
+            let ok = match (data) {
+                Some(d) => await changeItem(mail, s, connection, doc, d, f, known)?,
+                null => false,
+            };
+            if (!ok) {
+                mem(answer.serverId.append(serverId))?;
+                answer.status = 8;
+                mem(answers.push(answer))?;
+            }
+            continue;
+        }
+        if (doc.is(c, NS_AIRSYNC, "Delete")) {
+            let ok = await deleteItem(mail, s, f, known, deletesAsMoves)?;
+            await forgetItem(connection, f.id, known)?;
+            if (!ok) {
+                answer.command = ANSWER_DELETE;
+                mem(answer.serverId.append(serverId))?;
+                answer.status = 8;
+                mem(answers.push(answer))?;
+            }
+        }
+    }
+    return Ok();
+}
+
+/// A message's flags from a client Change: Read and Flag.
+async fn changeItem(
+    mail: borrow SmtpContext,
+    s: borrow Session,
+    connection: borrow mut PgConnection,
+    doc: borrow XmlDocument,
+    data: usize,
+    f: borrow FolderState,
+    item: i64,
+) -> Result<bool, EasFail> {
+    if (f.kind != KIND_MAILBOX) {
+        match (await changeObject(mail, s, doc, data, f, item)?) {
+            Some(version) => {
+                await recordItem(connection, f.id, item, version, f.syncKey)?;
+                return Ok(true);
+            }
+            null => { return Ok(false); }
+        }
+    }
+    var change = FlagChange.create();
+    match (doc.child(data, NS_EMAIL, "Read")) {
+        Some(r) => {
+            if (doc.trimmed(r) == "1") {
+                change.add = change.add | FLAG_SEEN;
+            } else {
+                change.remove = change.remove | FLAG_SEEN;
+            }
+        }
+        null => {}
+    }
+    match (doc.child(data, NS_EMAIL, "Flag")) {
+        Some(flag) => {
+            if (childValue(doc, flag, NS_EMAIL, "FlagStatus") == "2") {
+                change.add = change.add | FLAG_FLAGGED;
+            } else {
+                change.remove = change.remove | FLAG_FLAGGED;
+            }
+        }
+        null => {}
+    }
+    var uids = UidSet.create();
+    match (uids.add(item)) {
+        Ok() => {}
+        Err(_) => { return Err(EasFail.Memory); }
+    }
+    var changed = MessageList.create();
+    if (change.add != 0 || change.remove != 0) {
+        match (await mail.store.setFlags(s.userId, f.sourceId, uids, change, mut changed)) {
+            Ok() => {}
+            Err(_) => { return Err(EasFail.Unavailable); }
+        }
+    }
+    // The device has these flags already: it need not be told of them.
+    var now = MessageList.create();
+    match (await mail.store.fetchMessages(s.userId, f.sourceId, uids, false, mut now)) {
+        Ok() => {}
+        Err(_) => { return Err(EasFail.Unavailable); }
+    }
+    if (now.count() == 0) {
+        return Ok(false);
+    }
+    await recordItem(connection, f.id, item, now.modseq(0), f.syncKey)?;
+    return Ok(true);
+}
+
+/// A client Delete: of a message, a move to Trash (unless it is in Trash, or the device asked for real deletes);
+/// of an event or contact, its deletion.
+async fn deleteItem(
+    mail: borrow SmtpContext,
+    s: borrow Session,
+    f: borrow FolderState,
+    item: i64,
+    asMove: bool,
+) -> Result<bool, EasFail> {
+    if (f.kind != KIND_MAILBOX) {
+        var object = PimObject.create();
+        match (await objectById(borrow mail.store, s.userId, item, mut object)) {
+            Ok(true) => {}
+            Ok(false) => { return Ok(false); }
+            Err(_) => { return Err(EasFail.Unavailable); }
+        }
+        match (await deleteObject(borrow mail.store, s.userId, object.collectionId, object.href.view(), "")) {
+            Ok() => { return Ok(true); }
+            Err(PimError.NotFound) => { return Ok(false); }
+            Err(_) => { return Err(EasFail.Unavailable); }
+        }
+    }
+    var uids = UidSet.create();
+    match (uids.add(item)) {
+        Ok() => {}
+        Err(_) => { return Err(EasFail.Memory); }
+    }
+    let trash = match (await mail.store.specialMailbox(s.userId, "\\Trash")) {
+        Ok(t) => t,
+        Err(_) => { return Err(EasFail.Unavailable); }
+    };
+    match (trash) {
+        Some(t) => {
+            if (asMove && t != f.sourceId) {
+                var moved = CopyResult.create();
+                match (await mail.store.copy(s.userId, f.sourceId, t, uids, true, mut moved)) {
+                    Ok() => { return Ok(moved.source.length > 0); }
+                    Err(_) => { return Err(EasFail.Unavailable); }
+                }
+            }
+        }
+        null => {}
+    }
+    var change = FlagChange.create();
+    change.add = FLAG_DELETED;
+    var changed = MessageList.create();
+    match (await mail.store.setFlags(s.userId, f.sourceId, uids, change, mut changed)) {
+        Ok() => {}
+        Err(_) => { return Err(EasFail.Unavailable); }
+    }
+    var gone = Vector<i64>.create();
+    match (await mail.store.expungeUids(s.userId, f.sourceId, uids, mut gone)) {
+        Ok() => { return Ok(gone.length > 0); }
+        Err(_) => { return Err(EasFail.Unavailable); }
+    }
+}
+
+/// A new event or contact from the device; its id and modseq.
+async fn addObject(
+    mail: borrow SmtpContext,
+    s: borrow Session,
+    doc: borrow XmlDocument,
+    data: usize,
+    f: borrow FolderState,
+) -> Result<[i64; 2]?, EasFail> {
+    var uid = String.create();
+    newUid(mut uid)?;
+    var text = Vector<u8>.create();
+    if (f.kind == KIND_EVENTS) {
+        eventFromEas(doc, data, uid.view(), mut text)?;
+    } else {
+        contactFromEas(doc, data, uid.view(), mut text)?;
+    }
+    var href = String.create();
+    mem(href.append(uid.view()))?;
+    mem(href.append(if (f.kind == KIND_EVENTS) ".ics" else ".vcf"))?;
+    var outcome = PutOutcome.create();
+    match (await putObject(
+        borrow mail.store,
+        s.userId,
+        f.sourceId,
+        href.view(),
+        StringView.fromUtf8(text.view()) ?? "",
+        "",
+        true,
+        mut outcome,
+    )) {
+        Ok() => { return Ok([outcome.id, outcome.modseq]); }
+        Err(PimError.Unavailable) => { return Err(EasFail.Unavailable); }
+        Err(_) => { return Ok(null); }
+    }
+}
+
+/// An event or contact changed on the device: rewritten from its data, keeping its UID; the new modseq.
+async fn changeObject(
+    mail: borrow SmtpContext,
+    s: borrow Session,
+    doc: borrow XmlDocument,
+    data: usize,
+    f: borrow FolderState,
+    item: i64,
+) -> Result<i64?, EasFail> {
+    var object = PimObject.create();
+    match (await objectById(borrow mail.store, s.userId, item, mut object)) {
+        Ok(true) => {}
+        Ok(false) => { return Ok(null); }
+        Err(_) => { return Err(EasFail.Unavailable); }
+    }
+    var text = Vector<u8>.create();
+    if (f.kind == KIND_EVENTS) {
+        eventFromEas(doc, data, object.uid.view(), mut text)?;
+    } else {
+        contactFromEas(doc, data, object.uid.view(), mut text)?;
+    }
+    var outcome = PutOutcome.create();
+    match (await putObject(
+        borrow mail.store,
+        s.userId,
+        object.collectionId,
+        object.href.view(),
+        StringView.fromUtf8(text.view()) ?? "",
+        "",
+        false,
+        mut outcome,
+    )) {
+        Ok() => { return Ok(outcome.modseq); }
+        Err(PimError.Unavailable) => { return Err(EasFail.Unavailable); }
+        Err(_) => { return Ok(null); }
+    }
+}
+
+/// A random UID, as a UUID's text.
+fn newUid(into: borrow mut String) -> Result<void, EasFail> {
+    var random = [0u8; 16];
+    match (Random.fill(mut random[..])) {
+        Ok() => {}
+        Err(_) => {}
+    }
+    random[6] = (random[6] & 0x0f) | 0x40;
+    random[8] = (random[8] & 0x3f) | 0x80;
+    let hex = "0123456789abcdef".bytes();
+    var out = Vector<u8>.create();
+    for (i in 0..16) {
+        if (i == 4 || i == 6 || i == 8 || i == 10) {
+            mem(out.push(0x2d))?;
+        }
+        mem(out.push(hex[truncate<usize>(random[i] >> 4)]))?;
+        mem(out.push(hex[truncate<usize>(random[i] & 0x0f)]))?;
+    }
+    into.clear();
+    return mem(into.append(StringView.fromUtf8(out.view()) ?? ""));
+}
+
+// ---- GetItemEstimate ----
+
+async fn getItemEstimate(mail: borrow SmtpContext, s: borrow Session, body: borrow Body) -> Result<Response, EasFail> {
+    let doc = borrow body.doc;
+    var w = WbxmlWriter.create();
+    w.start(PAGE_ESTIMATE, "GetItemEstimate");
+    if (!body.present) {
+        w.element(PAGE_ESTIMATE, "Status", "2");
+        w.end();
+        return written(w);
+    }
+    var collections = Vector<usize>.create();
+    mem(doc.findAll(doc.root(), NS_ESTIMATE, "Collection", mut collections))?;
+    for (c in collections.view()) {
+        // 14.x names the collection on the GetItemEstimate page and its key on AirSync's; 12.x has its own forms.
+        let estimateId = childValue(doc, c, NS_ESTIMATE, "CollectionId");
+        let id = if (estimateId.length > 0) estimateId else childValue(doc, c, NS_AIRSYNC, "CollectionId");
+        let key = childValue(doc, c, NS_AIRSYNC, "SyncKey");
+        w.start(PAGE_ESTIMATE, "Response");
+        match (await folderState(mail, s.device, id)?) {
+            Some(f) => {
+                if (key.length > 0 && (key.parseInt<i64>() ?? -1) != f.syncKey) {
+                    w.element(PAGE_ESTIMATE, "Status", if (key == "0" || f.syncKey == 0) "3" else "4");
+                } else {
+                    var state = f;
+                    match (doc.find(c, NS_AIRSYNC, "FilterType")) {
+                        Some(ft) => { state.filterType = doc.trimmed(ft).parseInt<i32>() ?? state.filterType; }
+                        null => {}
+                    }
+                    let n = await pendingCount(mail, state)?;
+                    w.element(PAGE_ESTIMATE, "Status", "1");
+                    w.start(PAGE_ESTIMATE, "Collection");
+                    w.element(PAGE_ESTIMATE, "CollectionId", id);
+                    w.number(PAGE_ESTIMATE, "Estimate", n);
+                    w.end();
+                }
+            }
+            null => { w.element(PAGE_ESTIMATE, "Status", "2"); }
+        }
+        w.end();
+    }
+    w.end();
+    return written(w);
+}
+
+// ---- Ping (MS-ASCMD §2.2.1.13) ----
+
+const PING_MIN: i64 = 60;
+const PING_MAX: i64 = 3540;
+
+async fn ping(mail: borrow SmtpContext, s: borrow Session, body: borrow Body) -> Result<Response, EasFail> {
+    let doc = borrow body.doc;
+    var heartbeat: i64 = 0;
+    var folders = Vector<String>.create();
+    if (body.present) {
+        heartbeat = childNumber(doc, doc.root(), NS_PING, "HeartbeatInterval", 0);
+        var list = Vector<usize>.create();
+        mem(doc.findAll(doc.root(), NS_PING, "Folder", mut list))?;
+        for (f in list.view()) {
+            var id = String.create();
+            mem(id.append(childValue(doc, f, NS_PING, "Id")))?;
+            mem(folders.push(id))?;
+        }
+    }
+    // A Ping without folders or interval repeats the last one's.
+    var params = PgParams.create();
+    pg(params.int64(s.device))?;
+    let saved = await query(
+        borrow mail.store,
+        "SELECT ping_folders, ping_heartbeat FROM eas_devices WHERE id = $1",
+        params,
+    )?;
+    if (heartbeat == 0) {
+        heartbeat = (saved.int32(0, 1) ?? 0) as i64;
+    }
+    if (folders.length == 0) {
+        for (part in (saved.text(0, 0) ?? "").split(",")) {
+            if (part.length > 0) {
+                var id = String.create();
+                mem(id.append(part))?;
+                mem(folders.push(id))?;
+            }
+        }
+    }
+    if (heartbeat == 0 || folders.length == 0) {
+        var w = WbxmlWriter.create();
+        w.start(PAGE_PING, "Ping");
+        w.element(PAGE_PING, "Status", "3"); // the parameters are missing
+        w.end();
+        return written(w);
+    }
+    if (heartbeat < PING_MIN || heartbeat > PING_MAX) {
+        var w = WbxmlWriter.create();
+        w.start(PAGE_PING, "Ping");
+        w.element(PAGE_PING, "Status", "5");
+        w.number(PAGE_PING, "HeartbeatInterval", if (heartbeat < PING_MIN) PING_MIN else PING_MAX);
+        w.end();
+        return written(w);
+    }
+    if (body.present) {
+        var joined = String.create();
+        for (i in 0..folders.length) {
+            if (i > 0) {
+                mem(joined.append(","))?;
+            }
+            mem(joined.append(folders[i].view()))?;
+        }
+        var save = PgParams.create();
+        pg(save.int64(s.device))?;
+        pg(save.text(joined.view()))?;
+        pg(save.int32(truncate<i32>(heartbeat)))?;
+        await query(
+            borrow mail.store,
+            "UPDATE eas_devices SET ping_folders = $2, ping_heartbeat = $3, updated_at = now() WHERE id = $1",
+            save,
+        )?;
+    }
+    // Watch first, then look: a change between the look and the wait is not missed.
+    let watch = await mail.store.notifications().watch(s.userId, 0);
+    let deadline = Clock.unixMillis() + heartbeat * 1000;
+    var changed = Vector<usize>.create();
+    loop {
+        changed.clear();
+        for (i in 0..folders.length) {
+            match (await folderState(mail, s.device, folders[i].view())?) {
+                Some(f) => {
+                    if (f.syncKey > 0 && await pendingCount(mail, f)? > 0) {
+                        mem(changed.push(i))?;
+                    }
+                }
+                null => {
+                    // The hierarchy changed: the device must FolderSync (status 7).
+                    var w = WbxmlWriter.create();
+                    w.start(PAGE_PING, "Ping");
+                    w.element(PAGE_PING, "Status", "7");
+                    w.end();
+                    return written(w);
+                }
+            }
+        }
+        let left = deadline - Clock.unixMillis();
+        if (changed.length > 0 || left <= 0) {
+            break;
+        }
+        match (borrow watch) {
+            Some(watching) => {
+                let woke: Result<void, AsyncError> = await Async.timeout(
+                    truncate<u64>(left),
+                    AsyncError.TimedOut,
+                    async () => match (await watching.changed()) {
+                        Ok() => Ok(),
+                        Err(e) => Err(e),
+                    },
+                );
+                match (woke) {
+                    Ok() => {
+                        match (await Timer.sleep(300)) {
+                            Ok() => {}
+                            Err(_) => {}
+                        }
+                    }
+                    Err(AsyncError.Cancelled) => { return emptyOk(); }
+                    Err(_) => {}
+                }
+            }
+            null => {
+                match (await Timer.sleep(if (left > 30000) 30000 else truncate<u64>(left))) {
+                    Ok() => {}
+                    Err(_) => { return emptyOk(); }
+                }
+            }
+        }
+    }
+    var w = WbxmlWriter.create();
+    w.start(PAGE_PING, "Ping");
+    if (changed.length == 0) {
+        w.element(PAGE_PING, "Status", "1");
+    } else {
+        w.element(PAGE_PING, "Status", "2");
+        w.start(PAGE_PING, "Folders");
+        for (i in changed.view()) {
+            w.element(PAGE_PING, "Folder", folders[i].view());
+        }
+        w.end();
+    }
+    w.end();
+    return written(w);
+}

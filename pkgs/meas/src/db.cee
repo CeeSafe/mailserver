@@ -1,0 +1,73 @@
+// Database helpers, and the failure every handler may end with.
+
+import mstore.MailStore;
+import postgres.PgConnection;
+import postgres.PgError;
+import postgres.PgParams;
+import postgres.PgRows;
+
+/// Why a command could not be answered: the store is down (503), or memory ran out (500).
+public enum EasFail {
+    Unavailable,
+    Memory,
+}
+
+fn mem(r: Result<void, AllocError>) -> Result<void, EasFail> => match (r) {
+    Ok() => Ok(),
+    Err(_) => Err(EasFail.Memory),
+};
+
+fn pg(r: Result<void, PgError>) -> Result<void, EasFail> => match (r) {
+    Ok() => Ok(),
+    Err(_) => Err(EasFail.Memory),
+};
+
+/// One query on a pooled connection.
+async fn query(store: borrow MailStore, sql: StringView, params: borrow PgParams) -> Result<PgRows, EasFail> {
+    var lease = match (await store.connections().acquire()) {
+        Ok(l) => l,
+        Err(_) => { return Err(EasFail.Unavailable); }
+    };
+    return match (await lease.connection().query(sql, params)) {
+        Ok(r) => Ok(r),
+        Err(_) => Err(EasFail.Unavailable),
+    };
+}
+
+/// One query on `connection` (inside a transaction).
+async fn queryOn(
+    connection: borrow mut PgConnection,
+    sql: StringView,
+    params: borrow PgParams,
+) -> Result<PgRows, EasFail> =>
+    match (await connection.query(sql, params)) {
+        Ok(r) => Ok(r),
+        Err(_) => Err(EasFail.Unavailable),
+    };
+
+async fn batch(connection: borrow mut PgConnection, sql: StringView) -> Result<void, EasFail> {
+    var none = PgParams.create();
+    return match (await connection.execute(sql, none)) {
+        Ok(_) => Ok(),
+        Err(_) => Err(EasFail.Unavailable),
+    };
+}
+
+/// `{1,2,3}`: an int8[] parameter's text.
+fn arrayText(values: borrow Vector<i64>, into: borrow mut String) -> Result<void, EasFail> {
+    into.clear();
+    mem(into.append("{"))?;
+    for (i in 0..values.length) {
+        if (i > 0) {
+            mem(into.append(","))?;
+        }
+        mem(into.appendNumber(values[i]))?;
+    }
+    mem(into.append("}"))?;
+    return Ok();
+}
+
+fn copyText(rows: borrow PgRows, row: usize, column: usize, into: borrow mut String) -> Result<void, EasFail> {
+    into.clear();
+    return mem(into.append(rows.text(row, column) ?? ""));
+}

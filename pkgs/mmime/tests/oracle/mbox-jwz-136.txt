@@ -1,0 +1,10 @@
+size 79564
+envelope ("Fri, 1 Nov 91 10:50:01 EST" "A picture" (("Stephen A Uhler" NIL "sau" "sleepy.bellcore.com")) (("Stephen A Uhler" NIL "sau" "sleepy.bellcore.com")) (("Stephen A Uhler" NIL "sau" "sleepy.bellcore.com")) ((NIL NIL "nsb" "thumper.bellcore.com")) NIL NIL NIL NIL)
+bodystructure (("image" "pbm" NIL NIL NIL "base64" 78694 NIL NIL NIL NIL) "mixed" ("boundary" "mail.sleepy.sau.305.3789") NIL NIL NIL)
+body (("image" "pbm" NIL NIL NIL "base64" 78694) "mixed")
+section HEADER 608 5334bc4842901b7dde71712c05971a2b04288f4555e77741c10a0823d86e8fa1
+section TEXT 78956 27e9fab6024d5d7e9c5555b1d546d074a0127a53e575b3d2146c433c09f74303
+section HEADER.FIELDS 203 39111a0462efa8956ba5a6113b0c6620906237ec6603095c4d4a4033481ca509
+section HEADER.FIELDS.NOT 407 b488edc5346bf6afa6058f92ed87f8ccd1505a8ad69513b915c282369734cefe
+section 1 78694 0e8b3f5a1e30d7d4453baa5fa47e887fab1b1e547aecd8922bfef1eff98fd43d
+section 1.MIME 164 dc1374f039eda4d06576b7d183a60e7c463716ceb51157158bba784821de00e9

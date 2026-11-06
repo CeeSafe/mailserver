@@ -1,0 +1,30 @@
+size 26272
+envelope ("Mon,  8 Jun 1992 15:56:59 -0400 (EDT)" "Fwd: revised MIME architecture" (("Darren New" NIL "dnew" "MISSING_DOMAIN")) (("Darren New" NIL "dnew" "MISSING_DOMAIN")) (("Darren New" NIL "dnew" "MISSING_DOMAIN")) (("Nathaniel Borenstein" NIL "nsb" "MISSING_DOMAIN")) NIL NIL NIL "<0eAvi=C0M2U=0U4XZI@thumper.bellcore.com>")
+bodystructure (("text" "plain" ("charset" "US-ASCII") NIL NIL "7bit" 9312 349 NIL NIL NIL NIL) (("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 2844 69 NIL NIL NIL NIL) ("message" "external-body" ("access-type" "X-HTTP" "host" "info.cern.ch" "port" "2784" "path" "/hypertext/WWW/TheProject.html") NIL "Object of type 'message/external-body;" "7bit" 33 NIL NIL NIL NIL) ("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 996 22 NIL NIL NIL NIL) ("text" "SGML" ("charset" "us-ascii") NIL "Object of type 'text/SGML" "quoted-printable" 374 15 NIL NIL NIL NIL) ("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 12 2 NIL NIL NIL NIL) ("message" "external-body" ("access-type" "X-HTTP 	" "host" "info.cern.ch" "name" "/hypertext/WWW/TheProject.html") NIL "Object of type 'message/external-body" "7bit" 31 NIL NIL NIL NIL) ("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 12 2 NIL NIL NIL NIL) ("image" "gif" NIL NIL "Object of type 'image/gif" "base64" 3026 NIL NIL NIL NIL) ("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 6852 260 NIL NIL NIL NIL) "mixed" ("boundary" "Alternative.Boundary.keAvi9O0M2U=8U4XMt") NIL NIL NIL) "alternative" ("boundary" "Interpart.Boundary.keAvi9O0M2U=AU4XRw") NIL NIL NIL)
+body (("text" "plain" ("charset" "US-ASCII") NIL NIL "7bit" 9312 349) (("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 2844 69) ("message" "external-body" ("access-type" "X-HTTP" "host" "info.cern.ch" "port" "2784" "path" "/hypertext/WWW/TheProject.html") NIL "Object of type 'message/external-body;" "7bit" 33) ("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 996 22) ("text" "SGML" ("charset" "us-ascii") NIL "Object of type 'text/SGML" "quoted-printable" 374 15) ("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 12 2) ("message" "external-body" ("access-type" "X-HTTP 	" "host" "info.cern.ch" "name" "/hypertext/WWW/TheProject.html") NIL "Object of type 'message/external-body" "7bit" 31) ("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 12 2) ("image" "gif" NIL NIL "Object of type 'image/gif" "base64" 3026) ("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 6852 260) "mixed") "alternative")
+section HEADER 815 8e883f4b653ac21a8c04bc5e1e1fef762e23ca5f162a069e00a346057a20de94
+section TEXT 25457 ea6e9bff71a4de8c8138f946f71d93122beb63c2d62457db02442a27e69b8e78
+section HEADER.FIELDS 290 67a210a7c52f3bc36ed47d1d7e8e6c90ad0c020f662b4266fe66f8e77870e046
+section HEADER.FIELDS.NOT 527 6fc576d83e7e73b1e4b9275fb73f7258ba38973fbd304b82c2dcee2f491d4ca3
+section 1 9312 9e9fcded81fb14ea194c0ee599034b90f8450b455f6f7599b1aca9998cc941aa
+section 1.MIME 46 b3532c649b28a23803c77a2acc4907f5048ea77b89e0c51dcf7f271f2db4bfa6
+section 2 15724 1ef2e0fdc16d76072c3fef96bb1c33edb1c90371a7c3b44ef2b00608a6f88ea6
+section 2.MIME 88 2797bb2eadfcc7846cf507965c5c20c008a135f01c5803e06efb276634150d53
+section 2.1 2844 2d976b26922d955441fd9471f02ee81f827417866f508967b5bac0a497955627
+section 2.1.MIME 94 7d35d8c48d3869c4391f6ff71123bfb4c8466e5b04f02d64c3961f23d7d8bf61
+section 2.2 33 c6e398a97e737f4b82ff0bf0bb0555a8540c552b1da48829a682ab2bcbdf7fca
+section 2.2.MIME 203 c5d5109c0d853817fe8d2581eda4cb79d65fb1672df4ba0c3c4ba1559bc3f868
+section 2.3 996 03c64321e5ba9e9196ad5bf57729111d5c05eb0becd8b146d662f3ca6e5d74d7
+section 2.3.MIME 94 7d35d8c48d3869c4391f6ff71123bfb4c8466e5b04f02d64c3961f23d7d8bf61
+section 2.4 374 ef3c48fba8141b2a2579122efbb4ddd7793f9d685e7e68e31cc7130b3e4cab00
+section 2.4.MIME 120 cc37082177b911e218f6678233000f99833b7011c8d1a83168d890687a2d7830
+section 2.5 12 c5b3f440dc8277c4959d27796d6aadb33a153bd2919367db52086c7cbf90f539
+section 2.5.MIME 94 7d35d8c48d3869c4391f6ff71123bfb4c8466e5b04f02d64c3961f23d7d8bf61
+section 2.6 31 654fec2403c49ee6b0fd3d2d98e8fe5530e7ea2266064d26c7b6f5b4e0ad9871
+section 2.6.MIME 191 c888aceda0b0f7b3b67d0cdc73e51e15c0e2f07df2c65b18b1c95d36789289db
+section 2.7 12 c5b3f440dc8277c4959d27796d6aadb33a153bd2919367db52086c7cbf90f539
+section 2.7.MIME 94 7d35d8c48d3869c4391f6ff71123bfb4c8466e5b04f02d64c3961f23d7d8bf61
+section 2.8 3026 f4122a2a5076cc56826bbbd535d403ffe94644c368359c205149aae9bd101906
+section 2.8.MIME 110 6f37b48947c98f41ac3125703e86a32f9b9f7888d269697d0316a52957ea5f8a
+section 2.9 6852 59cc7a0c128f1512ef7885ca6d04da3211246f9e8434f5c963bb2a0816916edd
+section 2.9.MIME 94 7d35d8c48d3869c4391f6ff71123bfb4c8466e5b04f02d64c3961f23d7d8bf61

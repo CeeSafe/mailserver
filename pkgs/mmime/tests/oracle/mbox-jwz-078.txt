@@ -1,0 +1,12 @@
+size 12331
+envelope ("Tue, 01 Apr 1997 16:55:24 -0800" "multipart/related MHTML test case" (("Jamie Zawinski" NIL "jwz" "netscape.com")) (("Jamie Zawinski" NIL "jwz" "netscape.com")) (("Jamie Zawinski" NIL "jwz" "netscape.com")) NIL NIL NIL NIL "<3341AE7C.665F552F.6@netscape.com>")
+bodystructure (("text" "html" ("charset" "us-ascii") "<3341AE7C.665F552F.6.part1@netscape.com>" NIL "7bit" 629 28 NIL ("inline" NIL) NIL "http://www.netscape.com/people/index.html") ("image" "jpeg" NIL "<3341AE7C.665F552F.6.part2@netscape.com>" NIL "base64" 10870 NIL NIL NIL "http://www.netscape.com/people/jwz/jwz6.jpg") "related" ("boundary" "------------25F71003F6609771F5544030") NIL NIL NIL)
+body (("text" "html" ("charset" "us-ascii") "<3341AE7C.665F552F.6.part1@netscape.com>" NIL "7bit" 629 28) ("image" "jpeg" NIL "<3341AE7C.665F552F.6.part2@netscape.com>" NIL "base64" 10870) "related")
+section HEADER 304 6f298092687fb6cea62bafb711519e740a2c3010a1a33a1ca6a85c866e40732e
+section TEXT 12027 1fd975aea0adf3cb540deddb20ca26288c3ac75f5d45d63b8764b325c99258ed
+section HEADER.FIELDS 261 4d6fb88aa399e0f427ce036a1927c8321cbda15c5b3e989811c7ea5bcee8ceae
+section HEADER.FIELDS.NOT 45 8a6459d9a6590d4cc8852e700def6a3fe643f1a81bed821e0c6257d6ca454a4c
+section 1 629 1dcfc786a920d0f25f817d4a0ca0fa586be0f6867b1b8037642f67cd64f9e44f
+section 1.MIME 222 b4fa86b818eeb8ed0b512f85824ec3010cf26b8b9c9eff53816e2412704c6328
+section 2 10870 3bf757b20cbd7da604290623f8aa8e14377610beb8a21e7e6e1e338cddc05833
+section 2.MIME 180 6a0ef5d94e90a59a12d485e93d94a35dffeeec7ce9c4491a3eb5e2441fc71a36

@@ -1,0 +1,38 @@
+size 4034
+envelope ("26 Apr 1995 08:50:20 GMT" "Re: attach this, spanky" (("Jamie Zawinski" NIL "jwz" "netscape.com")) (("Jamie Zawinski" NIL "jwz" "netscape.com")) (("Jamie Zawinski" NIL "jwz" "netscape.com")) NIL NIL NIL NIL "<3nl1gc$lkb@flop.mcom.com>")
+bodystructure ("message" "rfc822" NIL NIL NIL "7bit" 3419 ("26 Apr 1995 08:33:17 GMT" "Re: attach this, spanky" (("Jamie Zawinski" NIL "jwz" "netscape.com")) (("Jamie Zawinski" NIL "jwz" "netscape.com")) (("Jamie Zawinski" NIL "jwz" "netscape.com")) NIL NIL NIL NIL "<3nl0gd$l55@flop.mcom.com>") ("message" "rfc822" NIL NIL NIL "7bit" 2833 ("26 Apr 1995 08:25:50 GMT" "Re: attach this, spanky" (("Jamie Zawinski" NIL "jwz" "netscape.com")) (("Jamie Zawinski" NIL "jwz" "netscape.com")) (("Jamie Zawinski" NIL "jwz" "netscape.com")) NIL NIL NIL NIL "<3nl02e$kmf@flop.mcom.com>") ("message" "rfc822" NIL NIL NIL "7bit" 2275 ("26 Apr 1995 08:24:06 GMT" "attach this, spanky" (("Jamie Zawinski" NIL "jwz" "netscape.com")) (("Jamie Zawinski" NIL "jwz" "netscape.com")) (("Jamie Zawinski" NIL "jwz" "netscape.com")) NIL NIL NIL NIL "<3nkvv6$kmf@flop.mcom.com>") (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 50 1 NIL NIL NIL NIL) ("message" "rfc822" NIL NIL NIL "7bit" 1282 ("22 Apr 1995 05:13:26 GMT" "Test for Bug 4498" (("Sharon Iimura" NIL "sharoni" "MISSING_DOMAIN")) (("Sharon Iimura" NIL "sharoni" "MISSING_DOMAIN")) (("Sharon Iimura" NIL "sharoni" "MISSING_DOMAIN")) ((NIL NIL "sharoni" "MISSING_DOMAIN")) NIL NIL NIL "<3na39m$3lf@flop.mcom.com>") (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 127 5 NIL NIL NIL NIL) ("text" "html" ("charset" "us-ascii") NIL NIL "quoted-printable" 287 4 NIL NIL NIL NIL) "mixed" ("boundary" "-------------------------------12402385823900") NIL NIL NIL) 38 NIL NIL NIL NIL) "mixed" ("boundary" "---------------------------2082357617733318156662372089") NIL NIL NIL) 70 NIL NIL NIL NIL) 86 NIL NIL NIL NIL) 102 NIL NIL NIL NIL)
+body ("message" "rfc822" NIL NIL NIL "7bit" 3419 ("26 Apr 1995 08:33:17 GMT" "Re: attach this, spanky" (("Jamie Zawinski" NIL "jwz" "netscape.com")) (("Jamie Zawinski" NIL "jwz" "netscape.com")) (("Jamie Zawinski" NIL "jwz" "netscape.com")) NIL NIL NIL NIL "<3nl0gd$l55@flop.mcom.com>") ("message" "rfc822" NIL NIL NIL "7bit" 2833 ("26 Apr 1995 08:25:50 GMT" "Re: attach this, spanky" (("Jamie Zawinski" NIL "jwz" "netscape.com")) (("Jamie Zawinski" NIL "jwz" "netscape.com")) (("Jamie Zawinski" NIL "jwz" "netscape.com")) NIL NIL NIL NIL "<3nl02e$kmf@flop.mcom.com>") ("message" "rfc822" NIL NIL NIL "7bit" 2275 ("26 Apr 1995 08:24:06 GMT" "attach this, spanky" (("Jamie Zawinski" NIL "jwz" "netscape.com")) (("Jamie Zawinski" NIL "jwz" "netscape.com")) (("Jamie Zawinski" NIL "jwz" "netscape.com")) NIL NIL NIL NIL "<3nkvv6$kmf@flop.mcom.com>") (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 50 1) ("message" "rfc822" NIL NIL NIL "7bit" 1282 ("22 Apr 1995 05:13:26 GMT" "Test for Bug 4498" (("Sharon Iimura" NIL "sharoni" "MISSING_DOMAIN")) (("Sharon Iimura" NIL "sharoni" "MISSING_DOMAIN")) (("Sharon Iimura" NIL "sharoni" "MISSING_DOMAIN")) ((NIL NIL "sharoni" "MISSING_DOMAIN")) NIL NIL NIL "<3na39m$3lf@flop.mcom.com>") (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 127 5) ("text" "html" ("charset" "us-ascii") NIL NIL "quoted-printable" 287 4) "mixed") 38) "mixed") 70) 86) 102)
+section HEADER 615 74c8a0d821f12f067b14923d498d5127745650e2b90e65599ecc8f2dd2d8015f
+section TEXT 3419 87ce54499be920c55e7622a15840303d4eda6cdcfe93487edf0bd83912e885e6
+section HEADER.FIELDS 179 ee5b01545064affcdc9fee02a7d013dd3aa1deb703d953b05b0757260688402d
+section HEADER.FIELDS.NOT 438 892566f59d2bd464f72350d72c2a50e17ae9df3a72ca64852dee6f84295f330f
+section 1 3419 87ce54499be920c55e7622a15840303d4eda6cdcfe93487edf0bd83912e885e6
+section 1.MIME 615 74c8a0d821f12f067b14923d498d5127745650e2b90e65599ecc8f2dd2d8015f
+section 1.HEADER 586 46dd0f819c08df838f5d9d10ff43d1bf9f4ef93c566a2f208072dc507bdc2e66
+section 1.TEXT 2833 15ad35fa9a5fa7cb16795f29211502c257c77281ae3457df899768d326ad59bf
+section 1.HEADER.FIELDS 179 cb29199a83b831b314c083a49cbcd0731a146e71096745ebcc86186528691634
+section 1.HEADER.FIELDS.NOT 409 dceb59d6e42af4a7585d7eeb6444dfdc48ae0f120a2d59636239e2fce42ea8f1
+section 1.1 2833 15ad35fa9a5fa7cb16795f29211502c257c77281ae3457df899768d326ad59bf
+section 1.1.MIME 586 46dd0f819c08df838f5d9d10ff43d1bf9f4ef93c566a2f208072dc507bdc2e66
+section 1.1.HEADER 558 9cdac87644ef41180c3d68361231f95d1964c29ae77fdd6580708a15a8ecfd42
+section 1.1.TEXT 2275 2799d0b64fe46dbf8142672e380613c815ad998d131c26b98ab0264f678d5386
+section 1.1.HEADER.FIELDS 179 e6fe9d64fb0a86bfdb3e4a18ff6375f0b58ea771de36fc22893ca1e849605b57
+section 1.1.HEADER.FIELDS.NOT 381 b1746a5e8d4f30d7a0f658071e20b0b2d799c1655d173f360e201a269ed0cfb2
+section 1.1.1 2275 2799d0b64fe46dbf8142672e380613c815ad998d131c26b98ab0264f678d5386
+section 1.1.1.MIME 558 9cdac87644ef41180c3d68361231f95d1964c29ae77fdd6580708a15a8ecfd42
+section 1.1.1.HEADER 564 ffabac87f882f00d14275a215e7fa17034af22a31411e96ef3c56f6540cd7555
+section 1.1.1.TEXT 1711 60aed0b500dd58ee56075e640d2f8bf0e91e5b783c3d9765720d81249639a941
+section 1.1.1.HEADER.FIELDS 246 8ec808d51ff94bc36efc6a0bff4a9ae8b966b8cbb907954833faa00afe09d950
+section 1.1.1.HEADER.FIELDS.NOT 320 4f3d2fd877b3eb9b12101d5f72d2caa47aa3eb4ce13ce401d6400e8882f8a802
+section 1.1.1.1 50 84474a5b0da6ef0bb8f8d3903f506d56ef725b585512c7b58de429bbeba357f5
+section 1.1.1.1.MIME 79 a096a6df2d55e2bb1f70f288e5aa4cc97fe96fadca4eebcf29ecb7987ae5315e
+section 1.1.1.2 1282 a1269d0456db671feb32eda56ecda991771bee50ad5a3d6b36b46adeb7eeed55
+section 1.1.1.2.MIME 65 10b60ab5d056003ccd86435127b0ba31f930d1689aeca7d685beb2d7ccbb5012
+section 1.1.1.2.HEADER 516 3f4299f48151e9428765c9662f7a36db4461fe7b0394853169a724b5c935e0f4
+section 1.1.1.2.TEXT 766 2f6f55f785c16429db3e818f76a128689885184dbf82762cca3e898773c45c82
+section 1.1.1.2.HEADER.FIELDS 237 fc2c82f74586efc7bb4687a263312e87af7801d856008911cdb6a9f0ace5ec8c
+section 1.1.1.2.HEADER.FIELDS.NOT 281 e1dfd0d7ee95bb8df8207fd5120150b6a1d01a1b9ae835b63523e455aa0eba91
+section 1.1.1.2.1 127 8b7c69742159ac031e6e635f5d82622edd2d0f0bf8e106ef0462fb4514f475f9
+section 1.1.1.2.1.MIME 79 a096a6df2d55e2bb1f70f288e5aa4cc97fe96fadca4eebcf29ecb7987ae5315e
+section 1.1.1.2.2 287 026db0c38342080eaa5f0f9ac959e844d02c5bb96c7d2473c9b0e74e3f07e957
+section 1.1.1.2.2.MIME 72 c078cb508ccf29d5fab6fa736724f9fc142a4e234c1110ecb98909c05b823d97

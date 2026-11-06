@@ -1,0 +1,12 @@
+size 5699
+envelope ("Mon, 23 Sep 96 09:20:00 PDT" "multipart/signed test" (("Ron Craswell" NIL "ronc" "deming.com")) ((NIL NIL "owner-smime-dev" "rsa.com")) (("Ron Craswell" NIL "ronc" "deming.com")) (("S-MIME DEV" NIL "smime-dev" "rsa.com")) NIL NIL NIL "<19960923092443.03af0217.in@peapod.deming.com>")
+bodystructure (("text" "plain" ("charset" "us-ascii") NIL NIL "quoted-printable" 159 7 NIL NIL NIL NIL) ("application" "x-pkcs7-signature" NIL NIL NIL "base64" 4152 NIL NIL NIL NIL) "signed" ("boundary" "---=_=_ 3784965-7724120-8948032 _=_=---" "micalg" "rsa-sha1" "protocol" "application/x-pkcs7-signature") NIL NIL NIL)
+body (("text" "plain" ("charset" "us-ascii") NIL NIL "quoted-printable" 159 7) ("application" "x-pkcs7-signature" NIL NIL NIL "base64" 4152) "signed")
+section HEADER 1096 480431934008943f59ecef6bf0e7a6beb433af8ae9f3c10664f2c494ea36dfe7
+section TEXT 4603 1e158b6a9173efc7dea10db060959c10abf17f079f816caed5280664410bcaab
+section HEADER.FIELDS 356 daba35e27c4c9b20b1bdeac9a196bb6f235fd69c510d019ac831a3cb5b7a147f
+section HEADER.FIELDS.NOT 742 eeadc3268a088d19c4a1929120b041cddf74a939233867c6a2b3c02fa55b6809
+section 1 159 b236327642980c5fcd8cf836ebee0e2a79c55fc7bb786a23876feb5d5b6eb984
+section 1.MIME 73 2a3e1b81321437a74d139cdcb40a2d8e61217a2ae3c103efdd968f7c6c3ce167
+section 2 4152 51a22a9dc517a57dd1ec478c2472772d89a6813f93464fea965698c96797e8ee
+section 2.MIME 82 af8b694dbc1b5e2815df2ee1f9d95cbd0fdb1f8e4b090d554726052ef7099ebe

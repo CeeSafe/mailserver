@@ -1,0 +1,121 @@
+// EWS ids in the C# server's format, the sync states, the ENVELOPE reader, dates, and the SOAP framing.
+
+import mxml.XmlWriter;
+import mxml.parseXml;
+
+fn text(s: borrow String) -> StringView => s.view();
+
+@test
+fn encodesIdsAsTheCSharpServer() -> Result<void, TestFailure> {
+    var s = String.create();
+    folderId(31, mut s)!;
+    Check.isTrue(s.view() == "ZjozMQ==", "f:31")?;
+    Check.isTrue((parseFolderId("ZjozMQ==".bytes()) ?? 0) == 31, "back")?;
+    Check.isTrue(parseFolderId("bm9wZQ==".bytes()) == null, "not a folder id")?;
+    folderId(-5, mut s)!;
+    Check.isTrue((parseFolderId(s.view().bytes()) ?? 0) == -5, "a virtual folder's id (f:-5) back")?;
+    rootFolderId(42, mut s)!;
+    Check.isTrue(s.view() == "cm9vdDo0Mg==", "root:42")?;
+    Check.isTrue(isRootFolderId(s.view().bytes()), "a per-user root")?;
+    Check.isTrue(isRootFolderId("cm9vdA==".bytes()), "the old constant root")?;
+    Check.isTrue(!isRootFolderId("ZjozMQ==".bytes()) && !isRootFolderId("!!".bytes()), "not roots")?;
+    itemId(7, 12, mut s)!;
+    Check.isTrue(s.view() == "NzoxMg==", "7:12")?;
+    let parsed = parseItemId("NzoxMg==".bytes()) ?? [0i64, 0i64];
+    Check.isTrue(parsed[0] == 7 && parsed[1] == 12, "item id back")?;
+    Check.isTrue(parseItemId("Nzow".bytes()) == null, "uid 0 is not an item")?;
+    // EncodeChangeKey("") in the C# server: base64 of "ck:" and the first 16 hex digits of SHA-256("").
+    changeKey("".bytes(), mut s)!;
+    Check.isTrue(s.view() == "Y2s6RTNCMEM0NDI5OEZDMUMxNA==", "the change key of nothing")?;
+    var state = Vector<u8>.create();
+    flagState(1 | 4, "$Label Work", mut state)!;
+    Check.isTrue(state.view() == "[$Label,Work,\\Flagged,\\Seen]".bytes(), "sorted flag names")?;
+    return Ok();
+}
+
+@test
+fn keepsSyncStates() -> Result<void, TestFailure> {
+    var uids = Vector<i64>.create();
+    for (u in [1i64, 2, 3, 5, 9, 10]) {
+        uids.push(u)!;
+    }
+    var s = String.create();
+    writeItemState(1700000000, 42, ALL_SENT, uids, mut s)!;
+    var raw = Vector<u8>.create();
+    Check.isTrue(unbase64(s.view().bytes(), mut raw), "base64")?;
+    Check.isTrue(raw.view() == "s2:1700000000:42:1-3,5,9-10".bytes(), "ranges")?;
+    let back = readItemState(s.view())! ?? ItemState { validity: 0, modseq: 0, after: 0, uids: Vector<i64>.create() };
+    Check.isTrue(back.validity == 1700000000 && back.modseq == 42, "fields back")?;
+    Check.isTrue(back.uids.length == 6 && back.uids[3] == 5 && back.uids[5] == 10, "uids back")?;
+    Check.isTrue(hasUid(back.uids, 9) && !hasUid(back.uids, 4), "membership")?;
+    writeItemState(5, 42, 3, uids, mut s)!;
+    let cut = readItemState(s.view())! ?? ItemState { validity: 0, modseq: 0, after: 0, uids: Vector<i64>.create() };
+    Check.isTrue(cut.modseq == 42 && cut.after == 3, "a cursor inside a modseq")?;
+    let empty = readItemState("")! ?? ItemState { validity: -9, modseq: 0, after: 0, uids: Vector<i64>.create() };
+    Check.isTrue(empty.validity == 0, "the empty state")?;
+    // The C# server's JSON state is refused, so the client starts over.
+    var json = String.create();
+    base64Of("{\"Epoch\":1,\"MaxUid\":4}".bytes(), mut json)!;
+    Check.isTrue(readItemState(json.view())! == null, "the C# state")?;
+    var ids = Vector<i64>.create();
+    var hier = String.create();
+    base64Of("{\"Ids\":[4,17]}".bytes(), mut hier)!;
+    Check.isTrue(hierarchyState(hier.view(), mut ids)!, "the C# hierarchy state is read")?;
+    Check.isTrue(ids.length == 2 && ids[0] == 4 && ids[1] == 17, "its ids")?;
+    Check.isTrue(!hierarchyState("bm9wZQ==", mut ids)!, "a foreign state")?;
+    return Ok();
+}
+
+@test
+fn readsEnvelopes() -> Result<void, TestFailure> {
+    let envelope =
+        "(\"Thu, 05 Nov 2026 10:00:00 +0100\" \"=?UTF-8?B?w6l0w6k=?= news\" ((\"Sender \\\"Q\\\" Name\" NIL \"sender\" \"remote.test\")) ((NIL NIL \"sender\" \"remote.test\")) NIL ((NIL NIL \"a\" \"example.org\")(NIL NIL \"team\" NIL)(\"B\" NIL \"b\" \"example.org\")(NIL NIL NIL NIL)) NIL NIL NIL \"<id@remote.test>\")";
+    var s = Summary.create();
+    Check.isTrue(readEnvelope(envelope.bytes(), mut s)!, "reads")?;
+    Check.isTrue(s.subject.view() == "\u{E9}t\u{E9} news".bytes(), "the subject, decoded")?;
+    Check.isTrue(s.from.length == 1 && s.from[0].name.view() == "Sender \"Q\" Name".bytes(), "the From name")?;
+    Check.isTrue(s.from[0].email.view() == "sender@remote.test".bytes(), "the From address")?;
+    Check.isTrue(s.to.length == 2 && s.to[1].email.view() == "b@example.org".bytes(), "a group flattened")?;
+    Check.isTrue(s.cc.length == 0, "no Cc")?;
+    Check.isTrue(s.messageId.view() == "<id@remote.test>".bytes(), "the Message-ID")?;
+    let literal = "(NIL {5}\r\nab\"cd NIL NIL NIL NIL NIL NIL NIL NIL)";
+    Check.isTrue(readEnvelope(literal.bytes(), mut s)!, "a literal")?;
+    Check.isTrue(s.subject.view() == "ab\"cd".bytes(), "the literal's bytes")?;
+    Check.isTrue(!readEnvelope("(\"x\"".bytes(), mut s)!, "truncated")?;
+    return Ok();
+}
+
+@test
+fn readsDates() -> Result<void, TestFailure> {
+    // 2026-11-05T09:00:00Z
+    let utc: i64 = 1793869200;
+    Check.isTrue((dateSeconds("Thu, 05 Nov 2026 10:00:00 +0100".bytes()) ?? 0) == utc, "an offset")?;
+    Check.isTrue((dateSeconds("Thu, 5 Nov 2026 04:00:00 -0500 (EST)".bytes()) ?? 0) == utc, "with a comment")?;
+    Check.isTrue((dateSeconds("5 Nov 2026 09:00:00 GMT".bytes()) ?? 0) == utc, "GMT")?;
+    Check.isTrue(dateSeconds("not a date".bytes()) == null, "nonsense")?;
+    return Ok();
+}
+
+@test
+fn framesSoap() -> Result<void, TestFailure> {
+    var w = XmlWriter.create();
+    beginEnvelope(mut w, "GetFolder");
+    failure(mut w, "GetFolder", "ErrorItemNotFound", "Folder not found");
+    endEnvelope(mut w);
+    let bytes = w.finish()!;
+    let doc = match (parseXml(bytes.view())) {
+        Ok(d) => d,
+        Err(_) => { return Err(TestFailure.create("the envelope parses")); }
+    };
+    Check.isTrue(doc.is(doc.root(), SOAP_NS, "Envelope"), "an envelope")?;
+    let version = doc.find(doc.root(), TYPES_NS, "ServerVersionInfo") ?? 0;
+    Check.isTrue(doc.attributeIs(version, "Version", "V2018_01_08"), "the version")?;
+    let message = doc.find(doc.root(), MESSAGES_NS, "GetFolderResponseMessage") ?? 0;
+    Check.isTrue(doc.attributeIs(message, "ResponseClass", "Error"), "an error message")?;
+    var code = String.create();
+    localText(doc, message, "ResponseCode", mut code)!;
+    Check.isTrue(code.view() == "ErrorItemNotFound", "its code")?;
+    let op = operationOf(doc);
+    Check.isTrue(op != null, "the body's first element")?;
+    return Ok();
+}

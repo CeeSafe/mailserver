@@ -1,0 +1,158 @@
+// Conversions: time zones (VTIMEZONE and the TimeZone blob), events and contacts both ways, mail dates, and the
+// base64 query form.
+
+import mpim.ContentLines;
+import mpim.daysFromCivil;
+import mxml.XmlDocument;
+
+const PARIS: StringView =
+    "BEGIN:VCALENDAR\r\nBEGIN:VTIMEZONE\r\nTZID:Europe/Paris\r\nBEGIN:STANDARD\r\nDTSTART:19701025T030000\r\nTZOFFSETTO:+0100\r\nRRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=-1SU\r\nEND:STANDARD\r\nBEGIN:DAYLIGHT\r\nDTSTART:19700329T020000\r\nTZOFFSETTO:+0200\r\nRRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=-1SU\r\nEND:DAYLIGHT\r\nEND:VTIMEZONE\r\nBEGIN:VEVENT\r\nUID:e-1\r\nDTSTART;TZID=Europe/Paris:20260710T140000\r\nDTEND;TZID=Europe/Paris:20260710T150000\r\nSUMMARY:Lunch\\, outside\r\nRRULE:FREQ=MONTHLY;BYDAY=2TU;UNTIL=20261231T000000Z\r\nEXDATE;TZID=Europe/Paris:20260811T140000\r\nATTENDEE;CN=Bob;PARTSTAT=TENTATIVE;ROLE=OPT-PARTICIPANT:mailto:bob@example.org\r\nBEGIN:VALARM\r\nTRIGGER:-PT30M\r\nEND:VALARM\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+
+fn decodedWriter(w: WbxmlWriter) -> Result<XmlDocument, TestFailure> {
+    let bytes = match (w.finish()) {
+        Ok(b) => b,
+        Err(_) => { return Err(TestFailure.create("the writer finished")); }
+    };
+    return match (decodeWbxml(bytes.view())) {
+        Ok(d) => Ok(d),
+        Err(_) => Err(TestFailure.create("it decodes")),
+    };
+}
+
+fn ok(r: Result<void, EasFail>, what: StringView) -> Result<void, TestFailure> => match (r) {
+    Ok() => Ok(),
+    Err(_) => Err(TestFailure.create(what)),
+};
+
+fn needNode(found: usize?, what: StringView) -> Result<usize, TestFailure> => match (found) {
+    Some(n) => Ok(n),
+    null => Err(TestFailure.create(what)),
+};
+
+@test
+fn knowsZones() -> Result<void, TestFailure> {
+    let lines = ContentLines.parse(PARIS.bytes())!;
+    let z = zoneOf(lines, "Europe/Paris".bytes());
+    Check.isTrue(z.standard == 60 && z.daylight == 120 && z.hasDaylight, "the offsets")?;
+    let july = daysFromCivil(2026, 7, 10) * 86400 + 14 * 3600;
+    Check.isTrue(zoneToUtc(z, july) == july - 7200, "summer time")?;
+    let january = daysFromCivil(2026, 1, 10) * 86400 + 14 * 3600;
+    Check.isTrue(zoneToUtc(z, january) == january - 3600, "winter time")?;
+    // 2026's switches: the last Sundays of March (29th) and October (25th).
+    Check.isTrue(nthWeekday(2026, 3, 5, 0) == daysFromCivil(2026, 3, 29), "the last Sunday of March")?;
+    Check.isTrue(nthWeekday(2026, 10, 5, 0) == daysFromCivil(2026, 10, 25), "the last Sunday of October")?;
+    var blob = Vector<u8>.create();
+    zoneBlob(z, mut blob)!;
+    let back = zoneFromBlob(blob.view());
+    Check.isTrue(back.standard == 60 && back.daylight == 120, "the blob's offsets")?;
+    Check.isTrue(back.toDaylightMonth == 3 && back.toDaylightWeek == 5 && back.toStandardMonth == 10, "the rules")?;
+    Check.isTrue(zoneToLocal(back, july - 7200) == july, "back to wall-clock time")?;
+    Check.isTrue(zoneFromBlob("not base64!".bytes()).standard == 0, "a bad blob is UTC")?;
+    return Ok();
+}
+
+@test
+fn writesEvents() -> Result<void, TestFailure> {
+    var w = WbxmlWriter.create();
+    w.start(PAGE_AIRSYNC, "ApplicationData");
+    ok(writeEvent(mut w, PARIS.bytes(), BodyOptions { bodyType: 1, truncation: -1 }, 141), "the event")?;
+    w.end();
+    let doc = decodedWriter(w)?;
+    let root = doc.root();
+    Check.isTrue(childValue(doc, root, NS_CALENDAR, "StartTime") == "20260710T120000Z", "the start in UTC")?;
+    Check.isTrue(childValue(doc, root, NS_CALENDAR, "Subject") == "Lunch, outside", "the subject unescaped")?;
+    Check.isTrue(childValue(doc, root, NS_CALENDAR, "Reminder") == "30", "the reminder")?;
+    let rec = needNode(doc.child(root, NS_CALENDAR, "Recurrence"), "the recurrence")?;
+    Check.isTrue(childValue(doc, rec, NS_CALENDAR, "Type") == "3", "monthly on the nth weekday")?;
+    Check.isTrue(childValue(doc, rec, NS_CALENDAR, "WeekOfMonth") == "2", "the 2nd")?;
+    Check.isTrue(childValue(doc, rec, NS_CALENDAR, "DayOfWeek") == "4", "Tuesday")?;
+    let ex = needNode(doc.find(root, NS_CALENDAR, "Exception"), "the exception")?;
+    Check.isTrue(childValue(doc, ex, NS_CALENDAR, "ExceptionStartTime") == "20260811T120000Z", "its start")?;
+    let attendee = needNode(doc.find(root, NS_CALENDAR, "Attendee"), "the attendee")?;
+    Check.isTrue(childValue(doc, attendee, NS_CALENDAR, "AttendeeStatus") == "2", "tentative")?;
+    Check.isTrue(childValue(doc, attendee, NS_CALENDAR, "AttendeeType") == "2", "optional")?;
+    // And back: the device's form of it, read into iCalendar.
+    var ics = Vector<u8>.create();
+    ok(eventFromEas(doc, root, "e-1", mut ics), "from the device")?;
+    let text = StringView.fromUtf8(ics.view()) ?? "";
+    Check.isTrue(text.indexOf("DTSTART:20260710T120000Z") != null, "DTSTART")?;
+    Check.isTrue(text.indexOf("RRULE:FREQ=MONTHLY;BYDAY=2TU;UNTIL=20261231T000000Z") != null, "RRULE")?;
+    Check.isTrue(text.indexOf("SUMMARY:Lunch\\, outside") != null, "SUMMARY escaped again")?;
+    Check.isTrue(text.indexOf("EXDATE:20260811T120000Z") != null, "EXDATE")?;
+    Check.isTrue(text.indexOf("PARTSTAT=TENTATIVE") != null && text.indexOf("ROLE=OPT-PARTICIPANT") != null, "ATTENDEE")?;
+    Check.isTrue(text.indexOf("TRIGGER:-PT30M") != null, "VALARM")?;
+    return Ok();
+}
+
+@test
+fn allDayEvents() -> Result<void, TestFailure> {
+    var w = WbxmlWriter.create();
+    w.start(PAGE_AIRSYNC, "ApplicationData");
+    w.element(PAGE_CALENDAR, "AllDayEvent", "1");
+    // Midnight in Paris (UTC+1 in winter) is 23:00 UTC the day before.
+    w.element(PAGE_CALENDAR, "StartTime", "20261209T230000Z");
+    w.element(PAGE_CALENDAR, "EndTime", "20261210T230000Z");
+    var blob = Vector<u8>.create();
+    let lines = ContentLines.parse(PARIS.bytes())!;
+    zoneBlob(zoneOf(lines, "Europe/Paris".bytes()), mut blob)!;
+    w.elementBytes(PAGE_CALENDAR, "TimeZone", blob.view());
+    w.element(PAGE_CALENDAR, "Subject", "Holiday");
+    w.end();
+    let doc = decodedWriter(w)?;
+    var ics = Vector<u8>.create();
+    ok(eventFromEas(doc, doc.root(), "h-1", mut ics), "converted")?;
+    let text = StringView.fromUtf8(ics.view()) ?? "";
+    Check.isTrue(text.indexOf("DTSTART;VALUE=DATE:20261210") != null, "the local date")?;
+    Check.isTrue(text.indexOf("DTEND;VALUE=DATE:20261211") != null, "the next day")?;
+    return Ok();
+}
+
+@test
+fn convertsContacts() -> Result<void, TestFailure> {
+    let card =
+        "BEGIN:VCARD\r\nVERSION:4.0\r\nUID:c-1\r\nFN:Jane Q. Doe\r\nN:Doe;Jane;Q.;Dr.;\r\nEMAIL;TYPE=work:jane@work.example\r\nEMAIL:jane@home.example\r\nTEL;TYPE=cell:+1 555 1\r\nTEL;TYPE=work,voice:+1 555 2\r\nTEL;TYPE=home:+1 555 3\r\nADR;TYPE=work:;;1 Main St\\, Suite 2;Springfield;IL;62701;USA\r\nORG:Acme;R&D\r\nBDAY:19900501\r\nNOTE:Met at the fair.\\nNice.\r\nNICKNAME:JJ\r\nCATEGORIES:Friends,Work\r\nEND:VCARD\r\n";
+    var w = WbxmlWriter.create();
+    w.start(PAGE_AIRSYNC, "ApplicationData");
+    ok(writeContact(mut w, card.bytes(), BodyOptions { bodyType: 1, truncation: -1 }), "the contact")?;
+    w.end();
+    let doc = decodedWriter(w)?;
+    let root = doc.root();
+    Check.isTrue(childValue(doc, root, NS_CONTACTS, "FirstName") == "Jane", "FirstName")?;
+    Check.isTrue(childValue(doc, root, NS_CONTACTS, "Title") == "Dr.", "Title")?;
+    Check.isTrue(childValue(doc, root, NS_CONTACTS, "Email2Address") == "jane@home.example", "Email2")?;
+    Check.isTrue(childValue(doc, root, NS_CONTACTS, "MobilePhoneNumber") == "+1 555 1", "mobile")?;
+    Check.isTrue(childValue(doc, root, NS_CONTACTS, "BusinessPhoneNumber") == "+1 555 2", "work")?;
+    Check.isTrue(childValue(doc, root, NS_CONTACTS, "HomePhoneNumber") == "+1 555 3", "home")?;
+    Check.isTrue(childValue(doc, root, NS_CONTACTS, "BusinessStreet") == "1 Main St, Suite 2", "street")?;
+    Check.isTrue(childValue(doc, root, NS_CONTACTS, "Department") == "R&D", "department")?;
+    Check.isTrue(childValue(doc, root, NS_CONTACTS, "Birthday") == "1990-05-01T00:00:00.000Z", "birthday")?;
+    Check.isTrue(childValue(doc, root, NS_CONTACTS2, "NickName") == "JJ", "nickname")?;
+    var back = Vector<u8>.create();
+    ok(contactFromEas(doc, root, "c-1", mut back), "back")?;
+    let text = StringView.fromUtf8(back.view()) ?? "";
+    Check.isTrue(text.indexOf("N:Doe;Jane;Q.;Dr.;") != null, "N")?;
+    Check.isTrue(text.indexOf("ADR;TYPE=WORK:;;1 Main St\\, Suite 2;Springfield;IL;62701;USA") != null, "ADR")?;
+    Check.isTrue(text.indexOf("NOTE:Met at the fair.\\nNice.") != null, "NOTE")?;
+    Check.isTrue(text.indexOf("CATEGORIES:Friends,Work") != null, "CATEGORIES")?;
+    Check.isTrue(text.indexOf("BDAY:1990-05-01") != null, "BDAY")?;
+    return Ok();
+}
+
+@test
+fn readsTheEncodedQuery() -> Result<void, TestFailure> {
+    // MS-ASHTTP §4.2.2's shape: version 14.1, Sync, locale, a 4-byte device id, a policy key, type "SP", and the
+    // CollectionId parameter.
+    let raw = [0x8du8, 0x00, 0x09, 0x04, 0x04, 0xde, 0xad, 0xbe, 0xef, 0x04, 0x01, 0x00, 0x00, 0x00, 0x02, 0x53, 0x50, 0x01,
+        0x02, 0x6d, 0x31];
+    var encoded = Vector<u8>.create();
+    encoding.Base64.encode(raw[..], mut encoded)!;
+    var s = Session.create();
+    Check.isTrue(readEncodedQuery(StringView.fromUtf8(encoded.view()) ?? "", mut s)!, "it reads")?;
+    Check.isTrue(s.version == 141 && s.command.view() == "sync", "version and command")?;
+    Check.isTrue(s.deviceId.view() == "DEADBEEF" && s.deviceType.view() == "SP", "the device")?;
+    Check.isTrue(s.sentPolicyKey == 1 && s.collectionId.view() == "m1", "the key and the parameter")?;
+    var date = String.create();
+    ok(isoTime(1793353800123, mut date), "a date")?;
+    Check.isTrue(date.view() == "2026-10-30T09:50:00.000Z", "DateReceived's form")?;
+    return Ok();
+}

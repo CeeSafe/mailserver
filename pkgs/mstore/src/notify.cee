@@ -1,0 +1,114 @@
+// The notify bus: IMAP sessions watch the mailbox they have selected, and every change the store makes to a mailbox
+// wakes its watchers at once, so IDLE reports it without polling.
+
+/// One session's interest in one mailbox, shared by its `Watch` (the session's) and the bus's list.
+@noncopy
+struct Watcher {
+    userId: i64;
+    mailboxId: i64;
+    signal: AsyncSignal;
+    /// False once the `Watch` is dropped: the bus then takes the watcher out the next time it holds its lock.
+    live: AtomicBool;
+}
+
+/// A session's watch on one mailbox, from `NotifyBus.watch`. `changed()` returns once the mailbox may have changed
+/// since it last returned; raises before the wait are kept, and a burst of them wakes it once. Dropping the watch
+/// ends it, however the session ends (UNSELECT, a new SELECT, LOGOUT, an error or cancellation): the drop needs no
+/// lock, and the bus forgets the watcher at its next `watch`, `raise` or `count`.
+@noncopy
+public struct Watch {
+    private watcher: Arc<Watcher>;
+
+    /// The mailbox watched.
+    public fn mailbox(borrow this) -> i64 => this.watcher.get().mailboxId;
+
+    /// Waits until the mailbox may have changed, then lowers the signal. `Err(AsyncError.Cancelled)` when the task
+    /// is cancelled first. One task waits on a watch at a time.
+    public async fn changed(borrow this) -> Result<void, AsyncError> => await this.watcher.get().signal.wait();
+
+    drop {
+        this.watcher.get().live.store(false);
+    }
+}
+
+/// The registry of watches, shared by every session of the server, on every worker thread. Raising holds its lock
+/// only to walk the list, never across an `await`.
+@noncopy
+public struct NotifyBus {
+    private watchers: AsyncMutex<Vector<Arc<Watcher>>>;
+
+    public fn create() -> Result<NotifyBus, AllocError> {
+        let list = Vector<Arc<Watcher>>.create();
+        return Ok(NotifyBus { watchers: AsyncMutex<Vector<Arc<Watcher>>>.create(list)? });
+    }
+
+    /// Watches the user's mailbox `mailboxId`; 0 watches every change of the user's (ActiveSync's Ping, EWS's
+    /// streaming notifications), and `-id` is the groupware collection `id` (dav_collections). Null when out of memory or cancelled: the session then has no watch,
+    /// and IDLE falls back to its slow refresh.
+    public async fn watch(borrow this, userId: i64, mailboxId: i64) -> Watch? {
+        let made = Arc<Watcher>.create(Watcher {
+            userId: userId,
+            mailboxId: mailboxId,
+            signal: AsyncSignal.create(),
+            live: AtomicBool.create(true),
+        });
+        let watcher = match (made) {
+            Ok(w) => w,
+            Err(_) => { return null; }
+        };
+        var guard = match (await this.watchers.lock()) {
+            Ok(g) => g,
+            Err(_) => { return null; }
+        };
+        let list = guard.data();
+        prune(list);
+        match (list.push(watcher.clone())) {
+            Ok() => {}
+            Err(_) => { return null; }
+        }
+        return Watch { watcher: watcher };
+    }
+
+    /// Wakes the watchers of the user's mailbox `mailboxId` (or `-id`: the groupware collection `id`), and those
+    /// watching all of the user's changes; with `mailboxId` 0, all of the user's watchers.
+    /// Call it after the change is committed. A cancelled caller wakes no one; IDLE's refresh catches that up.
+    public async fn raise(borrow this, userId: i64, mailboxId: i64) {
+        var guard = match (await this.watchers.lock()) {
+            Ok(g) => g,
+            Err(_) => { return; }
+        };
+        let list = guard.data();
+        prune(list);
+        for (shared in list.view()) {
+            let w = shared.get();
+            if (w.userId == userId && (mailboxId == 0 || w.mailboxId == 0 || w.mailboxId == mailboxId)) {
+                w.signal.raise();
+            }
+        }
+    }
+
+    /// The live watches, for tests and the server's log. 0 when cancelled.
+    public async fn count(borrow this) -> usize {
+        var guard = match (await this.watchers.lock()) {
+            Ok(g) => g,
+            Err(_) => { return 0; }
+        };
+        let list = guard.data();
+        prune(list);
+        return list.length;
+    }
+}
+
+/// Takes out the watchers whose `Watch` has been dropped.
+fn prune(list: borrow mut Vector<Arc<Watcher>>) {
+    var i: usize = 0;
+    while (i < list.length) {
+        if (list[i].get().live.load()) {
+            i += 1;
+            continue;
+        }
+        let last = list.length - 1;
+        list.swap(i, last);
+        let gone = list.pop();
+    }
+}

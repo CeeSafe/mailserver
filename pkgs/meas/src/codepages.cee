@@ -1,0 +1,231 @@
+// The WBXML code pages of ActiveSync (MS-ASWBXML §2.1.2.1). Each page is a list of tag names from 0x05 up, by
+// position; "-" marks a number the page does not use. A page's namespace, in the XmlDocument a request decodes
+// into, is its name ("AirSync", "Email", ...), as the C# server and Exchange's own XML forms name them.
+
+public const PAGE_AIRSYNC: u8 = 0;
+public const PAGE_CONTACTS: u8 = 1;
+public const PAGE_EMAIL: u8 = 2;
+public const PAGE_CALENDAR: u8 = 4;
+public const PAGE_MOVE: u8 = 5;
+public const PAGE_ESTIMATE: u8 = 6;
+public const PAGE_FOLDERS: u8 = 7;
+public const PAGE_MEETING: u8 = 8;
+public const PAGE_TASKS: u8 = 9;
+public const PAGE_RESOLVE: u8 = 10;
+public const PAGE_CONTACTS2: u8 = 12;
+public const PAGE_PING: u8 = 13;
+public const PAGE_PROVISION: u8 = 14;
+public const PAGE_SEARCH: u8 = 15;
+public const PAGE_GAL: u8 = 16;
+public const PAGE_BASE: u8 = 17;
+public const PAGE_SETTINGS: u8 = 18;
+public const PAGE_ITEMOPS: u8 = 20;
+public const PAGE_COMPOSE: u8 = 21;
+public const PAGE_EMAIL2: u8 = 22;
+public const PAGE_NOTES: u8 = 23;
+public const PAGE_FIND: u8 = 25;
+
+/// The number of code pages.
+public const PAGE_COUNT: u8 = 26;
+
+/// Namespace names, as used in the decoded document (`doc.is(n, NS_AIRSYNC, "Sync")`).
+public const NS_AIRSYNC: StringView = "AirSync";
+public const NS_CONTACTS: StringView = "Contacts";
+public const NS_EMAIL: StringView = "Email";
+public const NS_CALENDAR: StringView = "Calendar";
+public const NS_MOVE: StringView = "Move";
+public const NS_ESTIMATE: StringView = "GetItemEstimate";
+public const NS_FOLDERS: StringView = "FolderHierarchy";
+public const NS_MEETING: StringView = "MeetingResponse";
+public const NS_TASKS: StringView = "Tasks";
+public const NS_RESOLVE: StringView = "ResolveRecipients";
+public const NS_CONTACTS2: StringView = "Contacts2";
+public const NS_PING: StringView = "Ping";
+public const NS_PROVISION: StringView = "Provision";
+public const NS_SEARCH: StringView = "Search";
+public const NS_GAL: StringView = "GAL";
+public const NS_BASE: StringView = "AirSyncBase";
+public const NS_SETTINGS: StringView = "Settings";
+public const NS_ITEMOPS: StringView = "ItemOperations";
+public const NS_COMPOSE: StringView = "ComposeMail";
+public const NS_EMAIL2: StringView = "Email2";
+public const NS_NOTES: StringView = "Notes";
+public const NS_FIND: StringView = "Find";
+
+/// The namespace name of code page `page`; empty for a page ActiveSync does not use.
+public fn pageName(page: u8) -> StringView {
+    if (page == 0) { return "AirSync"; }
+    if (page == 1) { return "Contacts"; }
+    if (page == 2) { return "Email"; }
+    if (page == 3) { return "AirNotify"; }
+    if (page == 4) { return "Calendar"; }
+    if (page == 5) { return "Move"; }
+    if (page == 6) { return "GetItemEstimate"; }
+    if (page == 7) { return "FolderHierarchy"; }
+    if (page == 8) { return "MeetingResponse"; }
+    if (page == 9) { return "Tasks"; }
+    if (page == 10) { return "ResolveRecipients"; }
+    if (page == 11) { return "ValidateCert"; }
+    if (page == 12) { return "Contacts2"; }
+    if (page == 13) { return "Ping"; }
+    if (page == 14) { return "Provision"; }
+    if (page == 15) { return "Search"; }
+    if (page == 16) { return "GAL"; }
+    if (page == 17) { return "AirSyncBase"; }
+    if (page == 18) { return "Settings"; }
+    if (page == 19) { return "DocumentLibrary"; }
+    if (page == 20) { return "ItemOperations"; }
+    if (page == 21) { return "ComposeMail"; }
+    if (page == 22) { return "Email2"; }
+    if (page == 23) { return "Notes"; }
+    if (page == 24) { return "RightsManagement"; }
+    if (page == 25) { return "Find"; }
+    return "";
+}
+
+/// The page whose namespace name is `name`.
+public fn pageOf(name: Slice<u8>) -> u8? {
+    for (p in 0..PAGE_COUNT) {
+        let n = pageName(p);
+        if (n.length > 0 && n.bytes() == name) {
+            return p;
+        }
+    }
+    return null;
+}
+
+/// The tag names of page `page`, from 0x05, separated by spaces.
+fn pageTags(page: u8) -> StringView {
+    if (page == 0) {
+        return "Sync Responses Add Change Delete Fetch SyncKey ClientId ServerId Status Collection Class Version CollectionId GetChanges MoreAvailable WindowSize Commands Options FilterType Truncation RTFTruncation Conflict Collections ApplicationData DeletesAsMoves NotifyGUID Supported SoftDelete MIMESupport MIMETruncation Wait Limit Partial ConversationMode MaxItems HeartbeatInterval";
+    }
+    if (page == 1) {
+        return "Anniversary AssistantName AssistantPhoneNumber Birthday Body BodySize BodyTruncated Business2PhoneNumber BusinessCity BusinessCountry BusinessPostalCode BusinessState BusinessStreet BusinessFaxNumber BusinessPhoneNumber CarPhoneNumber Categories Category Children Child CompanyName Department Email1Address Email2Address Email3Address FileAs FirstName Home2PhoneNumber HomeCity HomeCountry HomePostalCode HomeState HomeStreet HomeFaxNumber HomePhoneNumber JobTitle LastName MiddleName MobilePhoneNumber OfficeLocation OtherCity OtherCountry OtherPostalCode OtherState OtherStreet PagerNumber RadioPhoneNumber Spouse Suffix Title WebPage YomiCompanyName YomiFirstName YomiLastName CompressedRTF Picture Alias WeightedRank";
+    }
+    if (page == 2) {
+        return "Attachment Attachments AttName AttSize Att0Id AttMethod AttRemoved Body BodySize BodyTruncated DateReceived DisplayName DisplayTo Importance MessageClass Subject Read To Cc From ReplyTo AllDayEvent Categories Category DTStamp EndTime InstanceType BusyStatus Location MeetingRequest Organizer RecurrenceId Reminder ResponseRequested Recurrences Recurrence Recurrence_Type Recurrence_Until Recurrence_Occurrences Recurrence_Interval Recurrence_DayOfWeek Recurrence_DayOfMonth Recurrence_WeekOfMonth Recurrence_MonthOfYear StartTime Sensitivity TimeZone GlobalObjId ThreadTopic MIMEData MIMETruncated MIMESize InternetCPID Flag FlagStatus ContentClass FlagType CompleteTime DisallowNewTimeProposal";
+    }
+    if (page == 4) {
+        return "TimeZone AllDayEvent Attendees Attendee Email Name Body BodyTruncated BusyStatus Categories Category CompressedRTF DTStamp EndTime Exception Exceptions Deleted ExceptionStartTime Location MeetingStatus OrganizerEmail OrganizerName Recurrence Type Until Occurrences Interval DayOfWeek DayOfMonth WeekOfMonth MonthOfYear Reminder Sensitivity Subject StartTime UID AttendeeStatus AttendeeType - - - - - - - - DisallowNewTimeProposal ResponseRequested AppointmentReplyTime ResponseType CalendarType IsLeapMonth FirstDayOfWeek OnlineMeetingConfLink OnlineMeetingExternalLink ClientUid";
+    }
+    if (page == 5) {
+        return "MoveItems Move SrcMsgId SrcFldId DstFldId Response Status DstMsgId";
+    }
+    if (page == 6) {
+        return "GetItemEstimate Version Collections Collection Class CollectionId DateTime Estimate Response Status";
+    }
+    if (page == 7) {
+        return "Folders Folder DisplayName ServerId ParentId Type Response Status ContentClass Changes Add Delete Update SyncKey FolderCreate FolderDelete FolderUpdate FolderSync Count Version";
+    }
+    if (page == 8) {
+        return "CalendarId CollectionId MeetingResponse RequestId Request Result Status UserResponse Version InstanceId ProposedStartTime ProposedEndTime SendResponse";
+    }
+    if (page == 9) {
+        return "Body BodySize BodyTruncated Categories Category Complete DateCompleted DueDate UtcDueDate Importance Recurrence Type Start Until Occurrences Interval DayOfMonth DayOfWeek WeekOfMonth MonthOfYear Regenerate DeadOccur ReminderSet ReminderTime Sensitivity StartDate UtcStartDate Subject CompressedRTF OrdinalDate SubOrdinalDate CalendarType IsLeapMonth FirstDayOfWeek";
+    }
+    if (page == 10) {
+        return "ResolveRecipients Response Status Type Recipient DisplayName EmailAddress Certificates Certificate MiniCertificate Options To CertificateRetrieval RecipientCount MaxCertificates MaxAmbiguousRecipients CertificateCount Availability StartTime EndTime MergedFreeBusy Picture MaxSize Data MaxPictures";
+    }
+    if (page == 11) {
+        return "ValidateCert Certificates Certificate CertificateChain CheckCRL Status";
+    }
+    if (page == 12) {
+        return "CustomerId GovernmentId IMAddress IMAddress2 IMAddress3 ManagerName CompanyMainPhone AccountName NickName MMS";
+    }
+    if (page == 13) {
+        return "Ping AutdState Status HeartbeatInterval Folders Folder Id Class MaxFolders";
+    }
+    if (page == 14) {
+        return "Provision Policies Policy PolicyType PolicyKey Data Status RemoteWipe EASProvisionDoc DevicePasswordEnabled AlphanumericDevicePasswordRequired RequireStorageCardEncryption PasswordRecoveryEnabled DocumentBrowseEnabled AttachmentsEnabled MinDevicePasswordLength MaxInactivityTimeDeviceLock MaxDevicePasswordFailedAttempts MaxAttachmentSize AllowSimpleDevicePassword DevicePasswordExpiration DevicePasswordHistory AllowStorageCard AllowCamera RequireDeviceEncryption AllowUnsignedApplications AllowUnsignedInstallationPackages MinDevicePasswordComplexCharacters AllowWiFi AllowTextMessaging AllowPOPIMAPEmail AllowBluetooth AllowIrDA RequireManualSyncWhenRoaming AllowDesktopSync MaxCalendarAgeFilter AllowHTMLEmail MaxEmailAgeFilter MaxEmailBodyTruncationSize MaxEmailHTMLBodyTruncationSize RequireSignedSMIMEMessages RequireEncryptedSMIMEMessages RequireSignedSMIMEAlgorithm RequireEncryptionSMIMEAlgorithm AllowSMIMEEncryptionAlgorithmNegotiation AllowSMIMESoftCerts AllowBrowser AllowConsumerEmail AllowRemoteDesktop AllowInternetSharing UnapprovedInROMApplicationList ApplicationName ApprovedApplicationList Hash AccountOnlyRemoteWipe";
+    }
+    if (page == 15) {
+        return "Search Searches Store Name Query Options Range Status Response Result Properties Total EqualTo Value And Or FreeText SubstringOp DeepTraversal LongId RebuildResults LessThan GreaterThan Schema Supported UserName Password ConversationId Picture MaxSize MaxPictures";
+    }
+    if (page == 16) {
+        return "DisplayName Phone Office Title Company Alias FirstName LastName HomePhone MobilePhone EmailAddress Picture Status Data";
+    }
+    if (page == 17) {
+        return "BodyPreference Type TruncationSize AllOrNone - Body Data EstimatedDataSize Truncated Attachments Attachment DisplayName FileReference Method ContentId ContentLocation IsInline NativeBodyType ContentType Preview BodyPartPreference BodyPart Status Add Delete ClientId Content Location Annotation Street City State Country PostalCode Latitude Longitude Accuracy Altitude AltitudeAccuracy LocationUri InstanceId";
+    }
+    if (page == 18) {
+        return "Settings Status Get Set Oof OofState StartTime EndTime OofMessage AppliesToInternal AppliesToExternalKnown AppliesToExternalUnknown Enabled ReplyMessage BodyType DevicePassword Password DeviceInformation Model IMEI FriendlyName OS OSLanguage PhoneNumber UserInformation EmailAddresses SMTPAddress UserAgent EnableOutboundSMS MobileOperator PrimarySmtpAddress Accounts Account AccountId AccountName UserDisplayName SendDisabled - RightsManagementInformation";
+    }
+    if (page == 19) {
+        return "LinkId DisplayName IsFolder CreationDate LastModifiedDate IsHidden ContentLength ContentType";
+    }
+    if (page == 20) {
+        return "ItemOperations Fetch Store Options Range Total Properties Data Status Response Version Schema Part EmptyFolderContents DeleteSubFolders UserName Password Move DstFldId ConversationId MoveAlways";
+    }
+    if (page == 21) {
+        return "SendMail SmartForward SmartReply SaveInSentItems ReplaceMime - Source FolderId ItemId LongId InstanceId Mime ClientId Status AccountId - Forwardees Forwardee ForwardeeName ForwardeeEmail";
+    }
+    if (page == 22) {
+        return "UmCallerID UmUserNotes UmAttDuration UmAttOrder ConversationId ConversationIndex LastVerbExecuted LastVerbExecutionTime ReceivedAsBcc Sender CalendarType IsLeapMonth AccountId FirstDayOfWeek MeetingMessageType - IsDraft Bcc Send";
+    }
+    if (page == 23) {
+        return "Subject MessageClass LastModifiedDate Categories Category";
+    }
+    if (page == 24) {
+        return "RightsManagementSupport RightsManagementTemplates RightsManagementTemplate RightsManagementLicense EditAllowed ReplyAllowed ReplyAllAllowed ForwardAllowed ModifyRecipientsAllowed ExtractAllowed PrintAllowed ExportAllowed ProgrammaticAccessAllowed Owner ContentExpiryDate TemplateID TemplateName TemplateDescription ContentOwner RemoveRightsManagementDistribution";
+    }
+    if (page == 25) {
+        return "Find SearchId ExecuteSearch MailBoxSearchCriterion Query Status FreeText Options Range DeepTraversal Response Result Properties Preview HasAttachments Total DisplayCc DisplayBcc GalSearchCriterion MaxPictures MaxSize Picture";
+    }
+    return "";
+}
+
+/// The name of tag `tag` (0x05..0x3f) on page `page`, as a range of `pageTags(page)`; null when unused.
+fn tagRange(page: u8, tag: u8) -> [usize; 2]? {
+    if (tag < 5) {
+        return null;
+    }
+    let tags = pageTags(page).bytes();
+    var index: u8 = 5;
+    var start: usize = 0;
+    while (start < tags.length) {
+        var end = start;
+        while (end < tags.length && tags[end] != 0x20) {
+            end += 1;
+        }
+        if (index == tag) {
+            if (end - start == 1 && tags[start] == 0x2d) {
+                return null;
+            }
+            return [start, end];
+        }
+        index += 1;
+        start = end + 1;
+    }
+    return null;
+}
+
+/// Appends the name of tag `tag` on page `page` to `into`; false when the page has no such tag.
+public fn tagName(page: u8, tag: u8, into: borrow mut Vector<u8>) -> Result<bool, AllocError> {
+    match (tagRange(page, tag)) {
+        Some(r) => {
+            let tags = pageTags(page).bytes();
+            into.extend(tags[r[0]..r[1]])?;
+            return Ok(true);
+        }
+        null => { return Ok(false); }
+    }
+}
+
+/// The tag of element `name` on page `page`.
+public fn tagOf(page: u8, name: Slice<u8>) -> u8? {
+    let tags = pageTags(page).bytes();
+    var index: u8 = 5;
+    var start: usize = 0;
+    while (start < tags.length) {
+        var end = start;
+        while (end < tags.length && tags[end] != 0x20) {
+            end += 1;
+        }
+        if (tags[start..end] == name) {
+            return index;
+        }
+        index += 1;
+        start = end + 1;
+    }
+    return null;
+}

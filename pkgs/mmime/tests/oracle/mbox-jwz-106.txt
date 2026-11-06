@@ -1,0 +1,10 @@
+size 17844
+envelope ("Wed, 11 Dec 1996 18:05:56 -0800" "signed frog 2" (("Jamie Zawinski" NIL "jwz" "netscape.com")) (("Jamie Zawinski" NIL "jwz" "netscape.com")) (("Jamie Zawinski" NIL "jwz" "netscape.com")) ((NIL NIL "jwz" "urchin.mcom.com")) NIL NIL NIL "<32AF6884.41C6@netscape.com>")
+bodystructure ("application" "x-pkcs7-mime" NIL NIL NIL "base64" 17020 NIL NIL NIL NIL)
+body ("application" "x-pkcs7-mime" NIL NIL NIL "base64" 17020)
+section HEADER 824 2dabbc7831559defd6c9dd5a08d726a24988607b50263deefb9a8156a6a487dd
+section TEXT 17020 9c2ee3329692e99a40dc6dae165d70ce1685118704ff87bf81b7a405443ef896
+section HEADER.FIELDS 213 daee2c8fe81b198371a5ff90f950a800ed08c6e312dc9586243c6511d58834e7
+section HEADER.FIELDS.NOT 613 bcff5b2b353b9ecb1b86d168d4e7fcad53a66a417f494ba98682c271ddb38717
+section 1 17020 9c2ee3329692e99a40dc6dae165d70ce1685118704ff87bf81b7a405443ef896
+section 1.MIME 824 2dabbc7831559defd6c9dd5a08d726a24988607b50263deefb9a8156a6a487dd

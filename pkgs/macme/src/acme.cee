@@ -1,0 +1,536 @@
+// An ACME client (RFC 8555) for one job: an account, an order for a set of DNS names, HTTP-01 challenges answered
+// through a `ChallengeStore`, the finalized order, and the certificate chain.
+
+import mhttp.ChallengeStore;
+import mhttp.ClientError;
+import mhttp.ClientLimits;
+import mhttp.ClientResponse;
+import mhttp.JsonDocument;
+import mhttp.JsonWriter;
+import mhttp.httpRequest;
+import pkey.PrivateKey;
+import tls.TlsConfig;
+
+/// How many times an authorization or order is polled (a second apart, or as Retry-After says, up to 10 s).
+const POLLS: u32 = 60;
+
+/// Why getting a certificate failed. `Problem` carries the CA's problem document type, e.g.
+/// `urn:ietf:params:acme:error:unauthorized`, and `detail` its text.
+public enum AcmeError {
+    /// The CA could not be reached, or answered with something that is not ACME.
+    Network,
+    /// The CA refused a request; see `AcmeClient.problem()`.
+    Problem,
+    /// An authorization or the order became invalid; see `problem()`.
+    Invalid,
+    /// It took longer than the polls allow.
+    TimedOut,
+    /// The account key cannot sign.
+    Key,
+    Cancelled,
+    OutOfMemory,
+}
+
+fn alloc<T>(r: Result<T, AllocError>) -> Result<T, AcmeError> => match (r) {
+    Ok(v) => Ok(v),
+    Err(_) => Err(AcmeError.OutOfMemory),
+};
+
+/// The CA's endpoints, from its directory.
+@noncopy
+struct AcmeDirectory {
+    newNonce: String;
+    newAccount: String;
+    newOrder: String;
+}
+
+/// A client for one CA, with one account key.
+@noncopy
+public struct AcmeClient {
+    tls: TlsConfig;
+    directoryUrl: String;
+    directory: AcmeDirectory;
+    key: AccountKey;
+    /// The account's URL, once registered (`kid`).
+    account: String;
+    nonce: String;
+    limits: ClientLimits;
+    problemType: String;
+    problemDetail: String;
+
+    /// A client for the CA whose directory is at `directoryUrl`, reached over TLS with `tls` (a client
+    /// configuration: the system's roots, or a test CA's).
+    public fn create(tls: TlsConfig, directoryUrl: StringView, key: AccountKey) -> Result<AcmeClient, AllocError> {
+        var url = String.create();
+        url.append(directoryUrl)?;
+        return Ok(AcmeClient {
+            tls: tls,
+            directoryUrl: url,
+            directory: AcmeDirectory {
+                newNonce: String.create(),
+                newAccount: String.create(),
+                newOrder: String.create(),
+            },
+            key: key,
+            account: String.create(),
+            nonce: String.create(),
+            limits: ClientLimits.defaults(),
+            problemType: String.create(),
+            problemDetail: String.create(),
+        });
+    }
+
+    /// The last problem document's type and detail (RFC 7807), for logging.
+    public fn problem(borrow this) -> StringView => this.problemType.view();
+
+    public fn detail(borrow this) -> StringView => this.problemDetail.view();
+
+    public fn accountUrl(borrow this) -> StringView => this.account.view();
+
+    fn network(borrow mut this, e: ClientError, what: StringView) -> AcmeError {
+        this.problemType.clear();
+        this.problemDetail.clear();
+        let described = match (this.problemType.append("network")) {
+            Ok() => this.problemDetail.append(what),
+            Err(x) => Err(x),
+        };
+        return match (e) {
+            ClientError.OutOfMemory => AcmeError.OutOfMemory,
+            _ => AcmeError.Network,
+        };
+    }
+
+    async fn get(borrow mut this, url: StringView, response: borrow mut ClientResponse) -> Result<void, AcmeError> {
+        let tls = borrow this.tls;
+        match (await httpRequest(tls, "GET", url, "", [0u8; 1][0..0], response, this.limits)) {
+            Ok() => { return Ok(); }
+            Err(e) => { return Err(this.network(e, url)); }
+        }
+    }
+
+    /// Reads the directory: the URLs of everything else.
+    async fn loadDirectory(borrow mut this) -> Result<void, AcmeError> {
+        if (this.directory.newOrder.length > 0) {
+            return Ok();
+        }
+        var response = ClientResponse.create();
+        var url = String.create();
+        alloc(url.append(this.directoryUrl.view()))?;
+        await this.get(url.view(), mut response)?;
+        if (response.status != 200) {
+            return Err(this.network(ClientError.Protocol, "the directory"));
+        }
+        let doc = match (JsonDocument.parse(response.body.view())) {
+            Ok(d) => d,
+            Err(_) => { return Err(this.network(ClientError.Protocol, "the directory")); }
+        };
+        let root = doc.root();
+        var found = 0;
+        match (doc.member(root, "newNonce")) {
+            Some(v) => {
+                if (alloc(doc.string(v, mut this.directory.newNonce))?) {
+                    found += 1;
+                }
+            }
+            null => {}
+        }
+        match (doc.member(root, "newAccount")) {
+            Some(v) => {
+                if (alloc(doc.string(v, mut this.directory.newAccount))?) {
+                    found += 1;
+                }
+            }
+            null => {}
+        }
+        match (doc.member(root, "newOrder")) {
+            Some(v) => {
+                if (alloc(doc.string(v, mut this.directory.newOrder))?) {
+                    found += 1;
+                }
+            }
+            null => {}
+        }
+        if (found != 3) {
+            return Err(this.network(ClientError.Protocol, "the directory lacks newNonce, newAccount or newOrder"));
+        }
+        return Ok();
+    }
+
+    async fn freshNonce(borrow mut this) -> Result<void, AcmeError> {
+        var response = ClientResponse.create();
+        var url = String.create();
+        alloc(url.append(this.directory.newNonce.view()))?;
+        let tls = borrow this.tls;
+        match (await httpRequest(tls, "HEAD", url.view(), "", [0u8; 1][0..0], mut response, this.limits)) {
+            Ok() => {}
+            Err(e) => { return Err(this.network(e, "newNonce")); }
+        }
+        if (!alloc(response.headerInto("Replay-Nonce", mut this.nonce))?) {
+            return Err(this.network(ClientError.Protocol, "newNonce gave no nonce"));
+        }
+        return Ok();
+    }
+
+    /// POSTs a JWS of `payload` to `url` (empty: POST-as-GET), taking the new nonce from the answer, and retrying
+    /// once on badNonce (§6.5). A response that is an error is `Problem`, with the document kept.
+    async fn post(
+        borrow mut this,
+        url: StringView,
+        payload: Slice<u8>,
+        response: borrow mut ClientResponse,
+    ) -> Result<void, AcmeError> {
+        var attempt = 0;
+        loop {
+            if (this.nonce.length == 0) {
+                await this.freshNonce()?;
+            }
+            var body = Vector<u8>.create();
+            var nonce = String.create();
+            alloc(nonce.append(this.nonce.view()))?;
+            this.nonce.clear();
+            var kid = String.create();
+            alloc(kid.append(this.account.view()))?;
+            match (this.key.sign(url, nonce.view(), kid.view(), payload, mut body)) {
+                Ok() => {}
+                Err(KeyProblem.OutOfMemory) => { return Err(AcmeError.OutOfMemory); }
+                Err(_) => { return Err(AcmeError.Key); }
+            }
+            let tls = borrow this.tls;
+            match (await httpRequest(tls, "POST", url, "application/jose+json", body.view(), response, this.limits)) {
+                Ok() => {}
+                Err(e) => { return Err(this.network(e, url)); }
+            }
+            alloc(response.headerInto("Replay-Nonce", mut this.nonce))?;
+            if (response.status < 400) {
+                return Ok();
+            }
+            this.readProblem(response)?;
+            if (this.problemType.view() == "urn:ietf:params:acme:error:badNonce" && attempt == 0) {
+                attempt += 1;
+                continue;
+            }
+            return Err(AcmeError.Problem);
+        }
+    }
+
+    fn readProblem(borrow mut this, response: borrow ClientResponse) -> Result<void, AcmeError> {
+        this.problemType.clear();
+        this.problemDetail.clear();
+        match (JsonDocument.parse(response.body.view())) {
+            Ok(doc) => { this.problemFrom(doc, doc.root())?; }
+            Err(_) => {
+                var status = String.create();
+                alloc(status.append("HTTP "))?;
+                alloc(status.appendNumber(response.status as u64))?;
+                alloc(this.problemType.append(status.view()))?;
+            }
+        }
+        return Ok();
+    }
+
+    fn problemFrom(borrow mut this, doc: borrow JsonDocument, at: usize) -> Result<void, AcmeError> {
+        match (doc.member(at, "type")) {
+            Some(v) => { alloc(doc.string(v, mut this.problemType))?; }
+            null => {}
+        }
+        match (doc.member(at, "detail")) {
+            Some(v) => { alloc(doc.string(v, mut this.problemDetail))?; }
+            null => {}
+        }
+        return Ok();
+    }
+
+    /// Registers the account (or finds the one this key already has: §7.3.1 answers 200 with its URL). `contact`
+    /// is an email address, or empty. Agreeing to the CA's terms is the operator's, by configuring the CA.
+    public async fn register(borrow mut this, contact: StringView) -> Result<void, AcmeError> {
+        await this.loadDirectory()?;
+        if (this.account.length > 0) {
+            return Ok();
+        }
+        var w = JsonWriter.create();
+        w.beginObject();
+        w.booleanField("termsOfServiceAgreed", true);
+        if (contact.length > 0) {
+            var mailto = String.create();
+            alloc(mailto.append("mailto:"))?;
+            alloc(mailto.append(contact))?;
+            w.key("contact");
+            w.beginArray();
+            w.string(mailto.view());
+            w.endArray();
+        }
+        w.endObject();
+        let payload = alloc(w.finish())?;
+        var response = ClientResponse.create();
+        var url = String.create();
+        alloc(url.append(this.directory.newAccount.view()))?;
+        await this.post(url.view(), payload.view(), mut response)?;
+        if (!alloc(response.headerInto("Location", mut this.account))?) {
+            return Err(this.network(ClientError.Protocol, "newAccount gave no account URL"));
+        }
+        return Ok();
+    }
+
+    /// Orders a certificate for `names`, answers each authorization's HTTP-01 challenge through `challenges`, and
+    /// finalizes with a request signed by `certificateKey`. The chain (PEM, leaf first) goes to `chain`.
+    public async fn obtain(
+        borrow mut this,
+        names: borrow Vector<String>,
+        certificateKey: borrow PrivateKey,
+        challenges: borrow ChallengeStore,
+        chain: borrow mut Vector<u8>,
+    ) -> Result<void, AcmeError> {
+        chain.clear();
+        await this.loadDirectory()?;
+        var w = JsonWriter.create();
+        w.beginObject();
+        w.key("identifiers");
+        w.beginArray();
+        for (n in names.view()) {
+            w.beginObject();
+            w.stringField("type", "dns");
+            w.stringField("value", n.view());
+            w.endObject();
+        }
+        w.endArray();
+        w.endObject();
+        let payload = alloc(w.finish())?;
+        var response = ClientResponse.create();
+        var newOrder = String.create();
+        alloc(newOrder.append(this.directory.newOrder.view()))?;
+        await this.post(newOrder.view(), payload.view(), mut response)?;
+        var orderUrl = String.create();
+        if (!alloc(response.headerInto("Location", mut orderUrl))?) {
+            return Err(this.network(ClientError.Protocol, "newOrder gave no order URL"));
+        }
+        var authorizations = Vector<String>.create();
+        var finalize = String.create();
+        {
+            let order = match (JsonDocument.parse(response.body.view())) {
+                Ok(d) => d,
+                Err(_) => { return Err(this.network(ClientError.Protocol, "the order")); }
+            };
+            match (order.member(order.root(), "authorizations")) {
+                Some(list) => {
+                    var items = Vector<usize>.create();
+                    alloc(order.items(list, mut items))?;
+                    for (i in items.view()) {
+                        var u = String.create();
+                        if (alloc(order.string(i, mut u))?) {
+                            alloc(authorizations.push(u))?;
+                        }
+                    }
+                }
+                null => {}
+            }
+            match (order.member(order.root(), "finalize")) {
+                Some(v) => { alloc(order.string(v, mut finalize))?; }
+                null => {}
+            }
+        }
+        if (finalize.length == 0) {
+            return Err(this.network(ClientError.Protocol, "the order has no finalize URL"));
+        }
+        for (a in authorizations.view()) {
+            await this.authorize(a.view(), challenges)?;
+        }
+        // Finalize with the request, then wait for the certificate.
+        var csr = Vector<u8>.create();
+        match (certificateRequest(certificateKey, names, mut csr)) {
+            Ok() => {}
+            Err(KeyProblem.OutOfMemory) => { return Err(AcmeError.OutOfMemory); }
+            Err(_) => { return Err(AcmeError.Key); }
+        }
+        var csrText = Vector<u8>.create();
+        alloc(appendBase64Url(mut csrText, csr.view()))?;
+        var fw = JsonWriter.create();
+        fw.beginObject();
+        fw.key("csr");
+        fw.stringBytes(csrText.view());
+        fw.endObject();
+        let finalizePayload = alloc(fw.finish())?;
+        await this.post(finalize.view(), finalizePayload.view(), mut response)?;
+        var certificateUrl = String.create();
+        var status = String.create();
+        var polls: u32 = 0;
+        loop {
+            {
+                let order = match (JsonDocument.parse(response.body.view())) {
+                    Ok(d) => d,
+                    Err(_) => { return Err(this.network(ClientError.Protocol, "the order")); }
+                };
+                match (order.member(order.root(), "status")) {
+                    Some(v) => { alloc(order.string(v, mut status))?; }
+                    null => { status.clear(); }
+                }
+                if (status.view() == "valid") {
+                    match (order.member(order.root(), "certificate")) {
+                        Some(v) => { alloc(order.string(v, mut certificateUrl))?; }
+                        null => {}
+                    }
+                } else if (status.view() == "invalid") {
+                    match (order.member(order.root(), "error")) {
+                        Some(e) => { this.problemFrom(order, e)?; }
+                        null => {}
+                    }
+                    return Err(AcmeError.Invalid);
+                }
+            }
+            if (certificateUrl.length > 0) {
+                break;
+            }
+            polls += 1;
+            if (polls > POLLS) {
+                return Err(AcmeError.TimedOut);
+            }
+            await pause(response)?;
+            await this.post(orderUrl.view(), [0u8; 1][0..0], mut response)?;
+        }
+        await this.post(certificateUrl.view(), [0u8; 1][0..0], mut response)?;
+        if (response.status != 200 || StringView.fromUtf8(response.body.view()) == null) {
+            return Err(this.network(ClientError.Protocol, "the certificate download"));
+        }
+        alloc(chain.extend(response.body.view()))?;
+        return Ok();
+    }
+
+    /// Settles one authorization: nothing to do when already valid; else publishes its HTTP-01 key authorization,
+    /// tells the CA to check, and waits for the verdict. The challenge is withdrawn however it ends.
+    async fn authorize(borrow mut this, url: StringView, challenges: borrow ChallengeStore) -> Result<void, AcmeError> {
+        var response = ClientResponse.create();
+        await this.post(url, [0u8; 1][0..0], mut response)?;
+        var token = String.create();
+        var challengeUrl = String.create();
+        {
+            let doc = match (JsonDocument.parse(response.body.view())) {
+                Ok(d) => d,
+                Err(_) => { return Err(this.network(ClientError.Protocol, "an authorization")); }
+            };
+            var status = String.create();
+            match (doc.member(doc.root(), "status")) {
+                Some(v) => { alloc(doc.string(v, mut status))?; }
+                null => {}
+            }
+            if (status.view() == "valid") {
+                return Ok();
+            }
+            match (doc.member(doc.root(), "challenges")) {
+                Some(list) => {
+                    var items = Vector<usize>.create();
+                    alloc(doc.items(list, mut items))?;
+                    var kind = String.create();
+                    for (c in items.view()) {
+                        match (doc.member(c, "type")) {
+                            Some(v) => { alloc(doc.string(v, mut kind))?; }
+                            null => { kind.clear(); }
+                        }
+                        if (kind.view() != "http-01") {
+                            continue;
+                        }
+                        match (doc.member(c, "token")) {
+                            Some(v) => { alloc(doc.string(v, mut token))?; }
+                            null => {}
+                        }
+                        match (doc.member(c, "url")) {
+                            Some(v) => { alloc(doc.string(v, mut challengeUrl))?; }
+                            null => {}
+                        }
+                    }
+                }
+                null => {}
+            }
+        }
+        if (token.length == 0 || challengeUrl.length == 0 || !validToken(token.view())) {
+            this.problemType.clear();
+            alloc(this.problemType.append("no usable http-01 challenge"))?;
+            return Err(AcmeError.Invalid);
+        }
+        var keyAuthorization = String.create();
+        alloc(this.key.keyAuthorization(token.view(), mut keyAuthorization))?;
+        if (!(await challenges.publish(token.view(), keyAuthorization.view()))) {
+            return Err(AcmeError.OutOfMemory);
+        }
+        let outcome = await this.respond(url, challengeUrl.view());
+        await challenges.withdraw(token.view());
+        return outcome;
+    }
+
+    /// Tells the CA the challenge is ready (`{}`), then polls the authorization until it is decided.
+    async fn respond(borrow mut this, authorization: StringView, challenge: StringView) -> Result<void, AcmeError> {
+        var response = ClientResponse.create();
+        await this.post(challenge, "{}".bytes(), mut response)?;
+        var polls: u32 = 0;
+        var status = String.create();
+        loop {
+            await pause(response)?;
+            await this.post(authorization, [0u8; 1][0..0], mut response)?;
+            let doc = match (JsonDocument.parse(response.body.view())) {
+                Ok(d) => d,
+                Err(_) => { return Err(this.network(ClientError.Protocol, "an authorization")); }
+            };
+            match (doc.member(doc.root(), "status")) {
+                Some(v) => { alloc(doc.string(v, mut status))?; }
+                null => { status.clear(); }
+            }
+            if (status.view() == "valid") {
+                return Ok();
+            }
+            if (status.view() != "pending" && status.view() != "processing") {
+                // invalid, deactivated, expired, revoked: the challenge's error says why.
+                this.problemType.clear();
+                this.problemDetail.clear();
+                alloc(this.problemType.append("authorization "))?;
+                alloc(this.problemType.append(status.view()))?;
+                match (doc.member(doc.root(), "challenges")) {
+                    Some(list) => {
+                        var items = Vector<usize>.create();
+                        alloc(doc.items(list, mut items))?;
+                        for (c in items.view()) {
+                            match (doc.member(c, "error")) {
+                                Some(e) => { this.problemFrom(doc, e)?; }
+                                null => {}
+                            }
+                        }
+                    }
+                    null => {}
+                }
+                return Err(AcmeError.Invalid);
+            }
+            polls += 1;
+            if (polls > POLLS) {
+                return Err(AcmeError.TimedOut);
+            }
+        }
+    }
+}
+
+/// A token is base64url (§8.3): it becomes a path segment, so nothing else may pass.
+fn validToken(token: StringView) -> bool {
+    if (token.length == 0 || token.length > 256) {
+        return false;
+    }
+    for (c in token.bytes()) {
+        let ok = (c >= 0x30 && c <= 0x39) || (c >= 0x41 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a) || c == 0x2d ||
+            c == 0x5f;
+        if (!ok) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Waits before polling again: Retry-After seconds when given (at most 10), else one second.
+async fn pause(response: borrow ClientResponse) -> Result<void, AcmeError> {
+    var seconds: u64 = 1;
+    match (response.header("Retry-After")) {
+        Some(v) => {
+            let n = v.view().parseInt<u64>() ?? 1;
+            seconds = if (n < 1) 1 else if (n > 10) 10 else n;
+        }
+        null => {}
+    }
+    match (await Timer.sleep(seconds * 1000)) {
+        Ok() => { return Ok(); }
+        Err(_) => { return Err(AcmeError.Cancelled); }
+    }
+}

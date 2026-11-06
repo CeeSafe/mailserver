@@ -1,0 +1,258 @@
+// SEARCH: the key grammar (RFC 3501 §6.4.4 and §9), the three-valued evaluation over rows and loaded text, and
+// RFC 5322 dates as Dovecot reads them.
+
+/// Feeds `wire` (lines and literals, as feedAll in parser_tests) and parses its SEARCH arguments into `q`.
+fn search(q: borrow mut SearchQuery, wire: StringView) -> Result<bool, ParseError> {
+    var r = CommandReader.create(Limits.defaults());
+    let bytes = wire.bytes();
+    var at: usize = 0;
+    loop {
+        var end = at;
+        while (end + 1 < bytes.length && !(bytes[end] == 0x0d && bytes[end + 1] == 0x0a)) {
+            end += 1;
+        }
+        if (end + 1 >= bytes.length) {
+            end = bytes.length;
+        }
+        let line = bytes[at..end];
+        at = if (end + 2 <= bytes.length) end + 2 else bytes.length;
+        match (r.feedLine(line)?) {
+            Feed.Complete => { break; }
+            Feed.NeedLiteral(request) => {
+                let n = truncate<usize>(request.size);
+                r.feedLiteral(bytes[at..at + n])?;
+                at += n;
+            }
+        }
+    }
+    r.tag()?;
+    r.command()?;
+    let ok = parseSearch(mut r, q)?;
+    if (ok) {
+        r.finish()?;
+    }
+    return Ok(ok);
+}
+
+fn fails(wire: StringView, want: ParseError) -> bool {
+    var q = SearchQuery.create();
+    return match (search(mut q, wire)) {
+        Ok(_) => false,
+        Err(e) => e == want,
+    };
+}
+
+fn rootKind(q: borrow SearchQuery) -> KeyKind => q.keys[q.root].kind;
+
+/// A row at `level` with these flags, an internal date and a size.
+fn row(level: u8, seq: u32, uid: u32, flags: u16, date: i64, size: i64) -> RowFacts => RowFacts {
+    level: level,
+    seq: seq,
+    uid: uid,
+    maxSeq: 10,
+    maxUid: 100,
+    flags: flags,
+    internalDate: date,
+    size: size,
+};
+
+/// Evaluates `wire`'s query at `level` on a message with `header`, `body` and keywords `$Work Later`.
+fn truth(wire: StringView, facts: RowFacts, header: StringView, body: StringView) -> Tri {
+    var q = SearchQuery.create();
+    search(mut q, wire)!;
+    var m = MessageFacts.create();
+    m.header.extend(header.bytes())!;
+    var scratch = Vector<u8>.create();
+    m.sentDay = sentDayOf(m.header.view(), mut scratch)!;
+    m.body.extend(body.bytes())!;
+    m.text.extend(header.bytes())!;
+    m.text.extend(body.bytes())!;
+    return evaluate(q, facts, "$Work Later".bytes(), m, mut scratch)!;
+}
+
+/// 2021-03-05 12:00:00 UTC in Unix milliseconds.
+const MARCH5: i64 = 1614945600000;
+
+const HEADER: StringView = "From: =?ISO-8859-1?Q?Andr=E9?= <andre@example.org>\r\nTo: Bob <bob@example.org>\r\nCc: carol@example.org\r\nSubject: Quarterly =?UTF-8?B?csOpc3VsdGF0cw==?=\r\nDate: Fri, 05 Mar 2021 23:30:00 -0500\r\nX-Empty:\r\n\r\n";
+
+fn yes(wire: StringView) -> bool => truth(wire, row(LEVEL_BODY, 3, 30, STORED_SEEN | STORED_FLAGGED, MARCH5, 2000), HEADER, "Hello Wörld, the numbers are in.\n") == Tri.Yes;
+
+fn no(wire: StringView) -> bool => truth(wire, row(LEVEL_BODY, 3, 30, STORED_SEEN | STORED_FLAGGED, MARCH5, 2000), HEADER, "Hello Wörld, the numbers are in.\n") == Tri.No;
+
+@test
+fn keyGrammar() -> Result<void, TestFailure> {
+    var q = SearchQuery.create();
+    let simple = [
+        "ALL", "ANSWERED", "DELETED", "DRAFT", "FLAGGED", "SEEN", "UNANSWERED", "UNDELETED", "UNDRAFT", "UNFLAGGED",
+        "UNSEEN", "NEW", "OLD", "RECENT", "keyword $Work", "UNKEYWORD Later", "BEFORE 1-Feb-1994",
+        "on \"05-Mar-2021\"", "SINCE 5-Mar-2021", "SENTBEFORE 1-Jan-2000", "SENTON 1-Jan-2000", "SENTSINCE 1-Jan-2000",
+        "LARGER 100", "SMALLER 4294967295", "FROM alice", "TO \"bob b\"", "CC x", "BCC x", "SUBJECT \"\"",
+        "HEADER X-Spam yes", "HEADER \"Message-ID\" \"\"", "BODY word", "TEXT word", "UID 1:*", "1,3:5,*", "*",
+        "NOT SEEN", "OR SEEN FLAGGED", "(SEEN)", "(SEEN FLAGGED)",
+    ];
+    for (key in simple) {
+        var wire = String.create();
+        wire.append("a SEARCH ")!;
+        wire.append(key)!;
+        Check.isTrue(search(mut q, wire.view())!, key)?;
+    }
+    search(mut q, "a SEARCH ALL")!;
+    Check.isTrue(rootKind(q) == KeyKind.All, "one key is the root")?;
+    search(mut q, "a SEARCH SEEN UNDELETED")!;
+    Check.isTrue(rootKind(q) == KeyKind.And && q.keys[q.root].b == 2, "keys are ANDed")?;
+    search(mut q, "a UID SEARCH CHARSET UTF-8 OR (FROM a TO b) NOT (SUBJECT c BODY d) 2:4")!;
+    Check.isTrue(rootKind(q) == KeyKind.And && q.level() == LEVEL_BODY, "nested, after CHARSET")?;
+    Check.isTrue(q.needsBody && !q.needsText, "BODY needs the body")?;
+    // The cheapest operand first: the sequence set, then OR (whose operands are the list and NOT).
+    let root = q.keys[q.root];
+    Check.isTrue(root.b == 2, "OR takes the two lists")?;
+    Check.isTrue(q.keys[q.operands[root.a]].kind == KeyKind.Seq, "the set first")?;
+    let or = q.keys[q.operands[root.a + 1]];
+    Check.isTrue(or.kind == KeyKind.Or && q.keys[or.a].kind == KeyKind.And && q.keys[or.b].kind == KeyKind.Not, "OR")?;
+    search(mut q, "a SEARCH charset us-ascii TEXT x")!;
+    Check.isTrue(q.needsText, "TEXT")?;
+    Check.isTrue(!search(mut q, "a SEARCH CHARSET ISO-8859-1 TEXT x")!, "another charset")?;
+    Check.isTrue(!search(mut q, "a SEARCH CHARSET \"KOI8-R\" ALL")!, "a quoted charset")?;
+    // Strings: quoted, literals (UTF-8), atoms; HEADER's two.
+    search(mut q, "a SEARCH SUBJECT {8}\r\nrésumé")!;
+    Check.isTrue(q.text(q.keys[q.root].text) == "résumé".bytes(), "a literal")?;
+    search(mut q, "a SEARCH HEADER {4+}\r\nX-Id \"a \\\"b\\\"\"")!;
+    let h = q.keys[q.root];
+    Check.isTrue(q.text(h.field) == "X-Id".bytes() && q.text(h.text) == "a \"b\"".bytes(), "HEADER")?;
+    search(mut q, "a SEARCH UID 5:3,9")!;
+    let u = q.keys[q.root];
+    Check.isTrue(u.kind == KeyKind.Uid && u.b == 2 && q.ranges[u.a].first == 5, "UID's set")?;
+    search(mut q, "a SEARCH LARGER 1024 BEFORE 01-Jan-1970")!;
+    let sizes = q.keys[q.root];
+    Check.isTrue(q.keys[q.operands[sizes.a]].value == 1024 && q.keys[q.operands[sizes.a + 1]].value == 0, "values")?;
+    return Ok();
+}
+
+@test
+fn keyErrors() -> Result<void, TestFailure> {
+    Check.isTrue(fails("a SEARCH", ParseError.MissingArgument), "no key")?;
+    Check.isTrue(fails("a SEARCH CHARSET UTF-8", ParseError.MissingArgument), "CHARSET alone")?;
+    Check.isTrue(fails("a SEARCH FOO", ParseError.UnknownSearchKey), "an unknown key")?;
+    Check.isTrue(fails("a SEARCH ()", ParseError.UnknownSearchKey), "an empty list")?;
+    Check.isTrue(fails("a SEARCH \"SEEN\"", ParseError.UnknownSearchKey), "a quoted key")?;
+    Check.isTrue(fails("a SEARCH OR SEEN", ParseError.MissingArgument), "OR with one operand")?;
+    Check.isTrue(fails("a SEARCH NOT", ParseError.MissingArgument), "NOT alone")?;
+    Check.isTrue(fails("a SEARCH SINCE 31-Apr-2000", ParseError.BadDate), "no 31 April")?;
+    Check.isTrue(fails("a SEARCH SINCE 2000-01-01", ParseError.BadDate), "an ISO date")?;
+    Check.isTrue(fails("a SEARCH LARGER x", ParseError.ExpectedNumber), "LARGER x")?;
+    Check.isTrue(fails("a SEARCH LARGER 4294967296", ParseError.ExpectedNumber), "LARGER too large")?;
+    Check.isTrue(fails("a SEARCH UID x", ParseError.BadSequenceSet), "UID x")?;
+    Check.isTrue(fails("a SEARCH 0", ParseError.BadSequenceSet), "sequence number 0")?;
+    Check.isTrue(fails("a SEARCH 1:", ParseError.BadSequenceSet), "1:")?;
+    Check.isTrue(fails("a SEARCH KEYWORD \\Seen", ParseError.BadFlag), "a system flag as a keyword")?;
+    Check.isTrue(fails("a SEARCH HEADER X-Spam", ParseError.MissingArgument), "HEADER with one string")?;
+    Check.isTrue(fails("a SEARCH SUBJECT (x)", ParseError.ExpectedString), "a list for a string")?;
+    // Nesting is bounded, with or without parentheses.
+    var deep = String.create();
+    deep.append("a SEARCH")!;
+    for (i in 0..100) {
+        deep.append(" NOT")!;
+    }
+    deep.append(" SEEN")!;
+    Check.isTrue(fails(deep.view(), ParseError.TooDeep), "NOT 100 deep")?;
+    return Check.isTrue(fails("a SEARCH (SEEN", ParseError.UnbalancedParens), "an open list");
+}
+
+@test
+fn rowKeys() -> Result<void, TestFailure> {
+    Check.isTrue(yes("a SEARCH ALL") && yes("a SEARCH SEEN") && yes("a SEARCH FLAGGED") && yes("a SEARCH OLD"), "set")?;
+    Check.isTrue(no("a SEARCH ANSWERED") && no("a SEARCH DELETED") && no("a SEARCH DRAFT"), "unset")?;
+    Check.isTrue(yes("a SEARCH UNANSWERED UNDELETED UNDRAFT") && no("a SEARCH UNSEEN") && no("a SEARCH UNFLAGGED"), "UN")?;
+    Check.isTrue(no("a SEARCH NEW") && no("a SEARCH RECENT"), "no \\Recent")?;
+    Check.isTrue(yes("a SEARCH KEYWORD $work") && no("a SEARCH KEYWORD $Wor") && yes("a SEARCH UNKEYWORD Lat"), "keywords")?;
+    Check.isTrue(yes("a SEARCH ON 5-Mar-2021") && no("a SEARCH ON 6-Mar-2021"), "ON")?;
+    Check.isTrue(yes("a SEARCH BEFORE 6-Mar-2021") && no("a SEARCH BEFORE 5-Mar-2021"), "BEFORE")?;
+    Check.isTrue(yes("a SEARCH SINCE 5-Mar-2021") && no("a SEARCH SINCE 6-Mar-2021"), "SINCE")?;
+    Check.isTrue(yes("a SEARCH LARGER 1999") && no("a SEARCH LARGER 2000"), "LARGER")?;
+    Check.isTrue(yes("a SEARCH SMALLER 2001") && no("a SEARCH SMALLER 2000"), "SMALLER")?;
+    Check.isTrue(yes("a SEARCH 3") && yes("a SEARCH 1:2,3") && no("a SEARCH 4:*") && yes("a SEARCH *:2") && no("a SEARCH 11:*"), "sequence")?;
+    Check.isTrue(yes("a SEARCH UID 30") && no("a SEARCH UID 31:*") && yes("a SEARCH UID 200:30"), "UID")?;
+    Check.isTrue(yes("a SEARCH NOT DELETED") && no("a SEARCH NOT (SEEN FLAGGED)"), "NOT")?;
+    Check.isTrue(yes("a SEARCH OR DELETED SEEN") && no("a SEARCH OR DELETED DRAFT"), "OR")?;
+    return Check.isTrue(yes("a SEARCH OR (DELETED SEEN) (NOT DRAFT LARGER 5)"), "OR of lists");
+}
+
+@test
+fn textKeys() -> Result<void, TestFailure> {
+    Check.isTrue(yes("a SEARCH FROM \"andré\"") && yes("a SEARCH FROM \"ANDRÉ\"") && yes("a SEARCH FROM @example.org"), "FROM")?;
+    Check.isTrue(yes("a SEARCH TO \"bob <\"") && no("a SEARCH TO carol") && yes("a SEARCH CC carol"), "TO, CC")?;
+    Check.isTrue(no("a SEARCH BCC example") && no("a SEARCH BCC \"\""), "no Bcc field")?;
+    Check.isTrue(yes("a SEARCH SUBJECT \"quarterly résultats\"") && yes("a SEARCH SUBJECT \"RÉSULTATS\""), "encoded words")?;
+    Check.isTrue(yes("a SEARCH HEADER x-empty \"\"") && no("a SEARCH HEADER X-Other \"\""), "HEADER with \"\"")?;
+    Check.isTrue(yes("a SEARCH HEADER DATE -0500") && no("a SEARCH HEADER Subject Andr"), "HEADER")?;
+    Check.isTrue(yes("a SEARCH BODY \"wörld\"") && yes("a SEARCH BODY \"THE NUMBERS\"") && no("a SEARCH BODY Bob"), "BODY")?;
+    Check.isTrue(yes("a SEARCH TEXT Bob") && yes("a SEARCH TEXT numbers") && no("a SEARCH TEXT nothing"), "TEXT")?;
+    // The Date header's own day (5 March in -0500, though 6 March in UTC).
+    Check.isTrue(yes("a SEARCH SENTON 5-Mar-2021") && yes("a SEARCH SENTBEFORE 6-Mar-2021"), "SENTON")?;
+    Check.isTrue(no("a SEARCH SENTSINCE 6-Mar-2021") && yes("a SEARCH SENTSINCE 5-Mar-2021"), "SENTSINCE")?;
+    return Check.isTrue(yes("a SEARCH NOT BODY absent FROM andre@") && no("a SEARCH OR BODY x SUBJECT zzz"), "mixed");
+}
+
+@test
+fn stagedEvaluation() -> Result<void, TestFailure> {
+    let empty = "";
+    let numbers = row(LEVEL_NUMBERS, 3, 30, 0, 0, 0);
+    Check.isTrue(truth("a SEARCH SEEN", numbers, empty, empty) == Tri.Unknown, "flags need the row")?;
+    Check.isTrue(truth("a SEARCH 4 SEEN", numbers, empty, empty) == Tri.No, "a set decides first")?;
+    Check.isTrue(truth("a SEARCH OR 3 SEEN", numbers, empty, empty) == Tri.Yes, "OR with a true operand")?;
+    Check.isTrue(truth("a SEARCH NOT SEEN", numbers, empty, empty) == Tri.Unknown, "NOT of unknown")?;
+    let unseen = row(LEVEL_ROW, 3, 30, 0, MARCH5, 10);
+    Check.isTrue(truth("a SEARCH SEEN BODY x", unseen, empty, empty) == Tri.No, "a row key decides an AND")?;
+    Check.isTrue(truth("a SEARCH UNSEEN BODY x", unseen, empty, empty) == Tri.Unknown, "BODY waits")?;
+    Check.isTrue(truth("a SEARCH OR UNSEEN BODY x", unseen, empty, empty) == Tri.Yes, "OR needs no body")?;
+    let header = row(LEVEL_HEADER, 3, 30, 0, MARCH5, 10);
+    Check.isTrue(truth("a SEARCH SUBJECT Quarterly TEXT x", header, HEADER, empty) == Tri.Unknown, "TEXT waits")?;
+    Check.isTrue(truth("a SEARCH SUBJECT nope TEXT x", header, HEADER, empty) == Tri.No, "SUBJECT decides")?;
+    let body = row(LEVEL_BODY, 3, 30, 0, MARCH5, 10);
+    return Check.isTrue(truth("a SEARCH SUBJECT Quarterly TEXT Bob", body, HEADER, empty) == Tri.Yes, "all known");
+}
+
+/// The day a Date value names, or -1 when it cannot be read.
+fn sentDay(value: StringView) -> i64 => match (parseMessageDate(value.bytes())) {
+    Some(local) => dayOf(local * 1000),
+    null => 0 - 1,
+};
+
+@test
+fn messageDates() -> Result<void, TestFailure> {
+    let march5 = daysFromCivil(2021, 3, 5);
+    Check.isTrue(sentDay("Fri, 05 Mar 2021 23:30:00 -0500") == march5, "the sender's zone")?;
+    Check.isTrue(sentDay("5 Mar 2021 01:30 +0900") == march5, "no seconds, no weekday")?;
+    Check.isTrue(sentDay("Fri,5 Mar 21 10:00:00 GMT") == march5, "a two-digit year")?;
+    Check.isTrue(sentDay("5 Mar 99 10:00:00 EST") == daysFromCivil(1999, 3, 5), "19xx")?;
+    Check.isTrue(sentDay("Fri (Friday), 5 (day) mar 2021 10:00:00 (noon-ish) +0000 (UTC)") == march5, "comments")?;
+    Check.isTrue(sentDay("Fri, 5 Mar 2021 23:59:59 PST") == march5, "a zone name")?;
+    Check.isTrue(sentDay("5 Mar 2021 10:00") == march5, "no zone")?;
+    Check.isTrue((parseMessageDate("5 Mar 2021 10:00 +0130".bytes()) ?? 0) == march5 * 86400 + 36000, "+0130")?;
+    // Late in the day east of UTC is still that day (imaptest's search-date).
+    Check.isTrue(sentDay("Fri, 5 Mar 2021 23:00:00 +0200") == march5, "23:00 +0200")?;
+    Check.isTrue(sentDay("Fri, 5 Mar 2021 23:59:59 +1400") == march5, "23:59 +1400")?;
+    Check.isTrue(sentDay("Fri, 5 Mar 2021 00:00:00 -1200") == march5, "00:00 -1200")?;
+    let bad = ["", "garbage here", "5 Mar 2021", "32 Mar 2021 10:00", "5 Foo 2021 10:00", "5 Mar 2021 25:00", "5 Mar 202 10:00"];
+    for (b in bad) {
+        Check.isTrue(parseMessageDate(b.bytes()) == null, b)?;
+    }
+    var scratch = Vector<u8>.create();
+    Check.isTrue(sentDayOf("Subject: x\r\n\r\n".bytes(), mut scratch)! == 0, "no Date: 1 Jan 1970")?;
+    Check.isTrue(sentDayOf("Date: soon\r\n\r\n".bytes(), mut scratch)! == 0, "a bad Date: 1 Jan 1970")?;
+    Check.isTrue(dayOf(0 - 1) == 0 - 1, "before 1970")?;
+    return Check.isTrue(dayOf(MARCH5) == march5, "an internal date's day");
+}
+
+@test
+fn helpers() -> Result<void, TestFailure> {
+    Check.isTrue(hasKeyword("$Work Later".bytes(), "later".bytes()) && !hasKeyword("".bytes(), "x".bytes()), "kw")?;
+    let ranges = [SeqRange { first: 2, last: 4 }, SeqRange { first: 0, last: 0 }];
+    Check.isTrue(inRanges(ranges[..], 3, 9) && inRanges(ranges[..], 9, 9) && !inRanges(ranges[..], 5, 9), "ranges")?;
+    var scratch = Vector<u8>.create();
+    let h = "Subject: a\r\nsubject: b\r\n\r\n".bytes();
+    Check.isTrue(headerHas(h, "SUBJECT".bytes(), "b".bytes(), mut scratch)!, "the second of two fields")?;
+    var name = Vector<u8>.create();
+    name.push(0xff)!;
+    return Check.isTrue(!headerHas(h, name.view(), "".bytes(), mut scratch)!, "a name that is not UTF-8");
+}

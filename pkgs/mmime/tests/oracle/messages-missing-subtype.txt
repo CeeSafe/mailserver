@@ -1,0 +1,10 @@
+size 264
+envelope ("Tue, 29 Dec 2015 09:06:17 -0400" "Test of an invalid mime-type" (("someone" NIL "someone" "somewhere.com")) (("someone" NIL "someone" "somewhere.com")) (("someone" NIL "someone" "somewhere.com")) (("someone else" NIL "someone.else" "somewhere.else.com")) NIL NIL NIL NIL)
+bodystructure ("" "" NIL NIL NIL "7bit" 16 NIL NIL NIL NIL)
+body ("" "" NIL NIL NIL "7bit" 16)
+section HEADER 248 6ca8df1f84918e5d4c297745bb1e7b056eb710e9ba0736cc203dd05ab75ecb7a
+section TEXT 16 579de681add9f8c686fa791c49d1222a63c236febff37769b5fb50659b007491
+section HEADER.FIELDS 229 9548a63b3935c93bd77233f06d32d37ddfa70ce3269c9d73effef2043f443328
+section HEADER.FIELDS.NOT 21 07a26ab8981ff3b1de28da29cf47f47e315b9c25685121dc5ebb60391005b2de
+section 1 16 579de681add9f8c686fa791c49d1222a63c236febff37769b5fb50659b007491
+section 1.MIME 248 6ca8df1f84918e5d4c297745bb1e7b056eb710e9ba0736cc203dd05ab75ecb7a

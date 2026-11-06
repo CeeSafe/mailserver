@@ -1,0 +1,10 @@
+size 390
+envelope ("Tue, 12 Nov 2013 09:12:42 -0500" "Откуда он появился?" ((NIL NIL "mimekit" "example.com")) ((NIL NIL "mimekit" "example.com")) ((NIL NIL "mimekit" "example.com")) ((NIL NIL "mimekit" "example.com")) NIL NIL NIL "<54AD68C9E3B0184CAC6041320424FD1B5B81E74D@localhost.localdomain>")
+bodystructure ("text" "plain" ("charset" "utf-8") NIL NIL "8bit" 37 1 NIL NIL NIL NIL)
+body ("text" "plain" ("charset" "utf-8") NIL NIL "8bit" 37 1)
+section HEADER 353 a676e3f32de1a77596f25c55319a3883e5290844bd1b5550c40629f4a4e51809
+section TEXT 37 7186f89e944bcd621dc0723de2e5a89f6c17655905bf2a0d5aa17596c5fc11cc
+section HEADER.FIELDS 260 0145c282b31089db14a1f78f8268a675fac79ebbf3157cd8a3ee443e87c70945
+section HEADER.FIELDS.NOT 95 d72bc3a0b464307a488285184e84d703a1237f5ff4e32751d379e338b6a1c48f
+section 1 37 7186f89e944bcd621dc0723de2e5a89f6c17655905bf2a0d5aa17596c5fc11cc
+section 1.MIME 353 a676e3f32de1a77596f25c55319a3883e5290844bd1b5550c40629f4a4e51809

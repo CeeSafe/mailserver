@@ -1,0 +1,400 @@
+// The login check SMTP AUTH and IMAP LOGIN share: the brute-force guard (this process's memory, then the store's
+// record), the password check, and the bookkeeping of a good or bad login.
+
+import bcrypt.Bcrypt;
+import sha256.Sha256;
+import mstore.LoginRecord;
+import mstore.MailStore;
+
+/// Why a login was refused.
+public enum LoginRefusal {
+    /// The client's address is blocked; no password was checked.
+    Blocked,
+    /// An unknown user, a wrong password or a disabled account; `true` when this failure got the address blocked.
+    BadCredentials(bool),
+    /// The store could not look the account up: a temporary failure.
+    Unavailable,
+}
+
+/// The most bcrypt checks run at once. Each takes about 250 ms of one core (cost 12) on a thread of its own
+/// (`Async.blocking`); unbounded, a burst of logins takes every core and every other command waits for the
+/// scheduler (imaptest's stress mode, which logs in at every cycle, saw FETCH and STORE at 70 to 100 ms). Further
+/// logins wait their turn, so the rest of the server keeps its latency.
+const BCRYPT_AT_ONCE: usize = 4;
+
+/// What every login check of a process shares: the in-memory throttle, the dummy hash, and the bcrypt permits.
+@noncopy
+public struct LoginGuard {
+    public throttle: AuthThrottle;
+    /// A real bcrypt hash of nothing, checked when the account does not exist, so a login for an unknown address
+    /// takes as long as one for a known address and does not reveal which exist.
+    dummyHash: String;
+    /// `BCRYPT_AT_ONCE` permits; a check takes one and its `BcryptPermit` gives it back.
+    permits: Channel<bool>;
+    /// HTTP clients' verified logins (`checkRepeatedLogin`).
+    cache: LoginCache;
+
+    public fn create() -> Result<LoginGuard, AllocError> {
+        var random = [0u8; 16];
+        match (Random.fill(mut random[..])) {
+            Ok() => {}
+            Err(_) => {}
+        }
+        let dummy = match (Bcrypt.hash(random[..], 12)) {
+            Ok(h) => h,
+            Err(_) => { return Err(AllocError.OutOfMemory); }
+        };
+        let permits = match (Channel<bool>.create(BCRYPT_AT_ONCE)) {
+            Ok(c) => c,
+            Err(_) => { return Err(AllocError.OutOfMemory); }
+        };
+        for (i in 0..BCRYPT_AT_ONCE) {
+            match (permits.trySend(true)) {
+                Ok() => {}
+                Err(_) => {}
+            }
+        }
+        return Ok(LoginGuard {
+            throttle: AuthThrottle.create()?,
+            dummyHash: dummy,
+            permits: permits,
+            cache: LoginCache.create()?,
+        });
+    }
+
+    /// Waits for a bcrypt permit; null when the channel failed (then the check runs without one).
+    async fn permit(borrow this) -> BcryptPermit? {
+        match (this.permits.tryRecv()) {
+            Some(_) => { return BcryptPermit { home: this.permits.clone() }; }
+            null => {}
+        }
+        match (await this.permits.recvAsync()) {
+            Ok(Some(_)) => { return BcryptPermit { home: this.permits.clone() }; }
+            _ => { return null; }
+        }
+    }
+}
+
+/// Checks `password` against the bcrypt `hash` under a permit; an empty `hash` (no account) is checked against the
+/// dummy hash and fails, so it takes as long. For logins other than SMTP's and IMAP's (the admin API's).
+public async fn verifyPassword(guard: borrow LoginGuard, hash: StringView, password: Slice<u8>) -> bool {
+    let against = if (hash.length > 0) hash else guard.dummyHash.view();
+    let held = await guard.permit();
+    let matched: bool = await Async.blocking(() => Bcrypt.verify(password, against));
+    return matched && hash.length > 0;
+}
+
+/// A bcrypt hash (cost 12) of `password`, under a permit; null when out of memory.
+public async fn hashPassword(guard: borrow LoginGuard, password: Slice<u8>) -> String? {
+    let held = await guard.permit();
+    let made: Result<String, bcrypt.BcryptError> = await Async.blocking(() => Bcrypt.hash(password, 12));
+    return match (made) {
+        Ok(h) => h,
+        Err(_) => null,
+    };
+}
+
+/// A bcrypt permit taken from a `LoginGuard`; its drop gives it back, however the check ends (cancellation too).
+@noncopy
+struct BcryptPermit {
+    home: Channel<bool>;
+
+    drop {
+        match (this.home.trySend(true)) {
+            Ok() => {}
+            Err(_) => {}
+        }
+    }
+}
+
+/// A client's address as the guard counts it: IPv6 as it is, IPv4 mapped (`::ffff:a.b.c.d`), zeros when unknown.
+public fn peerBytes(address: SocketAddress?) -> [u8; 16] {
+    var key = [0u8; 16];
+    match (address) {
+        Some(SocketAddress.V4(a, _)) => {
+            key[10] = 0xff;
+            key[11] = 0xff;
+            for (i in 0..4) {
+                key[12 + i] = a[i];
+            }
+        }
+        Some(SocketAddress.V6(a, _, _)) => { key = a; }
+        null => {}
+    }
+    return key;
+}
+
+/// Whether `peer` (see `peerBytes`) may not try to log in now: this process's memory first (no round trip), then the
+/// store's record, which every server process shares and which survives restarts. When the store cannot answer,
+/// memory alone decides.
+public async fn loginBlocked(guard: borrow LoginGuard, store: borrow MailStore, peer: [u8; 16]) -> bool {
+    if (!(await guard.throttle.allows(guardAddress(peer), Clock.unixMillis()))) {
+        return true;
+    }
+    var key = Vector<u8>.create();
+    match (guardKey(peer, mut key)) {
+        Ok() => {}
+        Err(_) => { return false; }
+    }
+    match (await store.authBlocked(StringView.fromUtf8(key.view())!)) {
+        Ok(b) => { return b; }
+        Err(_) => { return false; }
+    }
+}
+
+/// Counts a failed login from `peer` as `user` (a malformed exchange included), in memory and in the store. True
+/// when the failure got the address blocked.
+public async fn loginFailed(
+    guard: borrow LoginGuard,
+    store: borrow MailStore,
+    peer: [u8; 16],
+    user: Slice<u8>,
+) -> bool {
+    await guard.throttle.failed(guardAddress(peer), Clock.unixMillis());
+    var key = Vector<u8>.create();
+    match (guardKey(peer, mut key)) {
+        Ok() => {}
+        Err(_) => { return false; }
+    }
+    let login = match (StringView.fromUtf8(user)) {
+        Some(u) => u,
+        null => "",
+    };
+    match (await store.authFailed(StringView.fromUtf8(key.view())!, login)) {
+        Ok(b) => { return b; }
+        Err(_) => { return false; }
+    }
+}
+
+/// The whole login check of `user` with `password` from `peer` (see `peerBytes`): the guard (`loginBlocked`), one
+/// bcrypt check (against the dummy hash when there is no such account), the account's `active` flag, and the
+/// bookkeeping (`loginFailed`, or clearing the address's failures and `recordLogin`). Gives the user id, with the
+/// account's address in `email`. The caller wipes `password`.
+public async fn checkLogin(
+    guard: borrow LoginGuard,
+    store: borrow MailStore,
+    peer: [u8; 16],
+    user: Slice<u8>,
+    password: Slice<u8>,
+    email: borrow mut Vector<u8>,
+) -> Result<i64, LoginRefusal> {
+    var record = LoginRecord.create();
+    await verifyLogin(guard, store, peer, user, password, mut record)?;
+    email.clear();
+    match (email.extend(record.email.view().bytes())) {
+        Ok() => {}
+        Err(_) => { return Err(LoginRefusal.Unavailable); }
+    }
+    return Ok(record.userId);
+}
+
+/// `checkLogin`, keeping the whole account record.
+async fn verifyLogin(
+    guard: borrow LoginGuard,
+    store: borrow MailStore,
+    peer: [u8; 16],
+    user: Slice<u8>,
+    password: Slice<u8>,
+    record: borrow mut LoginRecord,
+) -> Result<void, LoginRefusal> {
+    if (await loginBlocked(guard, store, peer)) {
+        return Err(LoginRefusal.Blocked);
+    }
+    var success = false;
+    match (StringView.fromUtf8(user)) {
+        Some(name) => {
+            match (await store.findLogin(name, mut record)) {
+                Ok(found) => {
+                    // Always one bcrypt check, against the dummy hash when there is no account.
+                    let hash = if (found) record.passwordHash.view() else guard.dummyHash.view();
+                    // The permit is held until the check ends, and goes back with this block.
+                    let held = await guard.permit();
+                    let matched: bool = await Async.blocking(() => Bcrypt.verify(password, hash));
+                    success = found && record.active && matched;
+                }
+                Err(_) => { return Err(LoginRefusal.Unavailable); }
+            }
+        }
+        null => {}
+    }
+    if (!success) {
+        return Err(LoginRefusal.BadCredentials(await loginFailed(guard, store, peer, user)));
+    }
+    await guard.throttle.succeeded(guardAddress(peer));
+    var key = Vector<u8>.create();
+    match (guardKey(peer, mut key)) {
+        Ok() => {
+            match (await store.authSucceeded(StringView.fromUtf8(key.view())!)) {
+                Ok() => {}
+                Err(_) => {}
+            }
+        }
+        Err(_) => {}
+    }
+    match (await store.recordLogin(record.userId)) {
+        Ok() => {}
+        Err(_) => {}
+    }
+    return Ok();
+}
+
+/// How long a verified HTTP login stays in the cache (`checkRepeatedLogin`), and how many are kept.
+const CACHE_MS: i64 = 900000;
+const CACHE_ENTRIES: usize = 4096;
+
+/// A login `checkRepeatedLogin` verified: a salted digest of its user name and password, never the password.
+struct CachedLogin {
+    digest: [u8; 32];
+    userId: i64;
+    /// The stored hash the password matched; the entry is worthless once the account's hash changes.
+    hash: String;
+    expires: i64;
+}
+
+/// The verified logins of HTTP clients, which send their password with every request.
+@noncopy
+struct LoginCache {
+    salt: [u8; 32];
+    entries: AsyncMutex<Vector<CachedLogin>>;
+
+    public fn create() -> Result<LoginCache, AllocError> {
+        var salt = [0u8; 32];
+        match (Random.fill(mut salt[..])) {
+            Ok() => {}
+            Err(_) => { return Err(AllocError.OutOfMemory); }
+        }
+        return Ok(LoginCache { salt: salt, entries: AsyncMutex<Vector<CachedLogin>>.create(Vector<CachedLogin>.create())? });
+    }
+
+    fn digestOf(borrow this, user: Slice<u8>, password: Slice<u8>) -> [u8; 32]? {
+        var input = Vector<u8>.create();
+        let built = joined(mut input, this.salt[..], user, password);
+        let digest = Sha256.hash(input.view());
+        for (i in 0..input.length) {
+            input[i] = 0;
+        }
+        return if (built) digest else null;
+    }
+}
+
+fn joined(input: borrow mut Vector<u8>, salt: Slice<u8>, user: Slice<u8>, password: Slice<u8>) -> bool {
+    match (input.extend(salt)) {
+        Ok() => {}
+        Err(_) => { return false; }
+    }
+    match (input.extend(user)) {
+        Ok() => {}
+        Err(_) => { return false; }
+    }
+    match (input.push(0)) {
+        Ok() => {}
+        Err(_) => { return false; }
+    }
+    match (input.extend(password)) {
+        Ok() => {}
+        Err(_) => { return false; }
+    }
+    return true;
+}
+
+fn sameDigest(a: [u8; 32], b: [u8; 32]) -> bool {
+    var differ: u8 = 0;
+    for (i in 0..32) {
+        differ = differ | (a[i] ^ b[i]);
+    }
+    return differ == 0;
+}
+
+/// `checkLogin` for clients that send the password with every request (HTTP Basic: ActiveSync, EWS, CalDAV): the
+/// same user name and password, verified in the last 15 minutes against the hash the account still has, pass
+/// without another bcrypt check, and without the bookkeeping. A phone's Ping and Sync every few minutes would
+/// otherwise each take a bcrypt check (about 250 ms of a core).
+public async fn checkRepeatedLogin(
+    guard: borrow LoginGuard,
+    store: borrow MailStore,
+    peer: [u8; 16],
+    user: Slice<u8>,
+    password: Slice<u8>,
+    email: borrow mut Vector<u8>,
+) -> Result<i64, LoginRefusal> {
+    let cache = borrow guard.cache;
+    let now = Clock.unixMillis();
+    let digest = match (cache.digestOf(user, password)) {
+        Some(d) => d,
+        null => { return Err(LoginRefusal.Unavailable); }
+    };
+    var cachedUser: i64 = 0;
+    var cachedHash = String.create();
+    {
+        var held = match (await cache.entries.lock()) {
+            Ok(g) => g,
+            Err(_) => { return Err(LoginRefusal.Unavailable); }
+        };
+        let list = held.data();
+        for (i in 0..list.length) {
+            if (list[i].expires > now && sameDigest(list[i].digest, digest)) {
+                cachedUser = list[i].userId;
+                match (cachedHash.append(list[i].hash.view())) {
+                    Ok() => {}
+                    Err(_) => { cachedUser = 0; }
+                }
+                break;
+            }
+        }
+    }
+    var record = LoginRecord.create();
+    if (cachedUser != 0) {
+        let name = match (StringView.fromUtf8(user)) {
+            Some(n) => n,
+            null => "",
+        };
+        match (await store.findLogin(name, mut record)) {
+            Ok(true) => {
+                if (record.active && record.userId == cachedUser && record.passwordHash.view() == cachedHash.view()) {
+                    email.clear();
+                    match (email.extend(record.email.view().bytes())) {
+                        Ok() => { return Ok(cachedUser); }
+                        Err(_) => { return Err(LoginRefusal.Unavailable); }
+                    }
+                }
+            }
+            Ok(false) => {}
+            Err(_) => { return Err(LoginRefusal.Unavailable); }
+        }
+        record = LoginRecord.create();
+    }
+    await verifyLogin(guard, store, peer, user, password, mut record)?;
+    email.clear();
+    match (email.extend(record.email.view().bytes())) {
+        Ok() => {}
+        Err(_) => { return Err(LoginRefusal.Unavailable); }
+    }
+    var hash = String.create();
+    match (hash.append(record.passwordHash.view())) {
+        Ok() => {}
+        Err(_) => { return Ok(record.userId); }
+    }
+    var held = match (await cache.entries.lock()) {
+        Ok(g) => g,
+        Err(_) => { return Ok(record.userId); }
+    };
+    let list = held.data();
+    // Expired entries and those of this login go; when full, the oldest goes.
+    list.retain((e) => e.expires > now && !sameDigest(e.digest, digest));
+    if (list.length >= CACHE_ENTRIES) {
+        var oldest: usize = 0;
+        for (j in 0..list.length) {
+            if (list[j].expires < list[oldest].expires) {
+                oldest = j;
+            }
+        }
+        let last = list.length - 1;
+        list.swap(oldest, last);
+        list.pop();
+    }
+    match (list.push(CachedLogin { digest: digest, userId: record.userId, hash: hash, expires: now + CACHE_MS })) {
+        Ok() => {}
+        Err(_) => {}
+    }
+    return Ok(record.userId);
+}

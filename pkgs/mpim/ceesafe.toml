@@ -1,0 +1,13 @@
+[package]
+name = "mpim"
+version = "0.1.0"
+kind = "library"
+tests = ["tests"]
+
+[dependencies]
+mhttp = { path = "../mhttp" }
+msmtp = { path = "../msmtp" }
+mstore = { path = "../mstore" }
+postgres = { path = "../../../PostgresClient" }
+encoding = { path = "../../../../CeeSafeLibs/encoding" }
+sha256 = { path = "../../../../CeeSafeLibs/sha256" }

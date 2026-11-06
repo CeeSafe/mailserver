@@ -1,0 +1,33 @@
+// The accept loop: one task per connection, on any worker of `Async.runWorkers`, at most `limit` at once.
+
+/// Serves connections from `listener` until cancelled. At `limit` connections, accepting waits for one to end, so a
+/// flood queues in the kernel's backlog rather than in memory.
+public async fn serve(
+    listener: borrow AsyncTcpListener,
+    mode: SmtpMode,
+    context: Arc<SmtpContext>,
+    limit: u32,
+) -> Result<void, Fault> {
+    return await Async.tasks(limit, Fault.OutOfMemory, async (set) => {
+        loop {
+            let stream = match (await listener.accept()) {
+                Ok(s) => s,
+                Err(AsyncError.Cancelled) => { return Ok(); }
+                Err(_) => {
+                    // EMFILE and the like: back off briefly rather than spin.
+                    match (await Timer.sleep(100)) {
+                        Ok() => {}
+                        Err(_) => { return Ok(); }
+                    }
+                    continue;
+                }
+            };
+            let shared = context.clone();
+            // The child owns its captures and moves the stream into the session.
+            match (await set.spawnSend(async move () => await serveConnection(shared.get(), stream, mode))) {
+                Ok() => {}
+                Err(_) => { return Ok(); }
+            }
+        }
+    });
+}

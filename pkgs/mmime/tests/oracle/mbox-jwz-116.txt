@@ -1,0 +1,18 @@
+size 3972
+envelope ("Fri, 07 Mar 1997 02:51:07 -0800" "forwarded encrypted message (mult/mixed)" (("Jamie Zawinski" NIL "jwz" "netscape.com")) (("Jamie Zawinski" NIL "jwz" "netscape.com")) (("Jamie Zawinski" NIL "jwz" "netscape.com")) (("Jamie Zawinski" NIL "jwz" "netscape.com")) NIL NIL NIL "<331FF31B.ABD@netscape.com>")
+bodystructure (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 16 1 NIL NIL NIL NIL) ("message" "rfc822" ("name" "smime18-encrypted.msg") NIL NIL "7bit" 2854 ("Fri, 13 Dec 1996 15:09:42 -0800" "Re: can you send me an encrypted message?" (("Blake Ramsdell" NIL "blaker" "craswell.com")) (("Blake Ramsdell" NIL "blaker" "craswell.com")) (("Blake Ramsdell" NIL "blaker" "craswell.com")) (("Jamie Zawinski" NIL "jwz" "netscape.com")) NIL NIL NIL "<3.0.32.19961213150855.009172e0@mail.craswell.com>") ("application" "x-pkcs7-mime" ("name" "smime.p7m") NIL NIL "base64" 1452 NIL ("attachment" ("filename" "smime.p7m")) NIL NIL) 43 NIL ("inline" ("filename" "smime18-encrypted.msg")) NIL NIL) "mixed" ("boundary" "------------31DF237C2F1C") NIL NIL NIL)
+body (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 16 1) ("message" "rfc822" ("name" "smime18-encrypted.msg") NIL NIL "7bit" 2854 ("Fri, 13 Dec 1996 15:09:42 -0800" "Re: can you send me an encrypted message?" (("Blake Ramsdell" NIL "blaker" "craswell.com")) (("Blake Ramsdell" NIL "blaker" "craswell.com")) (("Blake Ramsdell" NIL "blaker" "craswell.com")) (("Jamie Zawinski" NIL "jwz" "netscape.com")) NIL NIL NIL "<3.0.32.19961213150855.009172e0@mail.craswell.com>") ("application" "x-pkcs7-mime" ("name" "smime.p7m") NIL NIL "base64" 1452) 43) "mixed")
+section HEADER 727 190b4307f6a66f599e5fd323b75341b832f2be3421699b3e67e94324b9469824
+section TEXT 3245 8e81638e4b009007480ec2cfe2a1a8213dba864b536d3e0951754e19743e3e08
+section HEADER.FIELDS 281 35f95b3b82ebc5764a873404dbd3ca534f807cb246079eb65628439a1740f1c5
+section HEADER.FIELDS.NOT 448 fe9300b8f01ee1f9321df19a7b944945c5a98ed7aa8e73f78bdd118f32a27c96
+section 1 16 579de681add9f8c686fa791c49d1222a63c236febff37769b5fb50659b007491
+section 1.MIME 79 0c7232bcecc3ffb84bb1ae647f2ba1256591d4391f0f1b8a41938a97660cddcb
+section 2 2854 eddaa3b3f367719c60a7bc605b7ad7881598686e21514ce9b10e96125defec92
+section 2.MIME 158 bfeee0d9752291c33250ff7d84debe009ad8745a3835114b05a5b5f636b9e83c
+section 2.HEADER 1402 29e247b7d3210b7a33d6ca5e98bd178e173b94bdaa5f098bddfcce581776a773
+section 2.TEXT 1452 a7e7aaf95782dc1fae6ac1459a0ad873d0e80f9e2d71ee9a160c11657a785337
+section 2.HEADER.FIELDS 300 ac0cb98bca68a1d26acd8aee68df63860c85afcce954ba30042ed180f899e724
+section 2.HEADER.FIELDS.NOT 1104 7b74745b086a21f2f00055e2ebe2a6c72b57879ee839d010d385b2bca871d8a2
+section 2.1 1452 a7e7aaf95782dc1fae6ac1459a0ad873d0e80f9e2d71ee9a160c11657a785337
+section 2.1.MIME 1402 29e247b7d3210b7a33d6ca5e98bd178e173b94bdaa5f098bddfcce581776a773

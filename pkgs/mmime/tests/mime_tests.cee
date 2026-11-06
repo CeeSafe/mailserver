@@ -1,0 +1,322 @@
+// Unit tests with messages written inline. The corpus differential against Dovecot is tools/differential.py.
+
+fn scan(text: StringView) -> MessageIndex {
+    var scanner = MimeScanner.create();
+    scanner.feed(text.bytes())!;
+    var index = MessageIndex.create();
+    scanner.finish(mut index)!;
+    return index;
+}
+
+fn structureOf(index: borrow MessageIndex, extensible: bool) -> String {
+    var renderer = Renderer.create();
+    var out = Vector<u8>.create();
+    renderer.structure(index, 0, extensible, mut out)!;
+    var s = String.create();
+    s.append(StringView.fromUtf8(out.view())!)!;
+    return s;
+}
+
+fn envelopeOf(index: borrow MessageIndex) -> String {
+    var renderer = Renderer.create();
+    var out = Vector<u8>.create();
+    renderer.envelope(index, 0, mut out)!;
+    var s = String.create();
+    s.append(StringView.fromUtf8(out.view())!)!;
+    return s;
+}
+
+/// The bytes of `[start, end)` of `text`.
+fn range(text: StringView, start: u64, end: u64) -> StringView {
+    let bytes = text.bytes();
+    return StringView.fromUtf8(bytes[truncate<usize>(start)..truncate<usize>(end)])!;
+}
+
+fn section(index: borrow MessageIndex, numbers: Slice<u32>) -> Part {
+    let p = partAt(index, numbers)!;
+    if (p == NO_PART) {
+        Console.writeErrorLine("no such section");
+        Process.exit(1);
+    }
+    return index.parts[p];
+}
+
+@test
+fn readsAPlainMessage() -> Result<void, TestFailure> {
+    let text = "From: a@b.example\r\nSubject: hi\r\n\r\nline one\r\nline two\r\n";
+    let index = scan(text);
+    Check.isTrue(index.parts.length == 1 && index.size == text.length as u64, "one part")?;
+    let root = index.parts[0];
+    Check.isTrue(
+        range(text, root.headerStart, root.bodyStart) == "From: a@b.example\r\nSubject: hi\r\n\r\n",
+        "header",
+    )?;
+    Check.isTrue(range(text, root.bodyStart, root.bodyEnd) == "line one\r\nline two\r\n", "body")?;
+    Check.isTrue(root.lines == 2, "two lines")?;
+    let one = [1u32];
+    Check.isTrue(partAt(index, one[..])! == 0, "part 1 is the body")?;
+    let s = structureOf(index, false);
+    return Check.isTrue(s.view() == "(\"text\" \"plain\" (\"charset\" \"us-ascii\") NIL NIL \"7bit\" 20 2)", "BODY");
+}
+
+@test
+fn splitsMultipartsAtTheirBoundaries() -> Result<void, TestFailure> {
+    let text =
+        "Content-Type: multipart/mixed; boundary=\"b1\"\r\n\r\npreamble\r\n--b1\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nfirst\r\n\r\n--b1 \r\n\r\nsecond, no type\r\n--b1--\r\nepilogue\r\n";
+    let index = scan(text);
+    let one = [1u32];
+    let two = [2u32];
+    let a = section(index, one[..]);
+    let b = section(index, two[..]);
+    // The line break before a boundary belongs to the boundary.
+    Check.isTrue(range(text, a.bodyStart, a.bodyEnd) == "first\r\n", "part 1")?;
+    Check.isTrue(
+        range(text, a.headerStart, a.bodyStart) == "Content-Type: text/plain; charset=utf-8\r\n\r\n",
+        "1.MIME",
+    )?;
+    Check.isTrue(range(text, b.bodyStart, b.bodyEnd) == "second, no type", "part 2, a delimiter with trailing space")?;
+    Check.isTrue(a.lines == 1 && b.lines == 0, "lines are LFs in the body")?;
+    let three = [3u32];
+    Check.isTrue(partAt(index, three[..])! == NO_PART, "no part 3")?;
+    let s = structureOf(index, true);
+    let want =
+        "((\"text\" \"plain\" (\"charset\" \"utf-8\") NIL NIL \"7bit\" 7 1 NIL NIL NIL NIL)(\"text\" \"plain\" (\"charset\" \"us-ascii\") NIL NIL \"7bit\" 15 0 NIL NIL NIL NIL) \"mixed\" (\"boundary\" \"b1\") NIL NIL NIL)";
+    return Check.isTrue(s.view() == want, "BODYSTRUCTURE");
+}
+
+@test
+fn readsEncapsulatedMessages() -> Result<void, TestFailure> {
+    let text =
+        "Content-Type: multipart/mixed; boundary=outer\r\n\r\n--outer\r\nContent-Type: message/rfc822\r\n\r\nSubject: inner\r\nContent-Type: multipart/alternative; boundary=inner\r\n\r\n--inner\r\n\r\nplain\r\n--inner\r\nContent-Type: text/html\r\n\r\n<p>html</p>\r\n--inner--\r\n\r\n--outer--\r\n";
+    let index = scan(text);
+    let n2 = [1u32];
+    let message = section(index, n2[..]);
+    Check.isTrue(message.kind == PART_MESSAGE, "message/rfc822")?;
+    let inner = index.parts[partAt(index, n2[..])! + 1];
+    Check.isTrue(inner.isMessage && inner.kind == PART_MULTIPART, "an encapsulated multipart")?;
+    let html = [1u32, 2];
+    let h = section(index, html[..]);
+    Check.isTrue(range(text, h.bodyStart, h.bodyEnd) == "<p>html</p>", "1.2 inside the message")?;
+    // The message part runs to the outer boundary, less its line break.
+    Check.isTrue(range(text, message.bodyStart, message.bodyEnd).endsWith("--inner--\r\n"), "message end")?;
+    let deeper = [1u32, 2, 1];
+    Check.isTrue(partAt(index, deeper[..])! == NO_PART, "a leaf has no parts")?;
+    let s = structureOf(index, false);
+    return Check.isTrue(
+        s.view().contains("\"message\" \"rfc822\" NIL NIL NIL \"7bit\"") && s.view().contains("\"alternative\")"),
+        "body-type-msg",
+    );
+}
+
+@test
+fn defaultsDigestPartsToMessages() -> Result<void, TestFailure> {
+    let text = "Content-Type: multipart/digest; boundary=d\r\n\r\n--d\r\n\r\nSubject: one\r\n\r\nbody one\r\n--d--\r\n";
+    let index = scan(text);
+    let one = [1u32];
+    let p = section(index, one[..]);
+    Check.isTrue(p.kind == PART_MESSAGE, "a digest part is a message")?;
+    let s = structureOf(index, false);
+    return Check.isTrue(s.view().startsWith("((\"message\" \"rfc822\" NIL"), "rendered as one");
+}
+
+@test
+fn survivesBrokenStructure() -> Result<void, TestFailure> {
+    // No close delimiter: the last part runs to the end.
+    let open = scan("Content-Type: multipart/mixed; boundary=x\r\n\r\n--x\r\n\r\nunfinished\r\n");
+    let one = [1u32];
+    let last = section(open, one[..]);
+    Check.isTrue(last.bodyEnd == open.size, "runs to the end")?;
+    // A multipart with no parts gets one empty part.
+    let empty = scan("Content-Type: multipart/mixed; boundary=x\r\n\r\nnothing here\r\n");
+    Check.isTrue(
+        empty.parts.length == 2 && section(empty, one[..]).bodyEnd == section(empty, one[..]).bodyStart,
+        "an empty part",
+    )?;
+    // A header that never ends, and a message that is only header.
+    let headless = scan("Subject: no body");
+    Check.isTrue(headless.parts[0].bodyStart == headless.size, "all header")?;
+    let none = scan("");
+    return Check.isTrue(none.parts.length == 1 && none.size == 0, "an empty message");
+}
+
+@test
+fn capsNestingDepth() -> Result<void, TestFailure> {
+    var text = String.create();
+    for (i in 0..200) {
+        text.append("Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\n")!;
+    }
+    text.append("\r\nbottom\r\n")!;
+    let index = scan(text.view());
+    var deepest: u32 = 0;
+    for (i in 0..index.parts.length) {
+        if (index.parts[i].depth > deepest) {
+            deepest = index.parts[i].depth;
+        }
+    }
+    Check.isTrue(deepest <= 65, "depth is capped")?;
+    let s = structureOf(index, true);
+    return Check.isTrue(s.length > 0, "it still renders");
+}
+
+@test
+fn handlesHugeLines() -> Result<void, TestFailure> {
+    var text = String.create();
+    text.append("Content-Type: multipart/mixed; boundary=z\r\nX-Long: ")!;
+    for (i in 0..5000) {
+        text.append("0123456789")!;
+    }
+    text.append("\r\n\r\n--z\r\n\r\n")!;
+    for (i in 0..10000) {
+        text.append("abcdefghij")!;
+    }
+    text.append("\r\n--z--\r\n")!;
+    let index = scan(text.view());
+    let one = [1u32];
+    let p = section(index, one[..]);
+    Check.isTrue(p.bodyEnd - p.bodyStart == 100000, "a 100 KB line is one body line")?;
+    return Check.isTrue(index.headerBlock(0).length <= 64 * 1024, "huge header lines are cut");
+}
+
+@test
+fn streamsInAnyChunks() -> Result<void, TestFailure> {
+    let text =
+        "From: \"A B\" <a@b.example>\r\nContent-Type: multipart/mixed; boundary=\"=-x\"\r\n\r\n--=-x\r\nContent-Type: text/plain\r\n\r\nhello\r\n--=-x\r\nContent-Type: message/rfc822\r\n\r\nSubject: in\r\n\r\ninner\r\n--=-x--\r\n";
+    let whole = scan(text);
+    var renderer = Renderer.create();
+    var expected = Vector<u8>.create();
+    encodeMeta(whole, mut renderer, mut expected)!;
+    for (c in 1..12) {
+        let chunk = truncate<usize>(c);
+        var scanner = MimeScanner.create();
+        let bytes = text.bytes();
+        var at: usize = 0;
+        while (at < bytes.length) {
+            let end = if (at + chunk > bytes.length) bytes.length else at + chunk;
+            scanner.feed(bytes[at..end])!;
+            at = end;
+        }
+        var index = MessageIndex.create();
+        scanner.finish(mut index)!;
+        var got = Vector<u8>.create();
+        encodeMeta(index, mut renderer, mut got)!;
+        Check.isTrue(got.length == expected.length && got.view().startsWith(expected.view()), "same meta")?;
+    }
+    return Ok();
+}
+
+@test
+fn refusesDamagedMeta() -> Result<void, TestFailure> {
+    let index = scan("Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\n\r\none\r\n--b\r\n\r\ntwo\r\n--b--\r\n");
+    var renderer = Renderer.create();
+    var stored = Vector<u8>.create();
+    encodeMeta(index, mut renderer, mut stored)!;
+    var meta = MessageMeta.create();
+    Check.isTrue(meta.read(stored.view())!, "it reads back")?;
+    Check.isTrue(meta.parts.length == 3 && meta.size == index.size, "parts and size")?;
+    let two = [2u32];
+    let p = meta.partAt(two[..])!;
+    Check.isTrue(p == 2 && meta.parts[p].bodyEnd == index.parts[2].bodyEnd, "section 2")?;
+    Check.isTrue(metaBody(meta, stored.view()).startsWith("((\"text\"".bytes()), "BODY")?;
+    // Every truncation is refused.
+    for (n in 0..stored.length) {
+        Check.isTrue(!meta.read(stored[0..n])!, "a truncated value")?;
+    }
+    // Every single-byte change either reads as a consistent value or is refused; none crashes.
+    for (i in 0..stored.length) {
+        let saved = stored[i];
+        for (flip in 1..9) {
+            stored[i] = saved ^ (truncate<u8>(1u32 << (truncate<u32>(flip) - 1)));
+            match (meta.read(stored.view())) {
+                Ok(true) => {
+                    for (k in 0..meta.parts.length) {
+                        Check.isTrue(meta.parts[k].bodyEnd <= meta.size, "offsets inside the message")?;
+                    }
+                }
+                Ok(false) => {}
+                Err(_) => { return Check.fail("allocation failed"); }
+            }
+        }
+        stored[i] = saved;
+    }
+    return Ok();
+}
+
+@test
+fn readsAddresses() -> Result<void, TestFailure> {
+    let text =
+        "From: \"Doe, John\" <john@EXAMPLE.org>\r\nTo: friends: a@x.example, \"b c\"@y.example;, (Comment Name) c@z.example\r\nCc: <@relay.example:d@w.example>, nobody\r\nSubject:  spaced   out\r\n\r\n";
+    let e = envelopeOf(scan(text));
+    let want =
+        "(NIL \"spaced out\" ((\"Doe, John\" NIL \"john\" \"example.org\")) ((\"Doe, John\" NIL \"john\" \"example.org\")) ((\"Doe, John\" NIL \"john\" \"example.org\")) ((NIL NIL \"friends\" NIL)(NIL NIL \"a\" \"x.example\")(NIL NIL \"b c\" \"y.example\")(NIL NIL NIL NIL)(\"Comment Name\" NIL \"c\" \"z.example\")) ((NIL \"@relay.example\" \"d\" \"w.example\")(NIL NIL \"nobody\" \"MISSING_DOMAIN\")) NIL NIL NIL)";
+    if (e.view() != want) {
+        Console.writeErrorLine(e.view());
+    }
+    return Check.isTrue(e.view() == want, "ENVELOPE");
+}
+
+@test
+fn emptySenderIsFrom() -> Result<void, TestFailure> {
+    // RFC 3501 §7.4.2: a Sender or Reply-To that is present but empty is the From (imaptest's fetch-envelope).
+    let e = envelopeOf(scan("From: user@domain (Real Name)\r\nSender: \r\nReply-To: (nobody)\r\n\r\nbody\r\n"));
+    let from = "((\"Real Name\" NIL \"user\" \"domain\"))";
+    var want = String.create();
+    want.append("(NIL NIL ")!;
+    want.append(from)!;
+    want.append(" ")!;
+    want.append(from)!;
+    want.append(" ")!;
+    want.append(from)!;
+    want.append(" NIL NIL NIL NIL NIL)")!;
+    if (e.view() != want.view()) {
+        Console.writeErrorLine(e.view());
+    }
+    return Check.isTrue(e.view() == want.view(), "an empty Sender and Reply-To");
+}
+
+/// `appendHeaderFields` of `block` for the space-separated `list`, as text.
+fn fieldsOf(block: StringView, list: StringView, not: bool) -> String {
+    var names = Vector<Vector<u8>>.create();
+    for (word in list.split(" ")) {
+        var name = Vector<u8>.create();
+        name.extend(word.bytes())!;
+        names.push(name)!;
+    }
+    var out = Vector<u8>.create();
+    appendHeaderFields(block.bytes(), names, not, mut out)!;
+    var s = String.create();
+    s.append(StringView.fromUtf8(out.view())!)!;
+    return s;
+}
+
+@test
+fn selectsHeaderFields() -> Result<void, TestFailure> {
+    let block = "Received: from a\r\n\tby b\r\nFrom: A <a@example.org>\r\nno colon here\r\nSUBJECT : Hi\r\n  there\r\nTo: b@example.org\r\nsubject: again\r\n\r\n";
+    Check.isTrue(
+        fieldsOf(block, "subject from", false).view() ==
+        "From: A <a@example.org>\r\nSUBJECT : Hi\r\n  there\r\nsubject: again\r\n\r\n",
+        "the named fields, in order, folding kept",
+    )?;
+    Check.isTrue(
+        fieldsOf(block, "Subject FROM", true).view() ==
+        "Received: from a\r\n\tby b\r\nno colon here\r\nTo: b@example.org\r\n\r\n",
+        "the others, and the line without a name",
+    )?;
+    Check.isTrue(fieldsOf(block, "Cc", false).view() == "\r\n", "none: the blank line alone")?;
+    Check.isTrue(fieldsOf(block, "Fro", false).view() == "\r\n", "whole names only")?;
+    // A message that is all header has no blank line; a block cut short still ends its last line.
+    Check.isTrue(fieldsOf("To: x\nCc: y", "cc to", false).view() == "To: x\nCc: y\r\n", "a block cut short")?;
+    Check.isTrue(fieldsOf("To: x\r\nCc: y\r\n", "cc", true).view() == "To: x\r\n", "no blank line")?;
+    Check.isTrue(fieldsOf("To: x\n\n", "to", false).view() == "To: x\n\r\n", "a bare LF blank line")?;
+    Check.isTrue(fieldsOf("\r\n", "to", true).view() == "\r\n", "an empty header")?;
+    Check.isTrue(fieldsOf("", "to", true).view() == "", "no header")?;
+    // Appends, as FETCH builds one response.
+    var names = Vector<Vector<u8>>.create();
+    var to = Vector<u8>.create();
+    to.extend("to".bytes())!;
+    names.push(to)!;
+    var out = Vector<u8>.create();
+    out.extend("{".bytes())!;
+    appendHeaderFields(block.bytes(), names, false, mut out)!;
+    Check.isTrue(out.view() == "{To: b@example.org\r\n\r\n".bytes(), "appends")?;
+    return Ok();
+}

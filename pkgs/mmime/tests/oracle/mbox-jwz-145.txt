@@ -1,0 +1,10 @@
+size 187488
+envelope ("Mon, 16 Sep 1996 19:48:37 -0700" "Object Model Overviews" (("Scott Isaacs" NIL "scotti" "microsoft.com")) ((NIL NIL "html-erb-request" "w3.org")) (("Scott Isaacs" NIL "scotti" "microsoft.com")) (("'html-erb@w3.org'" NIL "html-erb" "w3.org")) (("Laurie Anna Edlund (Kaplan)" NIL "lakaplan" "microsoft.com")) NIL NIL "<c=US%a=_%p=msft%l=RED-99-MSG-960917024837Z-12886@mail2.microsoft.com>")
+bodystructure ("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 185750 2951 NIL NIL NIL NIL)
+body ("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 185750 2951)
+section HEADER 1738 9a605da9d3958c79d7d1c1dfdd36344e9c55047e88eababadc7ebf1f91b1de08
+section TEXT 185750 09682330cae7b2385e16f613a13d8765dbc7e3ed8757ef2b6bbcabfd428d6fe8
+section HEADER.FIELDS 304 41aa6663445b94aa2b13b488d10558a3d49c42a0d43ec95cb80687a6bcf22bcd
+section HEADER.FIELDS.NOT 1436 b84440e1e6dc36b6ad4d98c3ccb62d49d461e57dd1921590cb5d2d4bfbeb384b
+section 1 185750 09682330cae7b2385e16f613a13d8765dbc7e3ed8757ef2b6bbcabfd428d6fe8
+section 1.MIME 1738 9a605da9d3958c79d7d1c1dfdd36344e9c55047e88eababadc7ebf1f91b1de08

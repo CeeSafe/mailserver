@@ -1,0 +1,10 @@
+size 3613
+envelope ("Fri, 25 Sep 92 14:13:02 PDT" "More richtext questions/comments" ((NIL NIL "develop!nextmime" "ebony")) ((NIL NIL "develop!nextmime" "ebony")) ((NIL NIL "develop!nextmime" "ebony")) ((NIL NIL "MISSING_MAILBOX" "develop")) ((NIL NIL "robb" "develop")) NIL NIL "<9209252113.AA00975@ ebony >")
+bodystructure (("text" "richtext" ("charset" "us-ascii") NIL NIL "7bit" 2626 96 NIL NIL NIL NIL) "mixed" ("boundary" "tmrob") NIL NIL NIL)
+body (("text" "richtext" ("charset" "us-ascii") NIL NIL "7bit" 2626 96) "mixed")
+section HEADER 932 9687760aa26c00c2743680fec3bba143e3eabe6caed972cc70df2408f7963891
+section TEXT 2681 8de81fa4fd215e5ecc94145e7f31a6407a5e3a0a95c906d0597d3dd96c883c1f
+section HEADER.FIELDS 280 03ed6f46bfd0d4d7d2cb3fedc5574e896b14f443272ae1f4a523250f89418e74
+section HEADER.FIELDS.NOT 654 42dabb5086dedc51e84bc3e23d2273f5c98f61d8fbdd73a74ea0f0daadcde172
+section 1 2626 112d93067c9fdb49eb610f61d55ec7eea17becb89ffba8834ce0553655de05b0
+section 1.MIME 31 54336d449be3b98ba1be6bdd152a1b2b50a7aefd44228ffe397602ab5e498653

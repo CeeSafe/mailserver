@@ -1,0 +1,106 @@
+// Paths, hrefs and the XML helpers of the DAV side.
+
+import mhttp.Request;
+import mxml.XmlWriter;
+import mxml.parseXml;
+
+fn target(path: StringView) -> DavPath {
+    var t = DavPath.create();
+    parseTarget(path, mut t)!;
+    return t;
+}
+
+@test
+fn readsPaths() -> Result<void, TestFailure> {
+    Check.isTrue(target("/dav").kind == T_ROOT && target("/dav/").kind == T_ROOT, "the root")?;
+    Check.isTrue(target("/dav/principals/").kind == T_PRINCIPALS, "the principals")?;
+    let p = target("/dav/principals/Jane%40Example.org/");
+    Check.isTrue(p.kind == T_PRINCIPAL && p.email.view() == "jane@example.org", "a principal, decoded and lowercased")?;
+    Check.isTrue(target("/dav/principals/users/a@b.c/").email.view() == "a@b.c", "the C# server's users/ form")?;
+    Check.isTrue(target("/dav/calendars/a@b.c").kind == T_CAL_HOME, "a calendar home")?;
+    let cal = target("/dav/calendars/a@b.c/work%20stuff/");
+    Check.isTrue(cal.kind == T_CALENDAR && cal.collection.view() == "work stuff", "a calendar")?;
+    let ev = target("/dav/calendars/a@b.c/Default/x%2By.ics");
+    Check.isTrue(ev.kind == T_CAL_OBJECT && ev.href.view() == "x+y.ics", "an object")?;
+    Check.isTrue(target("/dav/contacts/a@b.c/Default/j.vcf").kind == T_CARD, "a vCard")?;
+    Check.isTrue(target("/dav/contacts/a@b.c/").kind == T_CARD_HOME, "a contacts home")?;
+    Check.isTrue(target("/dav/calendars/a@b.c/x/y/z").kind == T_UNKNOWN, "too deep")?;
+    Check.isTrue(target("/dav/files/").kind == T_UNKNOWN, "another area")?;
+    Check.isTrue(target("/other").kind == T_UNKNOWN, "not /dav")?;
+    return Ok();
+}
+
+@test
+fn writesHrefs() -> Result<void, TestFailure> {
+    var s = String.create();
+    objectHref(true, "a@b.c", "work stuff", "ü 1.ics", mut s)!;
+    Check.isTrue(s.view() == "/dav/calendars/a@b.c/work%20stuff/%C3%BC%201.ics", "encoded segments")?;
+    collectionHref(false, "a@b.c", "", mut s)!;
+    Check.isTrue(s.view() == "/dav/contacts/a@b.c/", "a home")?;
+    principalHref("a@b.c", mut s)!;
+    Check.isTrue(s.view() == "/dav/principals/a@b.c/", "a principal")?;
+    lastSegment("https://h.example/dav/calendars/a@b.c/Default/x%20y.ics", mut s)!;
+    Check.isTrue(s.view() == "x y.ics", "the last segment of a URL")?;
+    lastSegment("/dav/calendars/a@b.c/Default/", mut s)!;
+    Check.isTrue(s.view() == "Default", "a trailing slash")?;
+    return Ok();
+}
+
+@test
+fn namesProperties() -> Result<void, TestFailure> {
+    var name = String.create();
+    Check.isTrue(qualifiedName("DAV:", "getetag", mut name)! && name.view() == "D:getetag", "DAV")?;
+    Check.isTrue(qualifiedName(NS_CAL, "calendar-data", mut name)! && name.view() == "C:calendar-data", "CalDAV")?;
+    Check.isTrue(!qualifiedName("urn:x", "y", mut name)! && name.view() == "X:y", "an unknown namespace")?;
+    var w = XmlWriter.create();
+    w.start("D:prop");
+    w.attribute("xmlns:D", "DAV:");
+    emptyNamed(mut w, "urn:x", "thing")!;
+    w.end();
+    let bytes = w.finish()!;
+    let doc = match (parseXml(bytes.view())) {
+        Ok(d) => d,
+        Err(_) => { return Err(TestFailure.create("the fragment parses")); }
+    };
+    Check.isTrue(doc.find(doc.root(), "urn:x", "thing") != null, "the unknown namespace is declared")?;
+    return Ok();
+}
+
+@test
+fn readsPropRequests() -> Result<void, TestFailure> {
+    let body = "<propfind xmlns='DAV:' xmlns:c='urn:ietf:params:xml:ns:caldav'><prop><getetag/><c:calendar-data/></prop></propfind>";
+    let doc = match (parseXml(body.bytes())) {
+        Ok(d) => d,
+        Err(_) => { return Err(TestFailure.create("parses")); }
+    };
+    var asked = PropRequest.create();
+    readPropRequest(doc, doc.root(), mut asked)!;
+    Check.isTrue(asked.mode == ASK_PROPS && asked.names.length == 2, "two properties")?;
+    Check.isTrue(asked.wantsData(), "calendar-data")?;
+    let all = match (parseXml("<propfind xmlns='DAV:'><allprop/></propfind>".bytes())) {
+        Ok(d) => d,
+        Err(_) => { return Err(TestFailure.create("parses")); }
+    };
+    var everything = PropRequest.create();
+    readPropRequest(all, all.root(), mut everything)!;
+    Check.isTrue(everything.mode == ASK_ALL && !everything.wantsData(), "allprop")?;
+    var defaults = PropRequest.create();
+    defaultProps(T_CALENDAR, mut defaults)!;
+    Check.isTrue(!defaults.wantsData() && defaults.names.length > 8, "allprop leaves the data out")?;
+    return Ok();
+}
+
+@test
+fn readsEtagHeaders() -> Result<void, TestFailure> {
+    var request = Request.create();
+    match (request.parseHeaderLine("If-Match: W/\"abc\"".bytes())) {
+        Ok() => {}
+        Err(_) => { return Err(TestFailure.create("header")); }
+    }
+    var etag = String.create();
+    etagHeader(request, "If-Match", mut etag)!;
+    Check.isTrue(etag.view() == "abc", "unquoted, not weak")?;
+    etagHeader(request, "If-None-Match", mut etag)!;
+    Check.isTrue(etag.length == 0, "absent")?;
+    return Ok();
+}

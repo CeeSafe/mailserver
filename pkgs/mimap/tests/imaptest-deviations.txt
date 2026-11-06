@@ -1,0 +1,17 @@
+# The imaptest compliance commands that fail by design (tools/imaptest.py allows these). `group command n/m | tag`,
+# and `= tag: reason` defines a tag.
+
+= recent: \Recent is not kept (README, State): RECENT is always 0, no message has \Recent, NEW and RECENT match nothing and OLD matches everything, as Dovecot does when many sessions share a mailbox
+copy command 16/24 | recent
+copy command 17/24 | recent
+copy command 20/24 | recent
+copy command 21/24 | recent
+search-flags command 18/47 | recent
+search-flags command 19/47 | recent
+search-flags command 20/47 | recent
+select command 3/9 | recent
+select command 5/9 | recent
+select command 6/9 | recent
+
+= address: FROM, TO, CC and BCC search the field's text (README, SEARCH), not Dovecot's re-written address list: `<user-from (comment)@ (comment) domain.org>` does not hold `user-from@domain.org`
+search-addresses command 1/29 | address

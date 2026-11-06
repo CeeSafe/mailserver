@@ -1,0 +1,14 @@
+size 35936
+envelope ("22 Feb 93 11:59:17 GMT" "Meuf MIME-version" (("Daniel Glazman" NIL "glazman" "grif.grif.fr")) (("Daniel Glazman" NIL "glazman" "grif.grif.fr")) (("Daniel Glazman" NIL "glazman" "grif.grif.fr")) ((NIL NIL "info-metamail" "thumper.bellcore.com")) NIL NIL NIL "<9302221201.AA13410@pitea.grif.fr>")
+bodystructure (("text" "richtext" ("charset" "us-ascii") NIL NIL "quoted-printable" 433 13 NIL NIL NIL NIL) ("image" "x-xwd" NIL NIL NIL "base64" 34024 NIL NIL NIL NIL) ("text" "richtext" ("charset" "us-ascii") NIL NIL "quoted-printable" 101 7 NIL NIL NIL NIL) "mixed" ("boundary" "PART.BOUNDARY.2014.13404.pitea.730382496.1") NIL NIL NIL)
+body (("text" "richtext" ("charset" "us-ascii") NIL NIL "quoted-printable" 433 13) ("image" "x-xwd" NIL NIL NIL "base64" 34024) ("text" "richtext" ("charset" "us-ascii") NIL NIL "quoted-printable" 101 7) "mixed")
+section HEADER 771 15da52cd1536d568c9c8d53db5e92ba6296accf7c5dbbe70ca8d786751d18fa2
+section TEXT 35165 0a89170ea1563f30d2d02a8565a67e7988e2fa327368e133bf87cce8f2875f40
+section HEADER.FIELDS 279 4f6044d1842767f16cc5d9b9b8107dc23ab808a996a339939ed121289c1bd52b
+section HEADER.FIELDS.NOT 494 f8de729b3a4c522c34267aa503adb4448f890db645eb13add3fcdecb737b9d08
+section 1 433 0c58dd49d8e568964d5b444fd77ec9ded0aa4e474f1ef3538947b3fc197e84fd
+section 1.MIME 76 7712e776f2993a93b185dfb1c41705d43d20df049e3a88fcbbd6a81e4f5f5077
+section 2 34024 25adf6e009718cec511178adb439c6802f6679d24b09366063e7edcd106e538c
+section 2.MIME 64 08b4fee533f8ae60baf6a813124e7f68ec5b0af77306ceedaa44b33691f53825
+section 3 101 47abc7e026976d0496665356a7580bc791f9a1739e159d1f1583f7ddf72e7d6d
+section 3.MIME 76 7712e776f2993a93b185dfb1c41705d43d20df049e3a88fcbbd6a81e4f5f5077

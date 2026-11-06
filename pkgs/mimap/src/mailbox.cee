@@ -1,0 +1,798 @@
+// The authenticated state's commands: SELECT and EXAMINE, CREATE, DELETE, RENAME, SUBSCRIBE and UNSUBSCRIBE, LIST
+// and LSUB, NAMESPACE, STATUS and APPEND. Mailbox names are kept as sent (modified UTF-7 stays as it is), with `/`
+// as the hierarchy delimiter and INBOX in capitals.
+
+import diskio.FileError;
+import diskio.RawFile;
+import mmime.MessageIndex;
+import mmime.MimeScanner;
+import mmime.Renderer;
+import mmime.encodeMeta;
+import msmtp.SmtpContext;
+import msmtp.Wire;
+import msmtp.WireError;
+import mstore.BlobWriter;
+import mstore.CopyResult;
+import mstore.Delivered;
+import mstore.Delivery;
+import mstore.MailboxList;
+import mstore.MessageList;
+import mstore.StoreError;
+import mstore.UidSet;
+
+/// A name as the store keeps it, into `into`: INBOX, and the INBOX part of names under it, in capitals. False
+/// when it is not UTF-8.
+fn storedName(bytes: Slice<u8>, into: borrow mut String) -> Result<bool, AllocError> {
+    into.clear();
+    let text = match (StringView.fromUtf8(bytes)) {
+        Some(t) => t,
+        null => { return Ok(false); }
+    };
+    if (bytes.length >= 5 && bytes[0..5].equalsIgnoreAsciiCase("INBOX".bytes()) &&
+        (bytes.length == 5 || bytes[5] == 0x2f)) {
+        into.append("INBOX")?;
+        into.append(text[5..])?;
+        return Ok(true);
+    }
+    into.append(text)?;
+    return Ok(true);
+}
+
+/// The store's name for a mailbox argument, or `NO` (`false`) when it is not UTF-8.
+fn nameOf(r: borrow CommandReader, m: Mailbox, into: borrow mut String) -> Result<bool, Problem> =>
+    mem(storedName(r.text(m.name), into));
+
+// ---- SELECT and EXAMINE ----
+
+async fn select(
+    ctx: borrow SmtpContext,
+    wire: borrow mut Wire,
+    s: borrow mut Session,
+    r: borrow mut CommandReader,
+    readOnly: bool,
+) -> Result<u8, Problem> {
+    let m = parsed(r.mailbox())?;
+    parsed(r.finish())?;
+    // A SELECT deselects first, whether or not it succeeds.
+    deselect(s);
+    var name = String.create();
+    if (!nameOf(r, m, mut name)?) {
+        return tagged(s, "NO", "[NONEXISTENT] No such mailbox");
+    }
+    var boxes = MailboxList.create();
+    match (await ctx.store.findMailbox(s.userId, name.view(), mut boxes)) {
+        Ok(true) => {}
+        Ok(false) => { return tagged(s, "NO", "[NONEXISTENT] No such mailbox"); }
+        Err(_) => { return unavailable(s); }
+    }
+    let mailboxId = boxes.id(0);
+    // Watched before the messages are read, so a change made after the read wakes IDLE.
+    s.watch = await ctx.store.notifications().watch(s.userId, mailboxId);
+    s.watched = true;
+    var list = MessageList.create();
+    match (await ctx.store.messages(s.userId, mailboxId, 0, mut list)) {
+        Ok() => {}
+        Err(_) => {
+            s.watch = null;
+            return unavailable(s);
+        }
+    }
+    var firstUnseen: u32 = 0;
+    for (i in 0..list.count()) {
+        let uid = checkedTruncate<u32>(list.uid(i)) ?? 0;
+        if (uid == 0) {
+            continue;
+        }
+        if (mem(s.snapshot.push(uid, list.modseq(i)))? && firstUnseen == 0 && list.flags(i) & STORED_SEEN == 0) {
+            firstUnseen = s.snapshot.count();
+        }
+        mem(addKeywords(mut s.keywords, list.keywords(i).bytes()))?;
+    }
+    s.snapshot.highestModseq = boxes.highestModseq(0);
+    s.snapshot.announced = s.snapshot.count();
+    s.state = SELECTED;
+    s.mailboxId = mailboxId;
+    s.readOnly = readOnly;
+    s.uidValidity = boxes.uidValidity(0);
+    var uidNext = boxes.uidNext(0);
+    if (uidNext <= (s.snapshot.lastUid() as i64)) {
+        uidNext = (s.snapshot.lastUid() as i64) + 1;
+    }
+    var out = Vector<u8>.create();
+    mem(selectLines(s, firstUnseen, uidNext, mut out))?;
+    io(wire.send(out.view()))?;
+    return if (readOnly) tagged(s, "OK", "[READ-ONLY] EXAMINE completed") else tagged(
+        s,
+        "OK",
+        "[READ-WRITE] SELECT completed",
+    );
+}
+
+fn selectLines(
+    s: borrow Session,
+    firstUnseen: u32,
+    uidNext: i64,
+    out: borrow mut Vector<u8>,
+) -> Result<void, AllocError> {
+    flagsLines(s, out)?;
+    out.extend("* ".bytes())?;
+    writeNumber(out, s.snapshot.count() as u64)?;
+    out.extend(" EXISTS\r\n* 0 RECENT\r\n".bytes())?;
+    if (firstUnseen > 0) {
+        out.extend("* OK [UNSEEN ".bytes())?;
+        writeNumber(out, firstUnseen as u64)?;
+        out.extend("] First unseen\r\n".bytes())?;
+    }
+    out.extend("* OK [UIDVALIDITY ".bytes())?;
+    writeNumber(out, truncate<u64>(s.uidValidity))?;
+    out.extend("] UIDs valid\r\n* OK [UIDNEXT ".bytes())?;
+    writeNumber(out, truncate<u64>(uidNext))?;
+    return out.extend("] Predicted next UID\r\n".bytes());
+}
+
+/// `* FLAGS` with the keywords the session knows, and `PERMANENTFLAGS`: at SELECT, and again when a keyword is new.
+fn flagsLines(s: borrow Session, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    out.extend("* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft".bytes())?;
+    out.extend(s.keywords.view())?;
+    if (s.readOnly) {
+        return out.extend(")\r\n* OK [PERMANENTFLAGS ()] No permanent flags permitted\r\n".bytes());
+    }
+    out.extend(")\r\n* OK [PERMANENTFLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft".bytes())?;
+    out.extend(s.keywords.view())?;
+    return out.extend(" \\*)] Flags permitted\r\n".bytes());
+}
+
+/// Adds to `known` (each keyword after a space) those of `keywords` (space-separated) it lacks; whether any was new.
+fn addKeywords(known: borrow mut Vector<u8>, keywords: Slice<u8>) -> Result<bool, AllocError> {
+    var added = false;
+    for (k in keywords.split(" ".bytes())) {
+        if (k.length > 0 && !hasKeyword(known.view(), k)) {
+            known.push(0x20)?;
+            known.extend(k)?;
+            added = true;
+        }
+    }
+    return Ok(added);
+}
+
+/// Before a FETCH shows `keywords`: a new `* FLAGS` (and `PERMANENTFLAGS`) when one of them is new to the client.
+fn announceKeywords(
+    s: borrow mut Session,
+    keywords: Slice<u8>,
+    out: borrow mut Vector<u8>,
+) -> Result<void, AllocError> {
+    if (addKeywords(mut s.keywords, keywords)?) {
+        flagsLines(s, out)?;
+    }
+    return Ok();
+}
+
+// ---- CREATE, DELETE, RENAME, SUBSCRIBE ----
+
+/// A mailbox made by CREATE is not subscribed (RFC 3501 §6.3.3 leaves the subscriptions to SUBSCRIBE, as Dovecot
+/// does); the store's default subscribes the mailboxes it makes for a new user.
+async fn created(ctx: borrow SmtpContext, userId: i64, id: i64) -> Result<void, StoreError> =>
+    await ctx.store.subscribe(userId, id, false);
+
+/// Creates the parents of `name` that do not exist (`a` and `a/b` for `a/b/c`).
+async fn createParents(ctx: borrow SmtpContext, userId: i64, name: StringView) -> Result<void, StoreError> {
+    let bytes = name.bytes();
+    for (i in 1..bytes.length) {
+        if (bytes[i] != 0x2f) {
+            continue;
+        }
+        let parent = name[0..i];
+        if (parent == "INBOX") {
+            continue;
+        }
+        match (await ctx.store.createMailbox(userId, parent, "")) {
+            Ok(id) => { await created(ctx, userId, id)?; }
+            Err(StoreError.Exists) => {}
+            Err(e) => { return Err(e); }
+        }
+    }
+    return Ok();
+}
+
+async fn create(ctx: borrow SmtpContext, s: borrow mut Session, r: borrow mut CommandReader) -> Result<u8, Problem> {
+    let m = parsed(r.mailbox())?;
+    parsed(r.finish())?;
+    if (m.isInbox) {
+        return tagged(s, "NO", "[ALREADYEXISTS] INBOX always exists");
+    }
+    var name = String.create();
+    if (!mem(storedName(trimDelimiter(r.text(m.name)), mut name))? || name.length == 0) {
+        return tagged(s, "NO", "[CANNOT] Invalid mailbox name");
+    }
+    var boxes = MailboxList.create();
+    match (await ctx.store.findMailbox(s.userId, name.view(), mut boxes)) {
+        Ok(true) => { return tagged(s, "NO", "[ALREADYEXISTS] Mailbox already exists"); }
+        Ok(false) => {}
+        Err(_) => { return unavailable(s); }
+    }
+    match (await createParents(ctx, s.userId, name.view())) {
+        Ok() => {}
+        Err(StoreError.Invalid) => { return tagged(s, "NO", "[CANNOT] Invalid mailbox name"); }
+        Err(_) => { return unavailable(s); }
+    }
+    match (await ctx.store.createMailbox(s.userId, name.view(), "")) {
+        Ok(id) => {
+            match (await created(ctx, s.userId, id)) {
+                Ok() => { return tagged(s, "OK", "CREATE completed"); }
+                Err(_) => { return unavailable(s); }
+            }
+        }
+        Err(StoreError.Exists) => { return tagged(s, "NO", "[ALREADYEXISTS] Mailbox already exists"); }
+        Err(StoreError.Invalid) => { return tagged(s, "NO", "[CANNOT] Invalid mailbox name"); }
+        Err(_) => { return unavailable(s); }
+    }
+}
+
+async fn delete(ctx: borrow SmtpContext, s: borrow mut Session, r: borrow mut CommandReader) -> Result<u8, Problem> {
+    let m = parsed(r.mailbox())?;
+    parsed(r.finish())?;
+    if (m.isInbox) {
+        return tagged(s, "NO", "[CANNOT] INBOX cannot be deleted");
+    }
+    var name = String.create();
+    if (!nameOf(r, m, mut name)?) {
+        return tagged(s, "NO", "[NONEXISTENT] No such mailbox");
+    }
+    var boxes = MailboxList.create();
+    match (await ctx.store.findMailbox(s.userId, name.view(), mut boxes)) {
+        Ok(true) => {}
+        Ok(false) => { return tagged(s, "NO", "[NONEXISTENT] No such mailbox"); }
+        Err(_) => { return unavailable(s); }
+    }
+    let id = boxes.id(0);
+    // Mailboxes under it stay; its name then lists as \Noselect (RFC 3501 §6.3.4).
+    match (await ctx.store.deleteMailbox(s.userId, id)) {
+        Ok() => {}
+        Err(StoreError.NotFound) => { return tagged(s, "NO", "[NONEXISTENT] No such mailbox"); }
+        Err(_) => { return unavailable(s); }
+    }
+    if (s.state == SELECTED && s.mailboxId == id) {
+        deselect(s);
+    }
+    return tagged(s, "OK", "DELETE completed");
+}
+
+async fn rename(ctx: borrow SmtpContext, s: borrow mut Session, r: borrow mut CommandReader) -> Result<u8, Problem> {
+    let from = parsed(r.mailbox())?;
+    let to = parsed(r.mailbox())?;
+    parsed(r.finish())?;
+    if (to.isInbox) {
+        return tagged(s, "NO", "[ALREADYEXISTS] INBOX always exists");
+    }
+    var oldName = String.create();
+    var newName = String.create();
+    if (!nameOf(r, from, mut oldName)?) {
+        return tagged(s, "NO", "[NONEXISTENT] No such mailbox");
+    }
+    if (!mem(storedName(trimDelimiter(r.text(to.name)), mut newName))? || newName.length == 0) {
+        return tagged(s, "NO", "[CANNOT] Invalid mailbox name");
+    }
+    var boxes = MailboxList.create();
+    match (await ctx.store.findMailbox(s.userId, newName.view(), mut boxes)) {
+        Ok(true) => { return tagged(s, "NO", "[ALREADYEXISTS] Mailbox already exists"); }
+        Ok(false) => {}
+        Err(_) => { return unavailable(s); }
+    }
+    match (await ctx.store.findMailbox(s.userId, oldName.view(), mut boxes)) {
+        Ok(true) => {}
+        Ok(false) => { return tagged(s, "NO", "[NONEXISTENT] No such mailbox"); }
+        Err(_) => { return unavailable(s); }
+    }
+    let fromId = boxes.id(0);
+    match (await createParents(ctx, s.userId, newName.view())) {
+        Ok() => {}
+        Err(StoreError.Invalid) => { return tagged(s, "NO", "[CANNOT] Invalid mailbox name"); }
+        Err(_) => { return unavailable(s); }
+    }
+    if (from.isInbox) {
+        // RFC 3501 §6.3.5: INBOX's messages move to the new mailbox, and INBOX stays, empty.
+        let toId = match (await ctx.store.createMailbox(s.userId, newName.view(), "")) {
+            Ok(id) => id,
+            Err(StoreError.Exists) => { return tagged(s, "NO", "[ALREADYEXISTS] Mailbox already exists"); }
+            Err(StoreError.Invalid) => { return tagged(s, "NO", "[CANNOT] Invalid mailbox name"); }
+            Err(_) => { return unavailable(s); }
+        };
+        var all = UidSet.create();
+        match (all.addRange(1, 4294967295)) {
+            Ok() => {}
+            Err(_) => { return unavailable(s); }
+        }
+        var moved = CopyResult.create();
+        match (await ctx.store.copy(s.userId, fromId, toId, all, true, mut moved)) {
+            Ok() => { return tagged(s, "OK", "RENAME completed"); }
+            Err(_) => { return unavailable(s); }
+        }
+    }
+    match (await ctx.store.renameMailbox(s.userId, oldName.view(), newName.view())) {
+        Ok() => { return tagged(s, "OK", "RENAME completed"); }
+        Err(StoreError.Exists) => { return tagged(s, "NO", "[ALREADYEXISTS] Mailbox already exists"); }
+        Err(StoreError.Invalid) => { return tagged(s, "NO", "[CANNOT] Invalid mailbox name"); }
+        Err(StoreError.NotFound) => { return tagged(s, "NO", "[NONEXISTENT] No such mailbox"); }
+        Err(_) => { return unavailable(s); }
+    }
+}
+
+async fn subscribe(
+    ctx: borrow SmtpContext,
+    s: borrow mut Session,
+    r: borrow mut CommandReader,
+    on: bool,
+) -> Result<u8, Problem> {
+    let m = parsed(r.mailbox())?;
+    parsed(r.finish())?;
+    var name = String.create();
+    if (!nameOf(r, m, mut name)?) {
+        return tagged(s, "NO", "[NONEXISTENT] No such mailbox");
+    }
+    var boxes = MailboxList.create();
+    match (await ctx.store.findMailbox(s.userId, name.view(), mut boxes)) {
+        Ok(true) => {}
+        Ok(false) => { return tagged(s, "NO", "[NONEXISTENT] No such mailbox"); }
+        Err(_) => { return unavailable(s); }
+    }
+    match (await ctx.store.subscribe(s.userId, boxes.id(0), on)) {
+        Ok() => {}
+        Err(_) => { return unavailable(s); }
+    }
+    return if (on) tagged(s, "OK", "SUBSCRIBE completed") else tagged(s, "OK", "UNSUBSCRIBE completed");
+}
+
+// ---- LIST, LSUB, NAMESPACE ----
+
+async fn list(
+    ctx: borrow SmtpContext,
+    wire: borrow mut Wire,
+    s: borrow mut Session,
+    r: borrow mut CommandReader,
+    lsub: bool,
+) -> Result<u8, Problem> {
+    let reference = parsed(r.astring())?;
+    let pattern = parsed(r.listMailbox())?;
+    parsed(r.finish())?;
+    let done = if (lsub) "LSUB completed" else "LIST completed";
+    var out = Vector<u8>.create();
+    if (r.text(pattern).length == 0) {
+        // The hierarchy delimiter and the root of the reference (RFC 3501 §6.3.8).
+        if (!lsub) {
+            io(wire.send("* LIST (\\Noselect) \"/\" \"\"\r\n".bytes()))?;
+        }
+        return tagged(s, "OK", done);
+    }
+    var full = Vector<u8>.create();
+    mem(full.extend(r.text(reference)))?;
+    mem(full.extend(r.text(pattern)))?;
+    var boxes = MailboxList.create();
+    match (await ctx.store.mailboxes(s.userId, mut boxes)) {
+        Ok() => {}
+        Err(_) => { return unavailable(s); }
+    }
+    mem(listLines(boxes, full.view(), lsub, mut out))?;
+    io(wire.send(out.view()))?;
+    return tagged(s, "OK", done);
+}
+
+fn hasChildren(boxes: borrow MailboxList, name: Slice<u8>) -> bool {
+    for (j in 0..boxes.count()) {
+        if (isParentOf(name, boxes.name(j).bytes())) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn isMailbox(boxes: borrow MailboxList, name: Slice<u8>, lsub: bool) -> bool {
+    for (j in 0..boxes.count()) {
+        if (boxes.name(j).bytes() == name) {
+            return !lsub || boxes.subscribed(j);
+        }
+    }
+    return false;
+}
+
+fn listLine(
+    out: borrow mut Vector<u8>,
+    lsub: bool,
+    attributes: Slice<u8>,
+    name: Slice<u8>,
+) -> Result<void, AllocError> {
+    out.extend(if (lsub) "* LSUB (".bytes() else "* LIST (".bytes())?;
+    out.extend(attributes)?;
+    out.extend(") \"/\" ".bytes())?;
+    writeMailbox(out, name)?;
+    return out.extend("\r\n".bytes());
+}
+
+/// The LIST (or LSUB) lines of the mailboxes matching `pattern`. A name that is no mailbox but has mailboxes under
+/// it (its mailbox was deleted, or for LSUB is not subscribed) lists as `\Noselect` when `%` stops at it.
+fn listLines(
+    boxes: borrow MailboxList,
+    pattern: Slice<u8>,
+    lsub: bool,
+    out: borrow mut Vector<u8>,
+) -> Result<void, AllocError> {
+    var implied = Vector<Vector<u8>>.create();
+    var attributes = Vector<u8>.create();
+    for (i in 0..boxes.count()) {
+        let name = boxes.name(i).bytes();
+        if (lsub && !boxes.subscribed(i)) {
+            continue;
+        }
+        // Its parents that are not themselves listed.
+        for (k in 1..name.length) {
+            if (name[k] != 0x2f) {
+                continue;
+            }
+            let parent = name[0..k];
+            if (isMailbox(boxes, parent, lsub) || !listMatches(pattern, parent)) {
+                continue;
+            }
+            var seen = false;
+            for (p in implied.view()) {
+                if (p.view() == parent) {
+                    seen = true;
+                }
+            }
+            if (seen) {
+                continue;
+            }
+            var copy = Vector<u8>.create();
+            copy.extend(parent)?;
+            implied.push(copy)?;
+            listLine(out, lsub, if (lsub) "\\Noselect".bytes() else "\\Noselect \\HasChildren".bytes(), parent)?;
+        }
+        if (!listMatches(pattern, name)) {
+            continue;
+        }
+        attributes.clear();
+        if (!lsub) {
+            attributes.extend(if (hasChildren(boxes, name)) "\\HasChildren".bytes() else "\\HasNoChildren".bytes())?;
+            let special = boxes.specialUse(i).bytes();
+            if (special.length > 0) {
+                attributes.push(0x20)?;
+                attributes.extend(special)?;
+            }
+        }
+        listLine(out, lsub, attributes.view(), name)?;
+    }
+    return Ok();
+}
+
+async fn namespaces(wire: borrow mut Wire, s: borrow mut Session, r: borrow mut CommandReader) -> Result<u8, Problem> {
+    parsed(r.finish())?;
+    io(wire.send("* NAMESPACE ((\"\" \"/\")) NIL NIL\r\n".bytes()))?;
+    return tagged(s, "OK", "NAMESPACE completed");
+}
+
+// ---- STATUS ----
+
+async fn status(
+    ctx: borrow SmtpContext,
+    wire: borrow mut Wire,
+    s: borrow mut Session,
+    r: borrow mut CommandReader,
+) -> Result<u8, Problem> {
+    let m = parsed(r.mailbox())?;
+    var items = Vector<StatusItem>.create();
+    parsed(r.statusItems(mut items))?;
+    parsed(r.finish())?;
+    var name = String.create();
+    if (!nameOf(r, m, mut name)?) {
+        return tagged(s, "NO", "[NONEXISTENT] No such mailbox");
+    }
+    var boxes = MailboxList.create();
+    match (await ctx.store.findMailbox(s.userId, name.view(), mut boxes)) {
+        Ok(true) => {}
+        Ok(false) => { return tagged(s, "NO", "[NONEXISTENT] No such mailbox"); }
+        Err(_) => { return unavailable(s); }
+    }
+    var out = Vector<u8>.create();
+    mem(statusLine(boxes, name.view().bytes(), items, mut out))?;
+    io(wire.send(out.view()))?;
+    return tagged(s, "OK", "STATUS completed");
+}
+
+fn statusLine(
+    boxes: borrow MailboxList,
+    name: Slice<u8>,
+    items: borrow Vector<StatusItem>,
+    out: borrow mut Vector<u8>,
+) -> Result<void, AllocError> {
+    out.extend("* STATUS ".bytes())?;
+    writeMailbox(out, name)?;
+    out.extend(" (".bytes())?;
+    for (i in 0..items.length) {
+        if (i > 0) {
+            out.push(0x20)?;
+        }
+        let word = match (items[i]) {
+            StatusItem.Messages => "MESSAGES ",
+            StatusItem.Recent => "RECENT ",
+            StatusItem.UidNext => "UIDNEXT ",
+            StatusItem.UidValidity => "UIDVALIDITY ",
+            StatusItem.Unseen => "UNSEEN ",
+        };
+        let value = match (items[i]) {
+            StatusItem.Messages => boxes.messages(0),
+            StatusItem.Recent => 0i64,
+            StatusItem.UidNext => boxes.uidNext(0),
+            StatusItem.UidValidity => boxes.uidValidity(0),
+            StatusItem.Unseen => boxes.unseen(0),
+        };
+        out.extend(word.bytes())?;
+        writeNumber(out, if (value < 0) 0u64 else truncate<u64>(value))?;
+    }
+    return out.extend(")\r\n".bytes());
+}
+
+// ---- APPEND ----
+
+/// Flags from a client's list as stored bits and space-separated keywords; false for a flag that cannot be stored
+/// (an unknown `\` flag). `\Recent` is ignored.
+fn storedFlags(
+    r: borrow CommandReader,
+    flags: borrow Vector<Flag>,
+    bits: borrow mut u16,
+    keywords: borrow mut String,
+) -> Result<bool, AllocError> {
+    for (f in flags.view()) {
+        match (f.kind) {
+            FlagKind.Answered => { bits = bits | STORED_ANSWERED; }
+            FlagKind.Flagged => { bits = bits | STORED_FLAGGED; }
+            FlagKind.Deleted => { bits = bits | STORED_DELETED; }
+            FlagKind.Seen => { bits = bits | STORED_SEEN; }
+            FlagKind.Draft => { bits = bits | STORED_DRAFT; }
+            FlagKind.Recent => {}
+            FlagKind.Extension => { return Ok(false); }
+            FlagKind.Keyword => {
+                if (keywords.length > 0) {
+                    keywords.append(" ")?;
+                }
+                keywords.append(StringView.fromUtf8(r.text(f.name))!)?;
+            }
+        }
+    }
+    return Ok(true);
+}
+
+/// What streaming APPEND's message left: stored (the blob written and finished), or refused with its answer set.
+const STREAM_STORED: u8 = 0;
+const STREAM_REFUSED: u8 = 1;
+const STREAM_ENDED: u8 = 2;
+/// APPEND's message is read from the wire and written to the blob in pieces of this size.
+const APPEND_CHUNK: usize = 256 * 1024;
+
+/// APPEND (RFC 3501 §6.3.11). The message literal was left on the wire by the session (`literalPending`): the size,
+/// the mailbox and the quota are checked from its announced size first, so a refused message is never read (a
+/// synchronizing literal is then never sent; the session skips a non-synchronizing one). Then `+` (unless LITERAL+)
+/// and the message streams into the blob writer in pieces, through mmime's scanner as SMTP delivery does, so the
+/// part index is made in the same pass, and memory is a piece whatever the message's size.
+async fn append(
+    ctx: borrow SmtpContext,
+    wire: borrow mut Wire,
+    s: borrow mut Session,
+    r: borrow mut CommandReader,
+) -> Result<u8, Problem> {
+    let m = parsed(r.mailbox())?;
+    var flags = Vector<Flag>.create();
+    let args = parsed(r.appendArgs(mut flags))?;
+    parsed(r.finish())?;
+    var bits: u16 = 0;
+    var keywords = String.create();
+    if (!mem(storedFlags(r, flags, mut bits, mut keywords))?) {
+        return tagged(s, "BAD", "Unknown system flag");
+    }
+    let size = if (s.literalPending) s.literalSize else r.text(args.message).length as u64;
+    if (size > s.settings.maxAppendSize) {
+        return tagged(s, "NO", "[TOOBIG] Message too large");
+    }
+    var name = String.create();
+    if (!nameOf(r, m, mut name)?) {
+        return tagged(s, "NO", "[TRYCREATE] No such mailbox");
+    }
+    var boxes = MailboxList.create();
+    match (await ctx.store.findMailbox(s.userId, name.view(), mut boxes)) {
+        Ok(true) => {}
+        Ok(false) => { return tagged(s, "NO", "[TRYCREATE] No such mailbox"); }
+        Err(_) => { return unavailable(s); }
+    }
+    match (await ctx.store.quota(s.userId)) {
+        Ok(q) => {
+            if (q[0] > 0 && q[1] + (checkedTruncate<i64>(size) ?? q[0]) > q[0]) {
+                return tagged(s, "NO", "[OVERQUOTA] Quota exceeded");
+            }
+        }
+        Err(_) => { return unavailable(s); }
+    }
+    let blobs = ctx.store.blobs();
+    let begun: Result<BlobWriter, StoreError> = await Async.blocking(() => blobs.begin());
+    var writer = match (begun) {
+        Ok(w) => w,
+        Err(_) => { return unavailable(s); }
+    };
+    // The content, as SMTP stores it: the blob, and the part index made as it is written (mmime). Whatever stops
+    // the message before delivery (the connection dropping mid-literal, a disk error, a bad end of the command)
+    // removes the blob's temporary file; a cancelled session leaves it to `sweepTemporary`. No blob row exists
+    // until `deliver`.
+    var index = MessageIndex.create();
+    let w = borrow mut writer;
+    let streamed = await streamMessage(wire, s, r.text(args.message), w, mut index);
+    let outcome = match (streamed) {
+        Ok(o) => o,
+        Err(e) => {
+            await Async.blocking(() => w.discard());
+            return Err(e);
+        }
+    };
+    if (outcome != STREAM_STORED) {
+        await Async.blocking(() => w.discard());
+        return Ok(if (outcome == STREAM_ENDED) ENDED else CONTINUE);
+    }
+    var meta = Vector<u8>.create();
+    var renderer = Renderer.create();
+    match (encodeMeta(index, mut renderer, mut meta)) {
+        Ok() => {}
+        Err(_) => {
+            await Async.blocking(() => w.discard());
+            return Err(Problem.Wire(WireError.OutOfMemory));
+        }
+    }
+    var d = Delivery.to(s.userId, boxes.id(0), args.internalDate ?? Clock.unixMillis());
+    d.flags = bits;
+    mem(d.keywords.append(keywords.view()))?;
+    mem(d.meta.extend(meta.view()))?;
+    var targets = Vector<Delivery>.create();
+    mem(targets.push(d))?;
+    var delivered = Vector<Delivered>.create();
+    match (await ctx.store.deliver(w, targets, mut delivered)) {
+        Ok() => {}
+        Err(_) => {
+            await Async.blocking(() => w.discard());
+            return unavailable(s);
+        }
+    }
+    if (delivered.length == 0) {
+        return unavailable(s);
+    }
+    mem(startTagged(s, "OK"))?;
+    mem(s.tail.extend("[APPENDUID ".bytes()))?;
+    mem(writeNumber(mut s.tail, truncate<u64>(boxes.uidValidity(0))))?;
+    mem(s.tail.push(0x20))?;
+    mem(writeNumber(mut s.tail, truncate<u64>(delivered[0].uid)))?;
+    mem(endTagged(s, "] APPEND completed"))?;
+    return Ok(CONTINUE);
+}
+
+/// Writes APPEND's message to `writer` and indexes it into `index`: from the wire when the session left the literal
+/// there (sending `+` first for a synchronizing one, then reading the rest of the command's line, which must be
+/// empty), else `held`, the literal the reader kept. `STREAM_STORED` once the blob is finished; otherwise the
+/// tagged answer is set (`NO [UNAVAILABLE]` for a disk error, `BAD` for more arguments) and the caller discards
+/// the blob. A wire error (the client gone mid-literal) is returned as it is.
+async fn streamMessage(
+    wire: borrow mut Wire,
+    s: borrow mut Session,
+    held: Slice<u8>,
+    writer: borrow mut BlobWriter,
+    index: borrow mut MessageIndex,
+) -> Result<u8, Problem> {
+    var scanner = MimeScanner.create();
+    var stored = true;
+    if (!s.literalPending) {
+        mem(scanner.feed(held))?;
+        let wrote: Result<void, StoreError> = await Async.blocking(() => writer.write(held));
+        stored = match (wrote) {
+            Ok() => true,
+            Err(_) => false,
+        };
+    } else {
+        s.literalPending = false;
+        if (s.literalSync) {
+            io(wire.send("+ Ready for literal data\r\n".bytes()))?;
+        }
+        var chunk = Vector<u8>.create();
+        var left = s.literalSize;
+        while (left > 0) {
+            let take = if (left > (APPEND_CHUNK as u64)) APPEND_CHUNK else truncate<usize>(left);
+            chunk.clear();
+            io(await wire.readExact(take, mut chunk, LITERAL_TIMEOUT))?;
+            left -= take as u64;
+            if (!stored) {
+                continue; // a disk error: read on, so the session stays in step
+            }
+            mem(scanner.feed(chunk.view()))?;
+            let piece = chunk.view();
+            let wrote: Result<void, StoreError> = await Async.blocking(() => writer.write(piece));
+            match (wrote) {
+                Ok() => {}
+                Err(_) => { stored = false; }
+            }
+        }
+        // The rest of the command: nothing (MULTIAPPEND is not offered).
+        var line = Vector<u8>.create();
+        match (await wire.readLineWithin(mut line, MAX_LINE, LITERAL_TIMEOUT)) {
+            Ok() => {}
+            Err(WireError.TooLong) => {
+                io(wire.send("* BYE Command line too long\r\n".bytes()))?;
+                s.tail.clear();
+                return Ok(STREAM_ENDED);
+            }
+            Err(e) => { return Err(Problem.Wire(e)); }
+        }
+        if (line.length > 0) {
+            tagged(s, "BAD", describeError(ParseError.ExtraArguments))?;
+            match (trailingLiteral(line.view())) {
+                Some(t) => {
+                    if (io(await skipLiterals(wire, s, mut line, t))? == READ_CLOSE) {
+                        return Ok(STREAM_ENDED);
+                    }
+                }
+                null => {}
+            }
+            return Ok(STREAM_REFUSED);
+        }
+    }
+    if (stored) {
+        let done: Result<void, StoreError> = await Async.blocking(() => writer.finish());
+        stored = match (done) {
+            Ok() => true,
+            Err(_) => false,
+        };
+    }
+    if (!stored) {
+        unavailable(s)?;
+        return Ok(STREAM_REFUSED);
+    }
+    mem(scanner.finish(index))?;
+    return Ok(STREAM_STORED);
+}
+
+/// mmime's stored meta for the first `size` bytes of `file`, into `out`, read in pieces. Blocks on the disk.
+fn indexFile(file: borrow RawFile, size: u64, out: borrow mut Vector<u8>) -> Result<void, FileError> {
+    var scanner = MimeScanner.create();
+    var chunk = Vector<u8>.create();
+    match (chunk.resize(STREAM_CHUNK, 0)) {
+        Ok() => {}
+        Err(_) => { return Err(FileError.NoSpace); }
+    }
+    var at: u64 = 0;
+    while (at < size) {
+        let n = if (size - at > (STREAM_CHUNK as u64)) STREAM_CHUNK else truncate<usize>(size - at);
+        file.readExactAt(mut chunk[0..n], at)?;
+        match (scanner.feed(chunk[0..n])) {
+            Ok() => {}
+            Err(_) => { return Err(FileError.NoSpace); }
+        }
+        at += n as u64;
+    }
+    var index = MessageIndex.create();
+    var renderer = Renderer.create();
+    let built: Result<void, AllocError> = finishIndex(mut scanner, mut index, mut renderer, out);
+    return match (built) {
+        Ok() => Ok(),
+        Err(_) => Err(FileError.NoSpace),
+    };
+}
+
+fn finishIndex(
+    scanner: borrow mut MimeScanner,
+    index: borrow mut MessageIndex,
+    renderer: borrow mut Renderer,
+    out: borrow mut Vector<u8>,
+) -> Result<void, AllocError> {
+    scanner.finish(index)?;
+    return encodeMeta(index, renderer, out);
+}
+
+/// mmime's stored meta for `message`, into `out`.
+fn indexMessage(message: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    var scanner = MimeScanner.create();
+    scanner.feed(message)?;
+    var index = MessageIndex.create();
+    scanner.finish(mut index)?;
+    var renderer = Renderer.create();
+    return encodeMeta(index, mut renderer, out);
+}

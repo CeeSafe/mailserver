@@ -1,0 +1,122 @@
+// IMAP section numbers (RFC 9051 §6.4.5): the parts of a multipart are numbered from 1; a non-multipart message's
+// body is part 1; an encapsulated message's parts are numbered under its message/rfc822 part.
+
+/// The parts numbered directly under `part`, in order, into `into`: a multipart's children; for a message/rfc822
+/// part, its encapsulated message's parts (or that message itself, when it is not multipart); none for a leaf.
+/// `part == NO_PART` stands for the whole message.
+public fn numberedChildren(
+    index: borrow MessageIndex,
+    part: usize,
+    into: borrow mut Vector<usize>,
+) -> Result<void, AllocError> {
+    into.clear();
+    var holder = part;
+    if (part == NO_PART) {
+        holder = 0;
+        if (index.parts.length == 0) {
+            return Ok();
+        }
+        if (index.parts[0].kind != PART_MULTIPART) {
+            return into.push(0);
+        }
+    } else {
+        let p = index.parts[part];
+        if (p.kind == PART_LEAF) {
+            return Ok();
+        }
+        if (p.kind == PART_MESSAGE) {
+            holder = part + 1;
+            if (index.parts[holder].kind != PART_MULTIPART) {
+                return into.push(holder);
+            }
+        }
+    }
+    return index.children(holder, into);
+}
+
+/// The part a section number names (`[1, 2]` for `1.2`), or `NO_PART` when there is none.
+public fn partAt(index: borrow MessageIndex, numbers: Slice<u32>) -> Result<usize, AllocError> {
+    var part = NO_PART;
+    var kids = Vector<usize>.create();
+    for (n in numbers) {
+        numberedChildren(index, part, mut kids)?;
+        if (n == 0 || (n as usize) > kids.length) {
+            return Ok(NO_PART);
+        }
+        part = kids[(n as usize) - 1];
+    }
+    return Ok(part);
+}
+
+/// The fields of `block` (a header block, as `headerStart..bodyStart` of a part) that `BODY[HEADER.FIELDS (names)]`
+/// selects, or with `not` those `BODY[HEADER.FIELDS.NOT (names)]` selects (RFC 3501 §6.4.5), appended to `out`: each
+/// field whole, in its original order and bytes, folding kept, then the CRLF of the blank line that ends the block.
+/// Names compare without case. As Dovecot does:
+/// - a line without a field name (no colon) is in no list, so only HEADER.FIELDS.NOT gives it;
+/// - a block without its blank line (a message that is all header) gets none;
+/// - the last line of a block cut short gets a CRLF.
+public fn appendHeaderFields(
+    block: Slice<u8>,
+    names: borrow Vector<Vector<u8>>,
+    not: bool,
+    out: borrow mut Vector<u8>,
+) -> Result<void, AllocError> {
+    let blank = blankLineLength(block);
+    var cursor = HeaderCursor.start();
+    var at: usize = 0;
+    loop {
+        let field = match (cursor.next(block)) {
+            Some(f) => f,
+            null => { break; }
+        };
+        if (not) {
+            appendLines(block[at..field.nameStart], out)?;
+        }
+        at = field.valueEnd;
+        let name = block[field.nameStart..field.nameEnd];
+        var named = false;
+        for (i in 0..names.length) {
+            if (name.equalsIgnoreAsciiCase(names[i].view())) {
+                named = true;
+                break;
+            }
+        }
+        if (named != not) {
+            appendLines(block[field.nameStart..field.valueEnd], out)?;
+        }
+    }
+    if (not) {
+        appendLines(block[at..block.length - blank], out)?;
+    }
+    if (blank > 0) {
+        out.extend("\r\n".bytes())?;
+    }
+    return Ok();
+}
+
+/// The length of the blank line that ends `block` (CRLF or a bare LF), or 0 when it has none.
+fn blankLineLength(block: Slice<u8>) -> usize {
+    let n = block.length;
+    if (n == 0 || block[n - 1] != 0x0a) {
+        return 0;
+    }
+    if (n == 1 || block[n - 2] == 0x0a) {
+        return 1;
+    }
+    if (block[n - 2] == 0x0d && (n == 2 || block[n - 3] == 0x0a)) {
+        return 2;
+    }
+    return 0;
+}
+
+/// Appends whole lines of a header block, with a CRLF after the last when the block was cut short there.
+fn appendLines(lines: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    if (lines.length == 0) {
+        return Ok();
+    }
+    out.extend(lines)?;
+    if (lines[lines.length - 1] != 0x0a) {
+        out.extend("\r\n".bytes())?;
+    }
+    return Ok();
+}

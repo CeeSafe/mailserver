@@ -1,0 +1,127 @@
+// HTTP Basic logins (RFC 7617) for the groupware protocols: ActiveSync, EWS and CalDAV/CardDAV send the user's
+// address and password with every request. They are checked as IMAP's are (msmtp's login.cee: the failed-login
+// guard, bcrypt under its permits), through its cache of recent logins, so a phone's Ping every few minutes does not
+// cost a bcrypt check each time.
+
+import encoding.Base64;
+import mhttp.Request;
+import mhttp.Response;
+import msmtp.LoginRefusal;
+import msmtp.SmtpContext;
+import msmtp.checkRepeatedLogin;
+
+/// The account a request was made as.
+public struct Account {
+    public userId: i64;
+    /// The account's address, as stored (lowercase).
+    public email: String;
+
+    public fn create() -> Account => Account { userId: 0, email: String.create() };
+}
+
+/// Why a request's login failed.
+public enum LoginFailure {
+    /// No credentials, or not Basic ones: ask for them.
+    Missing,
+    /// Wrong ones, or the client's address is blocked.
+    Refused,
+    /// The store could not be asked.
+    Unavailable,
+}
+
+/// The `Authorization: Basic` credentials of `request`, checked; the account into `account`.
+public async fn basicLogin(
+    ctx: borrow SmtpContext,
+    request: borrow Request,
+    account: borrow mut Account,
+) -> Result<void, LoginFailure> {
+    let header = match (request.header("Authorization")) {
+        Some(h) => h.view(),
+        null => { return Err(LoginFailure.Missing); }
+    };
+    if (header.length < 6 || !header[0..6].equalsIgnoreAsciiCase("Basic ")) {
+        return Err(LoginFailure.Missing);
+    }
+    var decoded = Vector<u8>.create();
+    match (Base64.decode(header[6..].trim().bytes(), mut decoded)) {
+        Ok() => {}
+        Err(_) => { return Err(LoginFailure.Refused); }
+    }
+    var colon = decoded.length;
+    for (k in 0..decoded.length) {
+        if (decoded[k] == 0x3a) {
+            colon = k;
+            break;
+        }
+    }
+    if (colon == decoded.length) {
+        wipe(mut decoded);
+        return Err(LoginFailure.Refused);
+    }
+    var email = Vector<u8>.create();
+    // Some ActiveSync clients send DOMAIN\user; the part after the backslash is the address.
+    var userStart: usize = 0;
+    for (k in 0..colon) {
+        if (decoded[k] == 0x5c) {
+            userStart = k + 1;
+        }
+    }
+    var lowered = Vector<u8>.create();
+    for (b in decoded.view()[userStart..colon]) {
+        match (lowered.push(if (b >= 0x41 && b <= 0x5a) b + 0x20 else b)) {
+            Ok() => {}
+            Err(_) => {
+                wipe(mut decoded);
+                return Err(LoginFailure.Unavailable);
+            }
+        }
+    }
+    let outcome = await checkRepeatedLogin(
+        ctx.login,
+        ctx.store,
+        request.peer,
+        lowered.view(),
+        decoded.view()[(colon + 1)..],
+        mut email,
+    );
+    wipe(mut decoded);
+    match (outcome) {
+        Ok(id) => {
+            account.userId = id;
+            account.email.clear();
+            match (account.email.append(StringView.fromUtf8(email.view()) ?? "")) {
+                Ok() => {}
+                Err(_) => { return Err(LoginFailure.Unavailable); }
+            }
+            return Ok();
+        }
+        Err(LoginRefusal.Unavailable) => { return Err(LoginFailure.Unavailable); }
+        Err(_) => { return Err(LoginFailure.Refused); }
+    }
+}
+
+fn wipe(bytes: borrow mut Vector<u8>) {
+    for (i in 0..bytes.length) {
+        bytes[i] = 0;
+    }
+}
+
+/// The answer to a request whose login failed: 401 with a Basic challenge for `realm`, or 503 when the store is
+/// down.
+public fn loginAnswer(failure: LoginFailure, realm: StringView) -> Result<Response, AllocError> {
+    match (failure) {
+        LoginFailure.Unavailable => {
+            var r = Response.text(503, "The server cannot check logins now; try again later.")?;
+            r.header("Retry-After", "30")?;
+            return Ok(r);
+        }
+        _ => {}
+    }
+    var r = Response.text(401, "Unauthorized.")?;
+    var challenge = String.create();
+    challenge.append("Basic realm=\"")?;
+    challenge.append(realm)?;
+    challenge.append("\", charset=\"UTF-8\"")?;
+    r.header("WWW-Authenticate", challenge.view())?;
+    return Ok(r);
+}

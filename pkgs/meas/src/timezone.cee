@@ -1,0 +1,335 @@
+// Time zones: an iCalendar VTIMEZONE (its STANDARD and DAYLIGHT rules), and ActiveSync's TimeZone element, the
+// base64 of a Windows TIME_ZONE_INFORMATION (MS-ASDTYPE §2.6.4: a bias, and the yearly transitions as "the nth
+// weekday of a month at an hour"). Both read into one model, which converts wall-clock times to UTC and back.
+
+import encoding.Base64;
+import mpim.ContentLines;
+import mpim.civilFromDays;
+import mpim.daysFromCivil;
+import mpim.parseCalTime;
+import mpim.weekday;
+
+/// A time zone with at most one yearly daylight-saving period.
+struct Zone {
+    /// Offsets from UTC, in minutes (UTC+1 is 60).
+    standard: i64;
+    daylight: i64;
+    hasDaylight: bool;
+    /// The transitions: month 1-12, week 1-5 (5: the last), weekday 0 (Sunday) - 6, and the wall-clock minute of
+    /// the day it happens at (in the time it ends).
+    toStandardMonth: i64;
+    toStandardWeek: i64;
+    toStandardDay: i64;
+    toStandardMinute: i64;
+    toDaylightMonth: i64;
+    toDaylightWeek: i64;
+    toDaylightDay: i64;
+    toDaylightMinute: i64;
+}
+
+fn utcZone() -> Zone => Zone {
+    standard: 0,
+    daylight: 0,
+    hasDaylight: false,
+    toStandardMonth: 0,
+    toStandardWeek: 0,
+    toStandardDay: 0,
+    toStandardMinute: 0,
+    toDaylightMonth: 0,
+    toDaylightWeek: 0,
+    toDaylightDay: 0,
+    toDaylightMinute: 0,
+};
+
+/// The day number of the `week`th (5: last) `day` (0 Sunday) of `month` in `year`.
+fn nthWeekday(year: i64, month: i64, week: i64, day: i64) -> i64 {
+    let first = daysFromCivil(year, month, 1);
+    let firstDay = weekday(first);
+    var d = first + (day - firstDay + 7) % 7 + (week - 1) * 7;
+    let nextMonth = if (month == 12) daysFromCivil(year + 1, 1, 1) else daysFromCivil(year, month + 1, 1);
+    while (d >= nextMonth) {
+        d -= 7;
+    }
+    return d;
+}
+
+/// Whether wall-clock `local` (seconds, read as UTC) is in daylight-saving time.
+fn inDaylight(z: borrow Zone, local: i64) -> bool {
+    if (!z.hasDaylight || z.toDaylightMonth == 0 || z.toStandardMonth == 0) {
+        return false;
+    }
+    let days = (if (local >= 0) local else local - 86399) / 86400;
+    let year = civilFromDays(days)[0];
+    let begins = nthWeekday(
+        year,
+        z.toDaylightMonth,
+        z.toDaylightWeek,
+        z.toDaylightDay,
+    ) * 86400 + z.toDaylightMinute * 60;
+    let ends = nthWeekday(year, z.toStandardMonth, z.toStandardWeek, z.toStandardDay) * 86400 + z.toStandardMinute * 60;
+    if (begins < ends) {
+        return local >= begins && local < ends;
+    }
+    return local >= begins || local < ends; // the southern hemisphere
+}
+
+/// Wall-clock time `local` in the zone, as UTC.
+fn zoneToUtc(z: borrow Zone, local: i64) -> i64 {
+    let offset = if (inDaylight(z, local)) z.daylight else z.standard;
+    return local - offset * 60;
+}
+
+/// UTC `utc` as wall-clock time in the zone.
+fn zoneToLocal(z: borrow Zone, utc: i64) -> i64 {
+    let guess = utc + z.standard * 60;
+    let offset = if (inDaylight(z, guess)) z.daylight else z.standard;
+    return utc + offset * 60;
+}
+
+/// `+0100`, `-0530`: minutes.
+fn parseOffset(value: Slice<u8>) -> i64? {
+    let v = value.trim();
+    if (v.length < 5) {
+        return null;
+    }
+    let sign: i64 = if (v[0] == 0x2d) -1 else 1;
+    var digits: i64 = 0;
+    for (i in 1..5) {
+        let c = v[i];
+        if (c < 0x30 || c > 0x39) {
+            return null;
+        }
+        digits = digits * 10 + (c - 0x30) as i64;
+    }
+    return sign * ((digits / 100) * 60 + digits % 100);
+}
+
+fn dayNumber(code: Slice<u8>) -> i64? {
+    if (code.length != 2) {
+        return null;
+    }
+    let names = ["SU", "MO", "TU", "WE", "TH", "FR", "SA"];
+    for (i in 0..7) {
+        if (code.equalsIgnoreAsciiCase(names[i].bytes())) {
+            return truncate<i64>(i);
+        }
+    }
+    return null;
+}
+
+/// A rule part `NAME=value` of an RRULE, as a range of `rule`.
+fn rulePart(rule: Slice<u8>, name: StringView) -> [usize; 2]? {
+    var at: usize = 0;
+    while (at < rule.length) {
+        var end = at;
+        while (end < rule.length && rule[end] != 0x3b) {
+            end += 1;
+        }
+        let part = rule[at..end];
+        let eq = name.length;
+        if (part.length > eq && part[eq] == 0x3d && part[0..eq].equalsIgnoreAsciiCase(name.bytes())) {
+            return [at + eq + 1, end];
+        }
+        at = end + 1;
+    }
+    return null;
+}
+
+/// `-1SU`: [week (5: last), day].
+fn ordinalDay(text: Slice<u8>) -> [i64; 2]? {
+    if (text.length < 2) {
+        return null;
+    }
+    let day = dayNumber(text[(text.length - 2)..])?;
+    let n = text[0..(text.length - 2)];
+    if (n.length == 0) {
+        return [0i64, day];
+    }
+    let negative = n[0] == 0x2d;
+    let digits = if (negative || n[0] == 0x2b) n[1..] else n;
+    let value = (StringView.fromUtf8(digits) ?? "").parseInt<i64>()?;
+    return [if (negative) 5 else value, day];
+}
+
+/// The zone of the VTIMEZONE whose TZID is `tzid` in `lines`; UTC when there is none.
+fn zoneOf(lines: borrow ContentLines, tzid: Slice<u8>) -> Zone {
+    var z = utcZone();
+    var i: usize = 0;
+    while (i < lines.count()) {
+        if (lines.depth(i) == 2 && lines.begins(i, "VTIMEZONE")) {
+            let end = lines.componentEnd(i);
+            let id = lines.property(i + 1, end, 2, "TZID");
+            let matches = match (id) {
+                Some(l) => lines.rawValue(l).trim() == tzid.trim(),
+                null => false,
+            };
+            if (matches) {
+                readZone(lines, i, end, mut z);
+                return z;
+            }
+            i = end;
+            continue;
+        }
+        i += 1;
+    }
+    return z;
+}
+
+fn readZone(lines: borrow ContentLines, from: usize, to: usize, z: borrow mut Zone) {
+    var i = from + 1;
+    while (i < to) {
+        let standard = lines.begins(i, "STANDARD");
+        let daylight = lines.begins(i, "DAYLIGHT");
+        if (lines.depth(i) == 3 && (standard || daylight)) {
+            let end = lines.componentEnd(i);
+            let offset = match (lines.property(i + 1, end, 3, "TZOFFSETTO")) {
+                Some(l) => parseOffset(lines.rawValue(l)) ?? 0,
+                null => 0,
+            };
+            var month: i64 = 0;
+            var week: i64 = 0;
+            var day: i64 = 0;
+            var minute: i64 = 0;
+            match (lines.property(i + 1, end, 3, "DTSTART")) {
+                Some(l) => {
+                    match (parseCalTime(lines.rawValue(l))) {
+                        Some(t) => { minute = (t.seconds % 86400) / 60; }
+                        null => {}
+                    }
+                }
+                null => {}
+            }
+            match (lines.property(i + 1, end, 3, "RRULE")) {
+                Some(l) => {
+                    let rule = lines.rawValue(l);
+                    match (rulePart(rule, "BYMONTH")) {
+                        Some(r) => { month = (StringView.fromUtf8(rule[r[0]..r[1]]) ?? "").parseInt<i64>() ?? 0; }
+                        null => {}
+                    }
+                    match (rulePart(rule, "BYDAY")) {
+                        Some(r) => {
+                            match (ordinalDay(rule[r[0]..r[1]])) {
+                                Some(o) => {
+                                    week = if (o[0] == 0) 1 else o[0];
+                                    day = o[1];
+                                }
+                                null => {}
+                            }
+                        }
+                        null => {}
+                    }
+                }
+                null => {}
+            }
+            if (standard) {
+                z.standard = offset;
+                z.toStandardMonth = month;
+                z.toStandardWeek = week;
+                z.toStandardDay = day;
+                z.toStandardMinute = minute;
+            } else {
+                z.daylight = offset;
+                z.hasDaylight = true;
+                z.toDaylightMonth = month;
+                z.toDaylightWeek = week;
+                z.toDaylightDay = day;
+                z.toDaylightMinute = minute;
+            }
+            i = end;
+            continue;
+        }
+        i += 1;
+    }
+    if (!z.hasDaylight) {
+        z.daylight = z.standard;
+    }
+}
+
+fn putI32(out: borrow mut Vector<u8>, v: i64) -> Result<void, AllocError> {
+    let u = truncate<u32>(v);
+    out.push(truncate<u8>(u))?;
+    out.push(truncate<u8>(u >> 8))?;
+    out.push(truncate<u8>(u >> 16))?;
+    return out.push(truncate<u8>(u >> 24));
+}
+
+fn putU16(out: borrow mut Vector<u8>, v: i64) -> Result<void, AllocError> {
+    let u = truncate<u16>(v);
+    out.push(truncate<u8>(u))?;
+    return out.push(truncate<u8>(u >> 8));
+}
+
+fn putSystemTime(out: borrow mut Vector<u8>, month: i64, week: i64, day: i64, minute: i64) -> Result<void, AllocError> {
+    putU16(out, 0)?; // the year: 0, a yearly rule
+    putU16(out, month)?;
+    putU16(out, day)?;
+    putU16(out, week)?;
+    putU16(out, minute / 60)?;
+    putU16(out, minute % 60)?;
+    putU16(out, 0)?;
+    return putU16(out, 0);
+}
+
+/// The zone as ActiveSync's TimeZone value (base64 of 172 bytes).
+fn zoneBlob(z: borrow Zone, into: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    var raw = Vector<u8>.create();
+    putI32(mut raw, 0 - z.standard)?;
+    for (i in 0..64) {
+        raw.push(0)?;
+    }
+    if (z.hasDaylight) {
+        putSystemTime(mut raw, z.toStandardMonth, z.toStandardWeek, z.toStandardDay, z.toStandardMinute)?;
+    } else {
+        putSystemTime(mut raw, 0, 0, 0, 0)?;
+    }
+    putI32(mut raw, 0)?;
+    for (i in 0..64) {
+        raw.push(0)?;
+    }
+    if (z.hasDaylight) {
+        putSystemTime(mut raw, z.toDaylightMonth, z.toDaylightWeek, z.toDaylightDay, z.toDaylightMinute)?;
+    } else {
+        putSystemTime(mut raw, 0, 0, 0, 0)?;
+    }
+    putI32(mut raw, if (z.hasDaylight) z.standard - z.daylight else 0)?;
+    return Base64.encode(raw.view(), into);
+}
+
+fn getI32(raw: Slice<u8>, at: usize) -> i64 {
+    let u =
+        (raw[at] as u32) | ((raw[at + 1] as u32) << 8) | ((raw[at + 2] as u32) << 16) | ((raw[at + 3] as u32) << 24);
+    return (u as i64) - (if (u >= 0x80000000) 4294967296i64 else 0i64);
+}
+
+fn getU16(raw: Slice<u8>, at: usize) -> i64 => ((raw[at] as u32) | ((raw[at + 1] as u32) << 8)) as i64;
+
+/// ActiveSync's TimeZone value read; UTC when it is malformed.
+fn zoneFromBlob(text: Slice<u8>) -> Zone {
+    var raw = Vector<u8>.create();
+    match (Base64.decode(text.trim(), mut raw)) {
+        Ok() => {}
+        Err(_) => { return utcZone(); }
+    }
+    if (raw.length < 172) {
+        return utcZone();
+    }
+    let r = raw.view();
+    var z = utcZone();
+    let bias = getI32(r, 0);
+    z.standard = 0 - bias - getI32(r, 84);
+    let dstMonth = getU16(r, 154);
+    z.hasDaylight = dstMonth != 0 && getU16(r, 70) != 0;
+    z.daylight = 0 - bias - getI32(r, 168);
+    if (!z.hasDaylight) {
+        z.daylight = z.standard;
+    }
+    z.toStandardMonth = getU16(r, 70);
+    z.toStandardDay = getU16(r, 72);
+    z.toStandardWeek = getU16(r, 74);
+    z.toStandardMinute = getU16(r, 76) * 60 + getU16(r, 78);
+    z.toDaylightMonth = dstMonth;
+    z.toDaylightDay = getU16(r, 156);
+    z.toDaylightWeek = getU16(r, 158);
+    z.toDaylightMinute = getU16(r, 160) * 60 + getU16(r, 162);
+    return z;
+}

@@ -1,0 +1,8 @@
+[package]
+name = "spfcheck"
+version = "0.1.0"
+kind = "executable"
+
+[dependencies]
+mauth = { path = "../.." }
+mdns = { path = "../../../mdns" }

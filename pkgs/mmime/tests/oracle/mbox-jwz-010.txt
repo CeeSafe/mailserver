@@ -1,0 +1,10 @@
+size 58132
+envelope ("26 Dec 1991 20:45 (Thursday)" "couldn't resist this" (("Bob Kummerfeld" NIL "bob" "cs.su.oz.au")) (("Bob Kummerfeld" NIL "bob" "cs.su.oz.au")) (("Bob Kummerfeld" NIL "bob" "cs.su.oz.au")) ((NIL NIL "nsb" "thumper.bellcore.com")) NIL NIL NIL "<9112262015.AA13190@thumper.bellcore.com>")
+bodystructure ("image" "pbm" NIL NIL NIL "base64" 57561 NIL NIL NIL NIL)
+body ("image" "pbm" NIL NIL NIL "base64" 57561)
+section HEADER 571 9344dd931fc300ef0fa06fdc52932259d3b2db2c17d755bfae226729f38d3bee
+section TEXT 57561 22f94237e6ea0b4d3f04c5aa6637de61389732f3e9d0c5142cb40e21d329e7f1
+section HEADER.FIELDS 219 b34ff9874a801bc7128b7f4f522317e5e2bc63ac41990cab9eb5fc2236ed0de2
+section HEADER.FIELDS.NOT 354 8b17de0fc456fe3160248945f07ceed13e6746e6fdd0103ec80ed451830d249e
+section 1 57561 22f94237e6ea0b4d3f04c5aa6637de61389732f3e9d0c5142cb40e21d329e7f1
+section 1.MIME 571 9344dd931fc300ef0fa06fdc52932259d3b2db2c17d755bfae226729f38d3bee

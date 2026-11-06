@@ -1,0 +1,329 @@
+// The SMTP client against tools/fakemx.py (FAKEMX_PORT, FAKEMX_LOG; tests/run.sh starts it), and the bounce. Without
+// FAKEMX_PORT the client tests pass without running.
+
+import diskio.Files;
+import diskio.RawFile;
+import msmtp.ClientSettings;
+import msmtp.HOST_DONE;
+import msmtp.HOST_TLS_FAILED;
+import msmtp.HOST_UNUSABLE;
+import msmtp.HostResult;
+import msmtp.Message;
+import msmtp.RecipientResult;
+import msmtp.deliverTo;
+import tls.TlsConfig;
+
+fn basePort() -> u16? {
+    let text = Environment.variable("FAKEMX_PORT")?;
+    return text.parseInt<u16>();
+}
+
+fn local(p: u16) -> SocketAddress => SocketAddress.V4([127u8, 0, 0, 1], p);
+
+/// A file holding `text`, opened for reading.
+fn messageFile(name: StringView, text: Slice<u8>) -> RawFile {
+    var path = Directory.temporary()!;
+    path.append("/mqueue-test-")!;
+    path.append(name)!;
+    if (Files.exists(path.view())!) {
+        Files.remove(path.view())!;
+    }
+    var w = RawFile.createNew(path.view())!;
+    w.write(text)!;
+    return RawFile.open(path.view())!;
+}
+
+/// The addresses of a comma-separated list.
+fn addresses(list: StringView) -> Vector<String> {
+    var out = Vector<String>.create();
+    for (a in list.split(",")) {
+        var s = String.create();
+        s.append(a.trim())!;
+        out.push(s)!;
+    }
+    return out;
+}
+
+fn clientConfig() -> TlsConfig {
+    var c = TlsConfig.clientWithoutRoots()!;
+    c.verifyPeer(false);
+    return c;
+}
+
+fn quick() -> ClientSettings {
+    var s = ClientSettings.create("relay.test")!;
+    s.connectTimeout = 1000;
+    s.commandTimeout = 1000;
+    s.blockTimeout = 1000;
+    s.finalTimeout = 2000;
+    s.tlsTimeout = 1000;
+    return s;
+}
+
+async fn send(
+    port: u16,
+    prefix: Slice<u8>,
+    tryTls: bool,
+    recipients: borrow Vector<String>,
+    file: borrow RawFile,
+    size: u64,
+    results: borrow mut Vector<RecipientResult>,
+    host: borrow mut HostResult,
+) -> Result<void, AllocError> {
+    let settings = quick();
+    let config = clientConfig();
+    let message = Message { prefix: prefix, file: file, size: size + (prefix.length as u64), eightBit: true };
+    return await deliverTo(
+        local(port),
+        "localhost",
+        settings,
+        config,
+        tryTls,
+        "sender@relay.test",
+        recipients,
+        message,
+        results,
+        host,
+    );
+}
+
+/// Whether the outcomes are `want`, one digit each: 0 delivered, 1 transient, 2 permanent.
+fn outcomes(results: borrow Vector<RecipientResult>, want: StringView) -> bool {
+    let w = want.bytes();
+    if (results.length != w.length) {
+        return false;
+    }
+    for (i in 0..w.length) {
+        if (results[i].outcome != w[i] - 0x30) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Whether one of fakemx's records holds `marker` and `want` (in its JSON text, so CRLF reads `\r\n`).
+fn logged(marker: StringView, want: StringView) -> bool {
+    let dir = match (Environment.variable("FAKEMX_LOG")) {
+        Some(d) => d,
+        null => { return false; }
+    };
+    for (n in 1..400) {
+        var path = String.create();
+        path.append(dir)!;
+        path.append("/")!;
+        let digits = [
+            0x30u8 + truncate<u8>(n / 1000),
+            0x30u8 + truncate<u8>(n / 100 % 10),
+            0x30u8 + truncate<u8>(n / 10 % 10),
+            0x30u8 + truncate<u8>(n % 10),
+        ];
+        path.append(StringView.fromUtf8(digits[..])!)!;
+        path.append(".json")!;
+        if (!Files.exists(path.view())!) {
+            continue;
+        }
+        let f = RawFile.open(path.view())!;
+        var bytes = Vector<u8>.create();
+        bytes.resize(truncate<usize>(f.size()!), 0)!;
+        let got = f.readAt(mut bytes[..], 0)!;
+        let text = StringView.fromUtf8(bytes[0..got])!;
+        if (text.contains(marker) && text.contains(want)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn host() -> HostResult => HostResult { kind: 9, reply: String.create(), tls: false, security: 0 };
+
+@test
+fn deliversWithPipeliningAndTls() -> Result<void, TestFailure> {
+    let p = match (basePort()) {
+        Some(p) => p,
+        null => { return Ok(); }
+    };
+    // A leading dot to stuff, a bare LF to make CRLF, and no final line end.
+    let text = "Subject: marker-pipelining\r\n\r\n.leading dot\r\nbare\nline\r\n..two\r\nend";
+    let file = messageFile("pipelining", text.bytes());
+    let rcpts = addresses("ok@x.test, reject@x.test, defer@x.test, ok2@x.test");
+    var results = Vector<RecipientResult>.create();
+    var h = host();
+    Async.run(
+        send(p, "X-Added: on the way out\r\n".bytes(), true, rcpts, file, text.length as u64, mut results, mut h),
+    )!;
+    Check.isTrue(h.kind == HOST_DONE && h.tls, "a TLS session")?;
+    Check.isTrue(
+        logged("marker-pipelining", "\"data\": \"X-Added: on the way out\\r\\nSubject: marker-pipelining"),
+        "the prefix first",
+    )?;
+    Check.isTrue(outcomes(results, "0210"), "outcomes")?;
+    Check.isTrue(results[1].reply.view().startsWith("550 5.1.1"), "the server's words kept")?;
+    Check.isTrue(
+        logged("marker-pipelining", "\\r\\n..leading dot\\r\\nbare\\r\\nline\\r\\n...two\\r\\nend\\r\\n"),
+        "stuffed, CRLF",
+    )?;
+    return Check.isTrue(
+        logged("marker-pipelining", "SIZE=") && logged("marker-pipelining", "BODY=8BITMIME"),
+        "SIZE and BODY",
+    );
+}
+
+@test
+fn handlesUnusableHosts() -> Result<void, TestFailure> {
+    let p = match (basePort()) {
+        Some(p) => p,
+        null => { return Ok(); }
+    };
+    let text = "Subject: marker-unusable\r\n\r\nx\r\n";
+    let file = messageFile("unusable", text.bytes());
+    let rcpts = addresses("ok@x.test");
+    var results = Vector<RecipientResult>.create();
+    var h = host();
+    // 421 at the greeting.
+    Async.run(send(p + 1, "".bytes(), true, rcpts, file, text.length as u64, mut results, mut h))!;
+    Check.isTrue(h.kind == HOST_UNUSABLE && h.reply.view().startsWith("421") && outcomes(results, "1"), "421")?;
+    // Silence: the command timeout.
+    let started = Clock.unixMillis();
+    Async.run(send(p + 3, "".bytes(), true, rcpts, file, text.length as u64, mut results, mut h))!;
+    Check.isTrue(h.kind == HOST_UNUSABLE && Clock.unixMillis() - started < 3000, "a silent server times out")?;
+    // Nothing listening.
+    Async.run(send(1, "".bytes(), true, rcpts, file, text.length as u64, mut results, mut h))!;
+    Check.isTrue(h.kind == HOST_UNUSABLE, "refused")?;
+    // Dropped in the middle of DATA: accepted, but not delivered.
+    Async.run(send(p + 4, "".bytes(), true, rcpts, file, text.length as u64, mut results, mut h))!;
+    return Check.isTrue(outcomes(results, "1"), "a drop during DATA is not a delivery");
+}
+
+@test
+fn fallsBack() -> Result<void, TestFailure> {
+    let p = match (basePort()) {
+        Some(p) => p,
+        null => { return Ok(); }
+    };
+    let rcpts = addresses("ok@x.test, reject@x.test");
+    var results = Vector<RecipientResult>.create();
+    var h = host();
+    // HELO only.
+    let old = "Subject: marker-helo\r\n\r\nx\r\n";
+    let f1 = messageFile("helo", old.bytes());
+    Async.run(send(p + 2, "".bytes(), true, rcpts, f1, old.length as u64, mut results, mut h))!;
+    Check.isTrue(h.kind == HOST_DONE && outcomes(results, "02"), "HELO")?;
+    Check.isTrue(logged("marker-helo", "HELO relay.test"), "HELO sent")?;
+    // A broken STARTTLS, then the same server in the clear.
+    let broken = "Subject: marker-badtls\r\n\r\nx\r\n";
+    let f2 = messageFile("badtls", broken.bytes());
+    Async.run(send(p + 5, "".bytes(), true, rcpts, f2, broken.length as u64, mut results, mut h))!;
+    Check.isTrue(h.kind == HOST_TLS_FAILED, "the handshake fails")?;
+    Async.run(send(p + 5, "".bytes(), false, rcpts, f2, broken.length as u64, mut results, mut h))!;
+    Check.isTrue(h.kind == HOST_DONE && !h.tls && outcomes(results, "02"), "then in the clear")?;
+    // One command at a time.
+    let serial = "Subject: marker-serial\r\n\r\nx\r\n";
+    let f3 = messageFile("serial", serial.bytes());
+    Async.run(send(p + 6, "".bytes(), true, rcpts, f3, serial.length as u64, mut results, mut h))!;
+    return Check.isTrue(h.kind == HOST_DONE && outcomes(results, "02"), "no PIPELINING");
+}
+
+@test
+fn refusesWhatTheServerCannotTake() -> Result<void, TestFailure> {
+    let p = match (basePort()) {
+        Some(p) => p,
+        null => { return Ok(); }
+    };
+    var results = Vector<RecipientResult>.create();
+    var h = host();
+    // Over the advertised SIZE: refused before MAIL.
+    var big = Vector<u8>.create();
+    big.extend("Subject: marker-big\r\n\r\n".bytes())!;
+    while (big.length < 1100000) {
+        big.extend("0123456789012345678901234567890123456789012345678901234567890123456789\r\n".bytes())!;
+    }
+    let f1 = messageFile("big", big.view());
+    let one = addresses("ok@x.test");
+    Async.run(send(p, "".bytes(), false, one, f1, big.length as u64, mut results, mut h))!;
+    Check.isTrue(outcomes(results, "2") && results[0].reply.view().startsWith("552 5.3.4"), "SIZE")?;
+    // The message refused at the final dot: every accepted recipient fails.
+    let text = "Subject: marker-datafail\r\n\r\nx\r\n";
+    let f2 = messageFile("datafail", text.bytes());
+    let rcpts = addresses("datafail@x.test, ok@x.test, reject@x.test");
+    Async.run(send(p, "".bytes(), false, rcpts, f2, text.length as u64, mut results, mut h))!;
+    Check.isTrue(outcomes(results, "222"), "554 at the dot")?;
+    Check.isTrue(
+        results[0].reply.view().startsWith("554 5.6.0") && results[2].reply.view().startsWith("550"),
+        "replies",
+    )?;
+    // An internationalized address to a server without SMTPUTF8.
+    let utf = addresses("jörg@x.test");
+    Async.run(send(p + 6, "".bytes(), false, utf, f2, text.length as u64, mut results, mut h))!;
+    return Check.isTrue(outcomes(results, "2") && results[0].reply.view().startsWith("553 5.6.7"), "SMTPUTF8");
+}
+
+@test
+fn buildsBounces() -> Result<void, TestFailure> {
+    var failures = Vector<Failure>.create();
+    var a = Failure { recipient: String.create(), reply: String.create(), remote: String.create() };
+    a.recipient.append("reject@x.test")!;
+    a.reply.append("550 5.1.1 <reject@x.test>: no such user")!;
+    a.remote.append("mx.x.test")!;
+    failures.push(a)!;
+    var b = Failure { recipient: String.create(), reply: String.create(), remote: String.create() };
+    b.recipient.append("gone@nowhere.test")!;
+    b.reply.append("550 5.1.2 The recipient's domain does not exist")!;
+    failures.push(b)!;
+    var out = Vector<u8>.create();
+    let original = "Subject: hi\r\nMessage-ID: <m@x>\r\n\r\nbody that is not quoted\r\n";
+    buildBounce(
+        "".bytes(),
+        "mx.relay.test".bytes(),
+        "alice@relay.test".bytes(),
+        failures,
+        original.bytes(),
+        "Thu, 5 Nov 2026 10:00:00 +0000".bytes(),
+        "<b@mx.relay.test>".bytes(),
+        "=_b1".bytes(),
+        mut out,
+    )!;
+    let text = StringView.fromUtf8(out.view())!;
+    Check.isTrue(text.contains("Content-Type: multipart/report; report-type=delivery-status;"), "a report")?;
+    Check.isTrue(
+        text.contains(
+            "\r\nFinal-Recipient: rfc822; reject@x.test\r\nAction: failed\r\nStatus: 5.1.1\r\nRemote-MTA: dns; mx.x.test\r\nDiagnostic-Code: smtp; 550 5.1.1",
+        ),
+        "the remote failure",
+    )?;
+    Check.isTrue(
+        text.contains("\r\nFinal-Recipient: rfc822; gone@nowhere.test\r\nAction: failed\r\nStatus: 5.1.2\r\n"),
+        "our own failure",
+    )?;
+    Check.isTrue(
+        text.contains("Content-Type: text/rfc822-headers\r\n\r\nSubject: hi\r\nMessage-ID: <m@x>\r\n"),
+        "the header",
+    )?;
+    Check.isFalse(text.contains("not quoted"), "not the body")?;
+    // Status codes from replies.
+    var status = Vector<u8>.create();
+    // A delay notice.
+    buildBounce(
+        "Fri, 6 Nov 2026 10:00:00 +0000".bytes(),
+        "mx.relay.test".bytes(),
+        "alice@relay.test".bytes(),
+        failures,
+        original.bytes(),
+        "Thu, 5 Nov 2026 10:00:00 +0000".bytes(),
+        "<d@mx.relay.test>".bytes(),
+        "=_d1".bytes(),
+        mut out,
+    )!;
+    let notice = StringView.fromUtf8(out.view())!;
+    Check.isTrue(
+        notice.contains("Subject: Delayed Mail (still being retried)") && notice.contains("Action: delayed"),
+        "delayed",
+    )?;
+    Check.isTrue(notice.contains("\r\nWill-Retry-Until: Fri, 6 Nov 2026 10:00:00 +0000\r\n"), "until when")?;
+    Check.isFalse(notice.contains("Action: failed"), "nothing failed")?;
+    statusOf("452 4.2.2 full".bytes(), mut status)!;
+    Check.isTrue(StringView.fromUtf8(status.view())! == "4.2.2", "4.2.2")?;
+    statusOf("550 no enhanced code".bytes(), mut status)!;
+    Check.isTrue(StringView.fromUtf8(status.view())! == "5.0.0", "made from the code")?;
+    statusOf("550 4.2.2 mismatched class".bytes(), mut status)!;
+    return Check.isTrue(StringView.fromUtf8(status.view())! == "5.0.0", "a class that does not match the code");
+}

@@ -1,0 +1,45 @@
+// Small readers over a decoded request.
+
+import mxml.XmlDocument;
+
+/// The trimmed text of `element`'s child `local` in `space`; empty when there is none.
+public fn childValue<region r>(
+    doc: borrow(r) XmlDocument,
+    element: usize,
+    space: StringView,
+    local: StringView,
+) -> StringView<r> =>
+    match (doc.child(
+        element,
+        space,
+        local,
+    )) {
+        Some(c) => doc.trimmed(c),
+        null => "",
+    };
+
+/// The trimmed text of the first element `local` in `space` inside `element`, at any depth; empty when none.
+public fn findValue<region r>(
+    doc: borrow(r) XmlDocument,
+    element: usize,
+    space: StringView,
+    local: StringView,
+) -> StringView<r> =>
+    match (doc.find(
+        element,
+        space,
+        local,
+    )) {
+        Some(c) => doc.trimmed(c),
+        null => "",
+    };
+
+/// `childValue` as a number; `fallback` when absent or not a number.
+public fn childNumber(
+    doc: borrow XmlDocument,
+    element: usize,
+    space: StringView,
+    local: StringView,
+    fallback: i64,
+) -> i64 =>
+    childValue(doc, element, space, local).parseInt<i64>() ?? fallback;

@@ -1,0 +1,26 @@
+size 177075
+envelope ("Thu,  9 Jan 1992 13:30:05 -0500 (EST)" "How MIME looks in AMS (MIME format)" (("Nathaniel Borenstein" NIL "nsb" "MISSING_DOMAIN")) (("Nathaniel Borenstein" NIL "nsb" "MISSING_DOMAIN")) (("Nathaniel Borenstein" NIL "nsb" "MISSING_DOMAIN")) (("Bob Weiner" NIL "rsw" "cs.brown.edu")) (("Michael Littman" NIL "mlittman" "MISSING_DOMAIN")) NIL "<9201061308.AA17408@pebbles.cs.brown.edu>" "<MdP9Ghe0M2YtMbPm5Q@thumper.bellcore.com>")
+bodystructure (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 813 18 NIL NIL NIL NIL) (("text" "richtext" ("charset" "us-ascii") NIL NIL "quoted-printable" 496 7 NIL NIL NIL NIL) ("image" "gif" NIL NIL "Jessica Rabbit" "base64" 13180 NIL NIL NIL NIL) ("text" "plain" ("charset" "us-ascii") NIL NIL "quoted-printable" 21 1 NIL NIL NIL NIL) ("audio" "basic" NIL NIL "Would Be Cool" "base64" 56484 NIL NIL NIL NIL) ("text" "plain" ("charset" "us-ascii") NIL NIL "quoted-printable" 57 5 NIL NIL NIL NIL) ("image" "x-xwd" NIL NIL NIL "base64" 103552 NIL NIL NIL NIL) ("text" "plain" ("charset" "us-ascii") NIL NIL "quoted-printable" 4 2 NIL NIL NIL NIL) "mixed" ("boundary" "Alternative_Boundary_MdP9G7i0M2YtIbPlllMdP9G7i0M2YtEbPlps") NIL NIL NIL) "alternative" ("boundary" "Interpart_Boundary_MdP9G7i0M2YtQbPlt5MdP9G7i0M2YtMbPlxY") NIL NIL NIL)
+body (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 813 18) (("text" "richtext" ("charset" "us-ascii") NIL NIL "quoted-printable" 496 7) ("image" "gif" NIL NIL "Jessica Rabbit" "base64" 13180) ("text" "plain" ("charset" "us-ascii") NIL NIL "quoted-printable" 21 1) ("audio" "basic" NIL NIL "Would Be Cool" "base64" 56484) ("text" "plain" ("charset" "us-ascii") NIL NIL "quoted-printable" 57 5) ("image" "x-xwd" NIL NIL NIL "base64" 103552) ("text" "plain" ("charset" "us-ascii") NIL NIL "quoted-printable" 4 2) "mixed") "alternative")
+section HEADER 769 776ce6619c6686c0da299cd3b804915322653e4ca34c3801726636fa4e7b271f
+section TEXT 176306 d5803ab7bc82ef4cd541c1842d96a2b856b235f038203b4b9cce0cd4f9bf09c1
+section HEADER.FIELDS 357 521a2c63149f5e7ac1b7dcc7dad70492e39902ad292dfc11a1effe8e7fc1972a
+section HEADER.FIELDS.NOT 414 dc25e2ab62ffd083b7256c4bca08e9e9e4313daf7d6fd8f3d0faacff31152e23
+section 1 813 35d30eaa603c76acd9e3318000af2cfde77a8428381a332382d36e72b8528d4d
+section 1.MIME 2 7eb70257593da06f682a3ddda54a9d260d4fc514f645237f5ca74b08f8da61a6
+section 2 174857 c4c09ea9139a2bc41845d7494cac90f92b342d143d3c5a20dc0379d260ee491c
+section 2.MIME 106 710a80c1a90086755044e02dc06197ab0cc9ee9073b8801e52b0146ea6871273
+section 2.1 496 316d566a11aa936102a4e322b89e06986b4cde53b22600ed584493fa94dc7ade
+section 2.1.MIME 76 7712e776f2993a93b185dfb1c41705d43d20df049e3a88fcbbd6a81e4f5f5077
+section 2.2 13180 bd3d34b1b17570539570bfc43f84f16a0f797ad351bbc620c7a6851f05e039a0
+section 2.2.MIME 100 f5528ce4efe42ee8a8cde88019e26c9cbd32b6684157d9fafccf0346e93b92be
+section 2.3 21 20932c294cc40b276cf68f46bcba8b8900702ef0bfd1fd384a0481603171ad06
+section 2.3.MIME 73 572361e91fdfad091c8229b8f81a36a6e88093d00dff2ab1af23ca63bf781b19
+section 2.4 56484 10a9f28e62d2f75c7557efd12e98e5997ad8a8f95cdac6ad6bc6152206461ba4
+section 2.4.MIME 100 24a11e9e827a8b70832efd5efe44f3f463dd2061d2e6c33326bf2dc7e3db2e02
+section 2.5 57 b46588ffb28607651b613ccf104eb1c9499d8ddb453d88dedafa6368227e4fbb
+section 2.5.MIME 73 572361e91fdfad091c8229b8f81a36a6e88093d00dff2ab1af23ca63bf781b19
+section 2.6 103552 f6e9379ae4be85fc29978186bb57a82e42cfbddb0ed9f962e124000ba8f2d4e7
+section 2.6.MIME 64 08b4fee533f8ae60baf6a813124e7f68ec5b0af77306ceedaa44b33691f53825
+section 2.7 4 dba5166ad9db9ba648c1032ebbd34dcd0d085b50023b839ef5c68ca1db93a563
+section 2.7.MIME 73 572361e91fdfad091c8229b8f81a36a6e88093d00dff2ab1af23ca63bf781b19

@@ -1,0 +1,193 @@
+// Fetching an MTA-STS policy (RFC 8461 §3.3): `GET https://mta-sts.<domain>/.well-known/mta-sts.txt`, over TLS with a
+// certificate valid for that name under trusted roots, following no redirects, and taking only a 200 response of type
+// text/plain.
+
+import tls.TlsConfig;
+import tls.TlsError;
+import tls.TlsStream;
+
+/// How long a fetch may take in all, in milliseconds (§3.3 suggests a minute at most).
+const STS_FETCH_MS: u64 = 60000;
+
+/// The most bytes a response may have: the policy's limit, and room for the headers.
+const STS_RESPONSE_LIMIT: usize = STS_POLICY_LIMIT + 16384;
+
+/// Fetches `domain`'s policy file into `body`. False when there is none to be had: no address, no connection, a
+/// certificate that does not verify, a response other than 200 text/plain, or one too big.
+async fn fetchStsPolicy(relay: borrow Relay, domain: StringView, body: borrow mut String) -> Result<bool, AllocError> {
+    body.clear();
+    var host = String.create();
+    host.append("mta-sts.")?;
+    host.append(domain)?;
+    var addresses = Vector<SocketAddress>.create();
+    await addressesOf(relay.resolver, host.view(), relay.settings.stsPort, mut addresses)?;
+    var response = Vector<u8>.create();
+    for (a in 0..addresses.length) {
+        response.clear();
+        let address = addresses[a];
+        let fetched: Result<void, TlsError> = await Async.timeout(
+            STS_FETCH_MS,
+            TlsError.Io(AsyncError.TimedOut),
+            async () => await fetchFrom(
+                address,
+                relay.verifiedConfig,
+                host.view(),
+                relay.settings.client.tlsTimeout,
+                mut response,
+            ),
+        );
+        match (fetched) {
+            Ok() => { return parseStsResponse(response.view(), body); }
+            Err(TlsError.OutOfMemory) => { return Err(AllocError.OutOfMemory); }
+            Err(_) => {}
+        }
+    }
+    return Ok(false);
+}
+
+/// The whole response from the server at `address`, into `into`.
+async fn fetchFrom(
+    address: SocketAddress,
+    config: borrow TlsConfig,
+    host: StringView,
+    tlsTimeoutMs: u64,
+    into: borrow mut Vector<u8>,
+) -> Result<void, TlsError> {
+    let tcp = match (await AsyncTcpStream.connectTo(address)) {
+        Ok(s) => s,
+        Err(e) => { return Err(TlsError.Io(e)); }
+    };
+    var tls = await TlsStream.connectWithin(tcp, config, host, tlsTimeoutMs)?;
+    var request = String.create();
+    match (requestFor(host, mut request)) {
+        Ok() => {}
+        Err(_) => { return Err(TlsError.OutOfMemory); }
+    }
+    await tls.write(request.bytes())?;
+    var buffer = [0u8; 4096];
+    loop {
+        let n = match (await tls.read(mut buffer[..])) {
+            Ok(n) => n,
+            Err(TlsError.Truncated) => 0, // a close without close_notify: the length checks below still apply
+            Err(e) => { return Err(e); }
+        };
+        if (n == 0) {
+            return Ok();
+        }
+        if (into.length + n > STS_RESPONSE_LIMIT) {
+            return Err(TlsError.Protocol(0));
+        }
+        match (into.extend(buffer[0..n])) {
+            Ok() => {}
+            Err(_) => { return Err(TlsError.OutOfMemory); }
+        }
+    }
+}
+
+fn requestFor(host: StringView, into: borrow mut String) -> Result<void, AllocError> {
+    into.append("GET /.well-known/mta-sts.txt HTTP/1.1\r\nHost: ")?;
+    into.append(host)?;
+    into.append("\r\nUser-Agent: CeeSafe-mailserver\r\nAccept: text/plain\r\nConnection: close\r\n\r\n")?;
+    return Ok();
+}
+
+/// The body of an HTTP/1.x response that is 200 with Content-Type text/plain, into `body`: by Content-Length, chunked,
+/// or up to the end. False for any other response, or one that is not UTF-8.
+fn parseStsResponse(bytes: Slice<u8>, body: borrow mut String) -> Result<bool, AllocError> {
+    body.clear();
+    let text = match (StringView.fromUtf8(bytes)) {
+        Some(t) => t,
+        null => { return Ok(false); }
+    };
+    let end = match (text.indexOf("\r\n\r\n")) {
+        Some(i) => i,
+        null => { return Ok(false); }
+    };
+    let head = text[0..end];
+    let rest = text[end + 4..];
+    var first = true;
+    var plain = false;
+    var chunked = false;
+    var length: i64 = -1;
+    for (line in head.split("\r\n")) {
+        if (first) {
+            // "HTTP/1.1 200 OK": a redirect or anything else is no policy (§3.3).
+            if (!line.startsWith("HTTP/1.") || line.length < 12 || line[8..12] != " 200") {
+                return Ok(false);
+            }
+            first = false;
+            continue;
+        }
+        let colon = match (line.indexOf(":")) {
+            Some(i) => i,
+            null => { return Ok(false); }
+        };
+        let name = line[0..colon].trim();
+        let value = line[colon + 1..].trim();
+        if (name.equalsIgnoreAsciiCase("Content-Type")) {
+            plain = value.length >= 10 && value[0..10].equalsIgnoreAsciiCase("text/plain");
+        } else if (name.equalsIgnoreAsciiCase("Transfer-Encoding")) {
+            chunked = value.equalsIgnoreAsciiCase("chunked");
+        } else if (name.equalsIgnoreAsciiCase("Content-Length")) {
+            length = value.parseInt<i64>() ?? -2;
+        }
+    }
+    if (!plain || length == -2) {
+        return Ok(false);
+    }
+    if (chunked) {
+        return dechunk(rest, body);
+    }
+    if (length >= 0) {
+        let want = checkedTruncate<usize>(length) ?? STS_RESPONSE_LIMIT;
+        if (rest.length < want || want > STS_POLICY_LIMIT) {
+            return Ok(false);
+        }
+        body.append(rest[0..want])?;
+        return Ok(true);
+    }
+    if (rest.length > STS_POLICY_LIMIT) {
+        return Ok(false);
+    }
+    body.append(rest)?;
+    return Ok(true);
+}
+
+/// A chunked body (RFC 9112 §7.1), into `body`; false when it is malformed or cut short.
+fn dechunk(text: StringView, body: borrow mut String) -> Result<bool, AllocError> {
+    var at: usize = 0;
+    loop {
+        let lineEnd = match (text[at..].indexOf("\r\n")) {
+            Some(i) => at + i,
+            null => { return Ok(false); }
+        };
+        let sizeText = text[at..lineEnd];
+        let digits = match (sizeText.indexOf(";")) {
+            Some(i) => sizeText[0..i].trim(),
+            null => sizeText.trim(),
+        };
+        if (digits.length == 0 || digits.length > 8) {
+            return Ok(false);
+        }
+        var size: usize = 0;
+        for (c in digits.bytes()) {
+            let v =
+                if (c >= 0x30 &&
+                    c <= 0x39) c - 0x30 else (if (c >= 0x61 &&
+                    c <= 0x66) c - 0x61 + 10 else (if (c >= 0x41 && c <= 0x46) c - 0x41 + 10 else 255));
+            if (v == 255) {
+                return Ok(false);
+            }
+            size = size * 16 + (v as usize);
+        }
+        let start = lineEnd + 2;
+        if (size == 0) {
+            return Ok(true);
+        }
+        if (start + size + 2 > text.length || body.length + size > STS_POLICY_LIMIT) {
+            return Ok(false);
+        }
+        body.append(text[start..start + size])?;
+        at = start + size + 2;
+    }
+}

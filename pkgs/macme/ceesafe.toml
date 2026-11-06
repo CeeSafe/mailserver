@@ -1,0 +1,12 @@
+[package]
+name = "macme"
+version = "0.1.0"
+kind = "library"
+tests = ["tests"]
+
+[dependencies]
+mhttp = { path = "../mhttp" }
+tls = { path = "../../../../CeeSafeLibs/tls" }
+pkey = { path = "../../../../CeeSafeLibs/pkey" }
+sha256 = { path = "../../../../CeeSafeLibs/sha256" }
+encoding = { path = "../../../../CeeSafeLibs/encoding" }

@@ -1,0 +1,358 @@
+// Keys for ACME: the account key signs requests as JWS (RFC 7515, RS256) and is named by its JWK thumbprint
+// (RFC 7638); the certificate key signs the certificate request (PKCS #10, RFC 2986). Both are RSA 2048, which every
+// CA accepts.
+
+import encoding.Base64;
+import pkey.KeyKind;
+import pkey.PrivateKey;
+import sha256.Sha256;
+
+/// Why a key could not be made or used.
+public enum KeyProblem {
+    /// Not an RSA private key this module can use.
+    BadKey,
+    Failed,
+    OutOfMemory,
+}
+
+fn keyResult<T>(r: Result<T, pkey.KeyError>) -> Result<T, KeyProblem> => match (r) {
+    Ok(v) => Ok(v),
+    Err(pkey.KeyError.OutOfMemory) => Err(KeyProblem.OutOfMemory),
+    Err(pkey.KeyError.BadKey) => Err(KeyProblem.BadKey),
+    Err(_) => Err(KeyProblem.Failed),
+};
+
+fn keyAlloc<T>(r: Result<T, AllocError>) -> Result<T, KeyProblem> => match (r) {
+    Ok(v) => Ok(v),
+    Err(_) => Err(KeyProblem.OutOfMemory),
+};
+
+/// A new RSA 2048 key.
+public fn generateKey() -> Result<PrivateKey, KeyProblem> => keyResult(PrivateKey.generate(KeyKind.Rsa, 2048));
+
+/// A PEM private key (as written by `keyPem`, or openssl's), which must be RSA.
+public fn keyFromPem(pem: Slice<u8>) -> Result<PrivateKey, KeyProblem> {
+    let key = keyResult(PrivateKey.fromPem(pem))?;
+    if (!key.isRsa()) {
+        return Err(KeyProblem.BadKey);
+    }
+    return Ok(key);
+}
+
+/// The key as PKCS #8 PEM (`-----BEGIN PRIVATE KEY-----`).
+public fn keyPem(key: borrow PrivateKey, out: borrow mut Vector<u8>) -> Result<void, AllocError> =>
+    appendPem(out, "PRIVATE KEY", key.der());
+
+/// `der` as PEM with `label`, in 64-column lines.
+public fn appendPem(out: borrow mut Vector<u8>, label: StringView, der: Slice<u8>) -> Result<void, AllocError> {
+    out.extend("-----BEGIN ".bytes())?;
+    out.extend(label.bytes())?;
+    out.extend("-----\n".bytes())?;
+    var text = Vector<u8>.create();
+    Base64.encode(der, mut text)?;
+    var at: usize = 0;
+    while (at < text.length) {
+        let end = if (at + 64 < text.length) at + 64 else text.length;
+        out.extend(text[at..end])?;
+        out.extend("\n".bytes())?;
+        at = end;
+    }
+    out.extend("-----END ".bytes())?;
+    out.extend(label.bytes())?;
+    return out.extend("-----\n".bytes());
+}
+
+/// The DER of each block labelled `label` in `pem`, in order (a certificate chain has several).
+public fn pemBlocks(
+    pem: Slice<u8>,
+    label: StringView,
+    into: borrow mut Vector<Vector<u8>>,
+) -> Result<void, AllocError> {
+    into.clear();
+    let text = StringView.fromUtf8(pem) ?? "";
+    var begin = String.create();
+    begin.append("-----BEGIN ")?;
+    begin.append(label)?;
+    begin.append("-----")?;
+    var end = String.create();
+    end.append("-----END ")?;
+    end.append(label)?;
+    end.append("-----")?;
+    var at: usize = 0;
+    loop {
+        let rest = text[at..];
+        let start = match (rest.indexOf(begin.view())) {
+            Some(i) => at + i + begin.length,
+            null => { return Ok(); }
+        };
+        let stop = match (text[start..].indexOf(end.view())) {
+            Some(i) => start + i,
+            null => { return Ok(); }
+        };
+        var der = Vector<u8>.create();
+        match (Base64.decodeIgnoringSpace(text[start..stop].bytes(), mut der)) {
+            Ok() => { into.push(der)?; }
+            Err(_) => {}
+        }
+        at = stop + end.length;
+    }
+}
+
+/// `text` in base64url without padding (RFC 7515 §2).
+public fn appendBase64Url(out: borrow mut Vector<u8>, text: Slice<u8>) -> Result<void, AllocError> {
+    var encoded = Vector<u8>.create();
+    Base64.encodeUrl(text, mut encoded)?;
+    var n = encoded.length;
+    while (n > 0 && encoded[n - 1] == 0x3d) {
+        n -= 1;
+    }
+    return out.extend(encoded[0..n]);
+}
+
+/// An ACME account key: an RSA key, with its JWK and thumbprint worked out once.
+@noncopy
+public struct AccountKey {
+    key: PrivateKey;
+    /// `{"e":"…","kty":"RSA","n":"…"}`: the members in the order RFC 7638 hashes them, no white space.
+    jwk: Vector<u8>;
+    /// base64url(SHA-256(jwk)).
+    thumbprint: Vector<u8>;
+
+    public fn create(key: PrivateKey) -> Result<AccountKey, KeyProblem> {
+        if (!key.isRsa()) {
+            return Err(KeyProblem.BadKey);
+        }
+        var spki = Vector<u8>.create();
+        keyResult(key.publicKey(mut spki))?;
+        var n = Vector<u8>.create();
+        var e = Vector<u8>.create();
+        if (!keyAlloc(rsaPublicNumbers(spki.view(), mut n, mut e))?) {
+            return Err(KeyProblem.BadKey);
+        }
+        var jwk = Vector<u8>.create();
+        keyAlloc(jwk.extend("{\"e\":\"".bytes()))?;
+        keyAlloc(appendBase64Url(mut jwk, e.view()))?;
+        keyAlloc(jwk.extend("\",\"kty\":\"RSA\",\"n\":\"".bytes()))?;
+        keyAlloc(appendBase64Url(mut jwk, n.view()))?;
+        keyAlloc(jwk.extend("\"}".bytes()))?;
+        let digest = Sha256.hash(jwk.view());
+        var thumbprint = Vector<u8>.create();
+        keyAlloc(appendBase64Url(mut thumbprint, digest[..]))?;
+        return Ok(AccountKey { key: key, jwk: jwk, thumbprint: thumbprint });
+    }
+
+    /// The public key as a JWK (JSON).
+    public fn jwkJson(borrow this) -> Slice<u8> => this.jwk.view();
+
+    public fn thumbprintText(borrow this) -> Slice<u8> => this.thumbprint.view();
+
+    /// The private key, to store.
+    public fn privateKey(borrow this) -> borrow PrivateKey => borrow this.key;
+
+    /// An HTTP-01 key authorization: `token.thumbprint` (RFC 8555 §8.1).
+    public fn keyAuthorization(borrow this, token: StringView, into: borrow mut String) -> Result<void, AllocError> {
+        into.clear();
+        into.append(token)?;
+        into.append(".")?;
+        return into.append(StringView.fromUtf8(this.thumbprint.view()) ?? "");
+    }
+
+    /// A flattened JWS (RFC 8555 §6.2) of `payload` for `url`: with `kid` (the account URL) once there is one, else
+    /// the JWK (newAccount). An empty `payload` is a POST-as-GET.
+    public fn sign(
+        borrow this,
+        url: StringView,
+        nonce: StringView,
+        kid: StringView,
+        payload: Slice<u8>,
+        out: borrow mut Vector<u8>,
+    ) -> Result<void, KeyProblem> {
+        out.clear();
+        var header = mhttp.JsonWriter.create();
+        header.beginObject();
+        header.stringField("alg", "RS256");
+        if (kid.length > 0) {
+            header.stringField("kid", kid);
+        } else {
+            header.key("jwk");
+            header.raw(this.jwk.view());
+        }
+        header.stringField("nonce", nonce);
+        header.stringField("url", url);
+        header.endObject();
+        let protectedJson = keyAlloc(header.finish())?;
+        var signingInput = Vector<u8>.create();
+        keyAlloc(appendBase64Url(mut signingInput, protectedJson.view()))?;
+        let protectedLength = signingInput.length;
+        keyAlloc(signingInput.extend(".".bytes()))?;
+        keyAlloc(appendBase64Url(mut signingInput, payload))?;
+        var signature = Vector<u8>.create();
+        keyResult(this.key.sign(signingInput.view(), mut signature))?;
+        keyAlloc(out.extend("{\"protected\":\"".bytes()))?;
+        keyAlloc(out.extend(signingInput[0..protectedLength]))?;
+        keyAlloc(out.extend("\",\"payload\":\"".bytes()))?;
+        keyAlloc(out.extend(signingInput[protectedLength + 1..]))?;
+        keyAlloc(out.extend("\",\"signature\":\"".bytes()))?;
+        keyAlloc(appendBase64Url(out, signature.view()))?;
+        keyAlloc(out.extend("\"}".bytes()))?;
+        return Ok();
+    }
+}
+
+// The OIDs, as their DER content.
+const OID_RSA_ENCRYPTION: [u8; 9] = [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01];
+const OID_SHA256_WITH_RSA: [u8; 9] = [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b];
+const OID_COMMON_NAME: [u8; 3] = [0x55, 0x04, 0x03];
+const OID_EXTENSION_REQUEST: [u8; 9] = [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09, 0x0e];
+const OID_SUBJECT_ALT_NAME: [u8; 3] = [0x55, 0x1d, 0x11];
+
+/// A Name of one CN: `SEQUENCE { SET { SEQUENCE { OID cn, UTF8String } } }`.
+fn appendName(out: borrow mut Vector<u8>, cn: StringView) -> Result<void, AllocError> {
+    var pair = Vector<u8>.create();
+    let cnOid = OID_COMMON_NAME;
+    appendTlv(mut pair, TAG_OID, cnOid[..])?;
+    appendTlv(mut pair, TAG_UTF8_STRING, cn.bytes())?;
+    var attribute = Vector<u8>.create();
+    appendTlv(mut attribute, TAG_SEQUENCE, pair.view())?;
+    var rdn = Vector<u8>.create();
+    appendTlv(mut rdn, TAG_SET, attribute.view())?;
+    return appendTlv(out, TAG_SEQUENCE, rdn.view());
+}
+
+/// Extensions holding one subjectAltName of `names`' dNSNames: `SEQUENCE { SEQUENCE { OID san, OCTET STRING {
+/// SEQUENCE OF [2] } } }`.
+fn appendSanExtensions(out: borrow mut Vector<u8>, names: borrow Vector<String>) -> Result<void, AllocError> {
+    var general = Vector<u8>.create();
+    for (n in names.view()) {
+        appendTlv(mut general, 0x82, n.bytes())?;
+    }
+    var sanValue = Vector<u8>.create();
+    appendTlv(mut sanValue, TAG_SEQUENCE, general.view())?;
+    var extension = Vector<u8>.create();
+    let sanOid = OID_SUBJECT_ALT_NAME;
+    appendTlv(mut extension, TAG_OID, sanOid[..])?;
+    appendTlv(mut extension, TAG_OCTET_STRING, sanValue.view())?;
+    var extensionSeq = Vector<u8>.create();
+    appendTlv(mut extensionSeq, TAG_SEQUENCE, extension.view())?;
+    return appendTlv(out, TAG_SEQUENCE, extensionSeq.view());
+}
+
+/// sha256WithRSAEncryption's AlgorithmIdentifier.
+fn appendSignatureAlgorithm(out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    var algorithm = Vector<u8>.create();
+    let sigOid = OID_SHA256_WITH_RSA;
+    appendTlv(mut algorithm, TAG_OID, sigOid[..])?;
+    algorithm.extend([TAG_NULL, 0u8][..])?;
+    return appendTlv(out, TAG_SEQUENCE, algorithm.view());
+}
+
+/// A PKCS #10 certificate request for `names` (the first is also the subject's CN), signed by `key`, as DER.
+public fn certificateRequest(
+    key: borrow PrivateKey,
+    names: borrow Vector<String>,
+    out: borrow mut Vector<u8>,
+) -> Result<void, KeyProblem> {
+    out.clear();
+    if (names.length == 0) {
+        return Err(KeyProblem.Failed);
+    }
+    var spki = Vector<u8>.create();
+    keyResult(key.publicKey(mut spki))?;
+    var subject = Vector<u8>.create();
+    keyAlloc(appendName(mut subject, names[0].view()))?;
+    var extensions = Vector<u8>.create();
+    keyAlloc(appendSanExtensions(mut extensions, names))?;
+    var values = Vector<u8>.create();
+    keyAlloc(appendTlv(mut values, TAG_SET, extensions.view()))?;
+    var request = Vector<u8>.create();
+    let requestOid = OID_EXTENSION_REQUEST;
+    keyAlloc(appendTlv(mut request, TAG_OID, requestOid[..]))?;
+    keyAlloc(request.extend(values.view()))?;
+    var attributeSeq = Vector<u8>.create();
+    keyAlloc(appendTlv(mut attributeSeq, TAG_SEQUENCE, request.view()))?;
+    // CertificationRequestInfo: version 0, subject, SPKI, [0] attributes.
+    var info = Vector<u8>.create();
+    keyAlloc(appendTlv(mut info, TAG_INTEGER, [0u8][..]))?;
+    keyAlloc(info.extend(subject.view()))?;
+    keyAlloc(info.extend(spki.view()))?;
+    keyAlloc(appendTlv(mut info, 0xa0, attributeSeq.view()))?;
+    var infoDer = Vector<u8>.create();
+    keyAlloc(appendTlv(mut infoDer, TAG_SEQUENCE, info.view()))?;
+    var signature = Vector<u8>.create();
+    keyResult(key.sign(infoDer.view(), mut signature))?;
+    var body = Vector<u8>.create();
+    keyAlloc(body.extend(infoDer.view()))?;
+    keyAlloc(appendSignatureAlgorithm(mut body))?;
+    keyAlloc(appendBitString(mut body, signature.view()))?;
+    return keyAlloc(appendTlv(out, TAG_SEQUENCE, body.view()));
+}
+
+/// A self-signed certificate for `names`, valid from now for `days`, signed by `key`: the placeholder a server starts
+/// with before its first ACME certificate, as DER.
+public fn selfSignedCertificate(
+    key: borrow PrivateKey,
+    names: borrow Vector<String>,
+    nowSeconds: i64,
+    days: i64,
+    out: borrow mut Vector<u8>,
+) -> Result<void, KeyProblem> {
+    out.clear();
+    if (names.length == 0) {
+        return Err(KeyProblem.Failed);
+    }
+    var spki = Vector<u8>.create();
+    keyResult(key.publicKey(mut spki))?;
+    var tbs = Vector<u8>.create();
+    // [0] EXPLICIT version v3
+    keyAlloc(tbs.extend([0xa0u8, 0x03, 0x02, 0x01, 0x02][..]))?;
+    // A serial from the time and the key: unique enough for a placeholder, positive, 16 bytes.
+    var seed = Vector<u8>.create();
+    keyAlloc(seed.extend(spki.view()))?;
+    var clock = String.create();
+    keyAlloc(clock.appendNumber(nowSeconds))?;
+    keyAlloc(seed.extend(clock.bytes()))?;
+    var serial = Sha256.hash(seed.view());
+    serial[0] = serial[0] & 0x7f;
+    keyAlloc(appendTlv(mut tbs, TAG_INTEGER, serial[0..16]))?;
+    keyAlloc(appendSignatureAlgorithm(mut tbs))?;
+    var name = Vector<u8>.create();
+    keyAlloc(appendName(mut name, names[0].view()))?;
+    keyAlloc(tbs.extend(name.view()))?;
+    var validity = Vector<u8>.create();
+    keyAlloc(appendTime(mut validity, nowSeconds - 3600))?;
+    keyAlloc(appendTime(mut validity, nowSeconds + days * 86400))?;
+    keyAlloc(appendTlv(mut tbs, TAG_SEQUENCE, validity.view()))?;
+    keyAlloc(tbs.extend(name.view()))?;
+    keyAlloc(tbs.extend(spki.view()))?;
+    var extensions = Vector<u8>.create();
+    keyAlloc(appendSanExtensions(mut extensions, names))?;
+    keyAlloc(appendTlv(mut tbs, 0xa3, extensions.view()))?;
+    var tbsDer = Vector<u8>.create();
+    keyAlloc(appendTlv(mut tbsDer, TAG_SEQUENCE, tbs.view()))?;
+    var signature = Vector<u8>.create();
+    keyResult(key.sign(tbsDer.view(), mut signature))?;
+    var body = Vector<u8>.create();
+    keyAlloc(body.extend(tbsDer.view()))?;
+    keyAlloc(appendSignatureAlgorithm(mut body))?;
+    keyAlloc(appendBitString(mut body, signature.view()))?;
+    return keyAlloc(appendTlv(out, TAG_SEQUENCE, body.view()));
+}
+
+/// A validity time: UTCTime before 2050, GeneralizedTime from then (RFC 5280 §4.1.2.5).
+fn appendTime(out: borrow mut Vector<u8>, unixSeconds: i64) -> Result<void, AllocError> {
+    var iso = Vector<u8>.create();
+    mhttp.appendIsoTime(mut iso, unixSeconds)?;
+    // 2026-11-06T08:49:37Z → 20261106084937Z
+    var digits = Vector<u8>.create();
+    for (c in iso.view()) {
+        if (c >= 0x30 && c <= 0x39) {
+            digits.push(c)?;
+        }
+    }
+    digits.push(0x5a)?;
+    let year = (digits[0] - 0x30) as i64 * 1000 + (digits[1] - 0x30) as i64 * 100;
+    if (year < 2000 || digits[2] < 0x35) {
+        return appendTlv(out, TAG_UTC_TIME, digits[2..]);
+    }
+    return appendTlv(out, TAG_GENERALIZED_TIME, digits.view());
+}

@@ -1,0 +1,12 @@
+size 16891
+envelope ("Wed, 11 Dec 1996 18:05:56 -0800" "signed frog" (("Jamie Zawinski" NIL "jwz" "netscape.com")) (("Jamie Zawinski" NIL "jwz" "netscape.com")) (("Jamie Zawinski" NIL "jwz" "netscape.com")) ((NIL NIL "jwz" "urchin.mcom.com")) NIL NIL NIL "<32AF6884.41C6@netscape.com>")
+bodystructure (("image" "jpeg" ("name" "bad-frog.jpg") NIL NIL "base64" 10868 NIL ("inline" ("filename" "bad-frog.jpg")) NIL NIL) ("application" "x-pkcs7-signature" ("name" "smime.p7s") NIL NIL "base64" 4674 NIL ("attachment" ("filename" "smime.p7s")) NIL NIL) "signed" ("protocol" "application/x-pkcs7-signature" "micalg" "sha1" "boundary" "------------167E2781446B") NIL NIL NIL)
+body (("image" "jpeg" ("name" "bad-frog.jpg") NIL NIL "base64" 10868) ("application" "x-pkcs7-signature" ("name" "smime.p7s") NIL NIL "base64" 4674) "signed")
+section HEADER 918 9e563ebab9918ebfcf17e23a4cb11833a1785bad4d55be808a1689f88782a64d
+section TEXT 15973 2e48d9491d6daacb4e459446765031d230241d38e55598fbdad117c27e84701c
+section HEADER.FIELDS 295 1d2ef86514c4c9e8b9cd61ecea5f8537fe5fde415135c41ce08407ae81c4f9cd
+section HEADER.FIELDS.NOT 625 18d42cf1df74fb93c61b961b86e6ba6398b92ff0ab7b0b7c33c00afdb163aeb3
+section 1 10868 3d050597cdfc5dae288ea396a823e64493cb4983b80e8d074bb1a187766d99ef
+section 1.MIME 138 332d1bf3e960a8c3a36c8e8d43de15112492a493cdb9a7a6b55fca82bf0d7fa9
+section 2 4674 1a53231ac612ecec5b45ed5459f47a84ffc65f1781d32b47c095a6d49500a000
+section 2.MIME 155 3f494fd607c17db262e344f14322972ba00d06304621f71328434bf52fff5389

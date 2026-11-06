@@ -1,0 +1,18 @@
+size 8194
+envelope ("Mon, 27 Jan 1992 10:52:05 -0500 (EST)" "PS -- Re: RFC-HDR care and feeding" (("Nathaniel Borenstein" NIL "nsb" "MISSING_DOMAIN")) (("Nathaniel Borenstein" NIL "nsb" "MISSING_DOMAIN")) (("Nathaniel Borenstein" NIL "nsb" "MISSING_DOMAIN")) (("Dave Crocker" NIL "dcrocker" "mordor.stanford.edu")) ((NIL NIL "ietf-822" "dimacs.rutgers.edu") (NIL NIL "paf" "comsol.se")) NIL "<9201250907.AA14565@nada.kth.se>" "<EdV2eZy0M2Yt5gpZkI@thumper.bellcore.com>")
+bodystructure (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 376 8 NIL NIL NIL NIL) (("text" "plain" ("charset" "us-ascii") NIL NIL "quoted-printable" 93 4 NIL NIL NIL NIL) ("image" "gif" NIL NIL "Metamail Displaying Patrik's Name" "base64" 5746 NIL NIL NIL NIL) ("text" "plain" ("charset" "us-ascii") NIL NIL "quoted-printable" 209 6 NIL NIL NIL NIL) "mixed" ("boundary" "Alternative_Boundary_UdV2eZS0M2YtFgpZZY") NIL NIL NIL) "alternative" ("boundary" "Interpart_Boundary_UdV2eZS0M2YtRgpZcG") NIL NIL NIL)
+body (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 376 8) (("text" "plain" ("charset" "us-ascii") NIL NIL "quoted-printable" 93 4) ("image" "gif" NIL NIL "Metamail Displaying Patrik's Name" "base64" 5746) ("text" "plain" ("charset" "us-ascii") NIL NIL "quoted-printable" 209 6) "mixed") "alternative")
+section HEADER 762 3e8476a208828d2354ef5d7ee01146d99ab9423a6e058b52a4f004be8f2f3f75
+section TEXT 7432 e5e583b28a3d505a845fff2bdbfb4c464f8fdac15d1f9dfa8b4e312053c194ed
+section HEADER.FIELDS 368 74e6f772151bf4a3a6a833df7b7e1026af4faec618049012ce8b90fd14cf6c6c
+section HEADER.FIELDS.NOT 396 700d729a86a67679e5f35a1aa33e377b47612874b34076b2bb0e5091f34fa98a
+section 1 376 e184e2b9ea18c239d1faeeabedaf699c35bc0afdb90b2f674526e2ab1dabb3cc
+section 1.MIME 2 7eb70257593da06f682a3ddda54a9d260d4fc514f645237f5ca74b08f8da61a6
+section 2 6492 14c1356b345d31b96d2bd1b117597293383658874567fd98d19c318cd64c40bf
+section 2.MIME 88 f8765998cb6d7b5e6d536adf70e61fed9da17f9e48a1ea330d7e3b6c12d4ef3c
+section 2.1 93 72f2a736d7e2c4b25a5ba399a0f88a2f2351ad1b4801114dd9e20a09c6765e00
+section 2.1.MIME 73 572361e91fdfad091c8229b8f81a36a6e88093d00dff2ab1af23ca63bf781b19
+section 2.2 5746 7892b2cdd075f89906b47d506e09a25509c4cb1e1e885ba8255e4849dfb8476d
+section 2.2.MIME 118 ae27e4d3b280d505e5ac96bf45838ac1ab65fb60c5716a8b675dbf6817ac3b21
+section 2.3 209 3d6aac18dd71de7648aa016d101d2a055389272a45ba53f635f41adcf7a888c7
+section 2.3.MIME 73 572361e91fdfad091c8229b8f81a36a6e88093d00dff2ab1af23ca63bf781b19

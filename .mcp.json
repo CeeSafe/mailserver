@@ -1,0 +1,5 @@
+{
+  "mcpServers": {
+    "ceesafe": { "command": "ceesafec", "args": ["mcp"] }
+  }
+}

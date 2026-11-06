@@ -1,0 +1,104 @@
+# The mail server's stack: the server (SMTP, IMAP, HTTP, the admin API), its Postgres, the scanners, and the admin
+# UI. One process does what CosmoMailServer's server, api and admin containers did.
+#
+#   cd /opt/mailserver && cp .env.example .env && $EDITOR .env mailserver.toml
+#   docker compose up -d
+#   docker compose exec mailserver mailserver --config /etc/mailserver/mailserver.toml add-admin admin 'PASSWORD'
+#
+# Public ports are published straight to the server here: it sees clients' real addresses and does its own TLS
+# (and ACME). Behind CosmoProxy, add docker-compose.cosmoproxy.yml instead (see that file).
+
+name: mailserver
+
+services:
+  mailserver:
+    image: ${MAILSERVER_IMAGE:-mailserver:dev}
+    restart: always
+    hostname: ${SERVER_HOSTNAME}
+    ulimits:
+      nofile: { soft: 65535, hard: 65535 }
+    ports:
+      - "25:2525"
+      - "587:2587"
+      - "465:2465"
+      - "993:2993"
+      - "143:2143"
+      - "80:8080"
+      - "443:8443"
+    volumes:
+      - ./mailserver.toml:/etc/mailserver/mailserver.toml:ro
+      - mailserver-data:/var/lib/mailserver
+    environment:
+      COSMOMAIL_JWT_SECRET: ${COSMOMAIL_JWT_SECRET}
+    networks:
+      default: { ipv4_address: 172.30.53.2 }
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:16-alpine
+    restart: always
+    environment:
+      POSTGRES_DB: mailserver
+      POSTGRES_USER: mailserver
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      default: { ipv4_address: 172.30.53.5 }
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mailserver -d mailserver"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # ClamAV: clamd on 3310 ([scan] clamd). Its signatures take a minute or two on first start; until then the server
+  # answers 451 (try later) to mail it cannot scan, unless [scan] clamd_unavailable = "accept".
+  clamav:
+    image: clamav/clamav:stable
+    restart: always
+    volumes:
+      - clamav-db:/var/lib/clamav
+    networks:
+      default: { ipv4_address: 172.30.53.10 }
+
+  # SpamAssassin's spamd on 783 ([scan] spamd). CosmoMailServer's image carries it; any spamd will do.
+  spamassassin:
+    image: ${SPAMD_IMAGE:-vkuttyp/cosmomailserver:latest}
+    restart: always
+    entrypoint: ["spamd", "-x", "-u", "debian-spamd", "-H", "/var/lib/spamassassin", "-i", "0.0.0.0:783",
+                 "--allowed-ips=127.0.0.1,172.16.0.0/12"]
+    volumes:
+      - spamassassin-data:/var/lib/spamassassin
+    networks:
+      default: { ipv4_address: 172.30.53.11 }
+
+  # CosmoMailAdmin's Nuxt UI, unchanged; it calls the admin API on the compose network. Published on loopback only:
+  # put a TLS proxy in front of it (or an SSH tunnel), never the bare port.
+  admin-ui:
+    image: ${ADMIN_UI_IMAGE:-mailserver-admin-ui:dev}
+    restart: always
+    ports:
+      - "127.0.0.1:9183:9183"
+    environment:
+      # nuxt.config reads COSMOMAIL_ADMIN_API_BASE at build time only; at run time Nuxt takes NUXT_API_BASE.
+      NUXT_API_BASE: http://mailserver:9184
+      COSMOMAIL_ADMIN_API_BASE: http://mailserver:9184
+      NUXT_SESSION_PASSWORD: ${NUXT_SESSION_PASSWORD}
+    depends_on:
+      - mailserver
+
+# Fixed addresses: mailserver.toml names Postgres and the scanners by IP (the server does not resolve host names
+# for them).
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.30.53.0/24
+
+volumes:
+  mailserver-data:
+  postgres-data:
+  clamav-db:
+  spamassassin-data:

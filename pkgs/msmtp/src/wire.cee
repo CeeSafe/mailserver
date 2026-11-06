@@ -1,0 +1,465 @@
+// A connection's bytes: buffered reads of lines and data, buffered writes (flushed when the client is waiting,
+// so pipelined commands get their replies in one write), over plain TCP or TLS, with STARTTLS.
+
+import tls.TlsConfig;
+import tls.TlsError;
+import tls.TlsStream;
+import tls.Tlsa;
+
+/// The most bytes a command line may have (RFC 5321 §4.5.3.1.4 says 512; clients send long AUTH lines).
+const MAX_LINE: usize = 8 * 1024;
+const READ_CHUNK: usize = 64 * 1024;
+
+/// Why a connection ended.
+public enum WireError {
+    Io,
+    Tls,
+    /// The client sent nothing for too long.
+    Timeout,
+    /// A command line over the limit.
+    TooLong,
+    /// The client closed the connection.
+    Closed,
+    OutOfMemory,
+}
+
+enum Transport {
+    Plain(AsyncTcpStream),
+    Secure(TlsStream),
+}
+
+@noncopy
+public struct Wire {
+    transport: Transport;
+    input: Vector<u8>;
+    start: usize;
+    end: usize;
+    output: Vector<u8>;
+    secure: bool;
+    /// The client's address from a PROXY header, which stands for the TCP peer (a proxy).
+    proxied: SocketAddress?;
+
+    public fn plain(stream: AsyncTcpStream) -> Result<Wire, WireError> {
+        match (stream.setNoDelay(true)) {
+            Ok() => {}
+            Err(_) => {}
+        }
+        return Wire.over(Transport.Plain(stream), false);
+    }
+
+    fn over(transport: Transport, secure: bool) -> Result<Wire, WireError> {
+        var input = Vector<u8>.create();
+        match (input.resize(READ_CHUNK, 0)) {
+            Ok() => {}
+            Err(_) => { return Err(WireError.OutOfMemory); }
+        }
+        return Ok(Wire {
+            transport: transport,
+            input: input,
+            start: 0,
+            end: 0,
+            output: Vector<u8>.create(),
+            secure: secure,
+            proxied: null,
+        });
+    }
+
+    /// Implicit TLS (SMTPS, port 465): the handshake comes first, within `timeoutMs`.
+    public async fn implicitTls(
+        stream: AsyncTcpStream,
+        config: borrow TlsConfig,
+        timeoutMs: u64,
+    ) -> Result<Wire, WireError> {
+        match (stream.setNoDelay(true)) {
+            Ok() => {}
+            Err(_) => {}
+        }
+        match (await TlsStream.acceptWithin(stream, config, timeoutMs)) {
+            Ok(session) => { return Wire.over(Transport.Secure(session), true); }
+            Err(_) => { return Err(WireError.Tls); }
+        }
+    }
+
+    /// STARTTLS: the handshake on this connection. Anything the client sent after the STARTTLS command was sent in
+    /// the clear and is thrown away, never read as part of the TLS session (RFC 3207 §6, CVE-2011-0411).
+    public async fn startTls(this, config: borrow TlsConfig, timeoutMs: u64) -> Result<Wire, WireError> {
+        let proxied = this.proxied;
+        match (this.transport) {
+            Transport.Plain(tcp) => {
+                match (await TlsStream.acceptWithin(tcp, config, timeoutMs)) {
+                    Ok(session) => {
+                        var upgraded = Wire.over(Transport.Secure(session), true)?;
+                        upgraded.proxied = proxied;
+                        return Ok(upgraded);
+                    }
+                    Err(_) => { return Err(WireError.Tls); }
+                }
+            }
+            Transport.Secure(_) => { return Err(WireError.Tls); }
+        }
+    }
+
+    /// STARTTLS as a client (the relay): the handshake with `serverName` (for SNI), within `timeoutMs`. A server
+    /// that pipelined anything after its 220 is broken; that input is thrown away likewise.
+    public async fn startTlsClient(
+        this,
+        config: borrow TlsConfig,
+        serverName: StringView,
+        timeoutMs: u64,
+    ) -> Result<Wire, WireError> {
+        match (this.transport) {
+            Transport.Plain(tcp) => {
+                match (await TlsStream.connectWithin(tcp, config, serverName, timeoutMs)) {
+                    Ok(session) => { return Wire.over(Transport.Secure(session), true); }
+                    Err(_) => { return Err(WireError.Tls); }
+                }
+            }
+            Transport.Secure(_) => { return Err(WireError.Tls); }
+        }
+    }
+
+    /// As `startTlsClient`, authenticating the server by its MX host's TLSA records (DANE, RFC 7672) instead of by
+    /// trusted roots. `config` must have had `enableDane`.
+    public async fn startTlsDaneClient(
+        this,
+        config: borrow TlsConfig,
+        serverName: StringView,
+        records: borrow Vector<Tlsa>,
+        timeoutMs: u64,
+    ) -> Result<Wire, WireError> {
+        match (this.transport) {
+            Transport.Plain(tcp) => {
+                match (await TlsStream.connectDaneWithin(tcp, config, serverName, records, timeoutMs)) {
+                    Ok(session) => { return Wire.over(Transport.Secure(session), true); }
+                    Err(_) => { return Err(WireError.Tls); }
+                }
+            }
+            Transport.Secure(_) => { return Err(WireError.Tls); }
+        }
+    }
+
+    public fn isTls(borrow this) -> bool => this.secure;
+
+    /// Sets the client's address given by a PROXY header (see proxy.cee).
+    public fn setProxied(borrow mut this, address: SocketAddress?) {
+        this.proxied = address;
+    }
+
+    /// The client's address: the PROXY header's, or the TCP peer's.
+    public fn peer(borrow this) -> SocketAddress? {
+        match (this.proxied) {
+            Some(a) => { return a; }
+            null => {}
+        }
+        match (borrow this.transport) {
+            Transport.Plain(tcp) => {
+                match (tcp.peerAddress()) {
+                    Ok(a) => { return a; }
+                    Err(_) => { return null; }
+                }
+            }
+            Transport.Secure(s) => {
+                match (s.tcp().peerAddress()) {
+                    Ok(a) => { return a; }
+                    Err(_) => { return null; }
+                }
+            }
+        }
+    }
+
+    /// Whether unread bytes are buffered (the client pipelined).
+    public fn hasBuffered(borrow this) -> bool => this.end > this.start;
+
+    /// Drops buffered input.
+    public fn discardBuffered(borrow mut this) {
+        this.start = 0;
+        this.end = 0;
+    }
+
+    /// Queues `bytes` to send.
+    public fn send(borrow mut this, bytes: Slice<u8>) -> Result<void, WireError> {
+        match (this.output.extend(bytes)) {
+            Ok() => { return Ok(); }
+            Err(_) => { return Err(WireError.OutOfMemory); }
+        }
+    }
+
+    /// Queues one reply line, CRLF added.
+    public fn reply(borrow mut this, text: StringView) -> Result<void, WireError> {
+        this.send(text.bytes())?;
+        return this.send("\r\n".bytes());
+    }
+
+    /// Sends what is queued.
+    public async fn flush(borrow mut this) -> Result<void, WireError> {
+        if (this.output.length == 0) {
+            return Ok();
+        }
+        var outcome = false;
+        match (borrow mut this.transport) {
+            Transport.Plain(tcp) => {
+                match (await tcp.write(this.output.view())) {
+                    Ok() => { outcome = true; }
+                    Err(_) => {}
+                }
+            }
+            Transport.Secure(s) => {
+                match (await s.write(this.output.view())) {
+                    Ok() => { outcome = true; }
+                    Err(_) => {}
+                }
+            }
+        }
+        this.output.clear();
+        if (!outcome) {
+            return Err(WireError.Io);
+        }
+        return Ok();
+    }
+
+    /// Sends what is queued, then `bytes` straight from the caller's buffer (not copied into the queue): for large
+    /// content sent in pieces, such as an IMAP literal read from a file over TLS.
+    public async fn sendNow(borrow mut this, bytes: Slice<u8>) -> Result<void, WireError> {
+        await this.flush()?;
+        if (bytes.length == 0) {
+            return Ok();
+        }
+        var outcome = false;
+        match (borrow mut this.transport) {
+            Transport.Plain(tcp) => {
+                match (await tcp.write(bytes)) {
+                    Ok() => { outcome = true; }
+                    Err(_) => {}
+                }
+            }
+            Transport.Secure(s) => {
+                match (await s.write(bytes)) {
+                    Ok() => { outcome = true; }
+                    Err(_) => {}
+                }
+            }
+        }
+        if (!outcome) {
+            return Err(WireError.Io);
+        }
+        return Ok();
+    }
+
+    /// Sends what is queued, then `length` bytes of `file` from `offset`, copied by the kernel (`sendfile`) on a
+    /// plaintext connection. Over TLS the bytes must be encrypted here, so it is refused (`Tls`) without sending
+    /// anything: read the file in pieces and `sendNow` them. A file shorter than `offset + length` is `Io`, with part
+    /// of the range sent, so the connection cannot go on.
+    public async fn sendFile(borrow mut this, file: borrow File, offset: u64, length: u64) -> Result<void, WireError> {
+        if (this.secure) {
+            return Err(WireError.Tls);
+        }
+        await this.flush()?;
+        match (borrow mut this.transport) {
+            Transport.Plain(tcp) => {
+                match (await tcp.sendFileAll(file, offset, length)) {
+                    Ok() => { return Ok(); }
+                    Err(_) => { return Err(WireError.Io); }
+                }
+            }
+            Transport.Secure(_) => { return Err(WireError.Tls); }
+        }
+    }
+
+    /// Reads more bytes into the buffer, within `timeoutMs`. Flushes queued replies first: the client is waiting.
+    async fn fill(borrow mut this, timeoutMs: u64) -> Result<void, WireError> {
+        await this.flush()?;
+        if (this.start > 0) {
+            // Compact: keep the unread bytes at the front.
+            let n = this.end - this.start;
+            for (i in 0..n) {
+                this.input[i] = this.input[this.start + i];
+            }
+            this.start = 0;
+            this.end = n;
+        }
+        if (this.end == this.input.length) {
+            match (this.input.resize(this.input.length * 2, 0)) {
+                Ok() => {}
+                Err(_) => { return Err(WireError.OutOfMemory); }
+            }
+        }
+        let read: Result<usize, WireError> = await Async.timeout(
+            timeoutMs,
+            WireError.Timeout,
+            async () => await this.readSome(),
+        );
+        let n = read?;
+        if (n == 0) {
+            return Err(WireError.Closed);
+        }
+        this.end += n;
+        return Ok();
+    }
+
+    async fn readSome(borrow mut this) -> Result<usize, WireError> {
+        let at = this.end;
+        match (borrow mut this.transport) {
+            Transport.Plain(tcp) => {
+                match (await tcp.read(mut this.input[at..])) {
+                    Ok(n) => { return Ok(n); }
+                    Err(_) => { return Err(WireError.Io); }
+                }
+            }
+            Transport.Secure(s) => {
+                match (await s.read(mut this.input[at..])) {
+                    Ok(n) => { return Ok(n); }
+                    Err(TlsError.Closed) => { return Ok(0); }
+                    Err(_) => { return Err(WireError.Io); }
+                }
+            }
+        }
+    }
+
+    /// The next line, without its CRLF (or bare LF), copied into `line`. `TooLong` past `MAX_LINE`.
+    public async fn readLine(borrow mut this, line: borrow mut Vector<u8>, timeoutMs: u64) -> Result<void, WireError> {
+        return await this.readLineWithin(line, MAX_LINE, timeoutMs);
+    }
+
+    /// As `readLine`, with lines of at most `maxLength` bytes (CRLF not counted); a longer one is `TooLong`, with
+    /// nothing consumed (SMTP says 500 and IMAP says BYE, and both close).
+    public async fn readLineWithin(
+        borrow mut this,
+        line: borrow mut Vector<u8>,
+        maxLength: usize,
+        timeoutMs: u64,
+    ) -> Result<void, WireError> {
+        loop {
+            match (this.input[this.start..this.end].indexOfByte(0x0a)) {
+                Some(lf) => {
+                    var stop = this.start + lf;
+                    if (stop > this.start && this.input[stop - 1] == 0x0d) {
+                        stop -= 1;
+                    }
+                    if (stop - this.start > maxLength) {
+                        return Err(WireError.TooLong);
+                    }
+                    line.clear();
+                    match (line.extend(this.input[this.start..stop])) {
+                        Ok() => {}
+                        Err(_) => { return Err(WireError.OutOfMemory); }
+                    }
+                    this.start += lf + 1;
+                    return Ok();
+                }
+                null => {}
+            }
+            // `maxLength` bytes and a CR may still end in time.
+            if (this.end - this.start > maxLength + 1) {
+                return Err(WireError.TooLong);
+            }
+            await this.fill(timeoutMs)?;
+        }
+    }
+
+    /// Appends exactly `n` bytes to `into` (an IMAP literal): the buffered bytes first, then more as they arrive.
+    /// `timeoutMs` bounds each wait for more, as for DATA. Queued replies (a continuation request) are sent before the
+    /// first wait.
+    public async fn readExact(
+        borrow mut this,
+        n: usize,
+        into: borrow mut Vector<u8>,
+        timeoutMs: u64,
+    ) -> Result<void, WireError> {
+        var left = n;
+        loop {
+            let have = this.end - this.start;
+            let take = if (have < left) have else left;
+            match (into.extend(this.input[this.start..this.start + take])) {
+                Ok() => {}
+                Err(_) => { return Err(WireError.OutOfMemory); }
+            }
+            this.start += take;
+            left -= take;
+            if (left == 0) {
+                return Ok();
+            }
+            this.start = 0;
+            this.end = 0;
+            await this.fill(timeoutMs)?;
+        }
+    }
+
+    /// Appends everything up to the end of the connection to `into` (an HTTP response delimited by the close):
+    /// `TooLong` past `maxBytes`, and `timeoutMs` bounds each wait.
+    public async fn readToEnd(
+        borrow mut this,
+        into: borrow mut Vector<u8>,
+        maxBytes: usize,
+        timeoutMs: u64,
+    ) -> Result<void, WireError> {
+        loop {
+            let have = this.end - this.start;
+            if (into.length + have > maxBytes) {
+                return Err(WireError.TooLong);
+            }
+            match (into.extend(this.input[this.start..this.end])) {
+                Ok() => {}
+                Err(_) => { return Err(WireError.OutOfMemory); }
+            }
+            this.start = 0;
+            this.end = 0;
+            match (await this.fill(timeoutMs)) {
+                Ok() => {}
+                Err(WireError.Closed) => { return Ok(); }
+                Err(e) => { return Err(e); }
+            }
+        }
+    }
+
+    /// Feeds the buffered bytes, then more as they arrive, to `decoder` until the end of the message; the decoded
+    /// bytes go to `sink.take` in pieces.
+    async fn readData(
+        borrow mut this,
+        decoder: borrow mut DotDecoder,
+        sink: borrow mut DataSink,
+        timeoutMs: u64,
+    ) -> Result<void, WireError> {
+        loop {
+            if (this.end > this.start) {
+                sink.piece.clear();
+                let used = match (decoder.decode(this.input[this.start..this.end], mut sink.piece)) {
+                    Ok(n) => n,
+                    Err(_) => { return Err(WireError.OutOfMemory); }
+                };
+                this.start += used;
+                match (await sink.take()) {
+                    Ok() => {}
+                    Err(_) => { return Err(WireError.OutOfMemory); }
+                }
+                if (decoder.isFinished()) {
+                    return Ok();
+                }
+            }
+            this.start = 0;
+            this.end = 0;
+            await this.fill(timeoutMs)?;
+        }
+    }
+
+    /// Ends the session politely (TLS close_notify); errors are ignored, the connection is closing anyway.
+    public async fn close(borrow mut this) {
+        match (await this.flush()) {
+            Ok() => {}
+            Err(_) => {}
+        }
+        match (borrow mut this.transport) {
+            Transport.Plain(tcp) => {
+                match (tcp.shutdownWrite()) {
+                    Ok() => {}
+                    Err(_) => {}
+                }
+            }
+            Transport.Secure(s) => {
+                match (await s.shutdown()) {
+                    Ok() => {}
+                    Err(_) => {}
+                }
+            }
+        }
+    }
+}

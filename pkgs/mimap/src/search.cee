@@ -1,0 +1,1008 @@
+// SEARCH and UID SEARCH (RFC 3501 §6.4.4, the grammar of §9): the search keys into a `SearchQuery`, a tree in
+// three vectors; evaluation in stages, each with more of the message known; and the command.
+//
+// Evaluation is three-valued. A key whose data is not loaded yet is `Unknown`, and NOT, OR and AND combine as
+// Kleene's logic does, so a message is decided as soon as what is known settles it:
+// - level 0, the sequence number and UID (from the snapshot, before any query): UID and sequence sets;
+// - level 1, the row (`fetchMessages` without meta): flags, keywords, INTERNALDATE and size;
+// - level 2, the header block, read from the blob with the meta's offsets: FROM, TO, CC, BCC, SUBJECT, HEADER and
+//   the SENT dates;
+// - level 3, the decoded text (mmime's `appendSearchText`): BODY and TEXT.
+// Each AND and OR evaluates its cheaper operands first. The mailbox is read in batches of `SEARCH_BATCH` messages,
+// one query for the rows and one for the meta of those still undecided, so memory stays bounded whatever its size;
+// what is loaded for a message is dropped before the next.
+
+import diskio.FileError;
+import diskio.RawFile;
+import mmime.MessageMeta;
+import mmime.SEARCH_TEXT_LIMIT;
+import mmime.appendHeaderValues;
+import mmime.appendSearchText;
+import mmime.containsFolded;
+import msmtp.SmtpContext;
+import msmtp.Wire;
+import mstore.MessageList;
+import mstore.StoreError;
+import mstore.UidSet;
+
+/// How many messages one batch reads.
+const SEARCH_BATCH: usize = 1000;
+/// How deeply NOT, OR and parentheses may nest.
+const MAX_SEARCH_DEPTH: u32 = 64;
+
+public enum KeyKind {
+    All,
+    Answered,
+    Deleted,
+    Draft,
+    Flagged,
+    Seen,
+    Unanswered,
+    Undeleted,
+    Undraft,
+    Unflagged,
+    Unseen,
+    /// `\Recent` is not kept: NEW and RECENT match nothing, OLD everything.
+    New,
+    Old,
+    Recent,
+    Keyword,
+    Unkeyword,
+    Before,
+    On,
+    Since,
+    SentBefore,
+    SentOn,
+    SentSince,
+    Larger,
+    Smaller,
+    From,
+    To,
+    Cc,
+    Bcc,
+    Subject,
+    Header,
+    Body,
+    Text,
+    Uid,
+    Seq,
+    Not,
+    Or,
+    And,
+}
+
+/// What is known of a message when a key is evaluated; a key needs its level.
+public const LEVEL_NUMBERS: u8 = 0;
+public const LEVEL_ROW: u8 = 1;
+public const LEVEL_HEADER: u8 = 2;
+public const LEVEL_BODY: u8 = 3;
+
+/// One search key. What `a`, `b`, `value`, `text` and `field` hold depends on the kind:
+/// - Not: `a`, the operand; Or: `a` and `b`; And: `b` operands from `SearchQuery.operands[a]`;
+/// - Uid and Seq: `b` ranges from `SearchQuery.ranges[a]`;
+/// - the dates: `value`, days since 1970-01-01; Larger and Smaller: `value`, the size;
+/// - the strings and keywords: `text`, in `SearchQuery.strings`; Header: `field` too.
+/// `level` is the most any key in it needs.
+public struct SearchKey {
+    public kind: KeyKind;
+    public level: u8;
+    public a: usize;
+    public b: usize;
+    public value: i64;
+    public text: Span;
+    public field: Span;
+}
+
+/// A parsed SEARCH: its keys, with `root` the one to evaluate (an AND of the command's keys).
+@noncopy
+public struct SearchQuery {
+    public keys: Vector<SearchKey>;
+    public operands: Vector<usize>;
+    public ranges: Vector<SeqRange>;
+    public strings: Vector<u8>;
+    public root: usize;
+    /// Whether any key needs the decoded body (BODY) or the header and body (TEXT).
+    public needsBody: bool;
+    public needsText: bool;
+
+    public fn create() -> SearchQuery => SearchQuery {
+        keys: Vector<SearchKey>.create(),
+        operands: Vector<usize>.create(),
+        ranges: Vector<SeqRange>.create(),
+        strings: Vector<u8>.create(),
+        root: 0,
+        needsBody: false,
+        needsText: false,
+    };
+
+    public fn clear(borrow mut this) {
+        this.keys.clear();
+        this.operands.clear();
+        this.ranges.clear();
+        this.strings.clear();
+        this.root = 0;
+        this.needsBody = false;
+        this.needsText = false;
+    }
+
+    /// A key's string.
+    public fn text(borrow this, span: Span) -> Slice<u8> => this.strings[span.start..span.start + span.length];
+
+    /// The level the whole query needs.
+    public fn level(borrow this) -> u8 => this.keys[this.root].level;
+}
+
+fn noSpan() -> Span => Span { start: 0, length: 0 };
+
+fn leafKey(kind: KeyKind) -> SearchKey => SearchKey {
+    kind: kind,
+    level: levelOf(kind),
+    a: 0,
+    b: 0,
+    value: 0,
+    text: noSpan(),
+    field: noSpan(),
+};
+
+/// The level a key of this kind needs (NOT, OR and AND: their operands').
+fn levelOf(kind: KeyKind) -> u8 => match (kind) {
+    KeyKind.All => LEVEL_NUMBERS,
+    KeyKind.New => LEVEL_NUMBERS,
+    KeyKind.Old => LEVEL_NUMBERS,
+    KeyKind.Recent => LEVEL_NUMBERS,
+    KeyKind.Uid => LEVEL_NUMBERS,
+    KeyKind.Seq => LEVEL_NUMBERS,
+    KeyKind.Not => LEVEL_NUMBERS,
+    KeyKind.Or => LEVEL_NUMBERS,
+    KeyKind.And => LEVEL_NUMBERS,
+    KeyKind.From => LEVEL_HEADER,
+    KeyKind.To => LEVEL_HEADER,
+    KeyKind.Cc => LEVEL_HEADER,
+    KeyKind.Bcc => LEVEL_HEADER,
+    KeyKind.Subject => LEVEL_HEADER,
+    KeyKind.Header => LEVEL_HEADER,
+    KeyKind.SentBefore => LEVEL_HEADER,
+    KeyKind.SentOn => LEVEL_HEADER,
+    KeyKind.SentSince => LEVEL_HEADER,
+    KeyKind.Body => LEVEL_BODY,
+    KeyKind.Text => LEVEL_BODY,
+    _ => LEVEL_ROW,
+};
+
+// ---- Parsing ----
+
+/// The search keys by name, and their kinds.
+fn keyOf(word: Slice<u8>) -> KeyKind? {
+    let names = [
+        "ALL", "ANSWERED", "DELETED", "DRAFT", "FLAGGED", "SEEN", "UNANSWERED", "UNDELETED", "UNDRAFT", "UNFLAGGED",
+        "UNSEEN", "NEW", "OLD", "RECENT", "KEYWORD", "UNKEYWORD", "BEFORE", "ON", "SINCE", "SENTBEFORE", "SENTON",
+        "SENTSINCE", "LARGER", "SMALLER", "FROM", "TO", "CC", "BCC", "SUBJECT", "HEADER", "BODY", "TEXT", "UID", "NOT",
+        "OR",
+    ];
+    let kinds = [
+        KeyKind.All, KeyKind.Answered, KeyKind.Deleted, KeyKind.Draft, KeyKind.Flagged, KeyKind.Seen,
+        KeyKind.Unanswered, KeyKind.Undeleted, KeyKind.Undraft, KeyKind.Unflagged, KeyKind.Unseen, KeyKind.New,
+        KeyKind.Old, KeyKind.Recent, KeyKind.Keyword, KeyKind.Unkeyword, KeyKind.Before, KeyKind.On, KeyKind.Since,
+        KeyKind.SentBefore, KeyKind.SentOn, KeyKind.SentSince, KeyKind.Larger, KeyKind.Smaller, KeyKind.From,
+        KeyKind.To, KeyKind.Cc, KeyKind.Bcc, KeyKind.Subject, KeyKind.Header, KeyKind.Body, KeyKind.Text, KeyKind.Uid,
+        KeyKind.Not, KeyKind.Or,
+    ];
+    for (i in 0..names.length) {
+        if (word.equalsIgnoreAsciiCase(names[i].bytes())) {
+            return kinds[i];
+        }
+    }
+    return null;
+}
+
+fn tokenText(r: borrow CommandReader, t: Token) -> Slice<u8> => r.text(Span { start: t.start, length: t.length });
+
+/// SEARCH's arguments, after the command name, into `q` (cleared first): `[CHARSET astring] 1*search-key`, the
+/// keys ANDed. False when CHARSET names a charset other than UTF-8 and US-ASCII (`NO [BADCHARSET]`); then the
+/// keys are not read.
+public fn parseSearch(r: borrow mut CommandReader, q: borrow mut SearchQuery) -> Result<bool, ParseError> {
+    q.clear();
+    match (r.peekToken()) {
+        Some(t) => {
+            if (t.kind == TokenKind.Atom && tokenText(r, t).equalsIgnoreAsciiCase("CHARSET".bytes())) {
+                r.next()?;
+                let span = r.astring()?;
+                let name = r.text(span);
+                if (!name.equalsIgnoreAsciiCase("UTF-8".bytes()) && !name.equalsIgnoreAsciiCase("US-ASCII".bytes())) {
+                    return Ok(false);
+                }
+            }
+        }
+        null => { return Err(ParseError.MissingArgument); }
+    }
+    var top = Vector<usize>.create();
+    loop {
+        let k = searchKey(r, q, 0)?;
+        grew(top.push(k))?;
+        if (r.atEnd()) {
+            break;
+        }
+    }
+    q.root = andOf(q, mut top)?;
+    return Ok(true);
+}
+
+fn pushKey(q: borrow mut SearchQuery, key: SearchKey) -> Result<usize, ParseError> {
+    grew(q.keys.push(key))?;
+    return Ok(q.keys.length - 1);
+}
+
+/// An AND of `list` (one key stands for itself), its operands ordered cheapest first.
+fn andOf(q: borrow mut SearchQuery, list: borrow mut Vector<usize>) -> Result<usize, ParseError> {
+    if (list.length == 1) {
+        return Ok(list[0]);
+    }
+    // Insertion sort by level, stable: lists are short.
+    for (i in 1..list.length) {
+        var j = i;
+        while (j > 0 && q.keys[list[j - 1]].level > q.keys[list[j]].level) {
+            list.swap(j - 1, j);
+            j -= 1;
+        }
+    }
+    var key = leafKey(KeyKind.And);
+    key.a = q.operands.length;
+    key.b = list.length;
+    for (k in list.view()) {
+        grew(q.operands.push(k))?;
+        if (q.keys[k].level > key.level) {
+            key.level = q.keys[k].level;
+        }
+    }
+    return pushKey(q, key);
+}
+
+/// A string argument (an astring: atom, quoted or literal), copied into the query.
+fn stringArg(r: borrow mut CommandReader, q: borrow mut SearchQuery) -> Result<Span, ParseError> {
+    let span = r.astring()?;
+    let start = q.strings.length;
+    grew(q.strings.extend(r.text(span)))?;
+    return Ok(Span { start: start, length: span.length });
+}
+
+/// One search key, its operands first; gives its index.
+fn searchKey(r: borrow mut CommandReader, q: borrow mut SearchQuery, depth: u32) -> Result<usize, ParseError> {
+    if (depth > MAX_SEARCH_DEPTH) {
+        return Err(ParseError.TooDeep);
+    }
+    let t = match (r.peekToken()) {
+        Some(x) => x,
+        null => { return Err(ParseError.MissingArgument); }
+    };
+    if (t.kind == TokenKind.Open) {
+        r.open()?;
+        var list = Vector<usize>.create();
+        while (!r.closeIfNext()) {
+            let k = searchKey(r, q, depth + 1)?;
+            grew(list.push(k))?;
+        }
+        if (list.length == 0) {
+            return Err(ParseError.UnknownSearchKey);
+        }
+        return andOf(q, mut list);
+    }
+    let word = tokenText(r, t);
+    let first = if (word.length > 0) word[0] else 0u8;
+    if (t.kind == TokenKind.Number ||
+        (t.kind == TokenKind.Atom && (first == 0x2a || (first >= 0x30 && first <= 0x39)))) {
+        r.next()?;
+        var key = leafKey(KeyKind.Seq);
+        key.a = q.ranges.length;
+        parseSequenceSet(tokenText(r, t), mut q.ranges)?;
+        key.b = q.ranges.length - key.a;
+        return pushKey(q, key);
+    }
+    if (t.kind != TokenKind.Atom) {
+        return Err(ParseError.UnknownSearchKey);
+    }
+    let kind = match (keyOf(word)) {
+        Some(k) => k,
+        null => { return Err(ParseError.UnknownSearchKey); }
+    };
+    r.next()?;
+    var key = leafKey(kind);
+    match (kind) {
+        KeyKind.Keyword => { key.text = keywordArg(r, q)?; }
+        KeyKind.Unkeyword => { key.text = keywordArg(r, q)?; }
+        KeyKind.Before => { key.value = r.date()?.daysSinceEpoch(); }
+        KeyKind.On => { key.value = r.date()?.daysSinceEpoch(); }
+        KeyKind.Since => { key.value = r.date()?.daysSinceEpoch(); }
+        KeyKind.SentBefore => { key.value = r.date()?.daysSinceEpoch(); }
+        KeyKind.SentOn => { key.value = r.date()?.daysSinceEpoch(); }
+        KeyKind.SentSince => { key.value = r.date()?.daysSinceEpoch(); }
+        KeyKind.Larger => { key.value = r.number()? as i64; }
+        KeyKind.Smaller => { key.value = r.number()? as i64; }
+        KeyKind.From => { key.text = stringArg(r, q)?; }
+        KeyKind.To => { key.text = stringArg(r, q)?; }
+        KeyKind.Cc => { key.text = stringArg(r, q)?; }
+        KeyKind.Bcc => { key.text = stringArg(r, q)?; }
+        KeyKind.Subject => { key.text = stringArg(r, q)?; }
+        KeyKind.Body => {
+            key.text = stringArg(r, q)?;
+            q.needsBody = true;
+        }
+        KeyKind.Text => {
+            key.text = stringArg(r, q)?;
+            q.needsText = true;
+        }
+        KeyKind.Header => {
+            key.field = stringArg(r, q)?;
+            key.text = stringArg(r, q)?;
+        }
+        KeyKind.Uid => {
+            let set = r.next()?;
+            if (set.kind != TokenKind.Atom && set.kind != TokenKind.Number) {
+                return Err(ParseError.BadSequenceSet);
+            }
+            key.a = q.ranges.length;
+            parseSequenceSet(tokenText(r, set), mut q.ranges)?;
+            key.b = q.ranges.length - key.a;
+        }
+        KeyKind.Not => {
+            key.a = searchKey(r, q, depth + 1)?;
+            key.level = q.keys[key.a].level;
+        }
+        KeyKind.Or => {
+            var x = searchKey(r, q, depth + 1)?;
+            var y = searchKey(r, q, depth + 1)?;
+            if (q.keys[y].level < q.keys[x].level) {
+                let z = x;
+                x = y;
+                y = z;
+            }
+            key.a = x;
+            key.b = y;
+            key.level = q.keys[y].level;
+        }
+        _ => {}
+    }
+    return pushKey(q, key);
+}
+
+/// KEYWORD's flag-keyword: an atom.
+fn keywordArg(r: borrow mut CommandReader, q: borrow mut SearchQuery) -> Result<Span, ParseError> {
+    let span = match (r.atom()) {
+        Ok(s) => s,
+        Err(ParseError.ExpectedAtom) => { return Err(ParseError.BadFlag); }
+        Err(e) => { return Err(e); }
+    };
+    let start = q.strings.length;
+    grew(q.strings.extend(r.text(span)))?;
+    return Ok(Span { start: start, length: span.length });
+}
+
+// ---- Evaluation ----
+
+/// A three-valued truth: a key whose data is not loaded yet is `Unknown`.
+public enum Tri {
+    No,
+    Yes,
+    Unknown,
+}
+
+/// What is known of a message from the snapshot and its row. `level` says how much: at `LEVEL_NUMBERS` only the
+/// numbers are set, from `LEVEL_ROW` the rest. `maxSeq` and `maxUid` are what `*` stands for.
+public struct RowFacts {
+    public level: u8;
+    public seq: u32;
+    public uid: u32;
+    public maxSeq: u32;
+    public maxUid: u32;
+    public flags: u16;
+    /// Unix milliseconds.
+    public internalDate: i64;
+    public size: i64;
+}
+
+/// What is loaded of a message beyond its row: its header block (from `LEVEL_HEADER`), the day its Date header
+/// names in its own zone, and its decoded text (from `LEVEL_BODY`): `body` for BODY, `text` (header and body)
+/// for TEXT. Kept for one message at a time, and reused.
+@noncopy
+public struct MessageFacts {
+    public header: Vector<u8>;
+    public sentDay: i64;
+    public body: Vector<u8>;
+    public text: Vector<u8>;
+
+    public fn create() -> MessageFacts => MessageFacts {
+        header: Vector<u8>.create(),
+        sentDay: 0,
+        body: Vector<u8>.create(),
+        text: Vector<u8>.create(),
+    };
+
+    public fn clear(borrow mut this) {
+        this.header.clear();
+        this.sentDay = 0;
+        this.body.clear();
+        this.text.clear();
+    }
+}
+
+/// Evaluates the query on a message with what `row.level` says is known.
+public fn evaluate(
+    q: borrow SearchQuery,
+    row: RowFacts,
+    keywords: Slice<u8>,
+    m: borrow MessageFacts,
+    scratch: borrow mut Vector<u8>,
+) -> Result<Tri, AllocError> => evaluateKey(q, q.root, row, keywords, m, scratch);
+
+fn evaluateKey(
+    q: borrow SearchQuery,
+    at: usize,
+    row: RowFacts,
+    keywords: Slice<u8>,
+    m: borrow MessageFacts,
+    scratch: borrow mut Vector<u8>,
+) -> Result<Tri, AllocError> {
+    let k = q.keys[at];
+    match (k.kind) {
+        KeyKind.Not => {
+            return Ok(match (evaluateKey(q, k.a, row, keywords, m, scratch)?) {
+                Tri.Yes => Tri.No,
+                Tri.No => Tri.Yes,
+                Tri.Unknown => Tri.Unknown,
+            });
+        }
+        KeyKind.Or => {
+            let x = evaluateKey(q, k.a, row, keywords, m, scratch)?;
+            if (x == Tri.Yes) {
+                return Ok(Tri.Yes);
+            }
+            let y = evaluateKey(q, k.b, row, keywords, m, scratch)?;
+            if (y == Tri.Yes) {
+                return Ok(Tri.Yes);
+            }
+            return Ok(if (x == Tri.No && y == Tri.No) Tri.No else Tri.Unknown);
+        }
+        KeyKind.And => {
+            var result = Tri.Yes;
+            for (i in k.a..k.a + k.b) {
+                let t = evaluateKey(q, q.operands[i], row, keywords, m, scratch)?;
+                if (t == Tri.No) {
+                    return Ok(Tri.No);
+                }
+                if (t == Tri.Unknown) {
+                    result = Tri.Unknown;
+                }
+            }
+            return Ok(result);
+        }
+        _ => {}
+    }
+    if (k.level > row.level) {
+        return Ok(Tri.Unknown);
+    }
+    return Ok(if (matchLeaf(q, k, row, keywords, m, scratch)?) Tri.Yes else Tri.No);
+}
+
+fn hasFlag(row: RowFacts, bit: u16) -> bool => row.flags & bit != 0;
+
+fn matchLeaf(
+    q: borrow SearchQuery,
+    k: SearchKey,
+    row: RowFacts,
+    keywords: Slice<u8>,
+    m: borrow MessageFacts,
+    scratch: borrow mut Vector<u8>,
+) -> Result<bool, AllocError> {
+    let internalDay = dayOf(row.internalDate);
+    return Ok(match (k.kind) {
+        KeyKind.All => true,
+        KeyKind.Answered => hasFlag(row, STORED_ANSWERED),
+        KeyKind.Deleted => hasFlag(row, STORED_DELETED),
+        KeyKind.Draft => hasFlag(row, STORED_DRAFT),
+        KeyKind.Flagged => hasFlag(row, STORED_FLAGGED),
+        KeyKind.Seen => hasFlag(row, STORED_SEEN),
+        KeyKind.Unanswered => !hasFlag(row, STORED_ANSWERED),
+        KeyKind.Undeleted => !hasFlag(row, STORED_DELETED),
+        KeyKind.Undraft => !hasFlag(row, STORED_DRAFT),
+        KeyKind.Unflagged => !hasFlag(row, STORED_FLAGGED),
+        KeyKind.Unseen => !hasFlag(row, STORED_SEEN),
+        KeyKind.New => false,
+        KeyKind.Recent => false,
+        KeyKind.Old => true,
+        KeyKind.Keyword => hasKeyword(keywords, q.text(k.text)),
+        KeyKind.Unkeyword => !hasKeyword(keywords, q.text(k.text)),
+        KeyKind.Before => internalDay < k.value,
+        KeyKind.On => internalDay == k.value,
+        KeyKind.Since => internalDay >= k.value,
+        KeyKind.SentBefore => m.sentDay < k.value,
+        KeyKind.SentOn => m.sentDay == k.value,
+        KeyKind.SentSince => m.sentDay >= k.value,
+        KeyKind.Larger => row.size > k.value,
+        KeyKind.Smaller => row.size < k.value,
+        KeyKind.From => headerHas(m.header.view(), "From".bytes(), q.text(k.text), scratch)?,
+        KeyKind.To => headerHas(m.header.view(), "To".bytes(), q.text(k.text), scratch)?,
+        KeyKind.Cc => headerHas(m.header.view(), "Cc".bytes(), q.text(k.text), scratch)?,
+        KeyKind.Bcc => headerHas(m.header.view(), "Bcc".bytes(), q.text(k.text), scratch)?,
+        KeyKind.Subject => headerHas(m.header.view(), "Subject".bytes(), q.text(k.text), scratch)?,
+        KeyKind.Header => headerHas(m.header.view(), q.text(k.field), q.text(k.text), scratch)?,
+        KeyKind.Body => containsFolded(m.body.view(), q.text(k.text)),
+        KeyKind.Text => containsFolded(m.text.view(), q.text(k.text)),
+        KeyKind.Uid => inRanges(q.ranges[k.a..k.a + k.b], row.uid, row.maxUid),
+        KeyKind.Seq => inRanges(q.ranges[k.a..k.a + k.b], row.seq, row.maxSeq),
+        _ => false,
+    });
+}
+
+/// Whether `n` is in the ranges, with `*` (0) as `max`.
+public fn inRanges(ranges: Slice<SeqRange>, n: u32, max: u32) -> bool {
+    for (r in ranges) {
+        let a = if (r.first == 0) max else r.first;
+        let b = if (r.last == 0) max else r.last;
+        let lo = if (a < b) a else b;
+        let hi = if (a < b) b else a;
+        if (n >= lo && n <= hi) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Whether the space-separated `keywords` hold `word`, in any case.
+public fn hasKeyword(keywords: Slice<u8>, word: Slice<u8>) -> bool {
+    for (k in keywords.split(" ".bytes())) {
+        if (k.length > 0 && k.equalsIgnoreAsciiCase(word)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Whether the header block has a field called `name` whose decoded value holds `needle` (an empty needle: whether
+/// it has the field at all).
+public fn headerHas(
+    header: Slice<u8>,
+    name: Slice<u8>,
+    needle: Slice<u8>,
+    scratch: borrow mut Vector<u8>,
+) -> Result<bool, AllocError> {
+    let fieldName = match (StringView.fromUtf8(name)) {
+        Some(n) => n,
+        null => { return Ok(false); }
+    };
+    scratch.clear();
+    let count = appendHeaderValues(header, fieldName, scratch)?;
+    return Ok(count > 0 && containsFolded(scratch.view(), needle));
+}
+
+/// The day (since 1970-01-01, UTC) of Unix milliseconds.
+public fn dayOf(unixMillis: i64) -> i64 => floorDiv(floorDiv(unixMillis, 1000), 86400);
+
+/// The day the header's Date field names, in its own zone, as Dovecot reads it: 1970-01-01 (day 0) when there is
+/// none or it cannot be read.
+public fn sentDayOf(header: Slice<u8>, scratch: borrow mut Vector<u8>) -> Result<i64, AllocError> {
+    scratch.clear();
+    if (appendHeaderValues(header, "Date", scratch)? == 0) {
+        return Ok(0);
+    }
+    let all = scratch.view();
+    let line = all[0..(all.indexOfByte(0x0a) ?? all.length)];
+    return Ok(match (parseMessageDate(line)) {
+        Some(local) => floorDiv(local, 86400),
+        null => 0,
+    });
+}
+
+// ---- RFC 5322 dates ----
+
+fn isAlpha(c: u8) -> bool => (c >= 0x41 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a);
+
+fn isDateSpace(c: u8) -> bool => c == 0x20 || c == 0x09 || c == 0x0d || c == 0x0a;
+
+/// A cursor over a Date value: tokens are runs of letters, runs of digits, or one other character; white space
+/// and comments are skipped.
+struct DateCursor {
+    at: usize;
+}
+
+/// The next token's bounds from `c.at`, skipping white space and (nested) comments; (end, end) at the end.
+fn nextToken(text: Slice<u8>, c: borrow mut DateCursor) -> Span {
+    loop {
+        while (c.at < text.length && isDateSpace(text[c.at])) {
+            c.at += 1;
+        }
+        if (c.at < text.length && text[c.at] == 0x28) {
+            var depth: u32 = 0;
+            while (c.at < text.length) {
+                let ch = text[c.at];
+                c.at += 1;
+                if (ch == 0x5c) {
+                    c.at += 1;
+                } else if (ch == 0x28) {
+                    depth += 1;
+                } else if (ch == 0x29) {
+                    depth -= 1;
+                    if (depth == 0) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        break;
+    }
+    let start = c.at;
+    if (start >= text.length) {
+        return Span { start: text.length, length: 0 };
+    }
+    let first = text[start];
+    var end = start + 1;
+    if (isAlpha(first)) {
+        while (end < text.length && isAlpha(text[end])) {
+            end += 1;
+        }
+    } else if (isDigit(first)) {
+        while (end < text.length && isDigit(text[end])) {
+            end += 1;
+        }
+    }
+    c.at = end;
+    return Span { start: start, length: end - start };
+}
+
+fn spanText(text: Slice<u8>, s: Span) -> Slice<u8> => text[s.start..s.start + s.length];
+
+fn digitsValue(t: Slice<u8>) -> i64? {
+    if (t.length == 0 || t.length > 9 || !isDigit(t[0])) {
+        return null;
+    }
+    var n: i64 = 0;
+    for (ch in t) {
+        n = n * 10 + ((ch - 0x30) as i64);
+    }
+    return n;
+}
+
+/// An RFC 5322 date-time (`[Fri,] 5 Mar 2021 23:30[:00] [-0500]`, with obsolete forms: two-digit years, zone names,
+/// comments), as seconds since 1970-01-01 in its own zone (the wall-clock time it names, which is the UTC time plus
+/// the zone's offset), as Dovecot reads it: a two-digit year below 70 is 20xx, else 19xx. Null when it cannot be
+/// read.
+public fn parseMessageDate(text: Slice<u8>) -> i64? {
+    var c = DateCursor { at: 0 };
+    var t = nextToken(text, mut c);
+    if (t.length > 0 && isAlpha(text[t.start])) {
+        // The day of the week, and its comma.
+        let save = c.at;
+        let comma = nextToken(text, mut c);
+        if (!(comma.length == 1 && text[comma.start] == 0x2c)) {
+            c.at = save;
+        }
+        t = nextToken(text, mut c);
+    }
+    let day = digitsValue(spanText(text, t))?;
+    if (t.length > 2) {
+        return null;
+    }
+    t = nextToken(text, mut c);
+    let month = monthOf(spanText(text, t))? as i64;
+    t = nextToken(text, mut c);
+    var year = digitsValue(spanText(text, t))?;
+    if (t.length == 2) {
+        year += if (year < 70) 2000i64 else 1900i64;
+    } else if (t.length != 4) {
+        return null;
+    }
+    if (day < 1 || !validDate(truncate<u32>(year), truncate<u32>(month), truncate<u32>(day))) {
+        return null;
+    }
+    // hh:mm[:ss]
+    t = nextToken(text, mut c);
+    let hour = digitsValue(spanText(text, t))?;
+    if (t.length > 2) {
+        return null;
+    }
+    t = nextToken(text, mut c);
+    if (!(t.length == 1 && text[t.start] == 0x3a)) {
+        return null;
+    }
+    t = nextToken(text, mut c);
+    let minute = digitsValue(spanText(text, t))?;
+    if (t.length > 2) {
+        return null;
+    }
+    var second: i64 = 0;
+    t = nextToken(text, mut c);
+    if (t.length == 1 && text[t.start] == 0x3a) {
+        t = nextToken(text, mut c);
+        second = digitsValue(spanText(text, t))?;
+        if (t.length > 2) {
+            return null;
+        }
+        t = nextToken(text, mut c);
+    }
+    if (hour > 23 || minute > 59 || second > 60) {
+        return null;
+    }
+    // The zone (+hhmm, -hhmm, a name, or nothing) is not needed: the day is the one the sender's clock showed.
+    let days = daysFromCivil(year, month, day);
+    return days * 86400 + hour * 3600 + minute * 60 + second;
+}
+
+// ---- The command ----
+
+/// SEARCH and UID SEARCH: `* SEARCH` with the matching sequence numbers (UIDs for UID SEARCH), ascending.
+async fn searchCommand(
+    ctx: borrow SmtpContext,
+    wire: borrow mut Wire,
+    s: borrow mut Session,
+    r: borrow mut CommandReader,
+    byUid: bool,
+) -> Result<u8, Problem> {
+    var q = SearchQuery.create();
+    if (!parsed(parseSearch(r, mut q))?) {
+        return tagged(s, "NO", "[BADCHARSET (UTF-8 US-ASCII)] Unsupported charset");
+    }
+    parsed(r.finish())?;
+    var found = Vector<u32>.create();
+    var failed = false;
+    let maxSeq = s.snapshot.announced;
+    let maxUid = s.snapshot.lastUid();
+    var facts = MessageFacts.create();
+    var scratch = Vector<u8>.create();
+    var batch = Vector<u32>.create();
+    var seq: u32 = 1;
+    while (seq <= maxSeq) {
+        // Level 0: the numbers rule out messages before any query.
+        batch.clear();
+        while (seq <= maxSeq && batch.length < SEARCH_BATCH) {
+            if (!s.snapshot.isGone(seq)) {
+                let row = RowFacts {
+                    level: LEVEL_NUMBERS,
+                    seq: seq,
+                    uid: s.snapshot.uidAt(seq),
+                    maxSeq: maxSeq,
+                    maxUid: maxUid,
+                    flags: 0,
+                    internalDate: 0,
+                    size: 0,
+                };
+                if (mem(evaluate(q, row, "".bytes(), facts, mut scratch))? != Tri.No) {
+                    mem(batch.push(seq))?;
+                }
+            }
+            seq += 1;
+        }
+        if (batch.length == 0) {
+            continue;
+        }
+        let ok = await searchBatch(ctx, s, q, batch, byUid, mut facts, mut scratch, mut found)?;
+        if (!ok) {
+            failed = true;
+        }
+    }
+    var out = Vector<u8>.create();
+    mem(out.extend("* SEARCH".bytes()))?;
+    for (n in found.view()) {
+        mem(out.push(0x20))?;
+        mem(writeNumber(mut out, n as u64))?;
+    }
+    mem(out.extend("\r\n".bytes()))?;
+    io(wire.send(out.view()))?;
+    if (failed) {
+        return tagged(s, "NO", "[UNAVAILABLE] Some messages could not be read");
+    }
+    return tagged(s, "OK", if (byUid) "UID SEARCH completed" else "SEARCH completed");
+}
+
+/// The UIDs of `seqs` (ascending), as runs.
+fn uidsOf(s: borrow Session, seqs: borrow Vector<u32>, uids: borrow mut UidSet) -> Result<void, AllocError> {
+    uids.clear();
+    var runStart: u32 = 0;
+    var runEnd: u32 = 0;
+    for (seq in seqs.view()) {
+        let uid = s.snapshot.uidAt(seq);
+        if (runStart != 0 && uid == runEnd + 1) {
+            runEnd = uid;
+            continue;
+        }
+        if (runStart != 0) {
+            added(uids.addRange(runStart as i64, runEnd as i64))?;
+        }
+        runStart = uid;
+        runEnd = uid;
+    }
+    if (runStart != 0) {
+        added(uids.addRange(runStart as i64, runEnd as i64))?;
+    }
+    return Ok();
+}
+
+/// Evaluates one batch: the rows (level 1), then, for the messages still undecided, the meta and header (level 2)
+/// and the decoded text (level 3). Appends the matches to `found`; false when a message could not be read.
+async fn searchBatch(
+    ctx: borrow SmtpContext,
+    s: borrow Session,
+    q: borrow SearchQuery,
+    seqs: borrow Vector<u32>,
+    byUid: bool,
+    facts: borrow mut MessageFacts,
+    scratch: borrow mut Vector<u8>,
+    found: borrow mut Vector<u32>,
+) -> Result<bool, Problem> {
+    var uids = UidSet.create();
+    mem(uidsOf(s, seqs, mut uids))?;
+    var rows = MessageList.create();
+    match (await ctx.store.fetchMessages(s.userId, s.mailboxId, uids, false, mut rows)) {
+        Ok() => {}
+        Err(_) => { return Ok(false); }
+    }
+    let maxSeq = s.snapshot.announced;
+    let maxUid = s.snapshot.lastUid();
+    var matched = Vector<bool>.create();
+    mem(matched.resize(rows.count(), false))?;
+    var pending = UidSet.create();
+    var anyPending = false;
+    facts.clear();
+    for (i in 0..rows.count()) {
+        let seq = match (knownSeq(s, rows.uid(i))) {
+            Some(n) => n,
+            null => { continue; }
+        };
+        let row = rowFacts(rows, i, LEVEL_ROW, seq, maxSeq, maxUid);
+        match (mem(evaluate(q, row, rows.keywords(i).bytes(), facts, scratch))?) {
+            Tri.Yes => { matched[i] = true; }
+            Tri.No => {}
+            Tri.Unknown => {
+                mem(added(pending.add(rows.uid(i))))?;
+                anyPending = true;
+            }
+        }
+    }
+    var ok = true;
+    if (anyPending) {
+        var full = MessageList.create();
+        match (await ctx.store.fetchMessages(s.userId, s.mailboxId, pending, true, mut full)) {
+            Ok() => {}
+            Err(_) => { return Ok(false); }
+        }
+        let blobs = ctx.store.blobs();
+        var metaBytes = Vector<u8>.create();
+        var meta = MessageMeta.create();
+        var hash = Vector<u8>.create();
+        var data = Vector<u8>.create();
+        var files = Vector<RawFile>.create();
+        for (j in 0..full.count()) {
+            let at = rowOf(rows, full.uid(j));
+            if (at == NONE) {
+                continue;
+            }
+            let seq = match (knownSeq(s, full.uid(j))) {
+                Some(n) => n,
+                null => { continue; }
+            };
+            facts.clear();
+            files.clear();
+            data.clear();
+            match (full.blob(j, mut hash)) {
+                Ok() => {}
+                Err(_) => {
+                    ok = false;
+                    continue;
+                }
+            }
+            let h = hash.view();
+            let opened: Result<RawFile, StoreError> = await Async.blocking(() => blobs.open(h));
+            match (opened) {
+                Ok(f) => { mem(files.push(f))?; }
+                Err(_) => {
+                    ok = false;
+                    continue;
+                }
+            }
+            let f = borrow files[0];
+            let size = truncate<u64>(full.size(j));
+            var haveMeta = match (full.meta(j, mut metaBytes)) {
+                Ok(x) => x,
+                Err(_) => false,
+            };
+            if (haveMeta) {
+                haveMeta = mem(meta.read(metaBytes.view()))? && meta.parts.length > 0;
+            }
+            if (!haveMeta) {
+                // No stored meta (or a damaged one): index the message now.
+                let got: Result<void, FileError> = await Async.blocking(() => readRange(f, 0, size, mut data));
+                if (!readOk(got)) {
+                    ok = false;
+                    continue;
+                }
+                metaBytes.clear();
+                mem(indexMessage(data.view(), mut metaBytes))?;
+                if (!mem(meta.read(metaBytes.view()))? || meta.parts.length == 0) {
+                    ok = false;
+                    continue;
+                }
+            }
+            // Level 2: the header block.
+            let headerEnd = meta.parts[0].bodyStart;
+            let gotHeader: Result<void, FileError> = await Async.blocking(
+                () => readRange(f, 0, headerEnd, mut facts.header),
+            );
+            if (!readOk(gotHeader)) {
+                ok = false;
+                continue;
+            }
+            facts.sentDay = mem(sentDayOf(facts.header.view(), scratch))?;
+            let row = rowFacts(rows, at, LEVEL_HEADER, seq, maxSeq, maxUid);
+            var t = mem(evaluate(q, row, rows.keywords(at).bytes(), facts, scratch))?;
+            if (t == Tri.Unknown) {
+                // Level 3: the decoded text, read and decoded off the event loop.
+                let needBody = q.needsBody;
+                let needText = q.needsText;
+                let m = borrow meta;
+                let loaded: Result<void, FileError> = await Async.blocking(
+                    () => loadText(f, size, m, needBody, needText, mut data, mut facts),
+                );
+                if (!readOk(loaded)) {
+                    ok = false;
+                    continue;
+                }
+                let deep = rowFacts(rows, at, LEVEL_BODY, seq, maxSeq, maxUid);
+                t = mem(evaluate(q, deep, rows.keywords(at).bytes(), facts, scratch))?;
+            }
+            if (t == Tri.Yes) {
+                matched[at] = true;
+            }
+        }
+    }
+    for (i in 0..rows.count()) {
+        if (matched[i]) {
+            let n = if (byUid) truncate<u32>(rows.uid(i)) else (knownSeq(s, rows.uid(i)) ?? 0u32);
+            mem(found.push(n))?;
+        }
+    }
+    facts.clear();
+    return Ok(ok);
+}
+
+fn readOk(r: Result<void, FileError>) -> bool => match (r) {
+    Ok() => true,
+    Err(_) => false,
+};
+
+fn rowFacts(rows: borrow MessageList, i: usize, level: u8, seq: u32, maxSeq: u32, maxUid: u32) -> RowFacts => RowFacts {
+    level: level,
+    seq: seq,
+    uid: truncate<u32>(rows.uid(i)),
+    maxSeq: maxSeq,
+    maxUid: maxUid,
+    flags: rows.flags(i),
+    internalDate: rows.internalDate(i),
+    size: rows.size(i),
+};
+
+/// Reads the whole message (unless `data` holds it already) and decodes its text into `facts`: `body` for BODY,
+/// `text` for TEXT, each capped at `SEARCH_TEXT_LIMIT`.
+fn loadText(
+    file: borrow RawFile,
+    size: u64,
+    meta: borrow MessageMeta,
+    needBody: bool,
+    needText: bool,
+    data: borrow mut Vector<u8>,
+    facts: borrow mut MessageFacts,
+) -> Result<void, FileError> {
+    if ((data.length as u64) != size) {
+        readRange(file, 0, size, data)?;
+    }
+    if (needBody) {
+        match (appendSearchText(data.view(), meta, false, SEARCH_TEXT_LIMIT, mut facts.body)) {
+            Ok(_) => {}
+            Err(_) => { return Err(FileError.NoSpace); }
+        }
+    }
+    if (needText) {
+        match (appendSearchText(data.view(), meta, true, SEARCH_TEXT_LIMIT, mut facts.text)) {
+            Ok(_) => {}
+            Err(_) => { return Err(FileError.NoSpace); }
+        }
+    }
+    return Ok();
+}

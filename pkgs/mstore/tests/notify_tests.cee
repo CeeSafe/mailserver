@@ -1,0 +1,278 @@
+// The notify bus on its own: no database needed.
+
+enum Waited {
+    TimedOut,
+    Failed,
+}
+
+/// Whether the watch fires within `ms`.
+async fn fires(w: borrow Watch, ms: u64) -> bool {
+    let got: Result<void, Waited> = await Async.timeout(ms, Waited.TimedOut, async () => {
+        match (await w.changed()) {
+            Ok() => { return Ok(); }
+            Err(_) => { return Err(Waited.Failed); }
+        }
+    });
+    return match (got) {
+        Ok() => true,
+        Err(_) => false,
+    };
+}
+
+fn check(checks: borrow mut Vector<bool>, ok: bool) {
+    checks.push(ok)!;
+}
+
+// verdict is live_tests.cee's.
+
+async fn registry(checks: borrow mut Vector<bool>) {
+    let bus = NotifyBus.create()!;
+    check(checks, await bus.count() == 0);
+    let a = (await bus.watch(1, 10))!;
+    var b: Watch? = await bus.watch(1, 11);
+    check(checks, await bus.count() == 2);
+    check(checks, a.mailbox() == 10);
+    b = null; // UNSELECT: dropping the watch ends it
+    check(checks, await bus.count() == 1);
+    {
+        let c = (await bus.watch(2, 10))!;
+        check(checks, c.mailbox() == 10 && await bus.count() == 2);
+    }
+    check(checks, await bus.count() == 1);
+}
+
+@test
+fn registersAndUnregisters() -> Result<void, TestFailure> {
+    var checks = Vector<bool>.create();
+    Async.run(registry(mut checks));
+    return verdict(checks, 6);
+}
+
+async fn matching(checks: borrow mut Vector<bool>) {
+    let bus = NotifyBus.create()!;
+    let a = (await bus.watch(1, 10))!;
+    let b = (await bus.watch(1, 11))!;
+    let c = (await bus.watch(2, 10))!; // another user's mailbox 10 cannot be, but the user decides too
+    await bus.raise(1, 10);
+    check(checks, await fires(a, 1000));
+    check(checks, !await fires(b, 50));
+    check(checks, !await fires(c, 50));
+    // 0: every watcher of the user (mailbox-list changes).
+    await bus.raise(1, 0);
+    check(checks, await fires(a, 1000));
+    check(checks, await fires(b, 1000));
+    check(checks, !await fires(c, 50));
+    // A raise for nobody's mailbox wakes nobody.
+    await bus.raise(1, 99);
+    check(checks, !await fires(a, 50));
+}
+
+@test
+fn raisingWakesOnlyMatchingWatchers() -> Result<void, TestFailure> {
+    var checks = Vector<bool>.create();
+    Async.run(matching(mut checks));
+    return verdict(checks, 7);
+}
+
+async fn coalescing(checks: borrow mut Vector<bool>) {
+    let bus = NotifyBus.create()!;
+    let a = (await bus.watch(1, 10))!;
+    // Raised before anyone waits: kept, and a burst counts once.
+    await bus.raise(1, 10);
+    await bus.raise(1, 10);
+    await bus.raise(1, 10);
+    check(checks, await fires(a, 1000));
+    check(checks, !await fires(a, 50));
+    // A raise while waiting wakes the waiter.
+    let raised: Result<void, Waited> = await Async.all(
+        async () => {
+            if (await fires(a, 2000)) {
+                return Ok();
+            }
+            return Err(Waited.TimedOut);
+        },
+        async () => {
+            match (await Timer.sleep(20)) {
+                Ok() => {}
+                Err(_) => { return Err(Waited.Failed); }
+            }
+            await bus.raise(1, 10);
+            return Ok();
+        },
+    );
+    check(checks, match (raised) {
+        Ok() => true,
+        Err(_) => false,
+    });
+}
+
+@test
+fn raisesCoalesceAndAreKept() -> Result<void, TestFailure> {
+    var checks = Vector<bool>.create();
+    Async.run(coalescing(mut checks));
+    return verdict(checks, 3);
+}
+
+/// A session's task: it watches, and waits for a change that never comes.
+async fn session(bus: borrow NotifyBus) -> Result<void, Waited> {
+    let w = match (await bus.watch(1, 10)) {
+        Some(w) => w,
+        null => { return Err(Waited.Failed); }
+    };
+    match (await w.changed()) {
+        Ok() => { return Ok(); }
+        Err(_) => { return Err(Waited.Failed); }
+    }
+}
+
+async fn cancelling(checks: borrow mut Vector<bool>) {
+    let bus = NotifyBus.create()!;
+    // Cancelled by a deadline, as a connection is when the server stops.
+    let out: Result<void, Waited> = await Async.timeout(50, Waited.TimedOut, async () => await session(bus));
+    check(checks, match (out) {
+        Err(Waited.TimedOut) => true,
+        _ => false,
+    });
+    check(checks, await bus.count() == 0);
+    // Cancelled by losing a race.
+    let raced: Result<Raced<u32>, Waited> = await Async.race(
+        async () => {
+            await session(bus)?;
+            return Ok(1u32);
+        },
+        async () => {
+            match (await Timer.sleep(20)) {
+                Ok() => { return Ok(2u32); }
+                Err(_) => { return Err(Waited.Failed); }
+            }
+        },
+    );
+    match (raced) {
+        Ok(r) => { check(checks, r.winner == 1); }
+        Err(_) => { check(checks, false); }
+    }
+    check(checks, await bus.count() == 0);
+}
+
+@test
+fn cancellationEndsTheWatch() -> Result<void, TestFailure> {
+    var checks = Vector<bool>.create();
+    Async.run(cancelling(mut checks));
+    return verdict(checks, 4);
+}
+
+/// Watchers on worker threads, raised from another: every one wakes, and the registry empties as they end.
+async fn workers(bus: Arc<NotifyBus>) -> Result<u32, Waited> {
+    var woken: u32 = 0;
+    let outcome = await Async.tasks(64, Waited.Failed, async (set) => {
+        for (i in 0..32) {
+            let mine = bus.clone();
+            match (await set.spawnSend(async move () => await session(mine.get()))) {
+                Ok() => {}
+                Err(_) => { return Err(Waited.Failed); }
+            }
+        }
+        // Raise until all 32 have registered and been woken; each ends, dropping its watch.
+        var tries = 0;
+        while (tries < 200) {
+            match (await Timer.sleep(10)) {
+                Ok() => {}
+                Err(_) => { return Err(Waited.Failed); }
+            }
+            await bus.get().raise(1, 10);
+            if (await bus.get().count() == 0 && tries > 5) {
+                break;
+            }
+            tries += 1;
+        }
+        return Ok();
+    });
+    match (outcome) {
+        Ok() => {}
+        Err(e) => { return Err(e); }
+    }
+    woken = 32;
+    if (await bus.get().count() != 0) {
+        return Err(Waited.Failed);
+    }
+    return Ok(woken);
+}
+
+@test
+fn watchersOnEveryWorkerWake() -> Result<void, TestFailure> {
+    let bus = Arc<NotifyBus>.create(NotifyBus.create()!)!;
+    let got = Async.runWorkers(4, workers(bus));
+    let all = match (got) {
+        Ok(n) => n == 32,
+        Err(_) => false,
+    };
+    Check.isTrue(all, "all woken and gone")?;
+    return Ok();
+}
+
+// ---- The store raises (needs PG_TEST_PORT, as live_tests.cee) ----
+
+async fn storeScenario(port: u16, root: StringView, checks: borrow mut Vector<bool>) -> Result<void, StoreError> {
+    let store = await openStore(port, "mstore_notify", root)?;
+    await store.createDomain("example.org")?;
+    let alice = await store.createUser("alice@example.org", "h", null)?;
+    var boxes = MailboxList.create();
+    let inbox = await mailbox(store, alice, "INBOX", mut boxes)?;
+    let archive = await mailbox(store, alice, "Archive", mut boxes)?;
+    let bus = store.notifications();
+    let a = (await bus.watch(alice, inbox))!;
+    let b = (await bus.watch(alice, archive))!;
+
+    // A delivery wakes its mailbox's watcher only.
+    let first = await deliverText(store, alice, inbox, "Subject: one\r\n\r\n")?;
+    await deliverText(store, alice, inbox, "Subject: two\r\n\r\n")?;
+    grown(checks.push(await fires(a, 1000) && !await fires(a, 30)))?;
+    grown(checks.push(!await fires(b, 30)))?;
+
+    // Flags: only when something changed.
+    var uids = UidSet.create();
+    uids.add(first.uid)?;
+    var change = FlagChange.create();
+    change.add = FLAG_DELETED;
+    var changed = MessageList.create();
+    await store.setFlags(alice, inbox, uids, change, mut changed)?;
+    grown(checks.push(await fires(a, 1000)))?;
+    await store.setFlags(alice, inbox, uids, change, mut changed)?;
+    grown(checks.push(changed.count() == 0 && !await fires(a, 30)))?;
+
+    // Expunge.
+    var gone = Vector<i64>.create();
+    await store.expunge(alice, inbox, mut gone)?;
+    grown(checks.push(gone.length == 1 && await fires(a, 1000) && !await fires(b, 30)))?;
+
+    // A move wakes both mailboxes; a copy only the target.
+    var all = UidSet.create();
+    all.addRange(1, 100)?;
+    var copied = CopyResult.create();
+    await store.copy(alice, inbox, archive, all, false, mut copied)?;
+    grown(checks.push(await fires(b, 1000) && !await fires(a, 30)))?;
+    await store.copy(alice, inbox, archive, all, true, mut copied)?;
+    grown(checks.push(await fires(a, 1000) && await fires(b, 1000)))?;
+
+    // Mailbox-list changes wake all of the user's watchers.
+    let made = await store.createMailbox(alice, "Projects", "")?;
+    grown(checks.push(await fires(a, 1000) && await fires(b, 1000)))?;
+    await store.renameMailbox(alice, "Projects", "Work")?;
+    grown(checks.push(await fires(a, 1000) && await fires(b, 1000)))?;
+    await store.deleteMailbox(alice, made)?;
+    grown(checks.push(await fires(a, 1000) && await fires(b, 1000)))?;
+    grown(checks.push(await bus.count() == 2))?;
+    return Ok();
+}
+
+@test
+fn storeChangesWakeWatchers() -> Result<void, TestFailure> {
+    let port = match (testPort()) {
+        Some(p) => p,
+        null => { return Ok(); }
+    };
+    var checks = Vector<bool>.create();
+    let root = blobRoot("n");
+    outcome(Async.run(storeScenario(port, root.view(), mut checks)))?;
+    return verdict(checks, 11);
+}

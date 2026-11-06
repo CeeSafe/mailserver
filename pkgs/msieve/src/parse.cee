@@ -1,0 +1,526 @@
+// Sieve's grammar (RFC 5228 §8): a script is commands; a command is an identifier, arguments (tags, numbers, string
+// lists), an optional test or test list, then `;` or a block. Parsed into a flat tree of nodes (first child and next
+// sibling), with every string unescaped into one buffer, so a script is a handful of allocations however long.
+
+/// The most bytes a script may have, nodes it may make, and how deep blocks and tests may nest.
+const MAX_SCRIPT: usize = 64 * 1024;
+const MAX_NODES: usize = 4096;
+const MAX_DEPTH: u32 = 32;
+
+const NONE: usize = 0xffffffffffffffff;
+
+/// An argument: a tag (`:is`), a number, or a string list (one string is a list of one).
+public const ARG_TAG: u8 = 0;
+public const ARG_NUMBER: u8 = 1;
+public const ARG_STRINGS: u8 = 2;
+
+struct Arg {
+    kind: u8;
+    /// The tag's name (without the colon), as a string index.
+    tag: usize;
+    number: u64;
+    /// The strings: `[first, first + count)` in `Script.strings`.
+    first: usize;
+    count: usize;
+}
+
+struct Text {
+    at: usize;
+    length: usize;
+}
+
+/// A command or a test.
+struct Node {
+    isTest: bool;
+    name: usize;
+    firstArg: usize;
+    argCount: usize;
+    firstChild: usize;
+    next: usize;
+    line: u32;
+}
+
+/// A parsed script.
+@noncopy
+public struct Script {
+    text: Vector<u8>;
+    strings: Vector<Text>;
+    args: Vector<Arg>;
+    nodes: Vector<Node>;
+    /// The top-level commands' first node, or NONE.
+    first: usize;
+    /// After a failed parse or validation: the reason and its line.
+    public error: String;
+    public errorLine: u32;
+
+    public fn create() -> Script => Script {
+        text: Vector<u8>.create(),
+        strings: Vector<Text>.create(),
+        args: Vector<Arg>.create(),
+        nodes: Vector<Node>.create(),
+        first: NONE,
+        error: String.create(),
+        errorLine: 0,
+    };
+
+    fn string(borrow this, i: usize) -> Slice<u8> {
+        let t = this.strings[i];
+        return this.text[t.at..t.at + t.length];
+    }
+
+    fn nameIs(borrow this, node: usize, name: StringView) -> bool =>
+        this.string(this.nodes[node].name).equalsIgnoreAsciiCase(name.bytes());
+}
+
+/// The parser's cursor and its output.
+@noncopy
+struct Parser {
+    source: Vector<u8>;
+    at: usize;
+    line: u32;
+    failed: bool;
+}
+
+fn isAlpha(c: u8) -> bool => (c >= 0x41 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a) || c == 0x5f;
+
+fn isDigit(c: u8) -> bool => c >= 0x30 && c <= 0x39;
+
+/// Parses `source` into `into`; false (with `into.error` set) when it is not a valid script.
+public fn parseScript(source: Slice<u8>, into: borrow mut Script) -> Result<bool, AllocError> {
+    into.text.clear();
+    into.strings.clear();
+    into.args.clear();
+    into.nodes.clear();
+    into.first = NONE;
+    into.error.clear();
+    into.errorLine = 0;
+    if (source.length > MAX_SCRIPT) {
+        return fail(into, 0, "script too large");
+    }
+    if (StringView.fromUtf8(source) == null) {
+        // Strings must be UTF-8 (RFC 5228 §2.4.2); a script that is not is refused whole.
+        return fail(into, 0, "script is not UTF-8");
+    }
+    var p = Parser { source: Vector<u8>.create(), at: 0, line: 1, failed: false };
+    p.source.extend(source)?;
+    let first = parseCommands(mut p, into, 0, false)?;
+    if (p.failed) {
+        return Ok(false);
+    }
+    into.first = first;
+    return validate(into);
+}
+
+fn fail(into: borrow mut Script, line: u32, message: StringView) -> Result<bool, AllocError> {
+    if (into.error.length == 0) {
+        into.error.append(message)?;
+        into.errorLine = line;
+    }
+    return Ok(false);
+}
+
+fn failAt(p: borrow mut Parser, into: borrow mut Script, message: StringView) -> Result<void, AllocError> {
+    p.failed = true;
+    fail(into, p.line, message)?;
+    return Ok();
+}
+
+/// Skips whitespace and comments (`# …` to the line end, `/* … */`).
+fn skipSpace(p: borrow mut Parser, into: borrow mut Script) -> Result<void, AllocError> {
+    let s = p.source.view();
+    while (p.at < s.length) {
+        let c = s[p.at];
+        if (c == 0x0a) {
+            p.line += 1;
+            p.at += 1;
+        } else if (c == 0x20 || c == 0x09 || c == 0x0d) {
+            p.at += 1;
+        } else if (c == 0x23) {
+            while (p.at < s.length && s[p.at] != 0x0a) {
+                p.at += 1;
+            }
+        } else if (c == 0x2f && p.at + 1 < s.length && s[p.at + 1] == 0x2a) {
+            p.at += 2;
+            loop {
+                if (p.at + 1 >= s.length) {
+                    return failAt(p, into, "unterminated comment");
+                }
+                if (s[p.at] == 0x0a) {
+                    p.line += 1;
+                }
+                if (s[p.at] == 0x2a && s[p.at + 1] == 0x2f) {
+                    p.at += 2;
+                    break;
+                }
+                p.at += 1;
+            }
+        } else {
+            return Ok();
+        }
+    }
+    return Ok();
+}
+
+/// An identifier into the string table; NONE if there is none here.
+fn identifier(p: borrow mut Parser, into: borrow mut Script) -> Result<usize, AllocError> {
+    let s = p.source.view();
+    let start = p.at;
+    if (p.at >= s.length || !isAlpha(s[p.at])) {
+        return Ok(NONE);
+    }
+    while (p.at < s.length && (isAlpha(s[p.at]) || isDigit(s[p.at]))) {
+        p.at += 1;
+    }
+    return addString(into, s[start..p.at]);
+}
+
+fn addString(into: borrow mut Script, bytes: Slice<u8>) -> Result<usize, AllocError> {
+    let at = into.text.length;
+    into.text.extend(bytes)?;
+    into.strings.push(Text { at: at, length: bytes.length })?;
+    return Ok(into.strings.length - 1);
+}
+
+/// A quoted string or a `text:` multi-line string, unescaped, into the string table.
+fn stringToken(p: borrow mut Parser, into: borrow mut Script) -> Result<usize, AllocError> {
+    let s = p.source.view();
+    var out = Vector<u8>.create();
+    if (s[p.at] == 0x22) {
+        p.at += 1;
+        loop {
+            if (p.at >= s.length) {
+                failAt(p, into, "unterminated string")?;
+                return Ok(NONE);
+            }
+            let c = s[p.at];
+            p.at += 1;
+            if (c == 0x22) {
+                break;
+            }
+            if (c == 0x5c && p.at < s.length) {
+                // \" and \\ are escapes; any other \x is x (RFC 5228 §2.4.2).
+                out.push(s[p.at])?;
+                p.at += 1;
+                continue;
+            }
+            if (c == 0x0a) {
+                p.line += 1;
+            }
+            out.push(c)?;
+        }
+        return addString(into, out.view());
+    }
+    // text: [spaces] [comment] CRLF, then lines up to a line of "."; a leading ".." is a dot (dot-stuffing).
+    p.at += 5;
+    while (p.at < s.length && (s[p.at] == 0x20 || s[p.at] == 0x09)) {
+        p.at += 1;
+    }
+    if (p.at < s.length && s[p.at] == 0x23) {
+        while (p.at < s.length && s[p.at] != 0x0a) {
+            p.at += 1;
+        }
+    }
+    if (p.at < s.length && s[p.at] == 0x0d) {
+        p.at += 1;
+    }
+    if (p.at >= s.length || s[p.at] != 0x0a) {
+        failAt(p, into, "text: must end its line")?;
+        return Ok(NONE);
+    }
+    p.at += 1;
+    p.line += 1;
+    loop {
+        if (p.at >= s.length) {
+            failAt(p, into, "unterminated text: string")?;
+            return Ok(NONE);
+        }
+        var end = p.at;
+        while (end < s.length && s[end] != 0x0a) {
+            end += 1;
+        }
+        let lineEnd = if (end > p.at && s[end - 1] == 0x0d) end - 1 else end;
+        let line = s[p.at..lineEnd];
+        p.at = if (end < s.length) end + 1 else end;
+        p.line += 1;
+        if (line.length == 1 && line[0] == 0x2e) {
+            break;
+        }
+        if (line.length >= 2 && line[0] == 0x2e && line[1] == 0x2e) {
+            out.extend(line[1..])?;
+        } else {
+            out.extend(line)?;
+        }
+        out.extend("\r\n".bytes())?;
+    }
+    return addString(into, out.view());
+}
+
+fn isStringStart(p: borrow Parser) -> bool {
+    let s = p.source.view();
+    if (p.at >= s.length) {
+        return false;
+    }
+    if (s[p.at] == 0x22) {
+        return true;
+    }
+    return p.at + 5 <= s.length && s[p.at..p.at + 5].equalsIgnoreAsciiCase("text:".bytes());
+}
+
+/// Arguments, then a test or test list (for commands and tests both).
+fn parseArguments(p: borrow mut Parser, into: borrow mut Script, node: usize, depth: u32) -> Result<void, AllocError> {
+    let firstArg = into.args.length;
+    loop {
+        skipSpace(p, into)?;
+        if (p.failed || p.at >= p.source.length) {
+            break;
+        }
+        let c = p.source[p.at];
+        if (c == 0x3a) {
+            p.at += 1;
+            let name = identifier(p, into)?;
+            if (name == NONE) {
+                return failAt(p, into, "a tag needs a name");
+            }
+            into.args.push(Arg { kind: ARG_TAG, tag: name, number: 0, first: 0, count: 0 })?;
+        } else if (isDigit(c)) {
+            var n: u64 = 0;
+            while (p.at < p.source.length && isDigit(p.source[p.at])) {
+                n = n * 10 + ((p.source[p.at] - 0x30) as u64);
+                if (n > 0xffffffff) {
+                    return failAt(p, into, "number too large");
+                }
+                p.at += 1;
+            }
+            if (p.at < p.source.length) {
+                let q = p.source[p.at] | 0x20;
+                if (q == 0x6b) {
+                    n = n * 1024;
+                    p.at += 1;
+                } else if (q == 0x6d) {
+                    n = n * 1024 * 1024;
+                    p.at += 1;
+                } else if (q == 0x67) {
+                    n = n * 1024 * 1024 * 1024;
+                    p.at += 1;
+                }
+            }
+            into.args.push(Arg { kind: ARG_NUMBER, tag: 0, number: n, first: 0, count: 0 })?;
+        } else if (c == 0x5b) {
+            p.at += 1;
+            var count: usize = 0;
+            var list = Vector<usize>.create();
+            loop {
+                skipSpace(p, into)?;
+                if (!isStringStart(p)) {
+                    return failAt(p, into, "a string list holds strings");
+                }
+                let s = stringToken(p, into)?;
+                if (p.failed) {
+                    return Ok();
+                }
+                list.push(s)?;
+                count += 1;
+                skipSpace(p, into)?;
+                if (p.at < p.source.length && p.source[p.at] == 0x2c) {
+                    p.at += 1;
+                    continue;
+                }
+                if (p.at < p.source.length && p.source[p.at] == 0x5d) {
+                    p.at += 1;
+                    break;
+                }
+                return failAt(p, into, "a string list needs , or ]");
+            }
+            // The list's strings are consecutive in the table (nothing else was added between them).
+            into.args.push(Arg { kind: ARG_STRINGS, tag: 0, number: 0, first: list[0], count: count })?;
+        } else if (isStringStart(p)) {
+            let s = stringToken(p, into)?;
+            if (p.failed) {
+                return Ok();
+            }
+            into.args.push(Arg { kind: ARG_STRINGS, tag: 0, number: 0, first: s, count: 1 })?;
+        } else {
+            break;
+        }
+    }
+    into.nodes[node].firstArg = firstArg;
+    into.nodes[node].argCount = into.args.length - firstArg;
+    if (p.failed || p.at >= p.source.length) {
+        return Ok();
+    }
+    // A test list "( test, test )" or a single test.
+    let c = p.source[p.at];
+    if (c == 0x28) {
+        p.at += 1;
+        var last = NONE;
+        loop {
+            skipSpace(p, into)?;
+            let t = parseTest(p, into, depth + 1)?;
+            if (p.failed) {
+                return Ok();
+            }
+            if (t == NONE) {
+                return failAt(p, into, "a test list holds tests");
+            }
+            if (last == NONE) {
+                into.nodes[node].firstChild = t;
+            } else {
+                into.nodes[last].next = t;
+            }
+            last = t;
+            skipSpace(p, into)?;
+            if (p.at < p.source.length && p.source[p.at] == 0x2c) {
+                p.at += 1;
+                continue;
+            }
+            if (p.at < p.source.length && p.source[p.at] == 0x29) {
+                p.at += 1;
+                return Ok();
+            }
+            return failAt(p, into, "a test list needs , or )");
+        }
+    }
+    if (isAlpha(c)) {
+        let t = parseTest(p, into, depth + 1)?;
+        into.nodes[node].firstChild = t;
+    }
+    return Ok();
+}
+
+fn newNode(p: borrow Parser, into: borrow mut Script, isTest: bool, name: usize) -> Result<usize, AllocError> {
+    into.nodes.push(
+        Node { isTest: isTest, name: name, firstArg: 0, argCount: 0, firstChild: NONE, next: NONE, line: p.line },
+    )?;
+    return Ok(into.nodes.length - 1);
+}
+
+fn parseTest(p: borrow mut Parser, into: borrow mut Script, depth: u32) -> Result<usize, AllocError> {
+    if (depth > MAX_DEPTH || into.nodes.length >= MAX_NODES) {
+        failAt(p, into, "script too deeply nested or too long")?;
+        return Ok(NONE);
+    }
+    let name = identifier(p, into)?;
+    if (name == NONE) {
+        return Ok(NONE);
+    }
+    let node = newNode(p, into, true, name)?;
+    parseArguments(p, into, node, depth)?;
+    return Ok(node);
+}
+
+/// Commands until the end (or a `}` when `inBlock`); gives the first, or NONE.
+fn parseCommands(
+    p: borrow mut Parser,
+    into: borrow mut Script,
+    depth: u32,
+    inBlock: bool,
+) -> Result<usize, AllocError> {
+    if (depth > MAX_DEPTH) {
+        failAt(p, into, "script too deeply nested")?;
+        return Ok(NONE);
+    }
+    var first = NONE;
+    var last = NONE;
+    loop {
+        skipSpace(p, into)?;
+        if (p.failed) {
+            return Ok(NONE);
+        }
+        if (p.at >= p.source.length) {
+            if (inBlock) {
+                failAt(p, into, "missing }")?;
+            }
+            return Ok(first);
+        }
+        if (p.source[p.at] == 0x7d) {
+            if (!inBlock) {
+                failAt(p, into, "unexpected }")?;
+                return Ok(NONE);
+            }
+            p.at += 1;
+            return Ok(first);
+        }
+        if (into.nodes.length >= MAX_NODES) {
+            failAt(p, into, "script too long")?;
+            return Ok(NONE);
+        }
+        let name = identifier(p, into)?;
+        if (name == NONE) {
+            failAt(p, into, "expected a command")?;
+            return Ok(NONE);
+        }
+        let node = newNode(p, into, false, name)?;
+        parseArguments(p, into, node, depth)?;
+        if (p.failed) {
+            return Ok(NONE);
+        }
+        skipSpace(p, into)?;
+        if (p.at < p.source.length && p.source[p.at] == 0x3b) {
+            p.at += 1;
+        } else if (p.at < p.source.length && p.source[p.at] == 0x7b) {
+            p.at += 1;
+            // A command's block hangs off its test (or the command when it has none): keep both by storing the
+            // block as the test's sibling chain head in a separate field — here, the block follows the test as the
+            // node's child list after it. See `blockOf`.
+            let block = parseCommands(p, into, depth + 1, true)?;
+            if (p.failed) {
+                return Ok(NONE);
+            }
+            let marker = newNode(p, into, false, name)?; // a block marker node
+            into.nodes[marker].firstChild = block;
+            into.nodes[marker].isTest = false;
+            into.nodes[marker].argCount = 0xffff; // marks "block"
+            if (into.nodes[node].firstChild == NONE) {
+                into.nodes[node].firstChild = marker;
+            } else {
+                var t = into.nodes[node].firstChild;
+                while (into.nodes[t].next != NONE) {
+                    t = into.nodes[t].next;
+                }
+                into.nodes[t].next = marker;
+            }
+        } else {
+            failAt(p, into, "expected ; or {")?;
+            return Ok(NONE);
+        }
+        if (first == NONE) {
+            first = node;
+        } else {
+            into.nodes[last].next = node;
+        }
+        last = node;
+    }
+}
+
+/// The block of a command (the commands inside its braces), or NONE.
+fn blockOf(script: borrow Script, command: usize) -> usize {
+    var c = script.nodes[command].firstChild;
+    while (c != NONE) {
+        if (script.nodes[c].argCount == 0xffff) {
+            return script.nodes[c].firstChild;
+        }
+        c = script.nodes[c].next;
+    }
+    return NONE;
+}
+
+/// Whether a command has a block.
+fn hasBlock(script: borrow Script, command: usize) -> bool {
+    var c = script.nodes[command].firstChild;
+    while (c != NONE) {
+        if (script.nodes[c].argCount == 0xffff) {
+            return true;
+        }
+        c = script.nodes[c].next;
+    }
+    return false;
+}
+
+/// The test of a command (its first child that is a test), or NONE.
+fn testOf(script: borrow Script, command: usize) -> usize {
+    let c = script.nodes[command].firstChild;
+    if (c != NONE && script.nodes[c].isTest) {
+        return c;
+    }
+    return NONE;
+}

@@ -1,0 +1,1530 @@
+// IMAP commands from the wire (RFC 3501 §9, with LITERAL+ from RFC 7888), with no I/O.
+//
+// A `CommandReader` is fed one command at a time: a line, and when the line ends in a literal marker (`{n}` or
+// `{n+}`), the literal's bytes and then the rest of the command, which is another line. Each line is split into
+// tokens as it comes, into one buffer, so a command is a handful of allocations. Once the command is complete, the
+// typed helpers read its arguments in order: the tag, the command name, then what that command takes.
+//
+// Atoms are read as runs of the bytes an atom, astring, list-mailbox, flag, sequence set or FETCH attribute may hold
+// (`BODY.PEEK[1.2.HEADER.FIELDS` is one run); the helpers check each run against the grammar of what they read. A
+// section's header list, `(FROM TO)`, is ordinary tokens, and the `]<0.100>` after it is a run that follows the `)`
+// with no space.
+
+/// The token kinds. Runs are `Atom`, `Number` (only digits) and `Nil` (`NIL` in any case).
+public enum TokenKind {
+    Atom,
+    Number,
+    Nil,
+    Quoted,
+    Literal,
+    Open,
+    Close,
+}
+
+/// A token: its kind, its bytes in the reader's buffer (unescaped for a quoted string), and whether a space came
+/// before it.
+public struct Token {
+    public kind: TokenKind;
+    public start: usize;
+    public length: usize;
+    public spaceBefore: bool;
+}
+
+/// Bytes in the reader's buffer; `CommandReader.text` gives them. They stay valid until the reader is reset.
+public struct Span {
+    public start: usize;
+    public length: usize;
+}
+
+/// Why a command is not valid, for a `BAD` (or, for `LiteralTooLarge`, a `NO [TOOBIG]`) answer.
+public enum ParseError {
+    EmptyCommand,
+    UnexpectedSpace,
+    MissingSpace,
+    BadCharacter,
+    UnterminatedQuoted,
+    BadEscape,
+    BadLiteral,
+    LiteralNotAtEnd,
+    LiteralTooLarge,
+    LiteralOverrun,
+    CommandTooLarge,
+    TooManyTokens,
+    TooDeep,
+    UnbalancedParens,
+    NotExpected,
+    MissingArgument,
+    ExtraArguments,
+    BadTag,
+    UnknownCommand,
+    ExpectedAtom,
+    ExpectedString,
+    ExpectedNumber,
+    ExpectedList,
+    ExpectedLiteral,
+    BadMailbox,
+    BadPattern,
+    BadFlag,
+    BadDate,
+    BadDateTime,
+    BadSequenceSet,
+    UnknownFetchAttribute,
+    BadSection,
+    MimeWithoutPart,
+    BadPartial,
+    BadStoreAction,
+    UnknownStatusItem,
+    UnknownSearchKey,
+    OutOfMemory,
+}
+
+/// The text for a `BAD` response.
+public fn describeError(e: ParseError) -> StringView => match (e) {
+    ParseError.EmptyCommand => "empty command",
+    ParseError.UnexpectedSpace => "unexpected space",
+    ParseError.MissingSpace => "missing space between arguments",
+    ParseError.BadCharacter => "invalid character",
+    ParseError.UnterminatedQuoted => "unterminated quoted string",
+    ParseError.BadEscape => "only \\\" and \\\\ may be escaped in a quoted string",
+    ParseError.BadLiteral => "invalid literal",
+    ParseError.LiteralNotAtEnd => "a literal must end its line",
+    ParseError.LiteralTooLarge => "literal too large",
+    ParseError.LiteralOverrun => "more literal data than announced",
+    ParseError.CommandTooLarge => "command too large",
+    ParseError.TooManyTokens => "too many arguments",
+    ParseError.TooDeep => "lists nested too deeply",
+    ParseError.UnbalancedParens => "unbalanced parentheses",
+    ParseError.NotExpected => "input not expected now",
+    ParseError.MissingArgument => "missing argument",
+    ParseError.ExtraArguments => "unexpected extra arguments",
+    ParseError.BadTag => "invalid tag",
+    ParseError.UnknownCommand => "unknown command",
+    ParseError.ExpectedAtom => "expected an atom",
+    ParseError.ExpectedString => "expected a string",
+    ParseError.ExpectedNumber => "expected a number",
+    ParseError.ExpectedList => "expected a parenthesised list",
+    ParseError.ExpectedLiteral => "expected a literal",
+    ParseError.BadMailbox => "invalid mailbox name",
+    ParseError.BadPattern => "invalid mailbox pattern",
+    ParseError.BadFlag => "invalid flag",
+    ParseError.BadDate => "invalid date",
+    ParseError.BadDateTime => "invalid date-time",
+    ParseError.BadSequenceSet => "invalid sequence set",
+    ParseError.UnknownFetchAttribute => "unknown FETCH attribute",
+    ParseError.BadSection => "invalid body section",
+    ParseError.MimeWithoutPart => "MIME needs a part number",
+    ParseError.BadPartial => "invalid partial range",
+    ParseError.BadStoreAction => "invalid STORE data item",
+    ParseError.UnknownStatusItem => "unknown STATUS item",
+    ParseError.UnknownSearchKey => "unknown search key",
+    ParseError.OutOfMemory => "out of memory",
+};
+
+/// What a reader may hold. The line length is the session's to enforce; these bound everything else.
+public struct Limits {
+    /// The largest literal, except in APPEND.
+    public maxLiteral: u64;
+    /// The largest literal in APPEND (the message size limit).
+    public maxAppendLiteral: u64;
+    /// The most bytes of tokens a command may hold, beyond an APPEND literal.
+    public maxBytes: usize;
+    public maxTokens: usize;
+    public maxDepth: u32;
+
+    /// 64 KiB literals, 50 MiB for APPEND, 256 KiB of tokens, 4096 tokens, lists 16 deep.
+    public fn defaults() -> Limits => Limits {
+        maxLiteral: 65536,
+        maxAppendLiteral: 52428800,
+        maxBytes: 262144,
+        maxTokens: 4096,
+        maxDepth: 16,
+    };
+}
+
+/// A literal the command announced: the session reads `size` bytes next, after sending `+ ` when it is
+/// synchronizing (`{n}`); `{n+}` (LITERAL+) is not.
+public struct LiteralRequest {
+    public size: u64;
+    public synchronizing: bool;
+}
+
+/// What `feedLine` found: the command is complete, or a literal follows.
+public enum Feed {
+    Complete,
+    NeedLiteral(LiteralRequest),
+}
+
+/// The commands, without their `UID` prefix.
+public enum Command {
+    Capability,
+    Noop,
+    Logout,
+    StartTls,
+    Authenticate,
+    Login,
+    Select,
+    Examine,
+    Create,
+    Delete,
+    Rename,
+    Subscribe,
+    Unsubscribe,
+    List,
+    Lsub,
+    Status,
+    Append,
+    Check,
+    Close,
+    Expunge,
+    Search,
+    Fetch,
+    Store,
+    Copy,
+    Move,
+    Idle,
+    Namespace,
+    Id,
+    Unselect,
+    Enable,
+}
+
+/// A command name, and whether it came after `UID`.
+public struct CommandName {
+    public command: Command;
+    public uid: bool;
+}
+
+/// A mailbox name as sent (modified UTF-7 is kept as is), and whether it is INBOX in any case.
+public struct Mailbox {
+    public name: Span;
+    public isInbox: bool;
+}
+
+public enum FlagKind {
+    Answered,
+    Flagged,
+    Deleted,
+    Seen,
+    Draft,
+    /// `\Recent`, which a client may not set.
+    Recent,
+    /// Another `\atom`.
+    Extension,
+    Keyword,
+}
+
+/// A flag: its kind, and its text (with the backslash).
+public struct Flag {
+    public kind: FlagKind;
+    public name: Span;
+}
+
+/// A calendar date, for SEARCH.
+public struct Date {
+    public year: u32;
+    public month: u32;
+    public day: u32;
+
+    /// Days since 1970-01-01.
+    public fn daysSinceEpoch(borrow this) -> i64 =>
+        daysFromCivil(this.year as i64, this.month as i64, this.day as i64);
+}
+
+/// One element of a sequence set; 0 stands for `*`. As given, `first` may be above `last`.
+public struct SeqRange {
+    public first: u32;
+    public last: u32;
+}
+
+/// A sequence set (`2,4:7,9,12:*`), for message sequence numbers or UIDs.
+@noncopy
+public struct SequenceSet {
+    public ranges: Vector<SeqRange>;
+
+    public fn create() -> SequenceSet => SequenceSet { ranges: Vector<SeqRange>.create() };
+
+    /// Whether `n` is in the set, when the mailbox's largest number (`*`) is `max`.
+    public fn contains(borrow this, n: u32, max: u32) -> bool {
+        for (r in this.ranges.view()) {
+            let a = if (r.first == 0) max else r.first;
+            let b = if (r.last == 0) max else r.last;
+            let lo = if (a < b) a else b;
+            let hi = if (a < b) b else a;
+            if (n >= lo && n <= hi) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Whether a number given explicitly is above `max`: for message sequence numbers, a `BAD`.
+    public fn exceeds(borrow this, max: u32) -> bool {
+        for (r in this.ranges.view()) {
+            if (r.first > max || r.last > max) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// The set as ascending, disjoint, non-adjacent ranges within `1..max`, with `*` as `max`. A range partly above
+    /// `max` is cut (for UIDs, `100:*` with `max` 50 is `50`); an empty mailbox gives no ranges.
+    public fn resolve(borrow this, max: u32, into: borrow mut Vector<SeqRange>) -> Result<void, AllocError> {
+        into.clear();
+        if (max == 0) {
+            return Ok();
+        }
+        for (r in this.ranges.view()) {
+            let a = if (r.first == 0) max else r.first;
+            let b = if (r.last == 0) max else r.last;
+            let lo = if (a < b) a else b;
+            var hi = if (a < b) b else a;
+            if (lo > max) {
+                continue;
+            }
+            if (hi > max) {
+                hi = max;
+            }
+            into.push(SeqRange { first: lo, last: hi })?;
+            // Insertion sort: sets are short.
+            var i = into.length - 1;
+            while (i > 0 && into[i - 1].first > into[i].first) {
+                into.swap(i - 1, i);
+                i -= 1;
+            }
+        }
+        // Merge overlapping and adjacent ranges.
+        var out: usize = 0;
+        for (i in 0..into.length) {
+            let r = into[i];
+            if (out > 0 && (r.first as u64) <= (into[out - 1].last as u64) + 1) {
+                if (r.last > into[out - 1].last) {
+                    into[out - 1].last = r.last;
+                }
+            } else {
+                into[out] = r;
+                out += 1;
+            }
+        }
+        into.truncate(out);
+        return Ok();
+    }
+}
+
+public enum FetchKind {
+    Envelope,
+    Flags,
+    InternalDate,
+    Rfc822,
+    Rfc822Header,
+    Rfc822Size,
+    Rfc822Text,
+    /// `BODY` without a section: the structure without extensions.
+    Body,
+    BodyStructure,
+    Uid,
+    /// `BODY[section]` or `BODY.PEEK[section]`.
+    BodySection,
+}
+
+public enum SectionText {
+    /// No text part: `BODY[]` or `BODY[1.2]`.
+    Whole,
+    Header,
+    HeaderFields,
+    HeaderFieldsNot,
+    Text,
+    Mime,
+}
+
+/// A body section: part numbers (`FetchRequest.partsOf`), a text specifier, and header names
+/// (`FetchRequest.fieldsOf`) for HEADER.FIELDS and HEADER.FIELDS.NOT.
+public struct Section {
+    public partsAt: usize;
+    public partsCount: usize;
+    public text: SectionText;
+    public fieldsAt: usize;
+    public fieldsCount: usize;
+}
+
+/// A FETCH attribute. For `BodySection`: whether it is `.PEEK`, the section, and the partial range `<origin.count>`.
+public struct FetchAtt {
+    public kind: FetchKind;
+    public peek: bool;
+    public section: Section;
+    public partial: bool;
+    public origin: u32;
+    public count: u32;
+}
+
+/// The FETCH attributes of one command, with the macros expanded.
+@noncopy
+public struct FetchRequest {
+    public items: Vector<FetchAtt>;
+    public parts: Vector<u32>;
+    public fields: Vector<Span>;
+
+    public fn create() -> FetchRequest =>
+        FetchRequest { items: Vector<FetchAtt>.create(), parts: Vector<u32>.create(), fields: Vector<Span>.create() };
+
+    public fn clear(borrow mut this) {
+        this.items.clear();
+        this.parts.clear();
+        this.fields.clear();
+    }
+
+    /// Whether the request has an item of this kind.
+    public fn has(borrow this, kind: FetchKind) -> bool {
+        for (a in this.items.view()) {
+            if (a.kind == kind) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public fn partsOf(borrow this, att: FetchAtt) -> Slice<u32> =>
+        this.parts[att.section.partsAt..att.section.partsAt + att.section.partsCount];
+
+    public fn fieldsOf(borrow this, att: FetchAtt) -> Slice<Span> =>
+        this.fields[att.section.fieldsAt..att.section.fieldsAt + att.section.fieldsCount];
+}
+
+public enum StoreMode {
+    Replace,
+    Add,
+    Remove,
+}
+
+/// STORE's `[+|-]FLAGS[.SILENT]`.
+public struct StoreAction {
+    public mode: StoreMode;
+    public silent: bool;
+}
+
+public enum StatusItem {
+    Messages,
+    Recent,
+    UidNext,
+    UidValidity,
+    Unseen,
+}
+
+/// APPEND's arguments after the mailbox: the date (Unix milliseconds) if given, and the message literal.
+public struct AppendArgs {
+    public internalDate: i64?;
+    public message: Span;
+}
+
+const STATE_LINE: u8 = 0;
+const STATE_LITERAL: u8 = 1;
+const STATE_COMPLETE: u8 = 2;
+
+const SP: u8 = 0x20;
+const DQUOTE: u8 = 0x22;
+const BACKSLASH: u8 = 0x5c;
+const OPEN: u8 = 0x28;
+const CLOSE: u8 = 0x29;
+const LBRACE: u8 = 0x7b;
+const RBRACE: u8 = 0x7d;
+const LBRACKET: u8 = 0x5b;
+const RBRACKET: u8 = 0x5d;
+
+fn isDigit(c: u8) -> bool => c >= 0x30 && c <= 0x39;
+
+/// A byte of a run: printable ASCII except the specials that end a token.
+fn isRunChar(c: u8) -> bool => c > SP && c < 0x7f && c != OPEN && c != CLOSE && c != DQUOTE && c != LBRACE;
+
+fn isAtomChar(c: u8) -> bool => isRunChar(c) && c != 0x25 && c != 0x2a && c != BACKSLASH && c != RBRACKET;
+
+fn isAstringChar(c: u8) -> bool => isAtomChar(c) || c == RBRACKET;
+
+fn isListChar(c: u8) -> bool => isAstringChar(c) || c == 0x25 || c == 0x2a;
+
+fn isRun(kind: TokenKind) -> bool => kind == TokenKind.Atom || kind == TokenKind.Number || kind == TokenKind.Nil;
+
+fn orFail<T>(v: T?, e: ParseError) -> Result<T, ParseError> => match (v) {
+    Some(x) => Ok(x),
+    null => Err(e),
+};
+
+fn grew<T>(r: Result<T, AllocError>) -> Result<T, ParseError> => match (r) {
+    Ok(v) => Ok(v),
+    Err(_) => Err(ParseError.OutOfMemory),
+};
+
+/// Reads one command at a time. Feed it with `feedLine` and `feedLiteral` until `feedLine` says `Complete`, then read
+/// the arguments with the typed helpers, then `finish`, then `reset` for the next command.
+@noncopy
+public struct CommandReader {
+    limits: Limits;
+    data: Vector<u8>;
+    tokens: Vector<Token>;
+    pos: usize;
+    depth: u32;
+    state: u8;
+    remaining: u64;
+    /// Whether the literal announced last is APPEND's message.
+    messageLiteral: bool;
+    /// The size of a literal left on the wire by `deferLiteral`.
+    deferred: u64;
+
+    public fn create(limits: Limits) -> CommandReader => CommandReader {
+        limits: limits,
+        data: Vector<u8>.create(),
+        tokens: Vector<Token>.create(),
+        pos: 0,
+        depth: 0,
+        state: STATE_LINE,
+        remaining: 0,
+        messageLiteral: false,
+        deferred: 0,
+    };
+
+    /// Forgets the command, for the next one.
+    public fn reset(borrow mut this) {
+        this.data.clear();
+        this.tokens.clear();
+        this.pos = 0;
+        this.depth = 0;
+        this.state = STATE_LINE;
+        this.remaining = 0;
+        this.messageLiteral = false;
+        this.deferred = 0;
+    }
+
+    /// Whether the literal just announced is APPEND's message: after the mailbox, outside any list. The session may
+    /// then leave its bytes on the wire (`deferLiteral`) and stream them itself.
+    public fn isAppendMessage(borrow this) -> bool => this.state == STATE_LITERAL && this.messageLiteral;
+
+    /// Leaves the literal just announced unread: the command is complete without its bytes (its token's text is
+    /// empty, `deferredSize` is its size), and the bytes and the rest of its line are the session's to read.
+    public fn deferLiteral(borrow mut this) {
+        if (this.state != STATE_LITERAL || this.tokens.length == 0) {
+            return;
+        }
+        let last = this.tokens.length - 1;
+        let t = this.tokens[last];
+        this.tokens[last] = Token { kind: t.kind, start: this.data.length, length: 0, spaceBefore: t.spaceBefore };
+        this.deferred = this.remaining;
+        this.remaining = 0;
+        this.state = STATE_COMPLETE;
+        this.pos = 0;
+    }
+
+    /// The size of the literal `deferLiteral` left on the wire (0 when none was).
+    public fn deferredSize(borrow this) -> u64 => this.deferred;
+
+    /// Whether the command is complete: its arguments can be read.
+    public fn isComplete(borrow this) -> bool => this.state == STATE_COMPLETE;
+
+    /// Whether a literal's bytes are expected next, and how many are left.
+    public fn literalRemaining(borrow this) -> u64 => if (this.state == STATE_LITERAL) this.remaining else 0;
+
+    /// Whether nothing has been fed since the last reset.
+    public fn isEmpty(borrow this) -> bool => this.tokens.length == 0 && this.state == STATE_LINE;
+
+    /// The bytes of a span.
+    public fn text(borrow this, span: Span) -> Slice<u8> => this.data[span.start..span.start + span.length];
+
+    public fn tokenCount(borrow this) -> usize => this.tokens.length;
+
+    public fn token(borrow this, i: usize) -> Token => this.tokens[i];
+
+    /// The first token when it is a valid tag, for a `BAD` that names it even when the command failed to parse.
+    public fn tagForReply(borrow this) -> Span? {
+        if (this.tokens.length == 0) {
+            return null;
+        }
+        let t = this.tokens[0];
+        if (!this.isTag(t)) {
+            return null;
+        }
+        return Span { start: t.start, length: t.length };
+    }
+
+    fn isTag(borrow this, t: Token) -> bool {
+        if (!isRun(t.kind) || t.length == 0) {
+            return false;
+        }
+        for (c in this.data[t.start..t.start + t.length]) {
+            if (!isAstringChar(c) || c == 0x2b) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // ---- Feeding ----
+
+    /// Takes a line of the command, with or without its CRLF. Says whether the command is complete, or which literal
+    /// the line announced at its end.
+    public fn feedLine(borrow mut this, input: Slice<u8>) -> Result<Feed, ParseError> {
+        if (this.state == STATE_LITERAL && this.remaining == 0) {
+            this.state = STATE_LINE;
+        }
+        if (this.state != STATE_LINE) {
+            return Err(ParseError.NotExpected);
+        }
+        var end = input.length;
+        if (end > 0 && input[end - 1] == 0x0a) {
+            end -= 1;
+            if (end > 0 && input[end - 1] == 0x0d) {
+                end -= 1;
+            }
+        }
+        let line = input[0..end];
+        let first = this.tokens.length == 0;
+        if (first && line.length == 0) {
+            return Err(ParseError.EmptyCommand);
+        }
+        var at: usize = 0;
+        var space = false;
+        while (at < line.length) {
+            let c = line[at];
+            if (c == SP) {
+                if (space || (first && at == 0)) {
+                    return Err(ParseError.UnexpectedSpace);
+                }
+                space = true;
+                at += 1;
+                continue;
+            }
+            if (c == OPEN) {
+                this.addToken(TokenKind.Open, this.data.length, 0, space, c)?;
+                this.depth += 1;
+                if (this.depth > this.limits.maxDepth) {
+                    return Err(ParseError.TooDeep);
+                }
+                at += 1;
+            } else if (c == CLOSE) {
+                if (this.depth == 0) {
+                    return Err(ParseError.UnbalancedParens);
+                }
+                this.addToken(TokenKind.Close, this.data.length, 0, space, c)?;
+                this.depth -= 1;
+                at += 1;
+            } else if (c == DQUOTE) {
+                at = this.quoted(line, at, space)?;
+            } else if (c == LBRACE) {
+                return this.literalMarker(line, at, space);
+            } else if (isRunChar(c)) {
+                var stop = at;
+                var digits = true;
+                while (stop < line.length && isRunChar(line[stop])) {
+                    if (!isDigit(line[stop])) {
+                        digits = false;
+                    }
+                    stop += 1;
+                }
+                let run = line[at..stop];
+                let kind = if (digits) TokenKind.Number else (if (run.equalsIgnoreAsciiCase(
+                    "NIL".bytes(),
+                )) TokenKind.Nil else TokenKind.Atom);
+                this.reserve(run.length)?;
+                let start = this.data.length;
+                grew(this.data.extend(run))?;
+                this.addToken(kind, start, run.length, space, c)?;
+                at = stop;
+            } else {
+                return Err(ParseError.BadCharacter);
+            }
+            space = false;
+        }
+        if (space) {
+            return Err(ParseError.UnexpectedSpace);
+        }
+        if (this.depth != 0) {
+            return Err(ParseError.UnbalancedParens);
+        }
+        this.state = STATE_COMPLETE;
+        this.pos = 0;
+        return Ok(Feed.Complete);
+    }
+
+    /// Takes the next bytes of the announced literal (all of it, or a part); gives how many are still to come.
+    public fn feedLiteral(borrow mut this, bytes: Slice<u8>) -> Result<u64, ParseError> {
+        if (this.state != STATE_LITERAL) {
+            return Err(ParseError.NotExpected);
+        }
+        if ((bytes.length as u64) > this.remaining) {
+            return Err(ParseError.LiteralOverrun);
+        }
+        grew(this.data.extend(bytes))?;
+        this.remaining -= bytes.length as u64;
+        if (this.remaining == 0) {
+            this.state = STATE_LINE;
+        }
+        return Ok(this.remaining);
+    }
+
+    fn addToken(
+        borrow mut this,
+        kind: TokenKind,
+        start: usize,
+        length: usize,
+        space: bool,
+        firstByte: u8,
+    ) -> Result<void, ParseError> {
+        if (this.tokens.length >= this.limits.maxTokens) {
+            return Err(ParseError.TooManyTokens);
+        }
+        if (this.tokens.length > 0) {
+            let prev = this.tokens[this.tokens.length - 1].kind;
+            if (kind == TokenKind.Close || prev == TokenKind.Open) {
+                if (space) {
+                    return Err(ParseError.UnexpectedSpace);
+                }
+            } else if (!space && !(prev == TokenKind.Close && isRun(kind) && firstByte == RBRACKET)) {
+                // Only a section's `]…` may follow a `)` directly.
+                return Err(ParseError.MissingSpace);
+            }
+        }
+        return grew(this.tokens.push(Token { kind: kind, start: start, length: length, spaceBefore: space }));
+    }
+
+    fn isAppend(borrow this) -> bool {
+        if (this.tokens.length < 2) {
+            return false;
+        }
+        let t = this.tokens[1];
+        return t.kind == TokenKind.Atom && this.data[t.start..t.start + t.length].equalsIgnoreAsciiCase(
+            "APPEND".bytes(),
+        );
+    }
+
+    fn byteLimit(borrow this) -> u64 {
+        let base = this.limits.maxBytes as u64;
+        return if (this.isAppend()) base + this.limits.maxAppendLiteral else base;
+    }
+
+    fn reserve(borrow this, n: usize) -> Result<void, ParseError> {
+        if ((this.data.length as u64) + (n as u64) > this.byteLimit()) {
+            return Err(ParseError.CommandTooLarge);
+        }
+        return Ok();
+    }
+
+    /// A quoted string from `line[at]` (the opening quote), unescaped into the buffer; gives where it ends.
+    fn quoted(borrow mut this, line: Slice<u8>, at: usize, space: bool) -> Result<usize, ParseError> {
+        this.reserve(line.length - at)?;
+        let start = this.data.length;
+        var i = at + 1;
+        loop {
+            if (i >= line.length) {
+                return Err(ParseError.UnterminatedQuoted);
+            }
+            let c = line[i];
+            i += 1;
+            if (c == DQUOTE) {
+                break;
+            }
+            if (c == BACKSLASH) {
+                if (i >= line.length) {
+                    return Err(ParseError.UnterminatedQuoted);
+                }
+                let e = line[i];
+                if (e != DQUOTE && e != BACKSLASH) {
+                    return Err(ParseError.BadEscape);
+                }
+                grew(this.data.push(e))?;
+                i += 1;
+                continue;
+            }
+            if (c < SP || c == 0x7f) {
+                return Err(ParseError.BadCharacter);
+            }
+            grew(this.data.push(c))?;
+        }
+        this.addToken(TokenKind.Quoted, start, this.data.length - start, space, DQUOTE)?;
+        return Ok(i);
+    }
+
+    /// `{n}` or `{n+}` at `line[at]`, which must end the line.
+    fn literalMarker(borrow mut this, line: Slice<u8>, at: usize, space: bool) -> Result<Feed, ParseError> {
+        var i = at + 1;
+        var size: u64 = 0;
+        let digitsAt = i;
+        while (i < line.length && isDigit(line[i])) {
+            size = size * 10 + ((line[i] - 0x30) as u64);
+            if (size > 0xffffffff) {
+                return Err(ParseError.BadLiteral);
+            }
+            i += 1;
+        }
+        if (i == digitsAt) {
+            return Err(ParseError.BadLiteral);
+        }
+        var synchronizing = true;
+        if (i < line.length && line[i] == 0x2b) {
+            synchronizing = false;
+            i += 1;
+        }
+        if (i >= line.length || line[i] != RBRACE) {
+            return Err(ParseError.BadLiteral);
+        }
+        if (i + 1 != line.length) {
+            return Err(ParseError.LiteralNotAtEnd);
+        }
+        // APPEND's message may be as large as the message size limit; its mailbox name, like every other literal,
+        // is bounded by `maxLiteral`.
+        this.messageLiteral = this.isAppend() && this.tokens.length >= 3 && this.depth == 0;
+        let limit = if (this.messageLiteral) this.limits.maxAppendLiteral else this.limits.maxLiteral;
+        if (size > limit || (this.data.length as u64) + size > this.byteLimit()) {
+            return Err(ParseError.LiteralTooLarge);
+        }
+        let length = checkedTruncate<usize>(size) ?? 0;
+        this.addToken(TokenKind.Literal, this.data.length, length, space, LBRACE)?;
+        this.state = STATE_LITERAL;
+        this.remaining = size;
+        return Ok(Feed.NeedLiteral(LiteralRequest { size: size, synchronizing: synchronizing }));
+    }
+
+    // ---- Reading the arguments ----
+
+    /// Whether every argument has been read.
+    public fn atEnd(borrow this) -> bool => this.pos >= this.tokens.length;
+
+    /// The next token's kind, without reading it.
+    public fn peek(borrow this) -> TokenKind? {
+        if (this.pos >= this.tokens.length) {
+            return null;
+        }
+        return this.tokens[this.pos].kind;
+    }
+
+    /// The next token, without reading it.
+    public fn peekToken(borrow this) -> Token? {
+        if (this.pos >= this.tokens.length) {
+            return null;
+        }
+        return this.tokens[this.pos];
+    }
+
+    fn peekIs(borrow this, kind: TokenKind) -> bool =>
+        this.pos < this.tokens.length && this.tokens[this.pos].kind == kind;
+
+    /// The next token.
+    public fn next(borrow mut this) -> Result<Token, ParseError> {
+        if (this.state != STATE_COMPLETE) {
+            return Err(ParseError.NotExpected);
+        }
+        if (this.pos >= this.tokens.length) {
+            return Err(ParseError.MissingArgument);
+        }
+        let t = this.tokens[this.pos];
+        this.pos += 1;
+        return Ok(t);
+    }
+
+    /// Ends the command: an error if arguments are left.
+    public fn finish(borrow this) -> Result<void, ParseError> {
+        if (this.pos < this.tokens.length) {
+            return Err(ParseError.ExtraArguments);
+        }
+        return Ok();
+    }
+
+    /// `(`.
+    public fn open(borrow mut this) -> Result<void, ParseError> {
+        let t = this.next()?;
+        if (t.kind != TokenKind.Open) {
+            return Err(ParseError.ExpectedList);
+        }
+        return Ok();
+    }
+
+    /// `)` if it is next: true when it was read.
+    public fn closeIfNext(borrow mut this) -> bool {
+        if (this.peekIs(TokenKind.Close)) {
+            this.pos += 1;
+            return true;
+        }
+        return false;
+    }
+
+    fn spanOf(t: Token) -> Span => Span { start: t.start, length: t.length };
+
+    fn runAll(borrow this, t: Token, test: @effects() fn(u8) -> bool) -> bool {
+        if (!isRun(t.kind) || t.length == 0) {
+            return false;
+        }
+        for (c in this.data[t.start..t.start + t.length]) {
+            if (!test(c)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    fn tokenIs(borrow this, t: Token, word: StringView) -> bool =>
+        this.data[t.start..t.start + t.length].equalsIgnoreAsciiCase(word.bytes());
+
+    /// The tag: astring characters except `+`.
+    public fn tag(borrow mut this) -> Result<Span, ParseError> {
+        let t = this.next()?;
+        if (!this.isTag(t)) {
+            return Err(ParseError.BadTag);
+        }
+        return Ok(CommandReader.spanOf(t));
+    }
+
+    /// The command name, in any case, after an optional `UID` (allowed before COPY, MOVE, FETCH, STORE, SEARCH and
+    /// EXPUNGE).
+    public fn command(borrow mut this) -> Result<CommandName, ParseError> {
+        var t = this.next()?;
+        if (t.kind != TokenKind.Atom) {
+            return Err(ParseError.UnknownCommand);
+        }
+        var uid = false;
+        if (this.tokenIs(t, "UID")) {
+            uid = true;
+            t = this.next()?;
+            if (t.kind != TokenKind.Atom) {
+                return Err(ParseError.UnknownCommand);
+            }
+        }
+        let command = orFail(commandOf(this.data[t.start..t.start + t.length]), ParseError.UnknownCommand)?;
+        if (uid) {
+            let allowed = match (command) {
+                Command.Copy => true,
+                Command.Move => true,
+                Command.Fetch => true,
+                Command.Store => true,
+                Command.Search => true,
+                Command.Expunge => true,
+                _ => false,
+            };
+            if (!allowed) {
+                return Err(ParseError.UnknownCommand);
+            }
+        }
+        return Ok(CommandName { command: command, uid: uid });
+    }
+
+    /// An atom.
+    public fn atom(borrow mut this) -> Result<Span, ParseError> {
+        let t = this.next()?;
+        if (!this.runAll(t, isAtomChar)) {
+            return Err(ParseError.ExpectedAtom);
+        }
+        return Ok(CommandReader.spanOf(t));
+    }
+
+    /// An astring: an atom (with `]`), a quoted string or a literal.
+    public fn astring(borrow mut this) -> Result<Span, ParseError> {
+        let t = this.next()?;
+        if (t.kind == TokenKind.Quoted || t.kind == TokenKind.Literal) {
+            return Ok(CommandReader.spanOf(t));
+        }
+        if (!this.runAll(t, isAstringChar)) {
+            return Err(ParseError.ExpectedString);
+        }
+        return Ok(CommandReader.spanOf(t));
+    }
+
+    /// A string: quoted or literal.
+    public fn string(borrow mut this) -> Result<Span, ParseError> {
+        let t = this.next()?;
+        if (t.kind != TokenKind.Quoted && t.kind != TokenKind.Literal) {
+            return Err(ParseError.ExpectedString);
+        }
+        return Ok(CommandReader.spanOf(t));
+    }
+
+    /// A string or NIL (null).
+    public fn nstring(borrow mut this) -> Result<Span?, ParseError> {
+        if (this.peekIs(TokenKind.Nil)) {
+            this.pos += 1;
+            return Ok(null);
+        }
+        return Ok(this.string()?);
+    }
+
+    /// A literal (APPEND's message).
+    public fn literal(borrow mut this) -> Result<Span, ParseError> {
+        let t = this.next()?;
+        if (t.kind != TokenKind.Literal) {
+            return Err(ParseError.ExpectedLiteral);
+        }
+        return Ok(CommandReader.spanOf(t));
+    }
+
+    /// A number (0 to 4294967295).
+    public fn number(borrow mut this) -> Result<u32, ParseError> {
+        let t = this.next()?;
+        if (t.kind != TokenKind.Number) {
+            return Err(ParseError.ExpectedNumber);
+        }
+        return orFail(parseU32(this.data[t.start..t.start + t.length]), ParseError.ExpectedNumber);
+    }
+
+    /// A mailbox name: an astring; INBOX in any case is INBOX.
+    public fn mailbox(borrow mut this) -> Result<Mailbox, ParseError> {
+        let name = match (this.astring()) {
+            Ok(s) => s,
+            Err(ParseError.ExpectedString) => {
+                return Err(ParseError.BadMailbox);
+            }
+            Err(e) => {
+                return Err(e);
+            }
+        };
+        let inbox = this.text(name).equalsIgnoreAsciiCase("INBOX".bytes());
+        return Ok(Mailbox { name: name, isInbox: inbox });
+    }
+
+    /// A LIST or LSUB pattern: list characters (with `%` and `*`), or a string.
+    public fn listMailbox(borrow mut this) -> Result<Span, ParseError> {
+        let t = this.next()?;
+        if (t.kind == TokenKind.Quoted || t.kind == TokenKind.Literal) {
+            return Ok(CommandReader.spanOf(t));
+        }
+        if (!this.runAll(t, isListChar)) {
+            return Err(ParseError.BadPattern);
+        }
+        return Ok(CommandReader.spanOf(t));
+    }
+
+    /// One flag: `\Seen` and the other system flags, `\atom`, or a keyword atom.
+    public fn flag(borrow mut this) -> Result<Flag, ParseError> {
+        let t = this.next()?;
+        if (!isRun(t.kind) || t.length == 0) {
+            return Err(ParseError.BadFlag);
+        }
+        let text = this.data[t.start..t.start + t.length];
+        let body = if (text[0] == BACKSLASH) text[1..] else text;
+        if (body.length == 0) {
+            return Err(ParseError.BadFlag);
+        }
+        for (c in body) {
+            if (!isAtomChar(c)) {
+                return Err(ParseError.BadFlag);
+            }
+        }
+        var kind = FlagKind.Keyword;
+        if (text[0] == BACKSLASH) {
+            kind = FlagKind.Extension;
+            if (body.equalsIgnoreAsciiCase("Answered".bytes())) {
+                kind = FlagKind.Answered;
+            } else if (body.equalsIgnoreAsciiCase("Flagged".bytes())) {
+                kind = FlagKind.Flagged;
+            } else if (body.equalsIgnoreAsciiCase("Deleted".bytes())) {
+                kind = FlagKind.Deleted;
+            } else if (body.equalsIgnoreAsciiCase("Seen".bytes())) {
+                kind = FlagKind.Seen;
+            } else if (body.equalsIgnoreAsciiCase("Draft".bytes())) {
+                kind = FlagKind.Draft;
+            } else if (body.equalsIgnoreAsciiCase("Recent".bytes())) {
+                kind = FlagKind.Recent;
+            }
+        }
+        return Ok(Flag { kind: kind, name: CommandReader.spanOf(t) });
+    }
+
+    /// A parenthesised flag list, possibly empty, appended to `into`.
+    public fn flagList(borrow mut this, into: borrow mut Vector<Flag>) -> Result<void, ParseError> {
+        this.open()?;
+        while (!this.closeIfNext()) {
+            let f = this.flag()?;
+            grew(into.push(f))?;
+        }
+        return Ok();
+    }
+
+    /// STORE's flags: a flag list, or flags separated by spaces up to the end of the command.
+    public fn storeFlags(borrow mut this, into: borrow mut Vector<Flag>) -> Result<void, ParseError> {
+        if (this.peekIs(TokenKind.Open)) {
+            return this.flagList(into);
+        }
+        let f = this.flag()?;
+        grew(into.push(f))?;
+        while (!this.atEnd()) {
+            let g = this.flag()?;
+            grew(into.push(g))?;
+        }
+        return Ok();
+    }
+
+    /// STORE's `[+|-]FLAGS[.SILENT]`.
+    public fn storeAction(borrow mut this) -> Result<StoreAction, ParseError> {
+        let t = this.next()?;
+        if (t.kind != TokenKind.Atom) {
+            return Err(ParseError.BadStoreAction);
+        }
+        let whole = this.data[t.start..t.start + t.length];
+        var mode = StoreMode.Replace;
+        if (whole.length > 0 && whole[0] == 0x2b) {
+            mode = StoreMode.Add;
+        } else if (whole.length > 0 && whole[0] == 0x2d) {
+            mode = StoreMode.Remove;
+        }
+        let text = if (mode == StoreMode.Replace) whole else whole[1..];
+        if (text.equalsIgnoreAsciiCase("FLAGS".bytes())) {
+            return Ok(StoreAction { mode: mode, silent: false });
+        }
+        if (text.equalsIgnoreAsciiCase("FLAGS.SILENT".bytes())) {
+            return Ok(StoreAction { mode: mode, silent: true });
+        }
+        return Err(ParseError.BadStoreAction);
+    }
+
+    /// STATUS's item list, appended to `into`.
+    public fn statusItems(borrow mut this, into: borrow mut Vector<StatusItem>) -> Result<void, ParseError> {
+        this.open()?;
+        if (this.closeIfNext()) {
+            return Err(ParseError.UnknownStatusItem);
+        }
+        while (!this.closeIfNext()) {
+            let t = this.next()?;
+            if (t.kind != TokenKind.Atom) {
+                return Err(ParseError.UnknownStatusItem);
+            }
+            let item = if (this.tokenIs(
+                t,
+                "MESSAGES",
+            )) StatusItem.Messages else (if (this.tokenIs(
+                t,
+                "RECENT",
+            )) StatusItem.Recent else (if (this.tokenIs(
+                t,
+                "UIDNEXT",
+            )) StatusItem.UidNext else (if (this.tokenIs(
+                t,
+                "UIDVALIDITY",
+            )) StatusItem.UidValidity else (if (this.tokenIs(t, "UNSEEN")) StatusItem.Unseen else {
+                return Err(ParseError.UnknownStatusItem);
+            }))));
+            grew(into.push(item))?;
+        }
+        return Ok();
+    }
+
+    /// A `date-time` ("dd-Mon-yyyy hh:mm:ss +zzzz", in quotes), as Unix milliseconds.
+    public fn dateTime(borrow mut this) -> Result<i64, ParseError> {
+        let t = this.next()?;
+        if (t.kind != TokenKind.Quoted) {
+            return Err(ParseError.BadDateTime);
+        }
+        return orFail(parseDateTime(this.data[t.start..t.start + t.length]), ParseError.BadDateTime);
+    }
+
+    /// A SEARCH `date`: "d-Mon-yyyy", quoted or not.
+    public fn date(borrow mut this) -> Result<Date, ParseError> {
+        let t = this.next()?;
+        if (t.kind != TokenKind.Quoted && t.kind != TokenKind.Atom) {
+            return Err(ParseError.BadDate);
+        }
+        let text = this.data[t.start..t.start + t.length];
+        let dash = text.indexOfByte(0x2d) ?? 0;
+        if (dash == 0 || dash > 2) {
+            return Err(ParseError.BadDate);
+        }
+        let day = parseU32(text[0..dash]) ?? 0;
+        let rest = text[dash + 1..];
+        if (rest.length != 8 || rest[3] != 0x2d) {
+            return Err(ParseError.BadDate);
+        }
+        let month = monthOf(rest[0..3]) ?? 0;
+        let year = parseU32(rest[4..8]) ?? 0;
+        if (!validDate(year, month, day)) {
+            return Err(ParseError.BadDate);
+        }
+        return Ok(Date { year: year, month: month, day: day });
+    }
+
+    /// APPEND's optional flag list (into `flags`) and date-time, then the message literal.
+    public fn appendArgs(borrow mut this, flags: borrow mut Vector<Flag>) -> Result<AppendArgs, ParseError> {
+        if (this.peekIs(TokenKind.Open)) {
+            this.flagList(flags)?;
+        }
+        var date: i64? = null;
+        if (this.peekIs(TokenKind.Quoted)) {
+            date = this.dateTime()?;
+        }
+        let message = this.literal()?;
+        return Ok(AppendArgs { internalDate: date, message: message });
+    }
+
+    /// A sequence set into `into` (cleared first): `seq-number` or `seq-number:seq-number`, separated by commas,
+    /// where a `seq-number` is a non-zero number or `*`.
+    public fn sequenceSet(borrow mut this, into: borrow mut SequenceSet) -> Result<void, ParseError> {
+        into.ranges.clear();
+        let t = this.next()?;
+        if (t.kind != TokenKind.Atom && t.kind != TokenKind.Number) {
+            return Err(ParseError.BadSequenceSet);
+        }
+        return parseSequenceSet(this.data[t.start..t.start + t.length], mut into.ranges);
+    }
+
+    /// FETCH's attributes into `into` (cleared first): a macro (ALL, FAST, FULL), one attribute, or a list of them.
+    public fn fetchAttributes(borrow mut this, into: borrow mut FetchRequest) -> Result<void, ParseError> {
+        into.clear();
+        if (this.peekIs(TokenKind.Open)) {
+            this.pos += 1;
+            if (this.closeIfNext()) {
+                return Err(ParseError.UnknownFetchAttribute);
+            }
+            while (!this.closeIfNext()) {
+                this.fetchAtt(into)?;
+            }
+            return Ok();
+        }
+        if (this.pos < this.tokens.length) {
+            let t = this.tokens[this.pos];
+            let full = this.tokenIs(t, "FULL");
+            if (t.kind == TokenKind.Atom && (full || this.tokenIs(t, "ALL") || this.tokenIs(t, "FAST"))) {
+                this.pos += 1;
+                pushSimple(into, FetchKind.Flags)?;
+                pushSimple(into, FetchKind.InternalDate)?;
+                pushSimple(into, FetchKind.Rfc822Size)?;
+                if (!this.tokenIs(t, "FAST")) {
+                    pushSimple(into, FetchKind.Envelope)?;
+                }
+                if (full) {
+                    pushSimple(into, FetchKind.Body)?;
+                }
+                return Ok();
+            }
+        }
+        return this.fetchAtt(into);
+    }
+
+    fn fetchAtt(borrow mut this, into: borrow mut FetchRequest) -> Result<void, ParseError> {
+        let t = this.next()?;
+        if (t.kind != TokenKind.Atom) {
+            return Err(ParseError.UnknownFetchAttribute);
+        }
+        var e = t.start + t.length;
+        var br = t.start;
+        while (br < e && this.data[br] != LBRACKET) {
+            br += 1;
+        }
+        let name = this.data[t.start..br];
+        if (br == e) {
+            let kind = simpleFetch(name) ?? FetchKind.BodySection;
+            if (kind == FetchKind.BodySection) {
+                return Err(ParseError.UnknownFetchAttribute);
+            }
+            return pushSimple(into, kind);
+        }
+        var peek = false;
+        if (name.equalsIgnoreAsciiCase("BODY.PEEK".bytes())) {
+            peek = true;
+        } else if (!name.equalsIgnoreAsciiCase("BODY".bytes())) {
+            return Err(ParseError.UnknownFetchAttribute);
+        }
+        var section = Section {
+            partsAt: into.parts.length,
+            partsCount: 0,
+            text: SectionText.Whole,
+            fieldsAt: into.fields.length,
+            fieldsCount: 0,
+        };
+        var at = br + 1;
+        // Part numbers: nz-number *("." nz-number), then "." and a text specifier, or "]".
+        var needText = false;
+        while (at < e && isDigit(this.data[at])) {
+            var n: u64 = 0;
+            while (at < e && isDigit(this.data[at])) {
+                n = n * 10 + ((this.data[at] - 0x30) as u64);
+                if (n > 0xffffffff) {
+                    return Err(ParseError.BadSection);
+                }
+                at += 1;
+            }
+            if (n == 0) {
+                return Err(ParseError.BadSection);
+            }
+            grew(into.parts.push(checkedTruncate<u32>(n) ?? 0))?;
+            section.partsCount += 1;
+            needText = false;
+            if (at < e && this.data[at] == 0x2e) {
+                at += 1;
+                needText = true;
+            } else {
+                break;
+            }
+        }
+        if (needText || (section.partsCount == 0 && at < e && this.data[at] != RBRACKET)) {
+            var w = at;
+            while (w < e && this.data[w] != RBRACKET) {
+                w += 1;
+            }
+            let word = this.data[at..w];
+            if (word.equalsIgnoreAsciiCase("HEADER".bytes())) {
+                section.text = SectionText.Header;
+            } else if (word.equalsIgnoreAsciiCase("HEADER.FIELDS".bytes())) {
+                section.text = SectionText.HeaderFields;
+            } else if (word.equalsIgnoreAsciiCase("HEADER.FIELDS.NOT".bytes())) {
+                section.text = SectionText.HeaderFieldsNot;
+            } else if (word.equalsIgnoreAsciiCase("TEXT".bytes())) {
+                section.text = SectionText.Text;
+            } else if (word.equalsIgnoreAsciiCase("MIME".bytes())) {
+                if (section.partsCount == 0) {
+                    return Err(ParseError.MimeWithoutPart);
+                }
+                section.text = SectionText.Mime;
+            } else {
+                return Err(ParseError.BadSection);
+            }
+            at = w;
+        }
+        if (section.text == SectionText.HeaderFields || section.text == SectionText.HeaderFieldsNot) {
+            // The run ends at the name; the list follows after a space, and `]` right after the list.
+            if (at != e) {
+                return Err(ParseError.BadSection);
+            }
+            let open = this.next()?;
+            if (open.kind != TokenKind.Open) {
+                return Err(ParseError.BadSection);
+            }
+            while (!this.closeIfNext()) {
+                let field = match (this.astring()) {
+                    Ok(s) => s,
+                    Err(ParseError.MissingArgument) => {
+                        return Err(ParseError.MissingArgument);
+                    }
+                    Err(_) => {
+                        return Err(ParseError.BadSection);
+                    }
+                };
+                grew(into.fields.push(field))?;
+                section.fieldsCount += 1;
+            }
+            if (section.fieldsCount == 0) {
+                return Err(ParseError.BadSection);
+            }
+            let rest = this.next()?;
+            if (rest.kind != TokenKind.Atom || rest.spaceBefore) {
+                return Err(ParseError.BadSection);
+            }
+            at = rest.start;
+            e = rest.start + rest.length;
+        }
+        if (at >= e || this.data[at] != RBRACKET) {
+            return Err(ParseError.BadSection);
+        }
+        at += 1;
+        var att = FetchAtt {
+            kind: FetchKind.BodySection,
+            peek: peek,
+            section: section,
+            partial: false,
+            origin: 0,
+            count: 0,
+        };
+        if (at < e) {
+            // <origin.count>
+            if (this.data[at] != 0x3c || this.data[e - 1] != 0x3e) {
+                return Err(ParseError.BadPartial);
+            }
+            let inner = this.data[at + 1..e - 1];
+            let dot = inner.indexOfByte(0x2e) ?? inner.length;
+            if (dot == inner.length) {
+                return Err(ParseError.BadPartial);
+            }
+            let origin = orFail(parseU32(inner[0..dot]), ParseError.BadPartial);
+            let count = orFail(parseU32(inner[dot + 1..]), ParseError.BadPartial);
+            att.partial = true;
+            att.origin = origin?;
+            att.count = count?;
+            if (att.count == 0) {
+                return Err(ParseError.BadPartial);
+            }
+        }
+        return grew(into.items.push(att));
+    }
+}
+
+fn pushSimple(into: borrow mut FetchRequest, kind: FetchKind) -> Result<void, ParseError> {
+    let section = Section { partsAt: 0, partsCount: 0, text: SectionText.Whole, fieldsAt: 0, fieldsCount: 0 };
+    return grew(
+        into.items.push(FetchAtt { kind: kind, peek: false, section: section, partial: false, origin: 0, count: 0 }),
+    );
+}
+
+fn simpleFetch(name: Slice<u8>) -> FetchKind? {
+    if (name.equalsIgnoreAsciiCase("ENVELOPE".bytes())) {
+        return FetchKind.Envelope;
+    }
+    if (name.equalsIgnoreAsciiCase("FLAGS".bytes())) {
+        return FetchKind.Flags;
+    }
+    if (name.equalsIgnoreAsciiCase("INTERNALDATE".bytes())) {
+        return FetchKind.InternalDate;
+    }
+    if (name.equalsIgnoreAsciiCase("RFC822".bytes())) {
+        return FetchKind.Rfc822;
+    }
+    if (name.equalsIgnoreAsciiCase("RFC822.HEADER".bytes())) {
+        return FetchKind.Rfc822Header;
+    }
+    if (name.equalsIgnoreAsciiCase("RFC822.SIZE".bytes())) {
+        return FetchKind.Rfc822Size;
+    }
+    if (name.equalsIgnoreAsciiCase("RFC822.TEXT".bytes())) {
+        return FetchKind.Rfc822Text;
+    }
+    if (name.equalsIgnoreAsciiCase("BODY".bytes())) {
+        return FetchKind.Body;
+    }
+    if (name.equalsIgnoreAsciiCase("BODYSTRUCTURE".bytes())) {
+        return FetchKind.BodyStructure;
+    }
+    if (name.equalsIgnoreAsciiCase("UID".bytes())) {
+        return FetchKind.Uid;
+    }
+    return null;
+}
+
+/// A command's name, in any case.
+public fn commandOf(name: Slice<u8>) -> Command? {
+    let names = [
+        "CAPABILITY", "NOOP", "LOGOUT", "STARTTLS", "AUTHENTICATE", "LOGIN", "SELECT", "EXAMINE", "CREATE", "DELETE",
+        "RENAME", "SUBSCRIBE", "UNSUBSCRIBE", "LIST", "LSUB", "STATUS", "APPEND", "CHECK", "CLOSE", "EXPUNGE", "SEARCH",
+        "FETCH", "STORE", "COPY", "MOVE", "IDLE", "NAMESPACE", "ID", "UNSELECT", "ENABLE",
+    ];
+    let commands = [
+        Command.Capability, Command.Noop, Command.Logout, Command.StartTls, Command.Authenticate, Command.Login,
+        Command.Select, Command.Examine, Command.Create, Command.Delete, Command.Rename, Command.Subscribe,
+        Command.Unsubscribe, Command.List, Command.Lsub, Command.Status, Command.Append, Command.Check, Command.Close,
+        Command.Expunge, Command.Search, Command.Fetch, Command.Store, Command.Copy, Command.Move, Command.Idle,
+        Command.Namespace, Command.Id, Command.Unselect, Command.Enable,
+    ];
+    for (i in 0..names.length) {
+        if (name.equalsIgnoreAsciiCase(names[i].bytes())) {
+            return commands[i];
+        }
+    }
+    return null;
+}
+
+/// A sequence set's text (`2,4:7,9,12:*`), its ranges appended to `into`.
+public fn parseSequenceSet(text: Slice<u8>, into: borrow mut Vector<SeqRange>) -> Result<void, ParseError> {
+    for (piece in text.split(",".bytes())) {
+        let colon = piece.indexOfByte(0x3a);
+        let r = match (colon) {
+            Some(c) => SeqRange { first: seqNumber(piece[0..c])?, last: seqNumber(piece[c + 1..])? },
+            null => {
+                let n = seqNumber(piece)?;
+                SeqRange { first: n, last: n }
+            }
+        };
+        grew(into.push(r))?;
+    }
+    return Ok();
+}
+
+/// A `seq-number`: a non-zero number, or `*` as 0.
+fn seqNumber(text: Slice<u8>) -> Result<u32, ParseError> {
+    if (text.length == 1 && text[0] == 0x2a) {
+        return Ok(0);
+    }
+    let n = parseU32(text) ?? 0;
+    if (n == 0 || text[0] == 0x30) {
+        return Err(ParseError.BadSequenceSet);
+    }
+    return Ok(n);
+}
+
+/// Digits only, at most 4294967295.
+fn parseU32(text: Slice<u8>) -> u32? {
+    if (text.length == 0 || text.length > 10) {
+        return null;
+    }
+    var n: u64 = 0;
+    for (c in text) {
+        if (!isDigit(c)) {
+            return null;
+        }
+        n = n * 10 + ((c - 0x30) as u64);
+    }
+    return checkedTruncate<u32>(n);
+}
+
+fn monthOf(text: Slice<u8>) -> u32? {
+    let months = "JanFebMarAprMayJunJulAugSepOctNovDec".bytes();
+    if (text.length != 3) {
+        return null;
+    }
+    for (m in 0..12) {
+        if (text.equalsIgnoreAsciiCase(months[m * 3..m * 3 + 3])) {
+            return truncate<u32>(m) + 1;
+        }
+    }
+    return null;
+}
+
+fn isLeap(year: u32) -> bool => (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+
+fn validDate(year: u32, month: u32, day: u32) -> bool {
+    if (month < 1 || month > 12 || day < 1 || year < 1) {
+        return false;
+    }
+    let lengths = [31u32, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    var most = lengths[truncate<usize>(month - 1)];
+    if (month == 2 && isLeap(year)) {
+        most = 29;
+    }
+    return day <= most;
+}
+
+/// Days since 1970-01-01 of a proleptic Gregorian date (Howard Hinnant's algorithm).
+public fn daysFromCivil(year: i64, month: i64, day: i64) -> i64 {
+    let y = if (month <= 2) year - 1 else year;
+    let era = floorDiv(y, 400);
+    let yoe = y - era * 400;
+    let mp = if (month > 2) month - 3 else month + 9;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + doe - 719468;
+}
+
+fn floorDiv(a: i64, b: i64) -> i64 {
+    let q = a / b;
+    return if ((a % b != 0) && ((a < 0) != (b < 0))) q - 1 else q;
+}
+
+/// "dd-Mon-yyyy hh:mm:ss +zzzz", the day with a leading space or zero (or, leniently, one digit), as Unix
+/// milliseconds.
+public fn parseDateTime(input: Slice<u8>) -> i64? {
+    let text = if (input.length == 26 && input[0] == SP) input[1..] else input;
+    if (text.length == 25) {
+        // One digit for the day.
+        return parseDateTimeFrom(text, 1);
+    }
+    if (text.length == 26) {
+        return parseDateTimeFrom(text, 2);
+    }
+    return null;
+}
+
+fn parseDateTimeFrom(text: Slice<u8>, dayDigits: usize) -> i64? {
+    let d = dayDigits;
+    // d-Mon-yyyy hh:mm:ss +zzzz
+    if (text[d] != 0x2d || text[d + 4] != 0x2d || text[d + 9] != SP || text[d + 12] != 0x3a || text[d + 15] != 0x3a) {
+        return null;
+    }
+    if (text[d + 18] != SP || (text[d + 19] != 0x2b && text[d + 19] != 0x2d)) {
+        return null;
+    }
+    let day = parseU32(text[0..d])?;
+    let month = monthOf(text[d + 1..d + 4])?;
+    let year = parseU32(text[d + 5..d + 9])?;
+    let hour = parseU32(text[d + 10..d + 12])?;
+    let minute = parseU32(text[d + 13..d + 15])?;
+    let second = parseU32(text[d + 16..d + 18])?;
+    let zoneHours = parseU32(text[d + 20..d + 22])?;
+    let zoneMinutes = parseU32(text[d + 22..d + 24])?;
+    if (!validDate(year, month, day) || hour > 23 || minute > 59 || second > 60 || zoneMinutes > 59) {
+        return null;
+    }
+    let days = daysFromCivil(year as i64, month as i64, day as i64);
+    var zone = (zoneHours as i64) * 3600 + (zoneMinutes as i64) * 60;
+    if (text[d + 19] == 0x2d) {
+        zone = 0 - zone;
+    }
+    let seconds = days * 86400 + (hour as i64) * 3600 + (minute as i64) * 60 + (second as i64) - zone;
+    return seconds * 1000;
+}

@@ -1,0 +1,148 @@
+// Unit tests: what the differential test against Pigeonhole cannot show (tests/differential/compare.py covers the
+// language): hostile scripts and patterns, the limits, and vacation's rules and reply.
+
+fn compile(source: StringView, into: borrow mut Script) -> bool => parseScript(source.bytes(), into)!;
+
+fn runOn(source: StringView, header: StringView, result: borrow mut SieveResult) -> bool {
+    var script = Script.create();
+    if (!compile(source, mut script)) {
+        return false;
+    }
+    let h = header.bytes();
+    let m = SieveMessage { header: h, envelopeFrom: "a@example.org".bytes(), envelopeTo: "u@example.com".bytes(), size: 100 };
+    runScript(script, m, result)!;
+    return true;
+}
+
+@test
+fn patternsCostLinearTime() -> Result<void, TestFailure> {
+    // A pattern that is exponential for a backtracking matcher: many stars against a long near-miss.
+    var key = String.create();
+    for (i in 0..200) {
+        key.append("*a")!;
+    }
+    key.append("b")!;
+    var source = String.create();
+    source.append("if header :matches \"subject\" \"")!;
+    source.append(key.view())!;
+    source.append("\" { discard; }")!;
+    var subject = String.create();
+    subject.append("Subject: ")!;
+    for (i in 0..4000) {
+        subject.append("a")!;
+    }
+    subject.append("\r\n\r\n")!;
+    var result = SieveResult.create();
+    let started = Clock.unixMillis();
+    Check.isTrue(runOn(source.view(), subject.view(), mut result), "compiles")?;
+    Check.isTrue(result.implicitKeep, "no match")?;
+    return Check.isTrue(Clock.unixMillis() - started < 2000, "fast");
+}
+
+@test
+fn limitsHold() -> Result<void, TestFailure> {
+    var script = Script.create();
+    // Nesting deeper than MAX_DEPTH.
+    var deep = String.create();
+    for (i in 0..100) {
+        deep.append("if true { ")!;
+    }
+    deep.append("keep;")!;
+    for (i in 0..100) {
+        deep.append(" }")!;
+    }
+    Check.isFalse(compile(deep.view(), mut script), "too deep")?;
+    var tests = String.create();
+    tests.append("if ")!;
+    for (i in 0..100) {
+        tests.append("not ")!;
+    }
+    tests.append("true { keep; }")!;
+    Check.isFalse(compile(tests.view(), mut script), "tests too deep")?;
+    // More than MAX_REDIRECTS redirects: a runtime error, so the message is kept and nothing else happens.
+    var result = SieveResult.create();
+    let redirects = "redirect \"a@x.org\"; redirect \"b@x.org\"; redirect \"c@x.org\"; redirect \"d@x.org\"; redirect \"e@x.org\";";
+    Check.isTrue(runOn(redirects, "Subject: x\r\n\r\n", mut result), "compiles")?;
+    Check.isTrue(result.error.length > 0 && result.implicitKeep && result.actions.length == 0, "redirects limited")?;
+    // Too large.
+    var big = String.create();
+    for (i in 0..70000) {
+        big.append("#")!;
+    }
+    Check.isFalse(compile(big.view(), mut script), "too large")?;
+    // Broken input never crashes: every prefix of a real script.
+    let full = "require [\"fileinto\", \"vacation\"]; if anyof (header :contains \"subject\" \"x\", size :over 10K) { fileinto \"A\"; } vacation :days 3 text:\nhi\n.\n;";
+    let bytes = full.bytes();
+    for (n in 0..bytes.length) {
+        let prefix = bytes[0..n];
+        let ignored = parseScript(prefix, mut script)!;
+    }
+    return Check.isTrue(compile(full, mut script), "the whole script compiles");
+}
+
+@test
+fn nullBytesAndBadUtf8() -> Result<void, TestFailure> {
+    var script = Script.create();
+    let bad = [0x6bu8, 0x65, 0x65, 0x70, 0x3b, 0x00];
+    Check.isFalse(parseScript(bad[..], mut script)!, "a NUL is not a script")?;
+    let latin = [0x66u8, 0x69, 0x6c, 0x65, 0x69, 0x6e, 0x74, 0x6f, 0x20, 0x22, 0xe9, 0x22, 0x3b];
+    var withRequire = Vector<u8>.create();
+    withRequire.extend("require \"fileinto\"; ".bytes())!;
+    withRequire.extend(latin[..])!;
+    Check.isFalse(parseScript(withRequire.view(), mut script)!, "a string that is not UTF-8")?;
+    return Ok();
+}
+
+fn vacationOf(source: StringView, result: borrow mut SieveResult) -> bool {
+    if (!runOn(source, "Subject: x\r\n\r\n", result)) {
+        return false;
+    }
+    return result.actions.length == 1;
+}
+
+fn allowed(header: StringView, sender: StringView, action: borrow SieveAction) -> bool =>
+    vacationAllowed(header.bytes(), sender.bytes(), "u@example.com".bytes(), action)!;
+
+@test
+fn vacationGoesOnlyWhereItShould() -> Result<void, TestFailure> {
+    var result = SieveResult.create();
+    Check.isTrue(vacationOf("require \"vacation\"; vacation :addresses \"alias@example.com\" \"away\";", mut result), "vacation")?;
+    let a = borrow result.actions[0];
+    let to = "From: a@example.org\r\nTo: Someone <U@Example.com>\r\nSubject: hi\r\n\r\n";
+    Check.isTrue(allowed(to, "a@example.org", a), "a person, to the user")?;
+    Check.isTrue(allowed("Cc: x@y.org, alias@example.com\r\n\r\n", "a@example.org", a), "to an :addresses alias")?;
+    Check.isFalse(allowed("To: list@example.org\r\n\r\n", "a@example.org", a), "the user is not a recipient")?;
+    Check.isFalse(allowed(to, "", a), "the null sender")?;
+    Check.isFalse(allowed(to, "u@example.com", a), "the user themselves")?;
+    Check.isFalse(allowed(to, "MAILER-DAEMON@example.org", a), "a daemon")?;
+    Check.isFalse(allowed(to, "owner-list@example.org", a), "a list owner")?;
+    Check.isFalse(allowed(to, "list-request@example.org", a), "a list's requests")?;
+    Check.isFalse(allowed(to, "noreply@example.org", a), "noreply")?;
+    Check.isFalse(allowed("To: u@example.com\r\nAuto-Submitted: auto-replied\r\n\r\n", "a@example.org", a), "auto")?;
+    Check.isTrue(allowed("To: u@example.com\r\nAuto-Submitted: no\r\n\r\n", "a@example.org", a), "Auto-Submitted: no")?;
+    Check.isFalse(allowed("To: u@example.com\r\nPrecedence: bulk\r\n\r\n", "a@example.org", a), "bulk")?;
+    Check.isFalse(allowed("To: u@example.com\r\nList-Id: <l.example.org>\r\n\r\n", "a@example.org", a), "a list")?;
+    return Check.isFalse(
+        allowed("To: u@example.com\r\nX-Auto-Response-Suppress: OOF, DR\r\n\r\n", "a@example.org", a),
+        "suppressed",
+    );
+}
+
+@test
+fn vacationReplyIsWellFormed() -> Result<void, TestFailure> {
+    var result = SieveResult.create();
+    Check.isTrue(vacationOf("require \"vacation\"; vacation :from \"Me\\r\\nBcc: x@evil.org <u@example.com>\" \"away\nback soon\";", mut result), "vacation")?;
+    let a = borrow result.actions[0];
+    let header = "Subject: =?utf-8?q?Gr=C3=BC=C3=9Fe?=\r\nMessage-ID: <m1@example.org>\r\nReferences: <m0@example.org>\r\n\r\n";
+    var out = Vector<u8>.create();
+    buildVacation(a, header.bytes(), "a@example.org".bytes(), "u@example.com".bytes(), "Thu, 5 Nov 2026 10:00:00 +0000".bytes(), "<r1@example.com>".bytes(), mut out)!;
+    let text = StringView.fromUtf8(out.view())!;
+    Check.isTrue(text.contains("\r\nTo: <a@example.org>\r\n"), "To")?;
+    Check.isTrue(text.contains("\r\nSubject: =?utf-8?b?QXV0bzogR3LDvMOfZQ==?=\r\n"), "an encoded Auto: subject")?;
+    Check.isTrue(text.contains("\r\nIn-Reply-To: <m1@example.org>\r\n"), "In-Reply-To")?;
+    Check.isTrue(text.contains("\r\nReferences: <m0@example.org> <m1@example.org>\r\n"), "References")?;
+    Check.isTrue(text.contains("\r\nAuto-Submitted: auto-replied (vacation)\r\n"), "Auto-Submitted")?;
+    Check.isTrue(text.contains("\r\n\r\naway\r\nback soon\r\n"), "the body, CRLF")?;
+    // The :from string cannot add a header field: its line end became a space.
+    return Check.isFalse(text.contains("\r\nBcc:"), "no injected header");
+}

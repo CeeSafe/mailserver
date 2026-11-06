@@ -1,0 +1,16 @@
+size 26222
+envelope ("28 Jul 1996 00:03:29 GMT" "Re: Win95, Netscape and File Types" (("Frank Tabor" NIL "phranc" "inmind.com")) (("Frank Tabor" NIL "phranc" "inmind.com")) (("Frank Tabor" NIL "phranc" "inmind.com")) NIL NIL NIL NIL "<01bb7c18$6d959700$cb68b1cc@phranc.inmind.com>")
+bodystructure ((("text" "plain" ("charset" "ISO-8859-1") NIL NIL "7bit" 1310 38 NIL NIL NIL NIL) ("text" "html" ("charset" "ISO-8859-1") NIL NIL "base64" 2496 32 NIL NIL NIL NIL) "alternative" ("boundary" "----=_NextPart_001_01BB7BF6.E683F700") NIL NIL NIL) ("application" "octet-stream" ("name" "filetype.jpg") NIL "filetype (LView Pro Image File)" "base64" 21020 NIL ("attachment" ("filename" "filetype.jpg")) NIL NIL) "mixed" ("boundary" "----=_NextPart_000_01BB7BF6.E683F700") NIL NIL NIL)
+body ((("text" "plain" ("charset" "ISO-8859-1") NIL NIL "7bit" 1310 38) ("text" "html" ("charset" "ISO-8859-1") NIL NIL "base64" 2496 32) "alternative") ("application" "octet-stream" ("name" "filetype.jpg") NIL "filetype (LView Pro Image File)" "base64" 21020) "mixed")
+section HEADER 598 05d66e7b73b25a63ded71debb68c76d0bf46891e785f264de61117c28ed72573
+section TEXT 25624 32d453224bb1ada0e2587f31294477693c91a868a8e62fb0fb43f3592322cc07
+section HEADER.FIELDS 260 d102eaf9435841c2c814a8688679f4aafb8af8e2b69e14ca5740c010851b9204
+section HEADER.FIELDS.NOT 340 de692e5825012e5f2273e3900572762c874830f4566a361aadcca02e92ad904f
+section 1 4099 cb1ddbfb87ec6e0d11a6d42b96973d860e583df365d3885e001352e0d97129d2
+section 1.MIME 121 1157d31c8b559bcf0028bdc61f2510d8a68182e3f5d95865f9ec87ed668c08c9
+section 1.1 1310 4903a0e041960989807a39cee006be848b4890dcc19854d221e77fc8dee5529b
+section 1.1.MIME 81 c9e6b84ef3db799cb1d1feff02c1bbc5ca34158775291f6e030c61bea13246db
+section 1.2 2496 50ee9f42002a60cd6db65c18cc94811cebd4e9c47a920b8021139031507b3915
+section 1.2.MIME 82 7561283be232235fbb6cb963a50eaba183a4fe95b030ce798522dd7c69c7ff4b
+section 2 21020 f4dbca983b02918bb9a9389871e6a7d34cc9440718c416ee13257816cf50d126
+section 2.MIME 210 2e5f240905bc2187723f0970ba2ed534c2d014726410f2772b67ee06c83769cb

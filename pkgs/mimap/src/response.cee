@@ -1,0 +1,192 @@
+// Writing responses: strings in the form that can carry them (atom, quoted string or literal), mailbox names, flag
+// lists, INTERNALDATE, and compressed number sets for COPYUID and APPENDUID (RFC 4315).
+
+/// The system flags, as bits.
+public const FLAG_ANSWERED: u32 = 1;
+public const FLAG_FLAGGED: u32 = 2;
+public const FLAG_DELETED: u32 = 4;
+public const FLAG_SEEN: u32 = 8;
+public const FLAG_DRAFT: u32 = 16;
+
+/// Appends `value` in decimal.
+public fn writeNumber(out: borrow mut Vector<u8>, value: u64) -> Result<void, AllocError> {
+    var digits = [0u8; 20];
+    var n = value;
+    var at: usize = 20;
+    loop {
+        at -= 1;
+        digits[at] = 0x30u8 + truncate<u8>(n % 10);
+        n = n / 10;
+        if (n == 0) {
+            break;
+        }
+    }
+    return out.extend(digits[at..]);
+}
+
+/// Whether a quoted string cannot hold `bytes`: CR, LF, NUL or a byte above 127.
+public fn needsLiteral(bytes: Slice<u8>) -> bool {
+    for (c in bytes) {
+        if (c == 0x0d || c == 0x0a || c == 0 || c >= 0x80) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// `{n}` CRLF and the bytes.
+public fn writeLiteral(out: borrow mut Vector<u8>, bytes: Slice<u8>) -> Result<void, AllocError> {
+    out.pushBE(0x7bu8)?;
+    writeNumber(out, bytes.length as u64)?;
+    out.extend("}\r\n".bytes())?;
+    return out.extend(bytes);
+}
+
+/// A quoted string, with `"` and `\` escaped. The bytes must not need a literal.
+public fn writeQuoted(out: borrow mut Vector<u8>, bytes: Slice<u8>) -> Result<void, AllocError> {
+    out.pushBE(0x22u8)?;
+    var run: usize = 0;
+    for (i in 0..bytes.length) {
+        let c = bytes[i];
+        if (c == 0x22 || c == 0x5c) {
+            out.extend(bytes[run..i])?;
+            out.pushBE(0x5cu8)?;
+            run = i;
+        }
+    }
+    out.extend(bytes[run..])?;
+    return out.pushBE(0x22u8);
+}
+
+/// A string: quoted, or a literal when a quoted string cannot hold it.
+public fn writeString(out: borrow mut Vector<u8>, bytes: Slice<u8>) -> Result<void, AllocError> {
+    if (needsLiteral(bytes)) {
+        return writeLiteral(out, bytes);
+    }
+    return writeQuoted(out, bytes);
+}
+
+/// A string, or NIL.
+public fn writeNString(out: borrow mut Vector<u8>, bytes: Slice<u8>?) -> Result<void, AllocError> {
+    return match (bytes) {
+        Some(b) => writeString(out, b),
+        null => out.extend("NIL".bytes()),
+    };
+}
+
+/// An astring: as an atom when it is one (and not `NIL`), else as a string.
+public fn writeAstring(out: borrow mut Vector<u8>, bytes: Slice<u8>) -> Result<void, AllocError> {
+    var atom = bytes.length > 0 && !bytes.equalsIgnoreAsciiCase("NIL".bytes());
+    for (c in bytes) {
+        if (!isAstringChar(c)) {
+            atom = false;
+        }
+    }
+    if (atom) {
+        return out.extend(bytes);
+    }
+    return writeString(out, bytes);
+}
+
+/// A mailbox name: INBOX in any case as `INBOX`, anything else as an astring.
+public fn writeMailbox(out: borrow mut Vector<u8>, name: Slice<u8>) -> Result<void, AllocError> {
+    if (name.equalsIgnoreAsciiCase("INBOX".bytes())) {
+        return out.extend("INBOX".bytes());
+    }
+    return writeAstring(out, name);
+}
+
+/// A flag list: the system flags in `bits`, then the keywords, in parentheses.
+public fn writeFlagList(
+    out: borrow mut Vector<u8>,
+    bits: u32,
+    keywords: Slice<StringView>,
+) -> Result<void, AllocError> {
+    out.pushBE(0x28u8)?;
+    let names = ["\\Answered", "\\Flagged", "\\Deleted", "\\Seen", "\\Draft"];
+    var first = true;
+    for (i in 0..names.length) {
+        if (bits & (1u32 << truncate<u32>(i)) != 0) {
+            if (!first) {
+                out.pushBE(0x20u8)?;
+            }
+            out.extend(names[i].bytes())?;
+            first = false;
+        }
+    }
+    for (k in keywords) {
+        if (!first) {
+            out.pushBE(0x20u8)?;
+        }
+        out.extend(k.bytes())?;
+        first = false;
+    }
+    return out.pushBE(0x29u8);
+}
+
+fn twoDigits(out: borrow mut Vector<u8>, n: i64) -> Result<void, AllocError> {
+    out.pushBE(0x30u8 + truncate<u8>(n / 10))?;
+    return out.pushBE(0x30u8 + truncate<u8>(n % 10));
+}
+
+/// INTERNALDATE: `"05-Nov-2026 12:34:56 +0000"`, in quotes, in UTC.
+public fn writeInternalDate(out: borrow mut Vector<u8>, unixMillis: i64) -> Result<void, AllocError> {
+    let seconds = floorDiv(unixMillis, 1000);
+    let days = floorDiv(seconds, 86400);
+    let secs = seconds - days * 86400;
+    // Civil from days (Howard Hinnant's algorithm).
+    let z = days + 719468;
+    let era = floorDiv(z, 146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if (mp < 10) mp + 3 else mp - 9;
+    let year = yoe + era * 400 + (if (month <= 2) 1i64 else 0i64);
+    let months = "JanFebMarAprMayJunJulAugSepOctNovDec".bytes();
+    out.pushBE(0x22u8)?;
+    twoDigits(out, day)?;
+    out.pushBE(0x2du8)?;
+    let m = truncate<usize>(month - 1) * 3;
+    out.extend(months[m..m + 3])?;
+    out.pushBE(0x2du8)?;
+    // date-year is four digits.
+    let y = if (year < 0) 0i64 else (if (year > 9999) 9999i64 else year);
+    twoDigits(out, y / 100)?;
+    twoDigits(out, y % 100)?;
+    out.pushBE(0x20u8)?;
+    twoDigits(out, secs / 3600)?;
+    out.pushBE(0x3au8)?;
+    twoDigits(out, (secs / 60) % 60)?;
+    out.pushBE(0x3au8)?;
+    twoDigits(out, secs % 60)?;
+    return out.extend(" +0000\"".bytes());
+}
+
+/// A sequence or UID set from ascending numbers, with runs compressed: `1:3,5`. Repeats are ignored; nothing is
+/// written for no numbers.
+public fn writeNumberSet(out: borrow mut Vector<u8>, sorted: Slice<u32>) -> Result<void, AllocError> {
+    var i: usize = 0;
+    var first = true;
+    while (i < sorted.length) {
+        let start = sorted[i];
+        var end = start;
+        var j = i + 1;
+        while (j < sorted.length && (sorted[j] == end || (sorted[j] as u64) == (end as u64) + 1)) {
+            end = sorted[j];
+            j += 1;
+        }
+        if (!first) {
+            out.pushBE(0x2cu8)?;
+        }
+        writeNumber(out, start as u64)?;
+        if (end != start) {
+            out.pushBE(0x3au8)?;
+            writeNumber(out, end as u64)?;
+        }
+        first = false;
+        i = j;
+    }
+    return Ok();
+}

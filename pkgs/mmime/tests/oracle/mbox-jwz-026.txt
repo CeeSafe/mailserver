@@ -1,0 +1,10 @@
+size 42865
+envelope ("Sun, 7 Jun 92 14:02 CDT" "makeitso.gif" (("Daniel A. Glasser" NIL "dag%gorgon.UUCP" "cs.wisc.edu")) (("Daniel A. Glasser" NIL "dag%gorgon.UUCP" "cs.wisc.edu")) (("Daniel A. Glasser" NIL "dag%gorgon.UUCP" "cs.wisc.edu")) ((NIL NIL "nsb" "thumper.bellcore.com")) NIL NIL NIL "<m0luSVj-0000UWC@gorgon.uucp>")
+bodystructure ("image" "gif" NIL NIL NIL "base64" 42100 NIL NIL NIL NIL)
+body ("image" "gif" NIL NIL NIL "base64" 42100)
+section HEADER 765 5962162f7599804610c0141d64a8d5d979e62aab72e97d2405933f78a51f3e2a
+section TEXT 42100 4911f125f38dda7156b7462eef8fe682be007e4df68713423a14ceac803faa56
+section HEADER.FIELDS 217 743f391314bb0de3ec2ba52bde11a40744c55c28a0a69c17ec7d98c6b9a2c05a
+section HEADER.FIELDS.NOT 550 f141f811a989acd3fd8a1de06a9c07510d3a685826f7d598dd5071ed2c3b2ee1
+section 1 42100 4911f125f38dda7156b7462eef8fe682be007e4df68713423a14ceac803faa56
+section 1.MIME 765 5962162f7599804610c0141d64a8d5d979e62aab72e97d2405933f78a51f3e2a

@@ -1,0 +1,10 @@
+size 2201
+envelope ("Sat, 13 Jun 92 11:23:08 JST" "Re: [95:taka@fxis.fujix] MIME and Header encoding RFC." (("Yutaka Sato =?ISO-2022-JP?B?GyRAOjRGI0stGyhK?=" NIL "ysato" "etl.go.jp")) (("Yutaka Sato =?ISO-2022-JP?B?GyRAOjRGI0stGyhK?=" NIL "ysato" "etl.go.jp")) (("Yutaka Sato =?ISO-2022-JP?B?GyRAOjRGI0stGyhK?=" NIL "ysato" "etl.go.jp")) ((NIL NIL "nsb" "thumper.bellcore.com")) NIL NIL NIL "<gELh6.ysato@etl.go.jp>")
+bodystructure ("text" "plain" ("charset" "ISO-2022-JP") NIL NIL "7bit" 1164 39 NIL NIL NIL NIL)
+body ("text" "plain" ("charset" "ISO-2022-JP") NIL NIL "7bit" 1164 39)
+section HEADER 1037 3c9e15771f9b18d537283e005c257c539b8d3e5bf6b667ae677a75fa1b592b23
+section TEXT 1164 6f39b2ac8b6fd392832f15972ad8578a43030ba36718ab29baeb1eaceff51011
+section HEADER.FIELDS 288 b0fdc8e54b237ba04c6dc7f530f41247fdafeaafd79ef86ac2a55be741e398f9
+section HEADER.FIELDS.NOT 751 1ee166f145754ce366649ead57b8bc6ed9c3f54b63b7bd37f50d6577f5ab712b
+section 1 1164 6f39b2ac8b6fd392832f15972ad8578a43030ba36718ab29baeb1eaceff51011
+section 1.MIME 1037 3c9e15771f9b18d537283e005c257c539b8d3e5bf6b667ae677a75fa1b592b23

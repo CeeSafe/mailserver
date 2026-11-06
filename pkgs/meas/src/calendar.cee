@@ -1,0 +1,808 @@
+// Events: iCalendar VEVENTs as ActiveSync Calendar items (MS-ASCAL), and back. Times go to the device in UTC with
+// the event's time zone (from its VTIMEZONE); recurrences, exceptions (deleted instances), attendees, the organizer,
+// reminders and categories are carried both ways. What ActiveSync cannot carry is lost when the device changes an
+// event: the event is rewritten from the device's fields, keeping its UID.
+
+import encoding.Base64;
+import mpim.ContentLines;
+import mpim.appendCalTime;
+import mpim.appendLine;
+import mpim.civilFromDays;
+import mpim.daysFromCivil;
+import mpim.escapeText;
+import mpim.weekday;
+import mpim.parseCalTime;
+import mpim.parseDuration;
+import mxml.XmlDocument;
+
+/// A DATE-TIME of the event as UTC seconds: its TZID's VTIMEZONE applied; floating times read as UTC.
+fn eventTime(lines: borrow ContentLines, line: usize) -> i64? {
+    let t = parseCalTime(lines.rawValue(line))?;
+    if (t.utc || t.date) {
+        return t.seconds;
+    }
+    var tzid = Vector<u8>.create();
+    match (lines.param(line, "TZID", mut tzid)) {
+        Ok(true) => {
+            let z = zoneOf(lines, tzid.view());
+            return zoneToUtc(z, t.seconds);
+        }
+        _ => {}
+    }
+    return t.seconds;
+}
+
+fn compactTime(seconds: i64, into: borrow mut String) -> Result<void, EasFail> {
+    var bytes = Vector<u8>.create();
+    mem(appendCalTime(mut bytes, seconds, false))?;
+    into.clear();
+    return mem(into.append(StringView.fromUtf8(bytes.view()) ?? ""));
+}
+
+fn writeTime(w: borrow mut WbxmlWriter, page: u8, name: StringView, seconds: i64) -> Result<void, EasFail> {
+    var text = String.create();
+    compactTime(seconds, mut text)?;
+    w.element(page, name, text.view());
+    return Ok();
+}
+
+/// The first VEVENT that is not an override (no RECURRENCE-ID), as [begin, end) lines.
+fn masterEvent(lines: borrow ContentLines) -> [usize; 2]? {
+    var i: usize = 0;
+    while (i < lines.count()) {
+        if (lines.depth(i) == 2 && lines.begins(i, "VEVENT")) {
+            let end = lines.componentEnd(i);
+            if (lines.property(i + 1, end, 2, "RECURRENCE-ID") == null) {
+                return [i, end];
+            }
+            i = end;
+            continue;
+        }
+        i += 1;
+    }
+    return null;
+}
+
+fn writeText(
+    w: borrow mut WbxmlWriter,
+    lines: borrow ContentLines,
+    line: usize?,
+    page: u8,
+    name: StringView,
+) -> Result<void, EasFail> {
+    match (line) {
+        Some(l) => {
+            var v = Vector<u8>.create();
+            mem(lines.textValue(l, mut v))?;
+            if (v.length > 0) {
+                w.elementBytes(page, name, v.view());
+            }
+        }
+        null => {}
+    }
+    return Ok();
+}
+
+/// The address of a `mailto:` value.
+fn mailtoOf(value: Slice<u8>) -> Slice<u8> {
+    let v = value.trim();
+    if (v.length > 7 && v[0..7].equalsIgnoreAsciiCase("mailto:".bytes())) {
+        return v[7..];
+    }
+    return v;
+}
+
+fn attendeeStatus(lines: borrow ContentLines, line: usize) -> StringView {
+    var v = Vector<u8>.create();
+    match (lines.param(line, "PARTSTAT", mut v)) {
+        Ok(true) => {}
+        _ => { return "5"; }
+    }
+    let p = v.view();
+    if (p.equalsIgnoreAsciiCase("ACCEPTED".bytes())) {
+        return "3";
+    }
+    if (p.equalsIgnoreAsciiCase("TENTATIVE".bytes())) {
+        return "2";
+    }
+    if (p.equalsIgnoreAsciiCase("DECLINED".bytes())) {
+        return "4";
+    }
+    return "5";
+}
+
+fn attendeeType(lines: borrow ContentLines, line: usize) -> StringView {
+    var v = Vector<u8>.create();
+    match (lines.param(line, "CUTYPE", mut v)) {
+        Ok(true) => {
+            if (v.view().equalsIgnoreAsciiCase("RESOURCE".bytes()) || v.view().equalsIgnoreAsciiCase("ROOM".bytes())) {
+                return "3";
+            }
+        }
+        _ => {}
+    }
+    match (lines.param(line, "ROLE", mut v)) {
+        Ok(true) => {
+            if (v.view().equalsIgnoreAsciiCase(
+                "OPT-PARTICIPANT".bytes(),
+            ) || v.view().equalsIgnoreAsciiCase("NON-PARTICIPANT".bytes())) {
+                return "2";
+            }
+        }
+        _ => {}
+    }
+    return "1";
+}
+
+/// RRULE as an ActiveSync Recurrence.
+fn writeRecurrence(
+    w: borrow mut WbxmlWriter,
+    rule: Slice<u8>,
+    start: i64,
+    allDay: bool,
+    z: borrow Zone,
+) -> Result<void, EasFail> {
+    let freq = match (rulePart(rule, "FREQ")) {
+        Some(r) => rule[r[0]..r[1]],
+        null => { return Ok(); }
+    };
+    let local = if (allDay) start else zoneToLocal(z, start);
+    let ymd = civilFromDays((if (local >= 0) local else local - 86399) / 86400);
+    var dayMask: u64 = 0;
+    var week: i64 = 0;
+    match (rulePart(rule, "BYDAY")) {
+        Some(r) => {
+            var at = r[0];
+            while (at < r[1]) {
+                var end = at;
+                while (end < r[1] && rule[end] != 0x2c) {
+                    end += 1;
+                }
+                match (ordinalDay(rule[at..end])) {
+                    Some(o) => {
+                        dayMask = dayMask | (1u64 << truncate<u32>(o[1]));
+                        if (o[0] != 0) {
+                            week = o[0];
+                        }
+                    }
+                    null => {}
+                }
+                at = end + 1;
+            }
+        }
+        null => {}
+    }
+    match (rulePart(rule, "BYSETPOS")) {
+        Some(r) => {
+            let pos = (StringView.fromUtf8(rule[r[0]..r[1]]) ?? "").parseInt<i64>() ?? 0;
+            week = if (pos < 0) 5 else pos;
+        }
+        null => {}
+    }
+    let monthDay = match (rulePart(rule, "BYMONTHDAY")) {
+        Some(r) => (StringView.fromUtf8(rule[r[0]..r[1]]) ?? "").parseInt<i64>() ?? ymd[2],
+        null => ymd[2],
+    };
+    let month = match (rulePart(rule, "BYMONTH")) {
+        Some(r) => (StringView.fromUtf8(rule[r[0]..r[1]]) ?? "").parseInt<i64>() ?? ymd[1],
+        null => ymd[1],
+    };
+    var kind: i64 = -1;
+    if (freq.equalsIgnoreAsciiCase("DAILY".bytes())) {
+        kind = if (dayMask != 0) 1 else 0;
+    } else if (freq.equalsIgnoreAsciiCase("WEEKLY".bytes())) {
+        kind = 1;
+        if (dayMask == 0) {
+            dayMask = 1u64 << truncate<u32>(weekday((if (local >= 0) local else local - 86399) / 86400));
+        }
+    } else if (freq.equalsIgnoreAsciiCase("MONTHLY".bytes())) {
+        kind = if (week != 0 && dayMask != 0) 3 else 2;
+    } else if (freq.equalsIgnoreAsciiCase("YEARLY".bytes())) {
+        kind = if (week != 0 && dayMask != 0) 6 else 5;
+    }
+    if (kind < 0) {
+        return Ok();
+    }
+    w.start(PAGE_CALENDAR, "Recurrence");
+    w.number(PAGE_CALENDAR, "Type", kind);
+    let interval = match (rulePart(rule, "INTERVAL")) {
+        Some(r) => (StringView.fromUtf8(rule[r[0]..r[1]]) ?? "").parseInt<i64>() ?? 1,
+        null => 1,
+    };
+    w.number(PAGE_CALENDAR, "Interval", interval);
+    match (rulePart(rule, "UNTIL")) {
+        Some(r) => {
+            match (parseCalTime(rule[r[0]..r[1]])) {
+                Some(t) => { writeTime(w, PAGE_CALENDAR, "Until", if (t.date) t.seconds + 86399 else t.seconds)?; }
+                null => {}
+            }
+        }
+        null => {}
+    }
+    match (rulePart(rule, "COUNT")) {
+        Some(r) => { w.elementBytes(PAGE_CALENDAR, "Occurrences", rule[r[0]..r[1]]); }
+        null => {}
+    }
+    if (kind == 1 || kind == 3 || kind == 6 || (kind == 0 && dayMask != 0)) {
+        w.number(PAGE_CALENDAR, "DayOfWeek", truncate<i64>(dayMask));
+    }
+    if (kind == 2 || kind == 5) {
+        w.number(PAGE_CALENDAR, "DayOfMonth", monthDay);
+    }
+    if (kind == 3 || kind == 6) {
+        w.number(PAGE_CALENDAR, "WeekOfMonth", week);
+    }
+    if (kind == 5 || kind == 6) {
+        w.number(PAGE_CALENDAR, "MonthOfYear", month);
+    }
+    w.end();
+    return Ok();
+}
+
+/// An event's ApplicationData. `self` is the account's address: a meeting it did not organize is one received.
+fn writeEvent(w: borrow mut WbxmlWriter, data: Slice<u8>, opts: BodyOptions, version: i32) -> Result<void, EasFail> {
+    let lines = match (ContentLines.parse(data)) {
+        Ok(l) => l,
+        Err(_) => { return Err(EasFail.Memory); }
+    };
+    let range = match (masterEvent(lines)) {
+        Some(r) => r,
+        null => { return Ok(); }
+    };
+    let from = range[0] + 1;
+    let to = range[1];
+    let startLine = lines.property(from, to, 2, "DTSTART");
+    let allDay = match (startLine) {
+        Some(l) => match (parseCalTime(lines.rawValue(l))) {
+            Some(t) => t.date,
+            null => false,
+        },
+        null => false,
+    };
+    var z = utcZone();
+    match (startLine) {
+        Some(l) => {
+            var tzid = Vector<u8>.create();
+            match (lines.param(l, "TZID", mut tzid)) {
+                Ok(true) => { z = zoneOf(lines, tzid.view()); }
+                _ => {}
+            }
+        }
+        null => {}
+    }
+    var blob = Vector<u8>.create();
+    mem(zoneBlob(z, mut blob))?;
+    w.elementBytes(PAGE_CALENDAR, "TimeZone", blob.view());
+    let start = match (startLine) {
+        Some(l) => eventTime(lines, l) ?? 0,
+        null => 0,
+    };
+    var end = start + (if (allDay) 86400i64 else 3600i64);
+    match (lines.property(from, to, 2, "DTEND")) {
+        Some(l) => { end = eventTime(lines, l) ?? end; }
+        null => {
+            match (lines.property(from, to, 2, "DURATION")) {
+                Some(l) => { end = start + (parseDuration(lines.rawValue(l)) ?? 0); }
+                null => {}
+            }
+        }
+    }
+    // An all-day event spans whole days of the zone sent (UTC here): midnight to midnight.
+    w.element(PAGE_CALENDAR, "AllDayEvent", if (allDay) "1" else "0");
+    if (opts.bodyType >= 1) {
+        match (lines.property(from, to, 2, "DESCRIPTION")) {
+            Some(l) => {
+                var v = Vector<u8>.create();
+                mem(lines.textValue(l, mut v))?;
+                let cut = cutAt(v.view(), opts.truncation);
+                w.start(PAGE_BASE, "Body");
+                w.element(PAGE_BASE, "Type", "1");
+                w.number(PAGE_BASE, "EstimatedDataSize", truncate<i64>(v.length));
+                if (cut < v.length) {
+                    w.element(PAGE_BASE, "Truncated", "1");
+                }
+                if (cut > 0) {
+                    w.elementBytes(PAGE_BASE, "Data", v.view()[0..cut]);
+                }
+                w.end();
+            }
+            null => {}
+        }
+    }
+    var busy: i64 = 2;
+    match (lines.property(from, to, 2, "TRANSP")) {
+        Some(l) => {
+            if (lines.rawValue(l).trim().equalsIgnoreAsciiCase("TRANSPARENT".bytes())) {
+                busy = 0;
+            }
+        }
+        null => {}
+    }
+    match (lines.property(from, to, 2, "X-MICROSOFT-CDO-BUSYSTATUS")) {
+        Some(l) => {
+            let v = lines.rawValue(l).trim();
+            if (v.equalsIgnoreAsciiCase("FREE".bytes())) {
+                busy = 0;
+            } else if (v.equalsIgnoreAsciiCase("TENTATIVE".bytes())) {
+                busy = 1;
+            } else if (v.equalsIgnoreAsciiCase("OOF".bytes())) {
+                busy = 3;
+            }
+        }
+        null => {}
+    }
+    w.number(PAGE_CALENDAR, "BusyStatus", busy);
+    var categories = Vector<u8>.create();
+    match (lines.property(from, to, 2, "CATEGORIES")) {
+        Some(l) => {
+            mem(lines.textValue(l, mut categories))?;
+        }
+        null => {}
+    }
+    if (categories.length > 0) {
+        w.start(PAGE_CALENDAR, "Categories");
+        var at: usize = 0;
+        let c = categories.view();
+        while (at <= c.length) {
+            var e = at;
+            while (e < c.length && c[e] != 0x2c) {
+                e += 1;
+            }
+            if (e > at) {
+                w.elementBytes(PAGE_CALENDAR, "Category", c[at..e].trim());
+            }
+            at = e + 1;
+        }
+        w.end();
+    }
+    match (lines.property(from, to, 2, "DTSTAMP")) {
+        Some(l) => {
+            match (parseCalTime(lines.rawValue(l))) {
+                Some(t) => { writeTime(w, PAGE_CALENDAR, "DTStamp", t.seconds)?; }
+                null => {}
+            }
+        }
+        null => { writeTime(w, PAGE_CALENDAR, "DTStamp", Clock.unixMillis() / 1000)?; }
+    }
+    writeTime(w, PAGE_CALENDAR, "EndTime", end)?;
+    writeText(w, lines, lines.property(from, to, 2, "LOCATION"), PAGE_CALENDAR, "Location")?;
+    // The organizer and attendees.
+    var attendees = Vector<usize>.create();
+    var i = from;
+    while (i < to) {
+        if (lines.depth(i) == 2 && lines.nameIs(i, "ATTENDEE")) {
+            mem(attendees.push(i))?;
+        }
+        i += 1;
+    }
+    let organizer = lines.property(from, to, 2, "ORGANIZER");
+    let meeting = attendees.length > 0;
+    w.element(PAGE_CALENDAR, "MeetingStatus", if (meeting) "1" else "0");
+    match (organizer) {
+        Some(l) => {
+            w.elementBytes(PAGE_CALENDAR, "OrganizerEmail", mailtoOf(lines.rawValue(l)));
+            var cn = Vector<u8>.create();
+            match (lines.param(l, "CN", mut cn)) {
+                Ok(true) => { w.elementBytes(PAGE_CALENDAR, "OrganizerName", cn.view()); }
+                _ => {}
+            }
+        }
+        null => {}
+    }
+    if (meeting) {
+        w.start(PAGE_CALENDAR, "Attendees");
+        for (a in attendees.view()) {
+            w.start(PAGE_CALENDAR, "Attendee");
+            w.elementBytes(PAGE_CALENDAR, "Email", mailtoOf(lines.rawValue(a)));
+            var cn = Vector<u8>.create();
+            match (lines.param(a, "CN", mut cn)) {
+                Ok(true) => {}
+                _ => { mem(cn.extend(mailtoOf(lines.rawValue(a))))?; }
+            }
+            w.elementBytes(PAGE_CALENDAR, "Name", cn.view());
+            if (version >= 120) {
+                w.element(PAGE_CALENDAR, "AttendeeStatus", attendeeStatus(lines, a));
+                w.element(PAGE_CALENDAR, "AttendeeType", attendeeType(lines, a));
+            }
+            w.end();
+        }
+        w.end();
+    }
+    match (lines.property(from, to, 2, "RRULE")) {
+        Some(l) => { writeRecurrence(w, lines.rawValue(l), start, allDay, z)?; }
+        null => {}
+    }
+    // Deleted instances (EXDATE).
+    var exdates = Vector<i64>.create();
+    i = from;
+    while (i < to) {
+        if (lines.depth(i) == 2 && lines.nameIs(i, "EXDATE")) {
+            let raw = lines.rawValue(i);
+            var tzid = Vector<u8>.create();
+            let zoned = match (lines.param(i, "TZID", mut tzid)) {
+                Ok(b) => b,
+                Err(_) => false,
+            };
+            let exZone = if (zoned) zoneOf(lines, tzid.view()) else utcZone();
+            var at: usize = 0;
+            while (at < raw.length) {
+                var e = at;
+                while (e < raw.length && raw[e] != 0x2c) {
+                    e += 1;
+                }
+                match (parseCalTime(raw[at..e])) {
+                    Some(t) => {
+                        let utc = if (t.utc || t.date) t.seconds else zoneToUtc(exZone, t.seconds);
+                        // An all-day series' instance starts at its date's midnight; a timed one at the series' time.
+                        mem(exdates.push(if (t.date && !allDay) utc + (start % 86400) else utc))?;
+                    }
+                    null => {}
+                }
+                at = e + 1;
+            }
+        }
+        i += 1;
+    }
+    if (exdates.length > 0) {
+        w.start(PAGE_CALENDAR, "Exceptions");
+        for (x in exdates.view()) {
+            w.start(PAGE_CALENDAR, "Exception");
+            w.element(PAGE_CALENDAR, "Deleted", "1");
+            writeTime(w, PAGE_CALENDAR, "ExceptionStartTime", x)?;
+            w.end();
+        }
+        w.end();
+    }
+    // A reminder: the first VALARM triggered before the start.
+    i = from;
+    while (i < to) {
+        if (lines.depth(i) == 3 && lines.begins(i, "VALARM")) {
+            let alarmEnd = lines.componentEnd(i);
+            match (lines.property(i + 1, alarmEnd, 3, "TRIGGER")) {
+                Some(l) => {
+                    match (parseDuration(lines.rawValue(l))) {
+                        Some(d) => {
+                            if (d <= 0) {
+                                w.number(PAGE_CALENDAR, "Reminder", (0 - d) / 60);
+                            }
+                        }
+                        null => {}
+                    }
+                }
+                null => {}
+            }
+            break;
+        }
+        i += 1;
+    }
+    var sensitivity: i64 = 0;
+    match (lines.property(from, to, 2, "CLASS")) {
+        Some(l) => {
+            let v = lines.rawValue(l).trim();
+            if (v.equalsIgnoreAsciiCase("PRIVATE".bytes())) {
+                sensitivity = 2;
+            } else if (v.equalsIgnoreAsciiCase("CONFIDENTIAL".bytes())) {
+                sensitivity = 3;
+            }
+        }
+        null => {}
+    }
+    w.number(PAGE_CALENDAR, "Sensitivity", sensitivity);
+    writeText(w, lines, lines.property(from, to, 2, "SUMMARY"), PAGE_CALENDAR, "Subject")?;
+    writeTime(w, PAGE_CALENDAR, "StartTime", start)?;
+    writeText(w, lines, lines.property(from, to, 2, "UID"), PAGE_CALENDAR, "UID")?;
+    if (meeting && version >= 140) {
+        w.element(PAGE_CALENDAR, "ResponseRequested", "1");
+    }
+    return Ok();
+}
+
+// ---- From the device ----
+
+/// An ActiveSync time: `20261106T090000Z`, or `2026-11-06T09:00:00.000Z`; UTC seconds.
+fn easTime(text: StringView) -> i64? {
+    var compact = Vector<u8>.create();
+    for (b in text.trim().bytes()) {
+        if (b == 0x2e) {
+            break; // milliseconds
+        }
+        if (b != 0x2d && b != 0x3a) {
+            match (compact.push(b)) {
+                Ok() => {}
+                Err(_) => { return null; }
+            }
+        }
+    }
+    if (compact.length == 15) {
+        match (compact.push(0x5a)) {
+            Ok() => {}
+            Err(_) => { return null; }
+        }
+    }
+    let t = parseCalTime(compact.view())?;
+    return t.seconds;
+}
+
+fn line(into: borrow mut Vector<u8>, nameAndParams: StringView, value: Slice<u8>) -> Result<void, EasFail> =>
+    mem(appendLine(into, nameAndParams, value));
+
+fn textLine(into: borrow mut Vector<u8>, name: StringView, value: StringView) -> Result<void, EasFail> {
+    if (value.length == 0) {
+        return Ok();
+    }
+    var escaped = Vector<u8>.create();
+    mem(escapeText(value.bytes(), mut escaped))?;
+    return line(into, name, escaped.view());
+}
+
+fn timeLine(into: borrow mut Vector<u8>, name: StringView, seconds: i64, date: bool) -> Result<void, EasFail> {
+    var v = Vector<u8>.create();
+    mem(appendCalTime(mut v, seconds, date))?;
+    var n = String.create();
+    mem(n.append(name))?;
+    if (date) {
+        mem(n.append(";VALUE=DATE"))?;
+    }
+    return line(into, n.view(), v.view());
+}
+
+fn bodyText<region r>(doc: borrow(r) XmlDocument, data: usize) -> StringView<r> =>
+    match (doc.child(data, NS_BASE, "Body")) {
+        Some(b) => childValue(doc, b, NS_BASE, "Data"),
+        null => childValue(doc, data, NS_CALENDAR, "Body"),
+    };
+
+const DAY_CODES: StringView = "SUMOTUWETHFRSA";
+
+fn dayList(mask: i64, ordinal: i64, into: borrow mut Vector<u8>) -> Result<void, EasFail> {
+    var first = true;
+    for (d in 0..7) {
+        if ((truncate<u64>(mask) & (1u64 << truncate<u32>(d))) != 0) {
+            if (!first) {
+                mem(into.push(0x2c))?;
+            }
+            first = false;
+            if (ordinal != 0) {
+                if (ordinal == 5) {
+                    mem(into.extend("-1".bytes()))?;
+                } else {
+                    var n = String.create();
+                    mem(n.appendNumber(ordinal))?;
+                    mem(into.extend(n.view().bytes()))?;
+                }
+            }
+            let codes = DAY_CODES.bytes();
+            mem(into.extend(codes[(d * 2)..(d * 2 + 2)]))?;
+        }
+    }
+    return Ok();
+}
+
+fn ruleFromEas(doc: borrow XmlDocument, rec: usize, into: borrow mut Vector<u8>) -> Result<void, EasFail> {
+    let kind = childNumber(doc, rec, NS_CALENDAR, "Type", 0);
+    let interval = childNumber(doc, rec, NS_CALENDAR, "Interval", 1);
+    let dayMask = childNumber(doc, rec, NS_CALENDAR, "DayOfWeek", 0);
+    let week = childNumber(doc, rec, NS_CALENDAR, "WeekOfMonth", 0);
+    var rule = Vector<u8>.create();
+    mem(
+        rule.extend(
+            if (kind == 0) "FREQ=DAILY".bytes() else if (kind == 1) "FREQ=WEEKLY".bytes() else if (kind == 2 ||
+                kind == 3) "FREQ=MONTHLY".bytes() else "FREQ=YEARLY".bytes(),
+        ),
+    )?;
+    if (interval > 1) {
+        var n = String.create();
+        mem(n.append(";INTERVAL="))?;
+        mem(n.appendNumber(interval))?;
+        mem(rule.extend(n.view().bytes()))?;
+    }
+    if ((kind == 0 || kind == 1) && dayMask != 0) {
+        mem(rule.extend(";BYDAY=".bytes()))?;
+        dayList(dayMask, 0, mut rule)?;
+    }
+    if (kind == 2 || kind == 5) {
+        let day = childNumber(doc, rec, NS_CALENDAR, "DayOfMonth", 0);
+        if (day > 0) {
+            var n = String.create();
+            mem(n.append(";BYMONTHDAY="))?;
+            mem(n.appendNumber(day))?;
+            mem(rule.extend(n.view().bytes()))?;
+        }
+    }
+    if ((kind == 3 || kind == 6) && dayMask != 0) {
+        mem(rule.extend(";BYDAY=".bytes()))?;
+        dayList(dayMask, week, mut rule)?;
+    }
+    if (kind == 5 || kind == 6) {
+        let month = childNumber(doc, rec, NS_CALENDAR, "MonthOfYear", 0);
+        if (month > 0) {
+            var n = String.create();
+            mem(n.append(";BYMONTH="))?;
+            mem(n.appendNumber(month))?;
+            mem(rule.extend(n.view().bytes()))?;
+        }
+    }
+    let occurrences = childNumber(doc, rec, NS_CALENDAR, "Occurrences", 0);
+    if (occurrences > 0) {
+        var n = String.create();
+        mem(n.append(";COUNT="))?;
+        mem(n.appendNumber(occurrences))?;
+        mem(rule.extend(n.view().bytes()))?;
+    }
+    match (easTime(childValue(doc, rec, NS_CALENDAR, "Until"))) {
+        Some(t) => {
+            mem(rule.extend(";UNTIL=".bytes()))?;
+            mem(appendCalTime(mut rule, t, false))?;
+        }
+        null => {}
+    }
+    return line(into, "RRULE", rule.view());
+}
+
+/// An iCalendar object made from a device's Calendar ApplicationData, with UID `uid`.
+fn eventFromEas(
+    doc: borrow XmlDocument,
+    data: usize,
+    uid: StringView,
+    into: borrow mut Vector<u8>,
+) -> Result<void, EasFail> {
+    into.clear();
+    let z = zoneFromBlob(childValue(doc, data, NS_CALENDAR, "TimeZone").bytes());
+    let allDay = childValue(doc, data, NS_CALENDAR, "AllDayEvent") == "1";
+    let start = easTime(childValue(doc, data, NS_CALENDAR, "StartTime")) ?? (Clock.unixMillis() / 1000);
+    let end = easTime(childValue(doc, data, NS_CALENDAR, "EndTime")) ?? (start + 3600);
+    mem(
+        into.extend(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//mailserver//ActiveSync//EN\r\nBEGIN:VEVENT\r\n".bytes(),
+        ),
+    )?;
+    textLine(into, "UID", uid)?;
+    timeLine(into, "DTSTAMP", Clock.unixMillis() / 1000, false)?;
+    if (allDay) {
+        // Midnight in the device's zone: the dates.
+        let localStart = zoneToLocal(z, start);
+        let localEnd = zoneToLocal(z, end);
+        let startDay = (localStart + 43200) / 86400 * 86400;
+        var endDay = (localEnd + 43200) / 86400 * 86400;
+        if (endDay <= startDay) {
+            endDay = startDay + 86400;
+        }
+        timeLine(into, "DTSTART", startDay, true)?;
+        timeLine(into, "DTEND", endDay, true)?;
+    } else {
+        timeLine(into, "DTSTART", start, false)?;
+        timeLine(into, "DTEND", if (end > start) end else start, false)?;
+    }
+    textLine(into, "SUMMARY", childValue(doc, data, NS_CALENDAR, "Subject"))?;
+    textLine(into, "LOCATION", childValue(doc, data, NS_CALENDAR, "Location"))?;
+    textLine(into, "DESCRIPTION", bodyText(doc, data))?;
+    let busy = childValue(doc, data, NS_CALENDAR, "BusyStatus");
+    if (busy == "0") {
+        mem(into.extend("TRANSP:TRANSPARENT\r\n".bytes()))?;
+    } else if (busy == "1") {
+        mem(into.extend("X-MICROSOFT-CDO-BUSYSTATUS:TENTATIVE\r\n".bytes()))?;
+    } else if (busy == "3") {
+        mem(into.extend("X-MICROSOFT-CDO-BUSYSTATUS:OOF\r\n".bytes()))?;
+    }
+    let sensitivity = childValue(doc, data, NS_CALENDAR, "Sensitivity");
+    if (sensitivity == "2") {
+        mem(into.extend("CLASS:PRIVATE\r\n".bytes()))?;
+    } else if (sensitivity == "3") {
+        mem(into.extend("CLASS:CONFIDENTIAL\r\n".bytes()))?;
+    }
+    match (doc.child(data, NS_CALENDAR, "Categories")) {
+        Some(cats) => {
+            var list = Vector<usize>.create();
+            mem(doc.children(cats, mut list))?;
+            var joined = Vector<u8>.create();
+            for (c in list.view()) {
+                if (joined.length > 0) {
+                    mem(joined.push(0x2c))?;
+                }
+                mem(escapeText(doc.trimmed(c).bytes(), mut joined))?;
+            }
+            if (joined.length > 0) {
+                line(into, "CATEGORIES", joined.view())?;
+            }
+        }
+        null => {}
+    }
+    let organizer = childValue(doc, data, NS_CALENDAR, "OrganizerEmail");
+    if (organizer.length > 0) {
+        var value = Vector<u8>.create();
+        mem(value.extend("mailto:".bytes()))?;
+        mem(value.extend(organizer.bytes()))?;
+        var name = String.create();
+        mem(name.append("ORGANIZER"))?;
+        let cn = childValue(doc, data, NS_CALENDAR, "OrganizerName");
+        if (cn.length > 0 && cn.indexOf("\"") == null) {
+            mem(name.append(";CN=\""))?;
+            mem(name.append(cn))?;
+            mem(name.append("\""))?;
+        }
+        line(into, name.view(), value.view())?;
+    }
+    match (doc.child(data, NS_CALENDAR, "Attendees")) {
+        Some(atts) => {
+            var list = Vector<usize>.create();
+            mem(doc.children(atts, mut list))?;
+            for (a in list.view()) {
+                let email = childValue(doc, a, NS_CALENDAR, "Email");
+                if (email.length == 0) {
+                    continue;
+                }
+                var name = String.create();
+                mem(name.append("ATTENDEE"))?;
+                let cn = childValue(doc, a, NS_CALENDAR, "Name");
+                if (cn.length > 0 && cn.indexOf("\"") == null) {
+                    mem(name.append(";CN=\""))?;
+                    mem(name.append(cn))?;
+                    mem(name.append("\""))?;
+                }
+                let kind = childValue(doc, a, NS_CALENDAR, "AttendeeType");
+                mem(
+                    name.append(
+                        if (kind ==
+                            "2") ";ROLE=OPT-PARTICIPANT" else if (kind ==
+                            "3") ";CUTYPE=RESOURCE" else ";ROLE=REQ-PARTICIPANT",
+                    ),
+                )?;
+                let status = childValue(doc, a, NS_CALENDAR, "AttendeeStatus");
+                mem(
+                    name.append(
+                        if (status ==
+                            "3") ";PARTSTAT=ACCEPTED" else if (status ==
+                            "2") ";PARTSTAT=TENTATIVE" else if (status ==
+                            "4") ";PARTSTAT=DECLINED" else ";PARTSTAT=NEEDS-ACTION",
+                    ),
+                )?;
+                var value = Vector<u8>.create();
+                mem(value.extend("mailto:".bytes()))?;
+                mem(value.extend(email.bytes()))?;
+                line(into, name.view(), value.view())?;
+            }
+        }
+        null => {}
+    }
+    match (doc.child(data, NS_CALENDAR, "Recurrence")) {
+        Some(rec) => { ruleFromEas(doc, rec, into)?; }
+        null => {}
+    }
+    match (doc.child(data, NS_CALENDAR, "Exceptions")) {
+        Some(exs) => {
+            var list = Vector<usize>.create();
+            mem(doc.children(exs, mut list))?;
+            for (x in list.view()) {
+                if (childValue(doc, x, NS_CALENDAR, "Deleted") != "1") {
+                    continue;
+                }
+                let given = childValue(doc, x, NS_CALENDAR, "ExceptionStartTime");
+                let at = if (given.length > 0) given else childValue(doc, x, NS_CALENDAR, "StartTime");
+                match (easTime(at)) {
+                    Some(t) => {
+                        if (allDay) {
+                            timeLine(into, "EXDATE", (zoneToLocal(z, t) + 43200) / 86400 * 86400, true)?;
+                        } else {
+                            timeLine(into, "EXDATE", t, false)?;
+                        }
+                    }
+                    null => {}
+                }
+            }
+        }
+        null => {}
+    }
+    let reminder = childValue(doc, data, NS_CALENDAR, "Reminder");
+    match (reminder.parseInt<i64>()) {
+        Some(minutes) => {
+            var trigger = String.create();
+            mem(trigger.append("BEGIN:VALARM\r\nACTION:DISPLAY\r\nDESCRIPTION:Reminder\r\nTRIGGER:-PT"))?;
+            mem(trigger.appendNumber(if (minutes < 0) 0 else minutes))?;
+            mem(trigger.append("M\r\nEND:VALARM\r\n"))?;
+            mem(into.extend(trigger.view().bytes()))?;
+        }
+        null => {}
+    }
+    mem(into.extend("END:VEVENT\r\nEND:VCALENDAR\r\n".bytes()))?;
+    return Ok();
+}

@@ -1,0 +1,12 @@
+size 639
+envelope (NIL "This is a test message" ((NIL NIL "unit-tests" "mimekit.net")) ((NIL NIL "unit-tests" "mimekit.net")) ((NIL NIL "unit-tests" "mimekit.net")) ((NIL NIL "unit-tests" "mimekit.net")) NIL NIL NIL "<123@example.org>")
+bodystructure (("text" "plain" ("charset" "us-ascii") NIL NIL "duckduckgo" 24 0 NIL NIL NIL NIL) ("application" "octet-stream" ("name" "attachment.dat") NIL NIL "base64" 16 NIL NIL NIL NIL) "mixed" ("boundary" "----=_NextPart_000_003F_01CE98CE.6E826F90") NIL NIL NIL)
+body (("text" "plain" ("charset" "us-ascii") NIL NIL "duckduckgo" 24 0) ("application" "octet-stream" ("name" "attachment.dat") NIL NIL "base64" 16) "mixed")
+section HEADER 273 f64ce76cb79577cb8da6d287945b5a8a5c077dcc406fba4aef41c5e9e112749d
+section TEXT 366 eef44931cdfbd1c499bc072f93d3e6bc269c192a015aeac23df872cd0fd0cb04
+section HEADER.FIELDS 209 94f17cb60ef25c1be23126781665184396ce2e5a18beba7df39850bd255eef83
+section HEADER.FIELDS.NOT 66 78bca447b797776b17de856a8777ab49f7341463a0a8a9130d2522a1fd6ee446
+section 1 24 c3dcb8c7a315a9ac8a4b0243e17bae0403d2ca094ecbe041d50e238a6cacea7f
+section 1.MIME 85 a5af3ceee715f91002c789ed0ddc6ae9b77178ca9bc167be32a6f54a620f96c4
+section 2 16 9b17515aa3a855425da56334202c38a612dabd2aa97d818b4cd5610cddf7797d
+section 2.MIME 100 c79f0f8848203ba1bbd906a49365765bab69465802e822f512008590c5066a77

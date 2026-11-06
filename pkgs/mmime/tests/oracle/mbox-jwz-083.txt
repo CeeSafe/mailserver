@@ -1,0 +1,18 @@
+size 48563
+envelope ("Thu, 8 Feb 1996 17:33:10 -0800" "Example of CID linking in a multipart/related MIME message" (("Dr. Mark K. Joseph" NIL "izzy" "scr.atm.com")) (("Dr. Mark K. Joseph" NIL "izzy" "scr.atm.com")) (("Dr. Mark K. Joseph" NIL "izzy" "scr.atm.com")) ((NIL NIL "jwz" "netscape.com")) NIL NIL NIL "<19960209013311.izzy@scr.atm.com>")
+bodystructure (("text" "html" ("charset" "ISO-8859-1") NIL NIL "quoted-printable" 2432 50 NIL NIL NIL NIL) ("image" "gif" NIL "<2.19960209013310.izzy@scr.atm.com>" NIL "base64" 6102 NIL ("inline" ("filename" "attach3.gif")) NIL NIL) ("image" "gif" NIL "<3.19960209013310.izzy@scr.atm.com>" NIL "base64" 12230 NIL ("inline" ("filename" "liluse.gif")) NIL NIL) ("image" "gif" NIL "<5.19960209013310.izzy@scr.atm.com>" NIL "base64" 21996 NIL ("inline" ("filename" "wollogo2.gif")) NIL NIL) ("image" "gif" NIL "<0.19960209013310.izzy@scr.atm.com>" "The Sender's Signature" "base64" 3438 NIL ("inline" ("filename" "BULLDOG.GIF")) NIL NIL) "related" ("boundary" "=_09tW13g.bO1996u.N01d000A.r02Y.33:0018d7" "type" "text/html" "start-info" "X-twg-cidlinking-V1.2") NIL NIL NIL)
+body (("text" "html" ("charset" "ISO-8859-1") NIL NIL "quoted-printable" 2432 50) ("image" "gif" NIL "<2.19960209013310.izzy@scr.atm.com>" NIL "base64" 6102) ("image" "gif" NIL "<3.19960209013310.izzy@scr.atm.com>" NIL "base64" 12230) ("image" "gif" NIL "<5.19960209013310.izzy@scr.atm.com>" NIL "base64" 21996) ("image" "gif" NIL "<0.19960209013310.izzy@scr.atm.com>" "The Sender's Signature" "base64" 3438) "related")
+section HEADER 1286 1a4f7e953e2316505755f2a6d2addd546c9a2a42283e25b8d2964d987aab2e7a
+section TEXT 47277 35e9a43fad44991ba1eac54d78ea4a8187bb2e0dc1a1c96cddea329d4b9ea784
+section HEADER.FIELDS 376 b84ceedac9a15eaccf03d78a23d98cb78bb8f7071538ebda107d3ad29abc1c9f
+section HEADER.FIELDS.NOT 912 910a4e71dd591489abfb9379fbc0682b552c1f5f27e80ef810794e1bb088d2c6
+section 1 2432 35c12292b3a20a25b4018fb432a82e4cb80532e524aa1adf943381f6cb192d52
+section 1.MIME 94 781d3f464b8f4931811a651b4cc292ae61df69bcc6466ce63cb21d580d575e6b
+section 2 6102 07938c4ce25d9143e63890842387a8db68a047195170eda61929b7e0fd39219e
+section 2.MIME 164 979e1775658662a053eb6637ac0ce4668f7722aed7a7fedb5ca9656b184751b4
+section 3 12230 ee8dac4976413674c250644081063b4f6767bee70002aab007db9fa47b405cde
+section 3.MIME 163 97f8a0c4b6ea905b0f21142576bdf0e2c1dc79e1f597bb2621a076dcf5f48819
+section 4 21996 567d3089f9b00bf8bf7539514147da0f8765b507c720507d80189b46a94309d0
+section 4.MIME 165 dcff4a63ab82b18c3bac56393394eee0a9c9756eaf70149719fd2c1c31a495f5
+section 5 3438 98124eff488c118a45e5d34c0d6b0803905bb9b4acd5cc9ed9beccdad8333394
+section 5.MIME 209 38585cbd9d1c7a20c2edfd85d32ad40183475329adf5630d7611e2f52eaab6ef

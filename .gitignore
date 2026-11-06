@@ -1,0 +1,6 @@
+out/
+__pycache__/
+*.pyc
+.DS_Store
+*.orig
+pkgs/mmime/tests/corpus/

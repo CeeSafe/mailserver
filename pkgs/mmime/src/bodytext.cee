@@ -1,0 +1,586 @@
+// Body text for IMAP SEARCH (RFC 3501 §6.4.4): a part's content with its Content-Transfer-Encoding undone, its
+// charset converted to UTF-8 and, for text/html, its tags dropped. BODY searches the text of every text part, TEXT
+// the decoded header too; FROM, SUBJECT, HEADER and the like search the decoded values of named fields.
+//
+// Decoding never fails and never rejects input: invalid base64 characters are skipped, malformed quoted-printable
+// stays as it is, unknown charsets read as UTF-8 if they are, else as Latin-1. The text is capped: see
+// `SEARCH_TEXT_LIMIT`.
+
+/// The default cap on the decoded text kept for one message (1 MiB), for `appendSearchText`.
+///
+/// A cap counts the UTF-8 bytes a call appends. Text past it is left out, cut at a character boundary, and the
+/// call says so; SEARCH then cannot find words past the first MiB of a message's text. Work stays bounded too: at
+/// most `limit` bytes are transfer-decoded per part (twice that for text/html, whose tags are then dropped), and
+/// the charset conversion needs up to four times that, transiently.
+public const SEARCH_TEXT_LIMIT: usize = 1024 * 1024;
+
+/// What `appendPartText` did with a part.
+public enum PartText {
+    /// It has no text/* type (an image, a PDF, an encoded message): nothing was appended.
+    Skipped,
+    /// All its text was appended.
+    Whole,
+    /// Its text was appended up to the limit and cut there.
+    Cut,
+}
+
+/// The value of `c` as a base64 digit, or 64.
+fn base64Value(c: u8) -> u8 {
+    if (c >= 0x41 && c <= 0x5a) {
+        return c - 0x41;
+    }
+    if (c >= 0x61 && c <= 0x7a) {
+        return c - 0x61 + 26;
+    }
+    if (c >= 0x30 && c <= 0x39) {
+        return c - 0x30 + 52;
+    }
+    if (c == 0x2b) {
+        return 62;
+    }
+    if (c == 0x2f) {
+        return 63;
+    }
+    return 64;
+}
+
+/// Appends the whole bytes of a group of `n` base64 digits held in `bits` (2 digits: 1 byte, 3: 2 bytes, 4: 3).
+fn flushGroup(bits: u32, n: u32, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    if (n == 4) {
+        out.pushBE(truncate<u8>(bits >> 16))?;
+        out.pushBE(truncate<u8>(bits >> 8))?;
+        return out.pushBE(truncate<u8>(bits));
+    }
+    if (n == 3) {
+        out.pushBE(truncate<u8>(bits >> 10))?;
+        return out.pushBE(truncate<u8>(bits >> 2));
+    }
+    if (n == 2) {
+        return out.pushBE(truncate<u8>(bits >> 4));
+    }
+    return Ok();
+}
+
+/// Appends base64 `text` decoded, leniently: bytes outside the alphabet (line breaks, spaces, garbage) are skipped;
+/// `=` ends a group, whose whole bytes are kept, and decoding goes on after it (concatenated base64); a last group of
+/// one digit is dropped. At most `limit` bytes are appended; false if the text was cut.
+fn decodeBase64Text(text: Slice<u8>, limit: usize, out: borrow mut Vector<u8>) -> Result<bool, AllocError> {
+    let start = out.length;
+    var bits: u32 = 0;
+    var n: u32 = 0;
+    var at: usize = 0;
+    while (at < text.length) {
+        if (out.length - start >= limit) {
+            out.truncate(start + limit);
+            return Ok(false);
+        }
+        let c = text[at];
+        at += 1;
+        if (c == 0x3d) {
+            flushGroup(bits, n, out)?;
+            bits = 0;
+            n = 0;
+            continue;
+        }
+        let v = base64Value(c);
+        if (v == 64) {
+            continue;
+        }
+        bits = (bits << 6) | (v as u32);
+        n += 1;
+        if (n == 4) {
+            flushGroup(bits, n, out)?;
+            bits = 0;
+            n = 0;
+        }
+    }
+    flushGroup(bits, n, out)?;
+    if (out.length - start > limit) {
+        out.truncate(start + limit);
+        return Ok(false);
+    }
+    return Ok(true);
+}
+
+/// Whether a quoted-printable line ends at `at` in `text`: its end, a LF, or a CRLF.
+fn lineEndsAt(text: Slice<u8>, at: usize) -> bool =>
+    at >= text.length || text[at] == 0x0a || (text[at] == 0x0d && (at + 1 == text.length || text[at + 1] == 0x0a));
+
+/// Appends quoted-printable `text` decoded (RFC 2045 §6.7): `=XX` in either case is a byte, `=` at the end of a line
+/// (trailing whitespace allowed) a soft line break, and whitespace at the end of a line is dropped. A malformed `=`
+/// stays as it is. At most `limit` bytes are appended; false if the text was cut.
+fn decodeQuotedPrintableText(text: Slice<u8>, limit: usize, out: borrow mut Vector<u8>) -> Result<bool, AllocError> {
+    let start = out.length;
+    var at: usize = 0;
+    while (at < text.length) {
+        if (out.length - start >= limit) {
+            out.truncate(start + limit);
+            return Ok(false);
+        }
+        let c = text[at];
+        if (c == 0x3d) {
+            if (at + 2 < text.length) {
+                let h = hexValue(text[at + 1]);
+                let l = hexValue(text[at + 2]);
+                if (h < 16 && l < 16) {
+                    out.pushBE((h << 4) | l)?;
+                    at += 3;
+                    continue;
+                }
+            }
+            var j = at + 1;
+            while (j < text.length && isWsp(text[j])) {
+                j += 1;
+            }
+            if (lineEndsAt(text, j)) {
+                // A soft line break: the `=`, its trailing whitespace and the line break go.
+                if (j < text.length && text[j] == 0x0d) {
+                    j += 1;
+                }
+                if (j < text.length && text[j] == 0x0a) {
+                    j += 1;
+                }
+                at = j;
+                continue;
+            }
+            out.pushBE(c)?;
+            at += 1;
+            continue;
+        }
+        if (isWsp(c)) {
+            var j = at;
+            while (j < text.length && isWsp(text[j])) {
+                j += 1;
+            }
+            if (!lineEndsAt(text, j)) {
+                out.extend(text[at..j])?;
+            }
+            at = j;
+            continue;
+        }
+        out.pushBE(c)?;
+        at += 1;
+    }
+    if (out.length - start > limit) {
+        out.truncate(start + limit);
+        return Ok(false);
+    }
+    return Ok(true);
+}
+
+/// Appends `body` with the Content-Transfer-Encoding `encoding` undone: base64 and quoted-printable are decoded
+/// (leniently, never failing); any other encoding (7bit, 8bit, binary, or one unknown, uuencode among them) is copied
+/// as it is. At most `limit` bytes are appended; false if the body was cut.
+public fn decodeTransfer(
+    encoding: Slice<u8>,
+    body: Slice<u8>,
+    limit: usize,
+    out: borrow mut Vector<u8>,
+) -> Result<bool, AllocError> {
+    if (encoding.equalsIgnoreAsciiCase("base64".bytes())) {
+        return decodeBase64Text(body, limit, out);
+    }
+    if (encoding.equalsIgnoreAsciiCase("quoted-printable".bytes())) {
+        return decodeQuotedPrintableText(body, limit, out);
+    }
+    if (body.length <= limit) {
+        out.extend(body)?;
+        return Ok(true);
+    }
+    out.extend(body[0..limit])?;
+    return Ok(false);
+}
+
+/// Appends UTF-8 `text`, or as much of it as `limit` bytes hold, cut at a character boundary; false if it was cut.
+fn appendCapped(text: Slice<u8>, limit: usize, out: borrow mut Vector<u8>) -> Result<bool, AllocError> {
+    if (text.length <= limit) {
+        out.extend(text)?;
+        return Ok(true);
+    }
+    var cut = limit;
+    while (cut > 0 && (text[cut] & 0xc0) == 0x80) {
+        cut -= 1;
+    }
+    out.extend(text[0..cut])?;
+    return Ok(false);
+}
+
+/// Appends the text of a leaf part whose header block is `header` (`headerStart..bodyStart` of the part) and whose
+/// content is `body` (`bodyStart..bodyEnd`), as UTF-8:
+/// - the part must have a text/* type, or none (which means text/plain); anything else is `Skipped`;
+/// - its Content-Transfer-Encoding is undone (`decodeTransfer`);
+/// - its charset (the `charset` parameter, US-ASCII when there is none) is converted to UTF-8 with
+///   `convertToUtf8`, which reads an unknown charset as UTF-8 if the bytes are valid UTF-8, else as Latin-1, and
+///   turns invalid sequences into U+FFFD;
+/// - with `stripHtml`, a text/html part's tags are dropped and its entities decoded (`appendHtmlText`); a charset
+///   named only in a `<meta>` tag is not read.
+///
+/// At most `limit` bytes are appended (see `SEARCH_TEXT_LIMIT`).
+public fn appendPartText(
+    header: Slice<u8>,
+    body: Slice<u8>,
+    stripHtml: bool,
+    limit: usize,
+    out: borrow mut Vector<u8>,
+) -> Result<PartText, AllocError> {
+    var media = MediaType.create();
+    let typed = match (headerValue(header, "Content-Type")) {
+        Some(v) => parseMediaType(v, mut media)?,
+        null => false,
+    };
+    if (typed && !media.isType("text")) {
+        return Ok(PartText.Skipped);
+    }
+    let html = stripHtml && typed && media.isSubtype("html");
+    var charset = Vector<u8>.create();
+    if (typed) {
+        decodeParam(media.params, "charset", mut charset)?;
+    }
+    var encoding = Vector<u8>.create();
+    match (headerValue(header, "Content-Transfer-Encoding")) {
+        Some(v) => {
+            var lexer = Lexer.of(v);
+            lexer.skipSpace();
+            let s = lexer.token();
+            encoding.extend(v[s..lexer.at])?;
+        }
+        null => {}
+    }
+    // Tags make up much of an HTML part: read twice the cap of it, then drop them.
+    var budget = limit;
+    if (html) {
+        budget = if (limit > 0x3fffffffffffffff) limit else limit * 2;
+    }
+    var raw = Vector<u8>.create();
+    let whole = decodeTransfer(encoding.view(), body, budget, mut raw)?;
+    var text = Vector<u8>.create();
+    convertToUtf8(charset.view(), raw.view(), mut text)?;
+    var fits = false;
+    if (html) {
+        var plain = Vector<u8>.create();
+        appendHtmlText(text.view(), mut plain)?;
+        fits = appendCapped(plain.view(), limit, out)?;
+    } else {
+        fits = appendCapped(text.view(), limit, out)?;
+    }
+    return Ok(if (fits && whole) PartText.Whole else PartText.Cut);
+}
+
+/// `appendPartText` for part `part` of the message `message` (the bytes `meta` describes), HTML stripped. A part that
+/// is not a leaf, or a message shorter than `meta` says, is `Skipped`.
+public fn appendLeafText(
+    message: Slice<u8>,
+    meta: borrow MessageMeta,
+    part: usize,
+    limit: usize,
+    out: borrow mut Vector<u8>,
+) -> Result<PartText, AllocError> {
+    if (part >= meta.parts.length || (message.length as u64) < meta.size) {
+        return Ok(PartText.Skipped);
+    }
+    let p = meta.parts[part];
+    if (p.kind != PART_LEAF) {
+        return Ok(PartText.Skipped);
+    }
+    let header = message[truncate<usize>(p.headerStart)..truncate<usize>(p.bodyStart)];
+    let body = message[truncate<usize>(p.bodyStart)..truncate<usize>(p.bodyEnd)];
+    return appendPartText(header, body, true, limit, out);
+}
+
+/// Appends the decoded value (`decodeHeader`: RFC 2047 words to UTF-8, unfolded) of each field called `name` (any
+/// case) in the header block `block`, a line break between two, and gives how many there were. For SEARCH FROM, TO,
+/// CC, BCC, SUBJECT and HEADER.
+public fn appendHeaderValues(
+    block: Slice<u8>,
+    name: StringView,
+    out: borrow mut Vector<u8>,
+) -> Result<usize, AllocError> {
+    var cursor = HeaderCursor.start();
+    var count: usize = 0;
+    loop {
+        let field = match (cursor.next(block)) {
+            Some(f) => f,
+            null => { return Ok(count); }
+        };
+        if (block[field.nameStart..field.nameEnd].equalsIgnoreAsciiCase(name.bytes())) {
+            if (count > 0) {
+                out.pushBE(0x0au8)?;
+            }
+            decodeHeader(block[field.valueStart..field.valueEnd], out)?;
+            count += 1;
+        }
+    }
+}
+
+/// Appends every field of the header block `block` as `Name: decoded value` and a line break, for SEARCH TEXT.
+public fn appendHeaderText(block: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    var cursor = HeaderCursor.start();
+    loop {
+        let field = match (cursor.next(block)) {
+            Some(f) => f,
+            null => { return Ok(); }
+        };
+        appendUtf8Lossy(block[field.nameStart..field.nameEnd], out)?;
+        out.extend(": ".bytes())?;
+        decodeHeader(block[field.valueStart..field.valueEnd], out)?;
+        out.pushBE(0x0au8)?;
+    }
+}
+
+/// Appends the searchable text of the message `message` (the bytes `meta` describes), and gives whether all of it
+/// fit in `limit` bytes:
+/// - with `withHeader` (SEARCH TEXT), the message's header first, as `appendHeaderText` gives it;
+/// - each leaf part with a text/* type, in order, as `appendPartText` gives it (HTML stripped), then a line break;
+/// - for each embedded message (message/rfc822 and message/global, at any depth), its header as `appendHeaderText`
+///   gives it (Subject, From, To and the rest, decoded), then its parts. Its header is part of the outer message's
+///   body, so BODY finds an attached message's subject, as Dovecot does.
+/// Parts' MIME headers (a part's own Content-Type and the like) are not included. A message shorter than `meta` says
+/// gives nothing.
+public fn appendSearchText(
+    message: Slice<u8>,
+    meta: borrow MessageMeta,
+    withHeader: bool,
+    limit: usize,
+    out: borrow mut Vector<u8>,
+) -> Result<bool, AllocError> {
+    if ((message.length as u64) < meta.size) {
+        return Ok(true);
+    }
+    let start = out.length;
+    var scratch = Vector<u8>.create();
+    for (i in 0..meta.parts.length) {
+        let p = meta.parts[i];
+        let header = message[truncate<usize>(p.headerStart)..truncate<usize>(p.bodyStart)];
+        if (p.isMessage && (i > 0 || withHeader)) {
+            scratch.clear();
+            appendHeaderText(header, mut scratch)?;
+            if (!appendCapped(scratch.view(), limit - (out.length - start), out)?) {
+                return Ok(false);
+            }
+        }
+        if (p.kind != PART_LEAF) {
+            continue;
+        }
+        let body = message[truncate<usize>(p.bodyStart)..truncate<usize>(p.bodyEnd)];
+        match (appendPartText(header, body, true, limit - (out.length - start), out)?) {
+            PartText.Skipped => {}
+            PartText.Cut => { return Ok(false); }
+            PartText.Whole => {
+                if (out.length - start < limit) {
+                    out.pushBE(0x0au8)?;
+                }
+            }
+        }
+    }
+    return Ok(true);
+}
+
+/// Appends code point `c` as UTF-8; U+FFFD for a surrogate, zero or anything past U+10FFFF.
+fn appendCodePoint(c: u32, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    if (c == 0 || c > 0x10ffff || (c >= 0xd800 && c <= 0xdfff)) {
+        return out.extend(REPLACEMENT.bytes());
+    }
+    if (c < 0x80) {
+        return out.pushBE(truncate<u8>(c));
+    }
+    if (c < 0x800) {
+        out.pushBE(0xc0u8 | truncate<u8>(c >> 6))?;
+        return out.pushBE(0x80u8 | truncate<u8>(c & 0x3f));
+    }
+    if (c < 0x10000) {
+        out.pushBE(0xe0u8 | truncate<u8>(c >> 12))?;
+        out.pushBE(0x80u8 | truncate<u8>((c >> 6) & 0x3f))?;
+        return out.pushBE(0x80u8 | truncate<u8>(c & 0x3f));
+    }
+    out.pushBE(0xf0u8 | truncate<u8>(c >> 18))?;
+    out.pushBE(0x80u8 | truncate<u8>((c >> 12) & 0x3f))?;
+    out.pushBE(0x80u8 | truncate<u8>((c >> 6) & 0x3f))?;
+    return out.pushBE(0x80u8 | truncate<u8>(c & 0x3f));
+}
+
+/// The entity at `at` in `html` (on its `&`) decoded into `out`: its length, or 0 when it is not one we know (and
+/// nothing was appended).
+fn htmlEntity(html: Slice<u8>, at: usize, out: borrow mut Vector<u8>) -> Result<usize, AllocError> {
+    var semi = at + 1;
+    while (semi < html.length && semi < at + 12 && html[semi] != 0x3b) {
+        semi += 1;
+    }
+    if (semi >= html.length || html[semi] != 0x3b) {
+        return Ok(0);
+    }
+    let name = html[at + 1..semi];
+    let length = semi + 1 - at;
+    if (name.length > 1 && name[0] == 0x23) {
+        var value: u32 = 0;
+        var any = false;
+        if (name[1] == 0x78 || name[1] == 0x58) {
+            for (c in name[2..]) {
+                let h = hexValue(c);
+                if (h >= 16) {
+                    return Ok(0);
+                }
+                value = if (value > 0x10ffff) value else (value << 4) | (h as u32);
+                any = true;
+            }
+        } else {
+            for (c in name[1..]) {
+                if (c < 0x30 || c > 0x39) {
+                    return Ok(0);
+                }
+                value = if (value > 0x10ffff) value else value * 10 + ((c - 0x30) as u32);
+                any = true;
+            }
+        }
+        if (!any) {
+            return Ok(0);
+        }
+        appendCodePoint(value, out)?;
+        return Ok(length);
+    }
+    if (name.equalsIgnoreAsciiCase("amp".bytes())) {
+        out.pushBE(0x26u8)?;
+    } else if (name.equalsIgnoreAsciiCase("lt".bytes())) {
+        out.pushBE(0x3cu8)?;
+    } else if (name.equalsIgnoreAsciiCase("gt".bytes())) {
+        out.pushBE(0x3eu8)?;
+    } else if (name.equalsIgnoreAsciiCase("quot".bytes())) {
+        out.pushBE(0x22u8)?;
+    } else if (name.equalsIgnoreAsciiCase("apos".bytes())) {
+        out.pushBE(0x27u8)?;
+    } else if (name.equalsIgnoreAsciiCase("nbsp".bytes())) {
+        out.pushBE(0x20u8)?;
+    } else {
+        return Ok(0);
+    }
+    return Ok(length);
+}
+
+/// The tags that end a run of text (a line break, a paragraph, a cell): dropping one leaves a space, so the words
+/// either side stay apart. Other tags (`b`, `span`, `a`, …) leave nothing.
+const BREAK_TAGS: StringView = "br p div tr td th li ul ol dl dt dd table h1 h2 h3 h4 h5 h6 hr blockquote pre title";
+
+fn isBreakTag(name: Slice<u8>) -> bool {
+    let list = BREAK_TAGS;
+    for (word in list.split(" ")) {
+        if (name.equalsIgnoreAsciiCase(word.bytes())) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn isAsciiLetter(c: u8) -> bool => (c >= 0x41 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a);
+
+/// Where `</name` (any case) next starts in `html` from `at`, or `html.length`.
+fn closingTag(html: Slice<u8>, at: usize, name: StringView) -> usize {
+    let n = name.bytes();
+    var i = at;
+    while (i + 2 + n.length <= html.length) {
+        if (html[i] == 0x3c && html[i + 1] == 0x2f && html[i + 2..i + 2 + n.length].equalsIgnoreAsciiCase(n)) {
+            return i;
+        }
+        i += 1;
+    }
+    return html.length;
+}
+
+/// Appends the text of UTF-8 `html`, crudely, as most IMAP servers search it:
+/// - tags (`<…>`, from a `<` followed by a letter, `/`, `!` or `?`) are dropped; a block tag (`BREAK_TAGS`) leaves
+///   a space; a `<` followed by anything else is text;
+/// - comments (`<!-- … -->`) and the contents of `<script>` and `<style>` are dropped;
+/// - `&amp; &lt; &gt; &quot; &apos; &nbsp;` and numeric `&#NN;` and `&#xHH;` are decoded (`&nbsp;` to a plain
+///   space, a bad code point to U+FFFD); any other `&` is text.
+public fn appendHtmlText(html: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    var at: usize = 0;
+    while (at < html.length) {
+        let c = html[at];
+        if (c == 0x26) {
+            let n = htmlEntity(html, at, out)?;
+            if (n > 0) {
+                at += n;
+                continue;
+            }
+            out.pushBE(c)?;
+            at += 1;
+            continue;
+        }
+        if (c != 0x3c || at + 1 >= html.length) {
+            out.pushBE(c)?;
+            at += 1;
+            continue;
+        }
+        let next = html[at + 1];
+        if (!isAsciiLetter(next) && next != 0x2f && next != 0x21 && next != 0x3f) {
+            out.pushBE(c)?;
+            at += 1;
+            continue;
+        }
+        if (html[at..].startsWith("<!--".bytes())) {
+            var j = at + 4;
+            while (j + 3 <= html.length && !html[j..j + 3].startsWith("-->".bytes())) {
+                j += 1;
+            }
+            at = if (j + 3 <= html.length) j + 3 else html.length;
+            continue;
+        }
+        let nameStart = if (next == 0x2f) at + 2 else at + 1;
+        var nameEnd = nameStart;
+        while (nameEnd < html.length && (isAsciiLetter(html[nameEnd]) || (html[nameEnd] >= 0x30 && html[nameEnd] <=
+            0x39))) {
+            nameEnd += 1;
+        }
+        let name = html[nameStart..nameEnd];
+        var end = match (html[at..].indexOfByte(0x3e)) {
+            Some(i) => at + i + 1,
+            null => html.length,
+        };
+        if (next != 0x2f && name.equalsIgnoreAsciiCase("script".bytes())) {
+            end = closingTag(html, end, "script");
+        } else if (next != 0x2f && name.equalsIgnoreAsciiCase("style".bytes())) {
+            end = closingTag(html, end, "style");
+        } else if (isBreakTag(name) && out.length > 0 && !isSpace(out[out.length - 1])) {
+            out.pushBE(0x20u8)?;
+        }
+        at = end;
+    }
+    return Ok();
+}
+
+/// The byte at `i` of UTF-8 `text`, folded: A–Z to a–z, and the Latin-1 capitals U+00C0–U+00DE (but U+00D7 ×) to
+/// their small letters, by their second byte after a 0xC3.
+fn foldedAt(text: Slice<u8>, i: usize) -> u8 {
+    let c = text[i];
+    if (c >= 0x41 && c <= 0x5a) {
+        return c + 0x20;
+    }
+    if (c >= 0x80 && c <= 0x9e && c != 0x97 && i > 0 && text[i - 1] == 0xc3) {
+        return c + 0x20;
+    }
+    return c;
+}
+
+/// Whether UTF-8 `needle` occurs in UTF-8 `haystack`, ignoring case as SEARCH does: ASCII letters, and the Latin-1
+/// letters À–Þ against à–þ (so `ÉTÉ` finds `été`). Other scripts' cases, ß, ÿ/Ÿ, accents and Unicode normalisation
+/// are not folded: `Ελλάδα` does not find `ΕΛΛΆΔΑ`, nor `e` find `é`. An empty needle is found everywhere.
+public fn containsFolded(haystack: Slice<u8>, needle: Slice<u8>) -> bool {
+    if (needle.length == 0) {
+        return true;
+    }
+    if (needle.length > haystack.length) {
+        return false;
+    }
+    let first = foldedAt(needle, 0);
+    for (i in 0..haystack.length - needle.length + 1) {
+        if (foldedAt(haystack, i) != first) {
+            continue;
+        }
+        var j: usize = 1;
+        while (j < needle.length && foldedAt(haystack, i + j) == foldedAt(needle, j)) {
+            j += 1;
+        }
+        if (j == needle.length) {
+            return true;
+        }
+    }
+    return false;
+}

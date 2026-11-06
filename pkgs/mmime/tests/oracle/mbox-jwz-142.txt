@@ -1,0 +1,12 @@
+size 119014
+envelope ("8 Dec 1991 09:11 (Sunday)" "RFC-XXXX" (("Bob Kummerfeld" NIL "bob" "cs.su.oz.au")) (("Bob Kummerfeld" NIL "bob" "cs.su.oz.au")) (("Bob Kummerfeld" NIL "bob" "cs.su.oz.au")) ((NIL NIL "nsb" "thumper.bellcore.com")) NIL NIL NIL "<9112072214.AA26057@thumper.bellcore.com>")
+bodystructure (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 982 19 NIL NIL NIL NIL) ("image" "pgm" NIL NIL NIL "base64" 117312 NIL NIL NIL NIL) "mixed" ("boundary" "qwertyuiop123") NIL NIL NIL)
+body (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 982 19) ("image" "pgm" NIL NIL NIL "base64" 117312) "mixed")
+section HEADER 567 396a22cdd1d132dfc49d9ff12f3f8d2a114ea4bce3519be61004a93f994c3a81
+section TEXT 118447 c3aabc2b863ac92f839048eab82727a7b8f03f2a72e7b156fb78ebd3fc33b32b
+section HEADER.FIELDS 235 fca20a42487dd857b9d0a2a2a10f7f360dca138198ed375193e12a0ea6bd7e03
+section HEADER.FIELDS.NOT 334 60e66908de877a4d41efb2087c8e4dcf7d22bc10758c3fe09a66303ca45bb199
+section 1 982 ed4d7dc5296f99523acd6376227f21faa7d22a1b5f797b9a3b33243d6a53b98a
+section 1.MIME 29 d196504d9ca2212f409776af58d2fd6118a241226b64e9620c611beb55f001b2
+section 2 117312 82ba872d04374faa60e21a551aa4f2e1a3e39cbf76bb2d96cd8321a024dfe7e9
+section 2.MIME 63 f8f5bf0c2d4eb5a1902354aabf720523f2bb74833a8a10273333aa633ed0582b

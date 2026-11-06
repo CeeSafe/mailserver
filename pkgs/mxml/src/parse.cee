@@ -1,0 +1,495 @@
+// The XML 1.0 reader (with Namespaces in XML 1.0): the input must be UTF-8 and well formed; prefixes resolve to
+// namespaces as they are declared; the five predefined entities and character references are decoded; comments and
+// processing instructions are skipped, CDATA is text, and a DOCTYPE is refused.
+
+const XML_NAMESPACE: StringView = "http://www.w3.org/XML/1998/namespace";
+
+/// A prefix in scope: its name (in `XmlReader.names`), its namespace (in the document's), and the depth it was
+/// declared at.
+struct XmlBinding {
+    prefix: XmlSpan;
+    uri: XmlSpan;
+    depth: usize;
+}
+
+/// An attribute of the start tag being read: its qualified name in the input, its decoded value in `values`.
+struct RawAttribute {
+    name: XmlSpan;
+    value: XmlSpan;
+}
+
+/// Reads XML text into an `XmlDocument`.
+public fn parseXml(text: Slice<u8>) -> Result<XmlDocument, XmlError> {
+    match (StringView.fromUtf8(text)) {
+        Some(_) => {}
+        null => { return Err(XmlError.Malformed); }
+    }
+    var doc = match (XmlDocument.create()) {
+        Ok(d) => d,
+        Err(_) => { return Err(XmlError.OutOfMemory); }
+    };
+    var reader = XmlReader {
+        at: 0,
+        names: Vector<u8>.create(),
+        bindings: Vector<XmlBinding>.create(),
+        tags: Vector<XmlSpan>.create(),
+        values: Vector<u8>.create(),
+        attributes: Vector<RawAttribute>.create(),
+        scratch: Vector<u8>.create(),
+    };
+    reader.read(text, mut doc)?;
+    return Ok(doc);
+}
+
+fn isSpace(c: u8) -> bool => c == 0x20 || c == 0x09 || c == 0x0a || c == 0x0d;
+
+/// A byte that ends a name.
+fn endsName(c: u8) -> bool =>
+    isSpace(c) || c == 0x2f || c == 0x3e || c == 0x3d || c == 0x3c || c == 0x22 || c == 0x27 || c == 0x26;
+
+fn startsWith(text: Slice<u8>, at: usize, prefix: StringView) -> bool {
+    let p = prefix.bytes();
+    return at + p.length <= text.length && text[at..(at + p.length)] == p;
+}
+
+fn indexFrom(text: Slice<u8>, at: usize, needle: StringView) -> usize? {
+    let n = needle.bytes();
+    var i = at;
+    while (i + n.length <= text.length) {
+        if (text[i..(i + n.length)] == n) {
+            return i;
+        }
+        i += 1;
+    }
+    return null;
+}
+
+fn appendUtf8(out: borrow mut Vector<u8>, cp: u32) -> Result<void, AllocError> {
+    if (cp < 0x80) {
+        out.push(truncate<u8>(cp))?;
+    } else if (cp < 0x800) {
+        out.push(truncate<u8>(0xc0 | (cp >> 6)))?;
+        out.push(truncate<u8>(0x80 | (cp & 0x3f)))?;
+    } else if (cp < 0x10000) {
+        out.push(truncate<u8>(0xe0 | (cp >> 12)))?;
+        out.push(truncate<u8>(0x80 | ((cp >> 6) & 0x3f)))?;
+        out.push(truncate<u8>(0x80 | (cp & 0x3f)))?;
+    } else {
+        out.push(truncate<u8>(0xf0 | (cp >> 18)))?;
+        out.push(truncate<u8>(0x80 | ((cp >> 12) & 0x3f)))?;
+        out.push(truncate<u8>(0x80 | ((cp >> 6) & 0x3f)))?;
+        out.push(truncate<u8>(0x80 | (cp & 0x3f)))?;
+    }
+    return Ok();
+}
+
+fn hexValue(c: u8) -> u32? {
+    if (c >= 0x30 && c <= 0x39) {
+        return (c - 0x30) as u32;
+    }
+    if (c >= 0x61 && c <= 0x66) {
+        return (c - 0x61 + 10) as u32;
+    }
+    if (c >= 0x41 && c <= 0x46) {
+        return (c - 0x41 + 10) as u32;
+    }
+    return null;
+}
+
+/// Decodes `raw` (text or an attribute value, with entity and character references) onto `out`.
+fn decodeInto(raw: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, XmlError> {
+    var i: usize = 0;
+    while (i < raw.length) {
+        let c = raw[i];
+        if (c == 0x3c) {
+            return Err(XmlError.Malformed);
+        }
+        if (c != 0x26) {
+            oomXml(out.push(c))?;
+            i += 1;
+            continue;
+        }
+        var semi = i + 1;
+        while (semi < raw.length && raw[semi] != 0x3b) {
+            semi += 1;
+        }
+        if (semi >= raw.length || semi - i > 12) {
+            return Err(XmlError.Malformed);
+        }
+        let name = raw[(i + 1)..semi];
+        if (name == "lt".bytes()) {
+            oomXml(out.push(0x3c))?;
+        } else if (name == "gt".bytes()) {
+            oomXml(out.push(0x3e))?;
+        } else if (name == "amp".bytes()) {
+            oomXml(out.push(0x26))?;
+        } else if (name == "quot".bytes()) {
+            oomXml(out.push(0x22))?;
+        } else if (name == "apos".bytes()) {
+            oomXml(out.push(0x27))?;
+        } else if (name.length >= 2 && name[0] == 0x23) {
+            var cp: u32 = 0;
+            let hex = name[1] == 0x78;
+            let digits = if (hex) name[2..] else name[1..];
+            if (digits.length == 0) {
+                return Err(XmlError.Malformed);
+            }
+            for (d in digits) {
+                let v = if (hex) hexValue(d) else if (d >= 0x30 && d <= 0x39) (d - 0x30) as u32 else null;
+                match (v) {
+                    Some(x) => {
+                        cp = cp * (if (hex) 16u32 else 10u32) + x;
+                        if (cp > 0x10ffff) {
+                            return Err(XmlError.Malformed);
+                        }
+                    }
+                    null => { return Err(XmlError.Malformed); }
+                }
+            }
+            // Char (XML 1.0 §2.2): no NUL or other C0 controls but TAB, LF and CR; no surrogates.
+            if ((cp < 0x20 && cp != 0x09 && cp != 0x0a && cp != 0x0d) || (cp >= 0xd800 && cp <= 0xdfff) || cp == 0xfffe || cp == 0xffff) {
+                return Err(XmlError.Malformed);
+            }
+            match (appendUtf8(out, cp)) {
+                Ok() => {}
+                Err(_) => { return Err(XmlError.OutOfMemory); }
+            }
+        } else {
+            return Err(XmlError.Malformed);
+        }
+        i = semi + 1;
+    }
+    return Ok();
+}
+
+struct XmlReader {
+    at: usize;
+    /// The prefixes in scope, and the qualified names of the open elements.
+    names: Vector<u8>;
+    bindings: Vector<XmlBinding>;
+    tags: Vector<XmlSpan>;
+    /// The current start tag's attribute values, decoded.
+    values: Vector<u8>;
+    attributes: Vector<RawAttribute>;
+    scratch: Vector<u8>;
+
+    fn read(borrow mut this, text: Slice<u8>, doc: borrow mut XmlDocument) -> Result<void, XmlError> {
+        // A byte order mark.
+        if (startsWith(text, 0, "\u{FEFF}")) {
+            this.at = 3;
+        }
+        var seenRoot = false;
+        loop {
+            this.skipSpace(text);
+            if (this.at >= text.length) {
+                break;
+            }
+            if (text[this.at] != 0x3c) {
+                return Err(XmlError.Malformed); // text outside the root
+            }
+            if (this.skipMarkup(text)?) {
+                continue;
+            }
+            if (seenRoot || startsWith(text, this.at, "</")) {
+                return Err(XmlError.Malformed);
+            }
+            this.element(text, doc)?;
+            seenRoot = true;
+        }
+        if (!seenRoot) {
+            return Err(XmlError.Malformed);
+        }
+        return doc.finish();
+    }
+
+    fn skipSpace(borrow mut this, text: Slice<u8>) {
+        while (this.at < text.length && isSpace(text[this.at])) {
+            this.at += 1;
+        }
+    }
+
+    /// Skips a comment, processing instruction or the XML declaration at `at` (a `<`); true if it was one. A
+    /// DOCTYPE is refused.
+    fn skipMarkup(borrow mut this, text: Slice<u8>) -> Result<bool, XmlError> {
+        if (startsWith(text, this.at, "<!--")) {
+            match (indexFrom(text, this.at + 4, "-->")) {
+                Some(e) => {
+                    this.at = e + 3;
+                    return Ok(true);
+                }
+                null => { return Err(XmlError.Malformed); }
+            }
+        }
+        if (startsWith(text, this.at, "<?")) {
+            match (indexFrom(text, this.at + 2, "?>")) {
+                Some(e) => {
+                    this.at = e + 2;
+                    return Ok(true);
+                }
+                null => { return Err(XmlError.Malformed); }
+            }
+        }
+        if (startsWith(text, this.at, "<!DOCTYPE")) {
+            return Err(XmlError.Unsupported);
+        }
+        return Ok(false);
+    }
+
+    fn name(borrow mut this, text: Slice<u8>) -> Result<XmlSpan, XmlError> {
+        let start = this.at;
+        while (this.at < text.length && !endsName(text[this.at])) {
+            this.at += 1;
+        }
+        if (this.at == start) {
+            return Err(XmlError.Malformed);
+        }
+        return Ok(XmlSpan { start: start, end: this.at });
+    }
+
+    /// The namespace bound to `prefix` (empty: the default namespace), into `doc`'s strings via `scratch`.
+    fn resolve(borrow this, prefix: Slice<u8>) -> XmlSpan? {
+        var i = this.bindings.length;
+        while (i > 0) {
+            i -= 1;
+            let b = this.bindings[i];
+            if (this.names[b.prefix.start..b.prefix.end] == prefix) {
+                return b.uri;
+            }
+        }
+        return null;
+    }
+
+    fn bind(borrow mut this, prefix: Slice<u8>, uri: Slice<u8>) -> Result<void, XmlError> {
+        let p = this.names.length;
+        oomXml(this.names.extend(prefix))?;
+        let pe = this.names.length;
+        oomXml(this.names.extend(uri))?;
+        oomXml(this.bindings.push(XmlBinding {
+            prefix: XmlSpan { start: p, end: pe },
+            uri: XmlSpan { start: pe, end: this.names.length },
+            depth: this.tags.length,
+        }))?;
+        return Ok();
+    }
+
+    /// Splits a qualified name into its prefix (possibly empty) and local part.
+    fn splitName(text: Slice<u8>, name: XmlSpan) -> Result<[usize; 2], XmlError> {
+        for (i in name.start..name.end) {
+            if (text[i] == 0x3a) {
+                if (i == name.start || i + 1 == name.end) {
+                    return Err(XmlError.Malformed);
+                }
+                return Ok([i, i + 1]);
+            }
+        }
+        return Ok([name.start, name.start]);
+    }
+
+    /// The namespace of a qualified name: its prefix's, or for no prefix the default namespace (elements) or none
+    /// (attributes). Copied into `scratch`, which it replaces.
+    fn spaceFor(borrow mut this, text: Slice<u8>, name: XmlSpan, element: bool) -> Result<XmlSpan, XmlError> {
+        let parts = XmlReader.splitName(text, name)?;
+        if (parts[0] == name.start) {
+            if (!element) {
+                return Ok(XmlSpan { start: 0, end: 0 });
+            }
+            return Ok(this.resolve(text[0..0]) ?? XmlSpan { start: 0, end: 0 });
+        }
+        let prefix = text[name.start..parts[0]];
+        if (prefix == "xml".bytes()) {
+            let start = this.names.length;
+            oomXml(this.names.extend(XML_NAMESPACE.bytes()))?;
+            return Ok(XmlSpan { start: start, end: this.names.length });
+        }
+        return match (this.resolve(prefix)) {
+            Some(uri) => Ok(uri),
+            null => Err(XmlError.Malformed),
+        };
+    }
+
+    /// An element at `at` (a `<` that starts a start tag), with its content and end tag.
+    fn element(borrow mut this, text: Slice<u8>, doc: borrow mut XmlDocument) -> Result<void, XmlError> {
+        let depthAtStart = this.tags.length;
+        let selfClosed = this.startTag(text, doc)?;
+        if (selfClosed) {
+            this.closed(doc)?;
+            return Ok();
+        }
+        // Content, until the end tag of this element; nested elements are read here too, without recursion.
+        loop {
+            if (this.at >= text.length) {
+                return Err(XmlError.Malformed);
+            }
+            if (text[this.at] != 0x3c) {
+                let start = this.at;
+                while (this.at < text.length && text[this.at] != 0x3c) {
+                    this.at += 1;
+                }
+                this.scratch.clear();
+                decodeInto(text[start..this.at], mut this.scratch)?;
+                if (indexFrom(text[start..this.at], 0, "]]>") != null) {
+                    return Err(XmlError.Malformed);
+                }
+                doc.addText(this.scratch.view())?;
+                continue;
+            }
+            if (startsWith(text, this.at, "<![CDATA[")) {
+                match (indexFrom(text, this.at + 9, "]]>")) {
+                    Some(e) => {
+                        doc.addText(text[(this.at + 9)..e])?;
+                        this.at = e + 3;
+                    }
+                    null => { return Err(XmlError.Malformed); }
+                }
+                continue;
+            }
+            if (this.skipMarkup(text)?) {
+                continue;
+            }
+            if (startsWith(text, this.at, "</")) {
+                this.at += 2;
+                let name = this.name(text)?;
+                this.skipSpace(text);
+                if (this.at >= text.length || text[this.at] != 0x3e) {
+                    return Err(XmlError.Malformed);
+                }
+                this.at += 1;
+                let open = this.tags[this.tags.length - 1];
+                if (text[name.start..name.end] != text[open.start..open.end]) {
+                    return Err(XmlError.Malformed);
+                }
+                this.closed(doc)?;
+                if (this.tags.length == depthAtStart) {
+                    return Ok();
+                }
+                continue;
+            }
+            if (startsWith(text, this.at, "<!")) {
+                return Err(XmlError.Malformed);
+            }
+            if (this.startTag(text, doc)?) {
+                this.closed(doc)?;
+            }
+        }
+    }
+
+    /// Ends the innermost element: its scope's bindings go.
+    fn closed(borrow mut this, doc: borrow mut XmlDocument) -> Result<void, XmlError> {
+        match (this.tags.pop()) {
+            Some(_) => {}
+            null => { return Err(XmlError.Malformed); }
+        }
+        let depth = this.tags.length;
+        while (this.bindings.length > 0 && this.bindings[this.bindings.length - 1].depth > depth) {
+            match (this.bindings.pop()) {
+                Some(_) => {}
+                null => {}
+            }
+        }
+        return doc.closeElement();
+    }
+
+    /// A start tag at `at`; opens its element in `doc` with its attributes. True when it was an empty-element tag.
+    fn startTag(borrow mut this, text: Slice<u8>, doc: borrow mut XmlDocument) -> Result<bool, XmlError> {
+        this.at += 1;
+        let name = this.name(text)?;
+        this.values.clear();
+        this.attributes.clear();
+        var selfClosed = false;
+        loop {
+            let before = this.at;
+            this.skipSpace(text);
+            if (this.at >= text.length) {
+                return Err(XmlError.Malformed);
+            }
+            let c = text[this.at];
+            if (c == 0x3e) {
+                this.at += 1;
+                break;
+            }
+            if (c == 0x2f) {
+                if (this.at + 1 >= text.length || text[this.at + 1] != 0x3e) {
+                    return Err(XmlError.Malformed);
+                }
+                this.at += 2;
+                selfClosed = true;
+                break;
+            }
+            if (this.at == before) {
+                return Err(XmlError.Malformed); // attributes are separated by white space
+            }
+            let attr = this.name(text)?;
+            this.skipSpace(text);
+            if (this.at >= text.length || text[this.at] != 0x3d) {
+                return Err(XmlError.Malformed);
+            }
+            this.at += 1;
+            this.skipSpace(text);
+            if (this.at >= text.length || (text[this.at] != 0x22 && text[this.at] != 0x27)) {
+                return Err(XmlError.Malformed);
+            }
+            let quote = text[this.at];
+            this.at += 1;
+            let start = this.at;
+            while (this.at < text.length && text[this.at] != quote) {
+                this.at += 1;
+            }
+            if (this.at >= text.length) {
+                return Err(XmlError.Malformed);
+            }
+            let valueStart = this.values.length;
+            decodeInto(text[start..this.at], mut this.values)?;
+            this.at += 1;
+            oomXml(this.attributes.push(RawAttribute {
+                name: attr,
+                value: XmlSpan { start: valueStart, end: this.values.length },
+            }))?;
+        }
+        // The tag is open from here: declarations made in it are in scope for it.
+        oomXml(this.tags.push(name))?;
+        for (i in 0..this.attributes.length) {
+            let a = this.attributes[i];
+            let qname = text[a.name.start..a.name.end];
+            if (qname == "xmlns".bytes()) {
+                let v = a.value;
+                this.scratch.clear();
+                oomXml(this.scratch.extend(this.values[v.start..v.end]))?;
+                this.bindPrefixed(text[0..0])?;
+            } else if (qname.length > 6 && qname[0..6] == "xmlns:".bytes()) {
+                let v = a.value;
+                if (v.end == v.start) {
+                    return Err(XmlError.Malformed); // a prefix cannot be undeclared in XML 1.0
+                }
+                this.scratch.clear();
+                oomXml(this.scratch.extend(this.values[v.start..v.end]))?;
+                this.bindPrefixed(qname[6..])?;
+            }
+        }
+        let space = this.spaceFor(text, name, true)?;
+        let parts = XmlReader.splitName(text, name)?;
+        let local = text[parts[1]..name.end];
+        doc.openElement(this.names[space.start..space.end], local)?;
+        for (i in 0..this.attributes.length) {
+            let a = this.attributes[i];
+            let qname = text[a.name.start..a.name.end];
+            if (qname == "xmlns".bytes() || (qname.length > 6 && qname[0..6] == "xmlns:".bytes())) {
+                continue;
+            }
+            let aspace = this.spaceFor(text, a.name, false)?;
+            let aparts = XmlReader.splitName(text, a.name)?;
+            doc.addAttribute(
+                this.names[aspace.start..aspace.end],
+                text[aparts[1]..a.name.end],
+                this.values[a.value.start..a.value.end],
+            )?;
+        }
+        return Ok(selfClosed);
+    }
+
+    /// Binds `prefix` to the namespace in `scratch`.
+    fn bindPrefixed(borrow mut this, prefix: Slice<u8>) -> Result<void, XmlError> {
+        var uri = Vector<u8>.create();
+        oomXml(uri.extend(this.scratch.view()))?;
+        return this.bind(prefix, uri.view());
+    }
+}

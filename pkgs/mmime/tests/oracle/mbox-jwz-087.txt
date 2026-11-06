@@ -1,0 +1,10 @@
+size 2607
+envelope ("Tue, 25 Apr 1995 18:28:11 -0400" "Re: New Virus Alert! No" (("Jeffrey A. Stuart" NIL "ncoast!tdi3!tdi4!jstuart" "usenet.ins.cwru.edu")) (("IBM OS/2 Unedited Discussion List" NIL "OS2-L" "hearn.nic.surfnet.nl")) (("IBM OS/2 Unedited Discussion List" NIL "OS2-L" "hearn.nic.surfnet.nl")) (("IN% OS2-L@HEARN.nic.SURFnet.nl Multiple recipients of list OS2-L" NIL "MISSING_MAILBOX" "MISSING_DOMAIN") ("Multiple recipients of list OS2-L" NIL "OS2-L" "hearn.nic.surfnet.nl")) NIL NIL "Message from Al Marrin <batec08@NERVM.NERDC.UFL.EDU> of\"Tue, 25  Apr 1995 08:32:04 EDT.\"<199504251232.IAA20833@name.ufl.edu>" "<199504252230.SAA26982@tdi3.tridelta.com>")
+bodystructure ("application" "pgp" ("format" "mime" "x-action" "signclear" "x-originator" "22CDDBF5") NIL NIL "7bit" 1424 NIL NIL NIL NIL)
+body ("application" "pgp" ("format" "mime" "x-action" "signclear" "x-originator" "22CDDBF5") NIL NIL "7bit" 1424)
+section HEADER 1183 5cf00172d68c70e0992413f1efa308d9903b1eecfada892c3aabdc949c76dbaa
+section TEXT 1424 52b6d441dd38bc16a76ec3133a71ddd1445bd9cbfe7a73cfb061f762ff26bda9
+section HEADER.FIELDS 438 c495e2e0630d4bd4f48d0365630eea509251900ef65fa903d89604c592352191
+section HEADER.FIELDS.NOT 747 8e72c70198aeb2e79d462bba7287f5ca2012756868dd4792055f4a50898d2023
+section 1 1424 52b6d441dd38bc16a76ec3133a71ddd1445bd9cbfe7a73cfb061f762ff26bda9
+section 1.MIME 1183 5cf00172d68c70e0992413f1efa308d9903b1eecfada892c3aabdc949c76dbaa

@@ -1,0 +1,16 @@
+size 1177
+envelope ("Wed, 26 Apr 1995 07:50:09 EDT" "Re: Newsletters & Shows" (("Gary Bolstridge" NIL "gary" "garopa.npt.nuwc.navy.mil")) (("Internet Bonsai Club" NIL "BONSAI" "cms.cc.wayne.edu")) (("Gary Bolstridge" NIL "gary" "garopa.npt.nuwc.navy.mil")) NIL NIL NIL NIL "<BONSAI%95042607552288@CMS.CC.WAYNE.EDU>")
+bodystructure ("message" "rfc822" NIL NIL NIL "7bit" 604 (NIL NIL NIL NIL NIL NIL NIL NIL NIL NIL) ("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 542 14 NIL NIL NIL NIL) 17 NIL NIL NIL NIL)
+body ("message" "rfc822" NIL NIL NIL "7bit" 604 (NIL NIL NIL NIL NIL NIL NIL NIL NIL NIL) ("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 542 14) 17)
+section HEADER 573 b42c5d550ff4d39a421e58bd65ec6d0bfe05abf0dc6bfa90383044ae4ea692d3
+section TEXT 604 1ce3d1a34a6ce23b0dcc722bf230242b5a2fb4078aa41e8874372e37bda27bc7
+section HEADER.FIELDS 212 e4381c162ee9dc4aa0275a7a0a11cdfe787ac48e53cab99868ba12989ed58066
+section HEADER.FIELDS.NOT 363 c1790d4c60cab4b8aaecfdb1ba4b7ecc7cf15700cc3a66e078c308476a8fa98f
+section 1 604 1ce3d1a34a6ce23b0dcc722bf230242b5a2fb4078aa41e8874372e37bda27bc7
+section 1.MIME 573 b42c5d550ff4d39a421e58bd65ec6d0bfe05abf0dc6bfa90383044ae4ea692d3
+section 1.HEADER 62 26a77b305f5dfcd2068a1439cb42cc629f2a6f6fc240a97e263250fe9b52d927
+section 1.TEXT 542 7fb768f72e71455d292ccb64553d1bb858b069d459a43d48e470c2a2c26b71d7
+section 1.HEADER.FIELDS 44 84c291f8bd1bbe81783e83a3a894e64ce3adee034b398af76a20be478830cf50
+section 1.HEADER.FIELDS.NOT 20 c0c0c3733b7630b37a38bcffb2bb9ed4ca36cb08f1a70816adb745a1c0d9019f
+section 1.1 542 7fb768f72e71455d292ccb64553d1bb858b069d459a43d48e470c2a2c26b71d7
+section 1.1.MIME 62 26a77b305f5dfcd2068a1439cb42cc629f2a6f6fc240a97e263250fe9b52d927

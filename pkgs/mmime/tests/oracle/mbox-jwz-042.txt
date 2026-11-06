@@ -1,0 +1,22 @@
+size 56550
+envelope ("Sat, 6 Jun 92 06:21:22 JST" "MIME example in VIN" (("Yutaka Sato =?ISO-2022-JP?B?GyRAOjRGI0stGyhK?=" NIL "ysato" "etl.go.jp")) (("Yutaka Sato =?ISO-2022-JP?B?GyRAOjRGI0stGyhK?=" NIL "ysato" "etl.go.jp")) (("Yutaka Sato =?ISO-2022-JP?B?GyRAOjRGI0stGyhK?=" NIL "ysato" "etl.go.jp")) ((NIL NIL "nsb" "thumper.bellcore.com")) NIL NIL NIL "<9206052121.AA02633@etlibs.etl.go.jp>")
+bodystructure (("text" "richtext" ("charset" "us-ascii") NIL NIL "quoted-printable" 473 9 NIL NIL NIL NIL) ("image" "gif" NIL NIL NIL "base64" 24568 NIL NIL NIL NIL) ("text" "richtext" ("charset" "us-ascii") NIL NIL "quoted-printable" 458 10 NIL NIL NIL NIL) ("image" "gif" NIL NIL NIL "base64" 11368 NIL NIL NIL NIL) ("text" "richtext" ("charset" "us-ascii") NIL NIL "quoted-printable" 310 6 NIL NIL NIL NIL) ("image" "gif" NIL NIL NIL "base64" 16676 NIL NIL NIL NIL) ("text" "richtext" ("charset" "us-ascii") NIL NIL "quoted-printable" 675 15 NIL NIL NIL NIL) "mixed" ("boundary" "PART.BOUNDARY.8715.2229.etlibs.707775096.1") NIL NIL NIL)
+body (("text" "richtext" ("charset" "us-ascii") NIL NIL "quoted-printable" 473 9) ("image" "gif" NIL NIL NIL "base64" 24568) ("text" "richtext" ("charset" "us-ascii") NIL NIL "quoted-printable" 458 10) ("image" "gif" NIL NIL NIL "base64" 11368) ("text" "richtext" ("charset" "us-ascii") NIL NIL "quoted-printable" 310 6) ("image" "gif" NIL NIL NIL "base64" 16676) ("text" "richtext" ("charset" "us-ascii") NIL NIL "quoted-printable" 675 15) "mixed")
+section HEADER 949 94f98d1871f6a254aa5c5f6bb05dd067ef9909092014752bb2f0b84beab1313e
+section TEXT 55601 693b457e4c3c59654fc4fd886f649f2c5b1d35a22657f6df4e358b20a0fb826d
+section HEADER.FIELDS 307 a6cd36cf7c7f9c925a7164c46fa68a0b0ce48e51badd330169bb3a20bf372e2d
+section HEADER.FIELDS.NOT 644 507528e01919b26f7c1529ba637f4ed3293f28a0631e17bff8799efc224173be
+section 1 473 64eae60f88026f10cc79565da8ce529d63a1c53480dbeef693dc5bb68615df8c
+section 1.MIME 76 7712e776f2993a93b185dfb1c41705d43d20df049e3a88fcbbd6a81e4f5f5077
+section 2 24568 a633de23346fcf9d2a2c8293dc6a4032080a6a103ada5900b28c7907209fe7ce
+section 2.MIME 62 2fb27438953deef4ea13e4977cb5bb44153dc2999dd955baf517c25d5663d435
+section 3 458 46e4211edc93ebb653bb44bb73ab7d6d6f997c1f2f0f486402398a3ff132d2a1
+section 3.MIME 76 7712e776f2993a93b185dfb1c41705d43d20df049e3a88fcbbd6a81e4f5f5077
+section 4 11368 bd9d203f8fa10f454dcc542d549c123c43554b7dd41e329663eff7c430b86219
+section 4.MIME 62 2fb27438953deef4ea13e4977cb5bb44153dc2999dd955baf517c25d5663d435
+section 5 310 9af58602aae54c39c07a0b30eef8feaf64ad0d1df633bc0f89557f221c81facb
+section 5.MIME 76 7712e776f2993a93b185dfb1c41705d43d20df049e3a88fcbbd6a81e4f5f5077
+section 6 16676 26c41b1c814aab01b00fd21c5c45afe3089823b62103ba9ca1562930fa5e84a6
+section 6.MIME 62 2fb27438953deef4ea13e4977cb5bb44153dc2999dd955baf517c25d5663d435
+section 7 675 895ce9d04499e88b3629822620a15301b5082560ac68843bcb747a83fbe256d9
+section 7.MIME 76 7712e776f2993a93b185dfb1c41705d43d20df049e3a88fcbbd6a81e4f5f5077

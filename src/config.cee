@@ -1,0 +1,678 @@
+// The configuration file: a TOML subset (`[section]`, `key = "string"`, `key = 123`, `key = true`, `#` comments).
+//
+//     hostname = "mail.example.org"
+//     database = "postgres://mail:secret@127.0.0.1/mail"
+//     blobs = "/var/lib/mailserver/blobs"
+//     workers = 4
+//     [smtp]
+//     mx = "0.0.0.0:25"               # empty to disable
+//     submission = "0.0.0.0:587"
+//     submissions = "0.0.0.0:465"
+//     max_message_size = 52428800
+//     max_connections = 1000
+//     plaintext_auth = false
+//     [imap]
+//     imap = "127.0.0.1:143"          # STARTTLS; empty to disable
+//     imaps = "0.0.0.0:993"           # implicit TLS
+//     allow_plaintext_auth = false    # LOGIN before TLS (only behind a TLS-terminating proxy, or for tests)
+//     max_append_size = 52428800      # the largest APPEND, in bytes
+//     max_connections = 1000
+//     [http]
+//     http = "0.0.0.0:80"             # ACME challenges and autoconfig; empty to disable
+//     https = "0.0.0.0:443"           # as http, and MTA-STS policies (needs [tls])
+//     admin = "127.0.0.1:9184"        # the admin API, for the admin UI's server; never expose it
+//     proxied = "127.0.0.1:9185"      # plain HTTP for a TLS-terminating proxy: as https, with forwarded fields
+//                                     #   trusted, without the admin API; never expose it
+//     max_connections = 1000
+//     imap_port = 993                 # the ports autoconfig and autodiscover tell clients to use
+//     submission_port = 465
+//     advertise_exchange = true       # Outlook's autodiscover also names EWS (macOS Mail then sets up Exchange)
+//     [admin]
+//     jwt_secret = "at least 32 random characters"   # signs the admin UI's logins; env COSMOMAIL_JWT_SECRET wins
+//     token = ""                      # a static token for scripts (X-CosmoMail-Admin-Token); env COSMOMAIL_ADMIN_TOKEN
+//     token_hours = 24
+//     [tls]
+//     certificate = "/etc/mailserver/fullchain.pem"
+//     key = "/etc/mailserver/key.pem"
+//     reload_interval = 60            # seconds between checks for a renewed certificate in those files
+//     [acme]
+//     directory = "https://acme-v02.api.letsencrypt.org/directory"   # empty: no ACME; certificates are yours
+//     email = "postmaster@example.org"   # the account's contact; configuring a CA agrees to its terms
+//     account_key = "/var/lib/mailserver/acme-account.pem"   # made on first use
+//     names = "mail.example.org"      # the hosts to certify (default: hostname); [tls]'s files are written
+//     mta_sts_names = true            # and mta-sts.<domain> for each domain publishing an MTA-STS policy
+//     renew_days = 30                 # renew this long before expiry
+//     check_interval = 43200          # seconds between checks
+//     retry_interval = 3600           # seconds before trying again after a failure
+//     trust_file = ""                 # PEM roots for the CA besides the system's (a test CA)
+//     [import]                        # import-cosmomail: copy a CosmoMailServer database into this one
+//     source = "postgres://cosmomail:secret@127.0.0.1:5432/CosmoMail"
+//     s3_endpoint = "http://127.0.0.1:8100"   # where its message content is, when not in its database
+//     s3_bucket = "default"
+//     s3_region = "us-east-1"
+//     s3_access_key = "default"
+//     s3_secret_key = "default"
+//     [proxy]
+//     from = "127.0.0.1, 172.16.0.0/12"   # TCP proxies (CosmoProxy, HAProxy) whose SMTP and IMAP connections start
+//                                     # with a PROXY header (v1 or v2) giving the client's address; required from
+//                                     # them, never read from anyone else. Empty: no proxy.
+//     [dns]
+//     servers = "1.1.1.1, 9.9.9.9"   # default: /etc/resolv.conf's
+//     port = 53
+//     inbound_auth = true             # SPF, DKIM and DMARC on port 25
+//     [scan]
+//     clamd = "127.0.0.1:3310"        # empty: no virus scanning
+//     spamd = "127.0.0.1:783"         # empty: no spam scoring
+//     spam_junk_score = "5.0"
+//     spam_reject_score = "10.0"
+//     clamd_unavailable = "tempfail"  # or "accept": deliver unscanned while clamd is down
+//     max_scan_size = 26214400
+//     max_spam_size = 524288
+//     clamd_timeout = 30              # seconds
+//     spamd_timeout = 30
+//     [relay]
+//     workers = 8                     # parallel deliveries; 0 turns the relay off
+//     port = 25                       # the MX hosts' port (another only for tests)
+//     starttls = true                 # opportunistic STARTTLS
+//     tls_policy = "published"        # opportunistic, published (honour DANE and MTA-STS), or verified (TLS with a
+//                                     # valid certificate for every domain)
+//     tls_trust_file = ""             # PEM roots trusted besides the system's, for checked certificates
+//     mta_sts_port = 443              # where MTA-STS policies are fetched (another only for tests)
+//     retry = "300, 900, 1800, 3600, 7200, 14400, 28800, 57600, 86400"   # seconds; the last repeats
+//     max_age = 432000                # seconds in the queue before the rest bounces (5 days)
+//     connect_timeout = 30            # seconds
+//     command_timeout = 300
+//     delay_notice = 14400            # seconds undelivered before the sender is told once (0: never)
+//     suppress_days = 30              # an address that does not exist is refused for this long (0: never)
+//     breaker_threshold = 3           # a domain unreachable this many times in a row waits…
+//     breaker_seconds = 60            # …this long, doubling each time, up to an hour
+//     srs_secret = "long random text" # SRS for forwarded mail; empty: forwarded mail keeps its sender
+//     srs_domain = ""                 # the domain of SRS addresses (default: hostname)
+//     pool_size = 64                  # idle connections kept for reuse (0: a connection per message)
+//     pool_idle = 60                  # seconds an idle connection is kept
+
+import mscan.tenthsOf;
+
+@noncopy
+struct Config {
+    hostname: String;
+    database: String;
+    blobs: String;
+    workers: u32;
+    mx: String;
+    submission: String;
+    submissions: String;
+    maxMessageSize: u64;
+    maxConnections: u32;
+    plaintextAuth: bool;
+    imap: String;
+    imaps: String;
+    imapPlaintextAuth: bool;
+    maxAppendSize: u64;
+    imapMaxConnections: u32;
+    http: String;
+    https: String;
+    admin: String;
+    proxied: String;
+    httpMaxConnections: u32;
+    advertisedImapPort: u16;
+    advertisedSubmissionPort: u16;
+    advertiseExchange: bool;
+    certificate: String;
+    key: String;
+    tlsReloadInterval: u64;
+    jwtSecret: String;
+    adminToken: String;
+    tokenHours: i64;
+    acmeDirectory: String;
+    acmeEmail: String;
+    acmeAccountKey: String;
+    acmeNames: String;
+    acmeMtaStsNames: bool;
+    acmeRenewDays: i64;
+    acmeCheckInterval: u64;
+    acmeRetryInterval: u64;
+    acmeTrustFile: String;
+    poolSize: usize;
+    dnsServers: String;
+    proxyFrom: String;
+    importSource: String;
+    s3Endpoint: String;
+    s3Bucket: String;
+    s3Region: String;
+    s3AccessKey: String;
+    s3SecretKey: String;
+    dnsPort: u16;
+    inboundAuth: bool;
+    clamd: String;
+    spamd: String;
+    junkTenths: i64;
+    rejectTenths: i64;
+    acceptUnscanned: bool;
+    maxScanSize: u64;
+    maxSpamSize: u64;
+    clamdTimeout: u64;
+    spamdTimeout: u64;
+    relayWorkers: u32;
+    relayPort: u16;
+    relayStartTls: bool;
+    relayTlsPolicy: String;
+    relayTlsTrustFile: String;
+    relayStsPort: u16;
+    relayRetry: String;
+    relayMaxAge: i64;
+    relayConnectTimeout: u64;
+    relayCommandTimeout: u64;
+    relayDelayNotice: i64;
+    relaySuppressDays: i64;
+    relayBreakerThreshold: u32;
+    relayBreakerSeconds: i64;
+    srsSecret: String;
+    srsDomain: String;
+    relayPoolSize: usize;
+    relayPoolIdle: i64;
+}
+
+fn defaults() -> Config => Config {
+    hostname: String.create(),
+    database: String.create(),
+    blobs: String.create(),
+    workers: 0,
+    mx: String.create(),
+    submission: String.create(),
+    submissions: String.create(),
+    maxMessageSize: 50 * 1024 * 1024,
+    maxConnections: 1000,
+    plaintextAuth: false,
+    imap: String.create(),
+    imaps: String.create(),
+    imapPlaintextAuth: false,
+    maxAppendSize: 50 * 1024 * 1024,
+    imapMaxConnections: 1000,
+    http: String.create(),
+    https: String.create(),
+    admin: String.create(),
+    proxied: String.create(),
+    httpMaxConnections: 1000,
+    advertisedImapPort: 993,
+    advertisedSubmissionPort: 465,
+    advertiseExchange: true,
+    certificate: String.create(),
+    key: String.create(),
+    tlsReloadInterval: 60,
+    jwtSecret: String.create(),
+    adminToken: String.create(),
+    tokenHours: 24,
+    acmeDirectory: String.create(),
+    acmeEmail: String.create(),
+    acmeAccountKey: String.create(),
+    acmeNames: String.create(),
+    acmeMtaStsNames: true,
+    acmeRenewDays: 30,
+    acmeCheckInterval: 43200,
+    acmeRetryInterval: 3600,
+    acmeTrustFile: String.create(),
+    poolSize: 16,
+    dnsServers: String.create(),
+    proxyFrom: String.create(),
+    importSource: String.create(),
+    s3Endpoint: String.create(),
+    s3Bucket: String.create(),
+    s3Region: String.create(),
+    s3AccessKey: String.create(),
+    s3SecretKey: String.create(),
+    dnsPort: 53,
+    inboundAuth: true,
+    clamd: String.create(),
+    spamd: String.create(),
+    junkTenths: 50,
+    rejectTenths: 100,
+    acceptUnscanned: false,
+    maxScanSize: 25 * 1024 * 1024,
+    maxSpamSize: 512 * 1024,
+    clamdTimeout: 30,
+    spamdTimeout: 30,
+    relayWorkers: 8,
+    relayPort: 25,
+    relayStartTls: true,
+    relayTlsPolicy: String.create(),
+    relayTlsTrustFile: String.create(),
+    relayStsPort: 443,
+    relayRetry: String.create(),
+    relayMaxAge: 5 * 86400,
+    relayConnectTimeout: 30,
+    relayCommandTimeout: 300,
+    relayDelayNotice: 4 * 3600,
+    relaySuppressDays: 30,
+    relayBreakerThreshold: 3,
+    relayBreakerSeconds: 60,
+    srsSecret: String.create(),
+    srsDomain: String.create(),
+    relayPoolSize: 64,
+    relayPoolIdle: 60,
+};
+
+/// A configuration problem, with the line it is on (0 for the file as a whole).
+@noncopy
+struct ConfigError {
+    line: usize;
+    message: String;
+}
+
+fn fail(line: usize, message: StringView) -> ConfigError {
+    var text = String.create();
+    match (text.append(message)) {
+        Ok() => {}
+        Err(_) => {}
+    }
+    return ConfigError { line: line, message: text };
+}
+
+fn readConfig(text: StringView) -> Result<Config, ConfigError> {
+    var config = defaults();
+    var section = String.create();
+    var number: usize = 0;
+    for (raw in text.split("\n")) {
+        number += 1;
+        // Comments: a `#` outside quotes.
+        var end = raw.length;
+        var quoted = false;
+        let bytes = raw.bytes();
+        for (i in 0..bytes.length) {
+            if (bytes[i] == 0x22) {
+                quoted = !quoted;
+            } else if (bytes[i] == 0x23 && !quoted) {
+                end = i;
+                break;
+            }
+        }
+        let line = raw[0..end].trim();
+        if (line.length == 0) {
+            continue;
+        }
+        if (line.startsWith("[")) {
+            if (!line.endsWith("]")) {
+                return Err(fail(number, "a section header needs its closing ]"));
+            }
+            section.clear();
+            let name = line[1..line.length - 1].trim();
+            match (section.append(name)) {
+                Ok() => {}
+                Err(_) => { return Err(fail(number, "out of memory")); }
+            }
+            continue;
+        }
+        let pair = match (line.splitOnce("=")) {
+            Some(p) => p,
+            null => { return Err(fail(number, "expected key = value")); }
+        };
+        let key = pair.left.trim();
+        let value = pair.right.trim();
+        set(mut config, section.view(), key, value, number)?;
+    }
+    if (config.hostname.length == 0) {
+        return Err(fail(0, "hostname is required"));
+    }
+    if (config.database.length == 0) {
+        return Err(fail(0, "database is required"));
+    }
+    if (config.blobs.length == 0) {
+        return Err(fail(0, "blobs is required"));
+    }
+    if ((config.certificate.length == 0) != (config.key.length == 0)) {
+        return Err(fail(0, "[tls] needs both certificate and key"));
+    }
+    return Ok(config);
+}
+
+fn text(into: borrow mut String, value: StringView, line: usize) -> Result<void, ConfigError> {
+    if (value.length < 2 || !value.startsWith("\"") || !value.endsWith("\"")) {
+        return Err(fail(line, "expected a quoted string"));
+    }
+    into.clear();
+    match (into.append(value[1..value.length - 1])) {
+        Ok() => { return Ok(); }
+        Err(_) => { return Err(fail(line, "out of memory")); }
+    }
+}
+
+fn integer(value: StringView, line: usize) -> Result<u64, ConfigError> {
+    match (value.parseInt<u64>()) {
+        Some(n) => { return Ok(n); }
+        null => { return Err(fail(line, "expected a number")); }
+    }
+}
+
+fn boolean(value: StringView, line: usize) -> Result<bool, ConfigError> {
+    if (value == "true") {
+        return Ok(true);
+    }
+    if (value == "false") {
+        return Ok(false);
+    }
+    return Err(fail(line, "expected true or false"));
+}
+
+fn set(
+    config: borrow mut Config,
+    section: StringView,
+    key: StringView,
+    value: StringView,
+    line: usize,
+) -> Result<void, ConfigError> {
+    if (section.length == 0) {
+        if (key == "hostname") {
+            return text(mut config.hostname, value, line);
+        }
+        if (key == "database") {
+            return text(mut config.database, value, line);
+        }
+        if (key == "blobs") {
+            return text(mut config.blobs, value, line);
+        }
+        if (key == "workers") {
+            config.workers = truncate<u32>(integer(value, line)?);
+            return Ok();
+        }
+        if (key == "pool_size") {
+            config.poolSize = truncate<usize>(integer(value, line)?);
+            return Ok();
+        }
+    } else if (section == "smtp") {
+        if (key == "mx") {
+            return text(mut config.mx, value, line);
+        }
+        if (key == "submission") {
+            return text(mut config.submission, value, line);
+        }
+        if (key == "submissions") {
+            return text(mut config.submissions, value, line);
+        }
+        if (key == "max_message_size") {
+            config.maxMessageSize = integer(value, line)?;
+            return Ok();
+        }
+        if (key == "max_connections") {
+            config.maxConnections = truncate<u32>(integer(value, line)?);
+            return Ok();
+        }
+        if (key == "plaintext_auth") {
+            config.plaintextAuth = boolean(value, line)?;
+            return Ok();
+        }
+    } else if (section == "imap") {
+        if (key == "imap") {
+            return text(mut config.imap, value, line);
+        }
+        if (key == "imaps") {
+            return text(mut config.imaps, value, line);
+        }
+        if (key == "allow_plaintext_auth") {
+            config.imapPlaintextAuth = boolean(value, line)?;
+            return Ok();
+        }
+        if (key == "max_append_size") {
+            config.maxAppendSize = integer(value, line)?;
+            return Ok();
+        }
+        if (key == "max_connections") {
+            config.imapMaxConnections = truncate<u32>(integer(value, line)?);
+            return Ok();
+        }
+    } else if (section == "http") {
+        if (key == "http") {
+            return text(mut config.http, value, line);
+        }
+        if (key == "https") {
+            return text(mut config.https, value, line);
+        }
+        if (key == "admin") {
+            return text(mut config.admin, value, line);
+        }
+        if (key == "proxied") {
+            return text(mut config.proxied, value, line);
+        }
+        if (key == "max_connections") {
+            config.httpMaxConnections = truncate<u32>(integer(value, line)?);
+            return Ok();
+        }
+        if (key == "imap_port") {
+            config.advertisedImapPort = truncate<u16>(integer(value, line)?);
+            return Ok();
+        }
+        if (key == "submission_port") {
+            config.advertisedSubmissionPort = truncate<u16>(integer(value, line)?);
+            return Ok();
+        }
+        if (key == "advertise_exchange") {
+            config.advertiseExchange = boolean(value, line)?;
+            return Ok();
+        }
+    } else if (section == "admin") {
+        if (key == "jwt_secret") {
+            return text(mut config.jwtSecret, value, line);
+        }
+        if (key == "token") {
+            return text(mut config.adminToken, value, line);
+        }
+        if (key == "token_hours") {
+            config.tokenHours = truncate<i64>(integer(value, line)?);
+            return Ok();
+        }
+    } else if (section == "acme") {
+        if (key == "directory") {
+            return text(mut config.acmeDirectory, value, line);
+        }
+        if (key == "email") {
+            return text(mut config.acmeEmail, value, line);
+        }
+        if (key == "account_key") {
+            return text(mut config.acmeAccountKey, value, line);
+        }
+        if (key == "names") {
+            return text(mut config.acmeNames, value, line);
+        }
+        if (key == "mta_sts_names") {
+            config.acmeMtaStsNames = boolean(value, line)?;
+            return Ok();
+        }
+        if (key == "renew_days") {
+            config.acmeRenewDays = truncate<i64>(integer(value, line)?);
+            return Ok();
+        }
+        if (key == "check_interval") {
+            config.acmeCheckInterval = integer(value, line)?;
+            return Ok();
+        }
+        if (key == "retry_interval") {
+            config.acmeRetryInterval = integer(value, line)?;
+            return Ok();
+        }
+        if (key == "trust_file") {
+            return text(mut config.acmeTrustFile, value, line);
+        }
+    } else if (section == "import") {
+        if (key == "source") {
+            return text(mut config.importSource, value, line);
+        }
+        if (key == "s3_endpoint") {
+            return text(mut config.s3Endpoint, value, line);
+        }
+        if (key == "s3_bucket") {
+            return text(mut config.s3Bucket, value, line);
+        }
+        if (key == "s3_region") {
+            return text(mut config.s3Region, value, line);
+        }
+        if (key == "s3_access_key") {
+            return text(mut config.s3AccessKey, value, line);
+        }
+        if (key == "s3_secret_key") {
+            return text(mut config.s3SecretKey, value, line);
+        }
+    } else if (section == "proxy") {
+        if (key == "from") {
+            return text(mut config.proxyFrom, value, line);
+        }
+    } else if (section == "dns") {
+        if (key == "servers") {
+            return text(mut config.dnsServers, value, line);
+        }
+        if (key == "port") {
+            config.dnsPort = truncate<u16>(integer(value, line)?);
+            return Ok();
+        }
+        if (key == "inbound_auth") {
+            config.inboundAuth = boolean(value, line)?;
+            return Ok();
+        }
+    } else if (section == "scan") {
+        if (key == "clamd") {
+            return text(mut config.clamd, value, line);
+        }
+        if (key == "spamd") {
+            return text(mut config.spamd, value, line);
+        }
+        if (key == "spam_junk_score" || key == "spam_reject_score") {
+            var score = String.create();
+            text(mut score, value, line)?;
+            let tenths = match (tenthsOf(score.view().bytes())) {
+                Some(t) => t,
+                null => { return Err(fail(line, "expected a score such as \"5.0\"")); }
+            };
+            if (key == "spam_junk_score") {
+                config.junkTenths = tenths;
+            } else {
+                config.rejectTenths = tenths;
+            }
+            return Ok();
+        }
+        if (key == "clamd_unavailable") {
+            var mode = String.create();
+            text(mut mode, value, line)?;
+            if (mode.view() != "tempfail" && mode.view() != "accept") {
+                return Err(fail(line, "clamd_unavailable is \"tempfail\" or \"accept\""));
+            }
+            config.acceptUnscanned = mode.view() == "accept";
+            return Ok();
+        }
+        if (key == "max_scan_size") {
+            config.maxScanSize = integer(value, line)?;
+            return Ok();
+        }
+        if (key == "clamd_timeout") {
+            config.clamdTimeout = integer(value, line)?;
+            return Ok();
+        }
+        if (key == "spamd_timeout") {
+            config.spamdTimeout = integer(value, line)?;
+            return Ok();
+        }
+        if (key == "max_spam_size") {
+            config.maxSpamSize = integer(value, line)?;
+            return Ok();
+        }
+    } else if (section == "relay") {
+        if (key == "workers") {
+            config.relayWorkers = truncate<u32>(integer(value, line)?);
+            return Ok();
+        }
+        if (key == "port") {
+            config.relayPort = truncate<u16>(integer(value, line)?);
+            return Ok();
+        }
+        if (key == "starttls") {
+            config.relayStartTls = boolean(value, line)?;
+            return Ok();
+        }
+        if (key == "tls_policy") {
+            return text(mut config.relayTlsPolicy, value, line);
+        }
+        if (key == "tls_trust_file") {
+            return text(mut config.relayTlsTrustFile, value, line);
+        }
+        if (key == "mta_sts_port") {
+            config.relayStsPort = truncate<u16>(integer(value, line)?);
+            return Ok();
+        }
+        if (key == "retry") {
+            return text(mut config.relayRetry, value, line);
+        }
+        if (key == "max_age") {
+            config.relayMaxAge = truncate<i64>(integer(value, line)?);
+            return Ok();
+        }
+        if (key == "connect_timeout") {
+            config.relayConnectTimeout = integer(value, line)?;
+            return Ok();
+        }
+        if (key == "command_timeout") {
+            config.relayCommandTimeout = integer(value, line)?;
+            return Ok();
+        }
+        if (key == "delay_notice") {
+            config.relayDelayNotice = truncate<i64>(integer(value, line)?);
+            return Ok();
+        }
+        if (key == "suppress_days") {
+            config.relaySuppressDays = truncate<i64>(integer(value, line)?);
+            return Ok();
+        }
+        if (key == "breaker_threshold") {
+            config.relayBreakerThreshold = truncate<u32>(integer(value, line)?);
+            return Ok();
+        }
+        if (key == "breaker_seconds") {
+            config.relayBreakerSeconds = truncate<i64>(integer(value, line)?);
+            return Ok();
+        }
+        if (key == "pool_size") {
+            config.relayPoolSize = truncate<usize>(integer(value, line)?);
+            return Ok();
+        }
+        if (key == "pool_idle") {
+            config.relayPoolIdle = truncate<i64>(integer(value, line)?);
+            return Ok();
+        }
+        if (key == "srs_secret") {
+            return text(mut config.srsSecret, value, line);
+        }
+        if (key == "srs_domain") {
+            return text(mut config.srsDomain, value, line);
+        }
+    } else if (section == "tls") {
+        if (key == "certificate") {
+            return text(mut config.certificate, value, line);
+        }
+        if (key == "key") {
+            return text(mut config.key, value, line);
+        }
+        if (key == "reload_interval") {
+            config.tlsReloadInterval = integer(value, line)?;
+            if (config.tlsReloadInterval == 0) {
+                return Err(fail(line, "reload_interval is at least 1 second"));
+            }
+            return Ok();
+        }
+    }
+    return Err(fail(line, "unknown setting"));
+}
+
+/// Splits `host:port` (or `[v6]:port`); `null` when malformed.
+struct Endpoint {
+    hostStart: usize;
+    hostEnd: usize;
+    port: u16;
+}
+
+fn endpoint(text: StringView) -> Endpoint? {
+    let colon = text.lastIndexOf(":")?;
+    let port = text[colon + 1..].parseInt<u16>()?;
+    var start: usize = 0;
+    var end = colon;
+    if (text.startsWith("[") && colon > 0 && text.bytes()[colon - 1] == 0x5d) {
+        start = 1;
+        end = colon - 1;
+    }
+    return Endpoint { hostStart: start, hostEnd: end, port: port };
+}

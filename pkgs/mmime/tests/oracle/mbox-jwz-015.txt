@@ -1,0 +1,10 @@
+size 1411
+envelope ("Tue, 16 Jun 1992 09:46:49 -0400 (EDT)" "Re: MIME & int'l mail" (("Nathaniel Borenstein" NIL "nsb" "MISSING_DOMAIN")) (("Nathaniel Borenstein" NIL "nsb" "MISSING_DOMAIN")) (("Nathaniel Borenstein" NIL "nsb" "MISSING_DOMAIN")) (("Yutaka Sato =?ISO-2022-JP?B?GyRAOjRGI0stGyhK?=" NIL "ysato" "etl.go.jp")) NIL NIL "<gEJO+.ysato@etl.go.jp>" "<4eDT39K0M2YtMC_2lL@thumper.bellcore.com>")
+bodystructure ("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 739 14 NIL NIL NIL NIL)
+body ("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 739 14)
+section HEADER 672 add1bf94aa251bb602107b9474e2783e97073daa972e7beddb269e306e61470c
+section TEXT 739 601aba43b898976c48bb64cbec55593c1ef23e0dcd632b285722c448a0b10dec
+section HEADER.FIELDS 282 3a69acd04e15c7c77cffc59e5ec82579d7135b8572a408776581987bbacb132e
+section HEADER.FIELDS.NOT 392 32cec3c39584a4e425cb79d15b84cf9001f4a76a090d1eea7ae8cae20790406d
+section 1 739 601aba43b898976c48bb64cbec55593c1ef23e0dcd632b285722c448a0b10dec
+section 1.MIME 672 add1bf94aa251bb602107b9474e2783e97073daa972e7beddb269e306e61470c

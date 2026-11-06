@@ -1,0 +1,12 @@
+size 2686
+envelope (NIL NIL NIL NIL NIL NIL NIL NIL NIL NIL)
+bodystructure (("image" "png" NIL NIL NIL "base64" 1220 NIL NIL NIL "image1") ("text" "html" ("charset" "utf-8") NIL NIL "quoted-printable" 930 13 NIL NIL NIL NIL) "related" ("type" "text/html" "boundary" "----=_NextPart_115e1404-dbbc-4611-b4ce-d08a4b021c45") NIL NIL NIL)
+body (("image" "png" NIL NIL NIL "base64" 1220) ("text" "html" ("charset" "utf-8") NIL NIL "quoted-printable" 930 13) "related")
+section HEADER 142 09a0d6ba625dc8f660e99edfa4e42679173027f7559c454d3f13c6ef2c690967
+section TEXT 2544 4ca16ef43ffbc6bab293e3a35422a5b199da4db5ccf9be6b0468130e0a3318f2
+section HEADER.FIELDS 123 980cb6461174b8761a901e4410ef2140cda348599b45235dcef01207088c6c92
+section HEADER.FIELDS.NOT 21 07a26ab8981ff3b1de28da29cf47f47e315b9c25685121dc5ebb60391005b2de
+section 1 1220 72cef554da0993a801cff2c215751c5fa01e6c568ebb73a281ddb99836130a43
+section 1.MIME 88 c8c0887baa6f804874218964c30867fcdcdd5820044e979309943e3352282fa8
+section 2 930 a7c34e62f68436338830464a304a08035345de06a8b1e30129af4efb5c2761b3
+section 2.MIME 89 05d24eba423400bbd6280ef17daac9e75f7294cdad68475eaadabc70b1ad2496

@@ -1,0 +1,97 @@
+// Content lines (RFC 5545 §3.1), dates and durations, and the facts the store indexes.
+
+fn need(found: usize?, what: StringView) -> Result<usize, TestFailure> => match (found) {
+    Some(n) => Ok(n),
+    null => Err(TestFailure.create(what)),
+};
+
+fn textOf(lines: borrow ContentLines, i: usize) -> String {
+    var v = Vector<u8>.create();
+    lines.textValue(i, mut v)!;
+    var s = String.create();
+    s.append(StringView.fromUtf8(v.view()) ?? "")!;
+    return s;
+}
+
+const EVENT: StringView =
+    "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VTIMEZONE\r\nTZID:Europe/Paris\r\nBEGIN:STANDARD\r\nDTSTART:19701025T030000\r\nEND:STANDARD\r\nEND:VTIMEZONE\r\nBEGIN:VEVENT\r\nUID:abc-123@example.org\r\nSUMMARY:Lunch\\, then a walk\\nby the river\r\nDESCRIPTION:A long line that is folded at seventy-five octets as RFC 5545 says it\r\n  should be\r\nATTENDEE;CN=\"Doe, Jane\";ROLE=REQ-PARTICIPANT:mailto:jane@example.org\r\nDTSTART;TZID=Europe/Paris:20261106T120000\r\nDURATION:PT1H30M\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+
+@test
+fn readsContentLines() -> Result<void, TestFailure> {
+    let lines = ContentLines.parse(EVENT.bytes())!;
+    Check.isTrue(lines.begins(0, "VCALENDAR"), "the calendar")?;
+    let end = lines.componentEnd(0);
+    Check.isTrue(end == lines.count(), "the calendar ends last")?;
+    let summary = need(lines.property(0, end, 2, "summary"), "SUMMARY at depth 2")?;
+    Check.isTrue(textOf(lines, summary).view() == "Lunch, then a walk\nby the river", "unescaped")?;
+    let description = need(lines.property(0, end, 2, "DESCRIPTION"), "DESCRIPTION")?;
+    Check.isTrue(textOf(lines, description).view().endsWith("says it should be"), "unfolded")?;
+    let attendee = need(lines.property(0, end, 2, "ATTENDEE"), "ATTENDEE")?;
+    var cn = Vector<u8>.create();
+    Check.isTrue(lines.param(attendee, "cn", mut cn)!, "CN is there")?;
+    Check.isTrue(cn.view() == "Doe, Jane".bytes(), "a quoted parameter with a comma")?;
+    Check.isTrue(lines.rawValue(attendee) == "mailto:jane@example.org".bytes(), "the value after quoted ':'s")?;
+    Check.isTrue(lines.paramHas(attendee, "ROLE", "req-participant"), "paramHas")?;
+    Check.isTrue(lines.property(0, end, 1, "UID") == null, "UID is not at depth 1")?;
+    return Ok();
+}
+
+@test
+fn knowsTheFacts() -> Result<void, TestFailure> {
+    var facts = ObjectFacts.create();
+    Check.isTrue(objectFacts(EVENT.bytes(), mut facts)!, "an event")?;
+    Check.isTrue(facts.component.view() == "VEVENT", "the component (not the VTIMEZONE)")?;
+    Check.isTrue(facts.uid.view() == "abc-123@example.org", "the UID")?;
+    let start = daysFromCivil(2026, 11, 6) * 86400 + 12 * 3600;
+    Check.isTrue((facts.start ?? 0) == start, "the start, read as UTC")?;
+    Check.isTrue((facts.end ?? 0) == start + 5400, "the end from DURATION")?;
+    let allDay = "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:x\nDTSTART;VALUE=DATE:20260101\nRRULE:FREQ=YEARLY\nEND:VEVENT\nEND:VCALENDAR\n";
+    Check.isTrue(objectFacts(allDay.bytes(), mut facts)!, "LF line ends")?;
+    Check.isTrue(facts.end == null, "a recurrence without UNTIL is open-ended")?;
+    let card = "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:card-1\r\nFN:Jane\r\nEND:VCARD\r\n";
+    Check.isTrue(objectFacts(card.bytes(), mut facts)!, "a vCard")?;
+    Check.isTrue(facts.component.view() == "VCARD" && facts.uid.view() == "card-1", "the vCard's facts")?;
+    Check.isTrue(!objectFacts("BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n".bytes(), mut facts)!, "no component")?;
+    Check.isTrue(!objectFacts("hello".bytes(), mut facts)!, "not iCalendar")?;
+    return Ok();
+}
+
+@test
+fn readsDatesAndDurations() -> Result<void, TestFailure> {
+    Check.isTrue(daysFromCivil(1970, 1, 1) == 0, "the epoch")?;
+    Check.isTrue(daysFromCivil(2000, 3, 1) == 11017, "2000-03-01")?;
+    let d = civilFromDays(daysFromCivil(2024, 2, 29));
+    Check.isTrue(d[0] == 2024 && d[1] == 2 && d[2] == 29, "a leap day back")?;
+    Check.isTrue(weekday(daysFromCivil(2026, 11, 6)) == 5, "a Friday")?;
+    let t = parseCalTime("20261106T093000Z".bytes()) ?? CalTime { seconds: 0, date: false, utc: false };
+    Check.isTrue(t.utc && !t.date && t.seconds == daysFromCivil(2026, 11, 6) * 86400 + 34200, "a UTC date-time")?;
+    Check.isTrue(parseCalTime("2026-11-06".bytes()) == null, "not iCalendar's form")?;
+    Check.isTrue(parseCalTime("20261306".bytes()) == null, "month 13")?;
+    var out = Vector<u8>.create();
+    appendCalTime(mut out, t.seconds, false)!;
+    Check.isTrue(out.view() == "20261106T093000Z".bytes(), "written back")?;
+    Check.isTrue((parseDuration("-PT15M".bytes()) ?? 0) == -900, "a negative duration")?;
+    Check.isTrue((parseDuration("P1W2D".bytes()) ?? 0) == 777600, "weeks and days")?;
+    Check.isTrue(parseDuration("P1".bytes()) == null, "a number without a unit")?;
+    var etag = String.create();
+    etagOf("".bytes(), mut etag)!;
+    Check.isTrue(etag.view() == "e3b0c44298fc1c149afbf4c8996fb924", "the C# server's etag")?;
+    return Ok();
+}
+
+@test
+fn foldsLines() -> Result<void, TestFailure> {
+    var out = Vector<u8>.create();
+    var long = Vector<u8>.create();
+    for (i in 0..100) {
+        long.push(0x61)!;
+    }
+    appendLine(mut out, "DESCRIPTION", long.view())!;
+    let lines = ContentLines.parse(out.view())!;
+    Check.isTrue(lines.count() == 1, "one line after unfolding")?;
+    Check.isTrue(lines.rawValue(0) == long.view(), "the same value")?;
+    var escaped = Vector<u8>.create();
+    escapeText("a,b;c\\d\ne".bytes(), mut escaped)!;
+    Check.isTrue(escaped.view() == "a\\,b\\;c\\\\d\\ne".bytes(), "escaped")?;
+    return Ok();
+}

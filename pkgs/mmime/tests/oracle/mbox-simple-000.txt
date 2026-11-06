@@ -1,0 +1,14 @@
+size 541
+envelope ("Fri, 23 Aug 2002 2:32:53 -0400" "this'll probably break a lot of mime parsers" ((NIL NIL "fejj" "gnome.org")) ((NIL NIL "fejj" "gnome.org")) ((NIL NIL "fejj" "gnome.org")) ((NIL NIL "fejj" "gnome.org")) NIL NIL NIL NIL)
+bodystructure (((("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 181 6 NIL NIL NIL NIL) "mixed" ("boundary" "xyz") NIL NIL NIL) "mixed" ("boundary" "xy") NIL NIL NIL) "mixed" ("boundary" "x") NIL NIL NIL)
+body (((("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 181 6) "mixed") "mixed") "mixed")
+section HEADER 217 46ca37e63454eec541b44019f27067d28de7d3f3424aa9c9bdac3972c13b4091
+section TEXT 324 2137e23880031d21f9433748e1abbcc919a40e9871fe7b7e939ea4926363bc6d
+section HEADER.FIELDS 182 b0539e49a81f0532ee543201c8e0946df61ca1be433277f0a5f3953bad6fde68
+section HEADER.FIELDS.NOT 37 a6fd99574e17ed318b44321047d47bfecb594f27fbfe7810464361d15fdeb852
+section 1 271 a48f928fb78a73a285be957f89cd13dd90a322644198c95476521937bd697456
+section 1.MIME 48 4375e31bbd1700d2e466247172b8288664566b1a82aaf900568c5b47c22b970f
+section 1.1 216 9d76016cd87f7491d49a9a6772e3e00534361236a428eb7ad9b2cca2a99ca229
+section 1.1.MIME 49 3054f4f8784a5d6cf12ca8e5dccf80302602bf20d2ed5ae40c2f3106d629c8ae
+section 1.1.1 181 f09f83b7f77bbc3ededa8dc85e77aa050b2b018d4574aba0b361862e86cb7a9e
+section 1.1.1.MIME 28 c3204dd99ab0f23ec6029433de09a5ae168a2daab5b5352645a32379e329b040

@@ -1,0 +1,10 @@
+size 43876
+envelope ("29 Apr 1995 22:08:36 GMT" "Jessica... - jesica.bmp [1/1]" (("Sorrow" NIL "Cat" "pic.net")) (("Sorrow" NIL "Cat" "pic.net")) (("Sorrow" NIL "Cat" "pic.net")) NIL NIL NIL NIL NIL)
+bodystructure ("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 43722 693 NIL NIL NIL NIL)
+body ("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 43722 693)
+section HEADER 154 157c7e8da1ea65ef7c3f12eb7633cd2c689c51817c6da11bb82856192a939923
+section TEXT 43722 e9a986f7fb027ee71cc6c4a02f95c8611ee330e9d04f4905910fb511a300106e
+section HEADER.FIELDS 102 e094a72cd969291dd24584efaccac9b20562b948ebc55ea1ed3fbbce0498b080
+section HEADER.FIELDS.NOT 54 32a876411e290f3d122cc63219bb3e7eada3aba298cb971faf4427f67762afd1
+section 1 43722 e9a986f7fb027ee71cc6c4a02f95c8611ee330e9d04f4905910fb511a300106e
+section 1.MIME 154 157c7e8da1ea65ef7c3f12eb7633cd2c689c51817c6da11bb82856192a939923

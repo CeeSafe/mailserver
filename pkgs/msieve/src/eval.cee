@@ -1,0 +1,1176 @@
+// Validating and running a parsed script (RFC 5228) with the extensions fileinto, envelope, copy (RFC 3894),
+// imap4flags (RFC 5232) and vacation (RFC 5230). The result is a list of actions; the delivery code carries them
+// out.
+
+import mmime.AddressList;
+import mmime.decodeHeader;
+import mmime.parseAddressList;
+
+/// What a script asks for.
+public const ACTION_KEEP: u8 = 0;
+public const ACTION_FILEINTO: u8 = 1;
+public const ACTION_REDIRECT: u8 = 2;
+public const ACTION_DISCARD: u8 = 3;
+public const ACTION_VACATION: u8 = 4;
+
+/// The most actions one script may take, and redirects among them.
+const MAX_ACTIONS: usize = 32;
+const MAX_REDIRECTS: usize = 4;
+
+@noncopy
+public struct SieveAction {
+    public kind: u8;
+    /// The mailbox (fileinto, keep: "INBOX") or the address (redirect).
+    public target: String;
+    /// IMAP flags to set, space-separated (keep, fileinto).
+    public flags: String;
+    // Vacation (RFC 5230).
+    public days: u64;
+    public subject: String;
+    public from: String;
+    public reason: String;
+    public handle: String;
+    public addresses: String;
+    public mime: bool;
+}
+
+fn action(kind: u8) -> SieveAction => SieveAction {
+    kind: kind,
+    target: String.create(),
+    flags: String.create(),
+    days: 7,
+    subject: String.create(),
+    from: String.create(),
+    reason: String.create(),
+    handle: String.create(),
+    addresses: String.create(),
+    mime: false,
+};
+
+/// The message a script looks at.
+public struct SieveMessage<region r> {
+    /// The raw header block (CRLF-terminated lines).
+    public header: Slice<r, u8>;
+    /// The envelope: MAIL FROM (empty for the null sender) and this recipient (RCPT TO).
+    public envelopeFrom: Slice<r, u8>;
+    public envelopeTo: Slice<r, u8>;
+    public size: u64;
+}
+
+/// The outcome of running a script.
+@noncopy
+public struct SieveResult {
+    public actions: Vector<SieveAction>;
+    /// Whether the implicit keep (into INBOX) still applies.
+    public implicitKeep: bool;
+    /// The flags the implicit keep stores with (imap4flags).
+    public implicitFlags: String;
+    /// A runtime error: the script stopped there, and RFC 5228 §2.10.6 says to keep the message.
+    public error: String;
+
+    public fn create() -> SieveResult => SieveResult {
+        actions: Vector<SieveAction>.create(),
+        implicitKeep: true,
+        implicitFlags: String.create(),
+        error: String.create(),
+    };
+}
+
+// ---- Arguments ----
+
+const MATCH_IS: u8 = 0;
+const MATCH_CONTAINS: u8 = 1;
+const MATCH_MATCHES: u8 = 2;
+const PART_ALL: u8 = 0;
+const PART_LOCAL: u8 = 1;
+const PART_DOMAIN: u8 = 2;
+
+/// A node's arguments, sorted out: the tags and what follows them, and the positional arguments.
+struct Options {
+    matchType: u8;
+    octet: bool;
+    part: u8;
+    over: bool;
+    under: bool;
+    copy: bool;
+    mime: bool;
+    days: u64;
+    subject: usize;
+    from: usize;
+    handle: usize;
+    addresses: usize;
+    flags: usize;
+    /// Positional arguments (indices into Script.args), at most three.
+    positional: [usize; 3];
+    count: usize;
+    bad: bool;
+}
+
+/// Sorts out `node`'s arguments. Unknown tags, or a tag without its value, make `bad`.
+fn optionsOf(script: borrow Script, node: usize) -> Options {
+    var o = Options {
+        matchType: MATCH_IS,
+        octet: false,
+        part: PART_ALL,
+        over: false,
+        under: false,
+        copy: false,
+        mime: false,
+        days: 7,
+        subject: NONE,
+        from: NONE,
+        handle: NONE,
+        addresses: NONE,
+        flags: NONE,
+        positional: [NONE; 3],
+        count: 0,
+        bad: false,
+    };
+    let n = script.nodes[node];
+    if (n.argCount == 0xffff) {
+        return o;
+    }
+    var i = n.firstArg;
+    let end = n.firstArg + n.argCount;
+    var seenMatch = false;
+    var seenPart = false;
+    while (i < end) {
+        let a = script.args[i];
+        i += 1;
+        if (a.kind != ARG_TAG) {
+            if (o.count >= 3) {
+                o.bad = true;
+                return o;
+            }
+            o.positional[o.count] = i - 1;
+            o.count += 1;
+            continue;
+        }
+        let tag = script.string(a.tag);
+        // Tags that take a value.
+        let valued = tag.equalsIgnoreAsciiCase("comparator".bytes()) || tag.equalsIgnoreAsciiCase("days".bytes()) ||
+            tag.equalsIgnoreAsciiCase("subject".bytes()) || tag.equalsIgnoreAsciiCase("from".bytes()) ||
+            tag.equalsIgnoreAsciiCase("handle".bytes()) || tag.equalsIgnoreAsciiCase("addresses".bytes()) ||
+            tag.equalsIgnoreAsciiCase("flags".bytes());
+        if (valued) {
+            if (i >= end || script.args[i].kind == ARG_TAG) {
+                o.bad = true;
+                return o;
+            }
+            let v = i;
+            i += 1;
+            let value = script.args[v];
+            if (tag.equalsIgnoreAsciiCase("days".bytes())) {
+                if (value.kind != ARG_NUMBER) {
+                    o.bad = true;
+                    return o;
+                }
+                o.days = value.number;
+            } else if (value.kind != ARG_STRINGS) {
+                o.bad = true;
+                return o;
+            } else if (tag.equalsIgnoreAsciiCase("comparator".bytes())) {
+                let c = script.string(value.first);
+                if (c.equalsIgnoreAsciiCase("i;octet".bytes())) {
+                    o.octet = true;
+                } else if (!c.equalsIgnoreAsciiCase("i;ascii-casemap".bytes())) {
+                    o.bad = true;
+                    return o;
+                }
+            } else if (tag.equalsIgnoreAsciiCase("subject".bytes())) {
+                o.subject = v;
+            } else if (tag.equalsIgnoreAsciiCase("from".bytes())) {
+                o.from = v;
+            } else if (tag.equalsIgnoreAsciiCase("handle".bytes())) {
+                o.handle = v;
+            } else if (tag.equalsIgnoreAsciiCase("addresses".bytes())) {
+                o.addresses = v;
+            } else {
+                o.flags = v;
+            }
+            continue;
+        }
+        if (tag.equalsIgnoreAsciiCase("is".bytes()) || tag.equalsIgnoreAsciiCase("contains".bytes()) ||
+            tag.equalsIgnoreAsciiCase("matches".bytes())) {
+            if (seenMatch) {
+                o.bad = true;
+                return o;
+            }
+            seenMatch = true;
+            o.matchType = if (tag.equalsIgnoreAsciiCase(
+                "is".bytes(),
+            )) MATCH_IS else (if (tag.equalsIgnoreAsciiCase("contains".bytes())) MATCH_CONTAINS else MATCH_MATCHES);
+        } else if (tag.equalsIgnoreAsciiCase("all".bytes()) || tag.equalsIgnoreAsciiCase("localpart".bytes()) ||
+            tag.equalsIgnoreAsciiCase("domain".bytes())) {
+            if (seenPart) {
+                o.bad = true;
+                return o;
+            }
+            seenPart = true;
+            o.part = if (tag.equalsIgnoreAsciiCase(
+                "all".bytes(),
+            )) PART_ALL else (if (tag.equalsIgnoreAsciiCase("localpart".bytes())) PART_LOCAL else PART_DOMAIN);
+        } else if (tag.equalsIgnoreAsciiCase("over".bytes())) {
+            o.over = true;
+        } else if (tag.equalsIgnoreAsciiCase("under".bytes())) {
+            o.under = true;
+        } else if (tag.equalsIgnoreAsciiCase("copy".bytes())) {
+            o.copy = true;
+        } else if (tag.equalsIgnoreAsciiCase("mime".bytes())) {
+            o.mime = true;
+        } else {
+            o.bad = true;
+            return o;
+        }
+    }
+    return o;
+}
+
+fn positionalKind(script: borrow Script, o: Options, i: usize) -> u8 {
+    if (i >= o.count) {
+        return 255;
+    }
+    return script.args[o.positional[i]].kind;
+}
+
+// ---- Validation ----
+
+/// What `require` asked for.
+struct Extensions {
+    fileinto: bool;
+    envelope: bool;
+    vacation: bool;
+    flags: bool;
+    copy: bool;
+}
+
+fn validate(into: borrow mut Script) -> Result<bool, AllocError> {
+    return validateScript(into);
+}
+
+fn validateScript(script: borrow mut Script) -> Result<bool, AllocError> {
+    var ext = Extensions { fileinto: false, envelope: false, vacation: false, flags: false, copy: false };
+    var c = script.first;
+    var requiresDone = false;
+    while (c != NONE) {
+        if (script.nameIs(c, "require")) {
+            if (requiresDone) {
+                return fail(script, script.nodes[c].line, "require must come before other commands");
+            }
+            let o = optionsOf(script, c);
+            if (o.bad || o.count != 1 || positionalKind(script, o, 0) != ARG_STRINGS || hasBlock(script, c) ||
+                testOf(script, c) != NONE) {
+                return fail(script, script.nodes[c].line, "require takes a string list");
+            }
+            let a = script.args[o.positional[0]];
+            for (k in 0..a.count) {
+                let name = script.string(a.first + k);
+                if (name.equalsIgnoreAsciiCase("fileinto".bytes())) {
+                    ext.fileinto = true;
+                } else if (name.equalsIgnoreAsciiCase("envelope".bytes())) {
+                    ext.envelope = true;
+                } else if (name.equalsIgnoreAsciiCase("vacation".bytes())) {
+                    ext.vacation = true;
+                } else if (name.equalsIgnoreAsciiCase("imap4flags".bytes())) {
+                    ext.flags = true;
+                } else if (name.equalsIgnoreAsciiCase("copy".bytes())) {
+                    ext.copy = true;
+                } else if (!name.equalsIgnoreAsciiCase("comparator-i;octet".bytes()) &&
+                    !name.equalsIgnoreAsciiCase("comparator-i;ascii-casemap".bytes())) {
+                    return fail(script, script.nodes[c].line, "unsupported extension");
+                }
+            }
+        } else {
+            requiresDone = true;
+        }
+        c = script.nodes[c].next;
+    }
+    return validateCommands(script, script.first, ext, false);
+}
+
+fn validateCommands(
+    script: borrow mut Script,
+    first: usize,
+    ext: Extensions,
+    inBlock: bool,
+) -> Result<bool, AllocError> {
+    var c = first;
+    var afterIf = false;
+    while (c != NONE) {
+        let line = script.nodes[c].line;
+        let o = optionsOf(script, c);
+        if (o.bad) {
+            return fail(script, line, "bad arguments");
+        }
+        let test = testOf(script, c);
+        let block = hasBlock(script, c);
+        var wasIf = false;
+        if (script.nameIs(c, "require")) {
+            if (inBlock) {
+                return fail(script, line, "require is only allowed at the top");
+            }
+        } else if (script.nameIs(c, "if") || script.nameIs(c, "elsif") || script.nameIs(c, "else")) {
+            let isElse = script.nameIs(c, "else");
+            if (!script.nameIs(c, "if") && !afterIf) {
+                return fail(script, line, "elsif and else must follow if");
+            }
+            if (!block || o.count != 0 || (isElse && test != NONE) || (!isElse && test == NONE)) {
+                return fail(script, line, "if takes a test and a block");
+            }
+            if (test != NONE && !validateTest(script, test, ext)?) {
+                return Ok(false);
+            }
+            if (!validateCommands(script, blockOf(script, c), ext, true)?) {
+                return Ok(false);
+            }
+            wasIf = !isElse;
+        } else {
+            if (block || test != NONE) {
+                return fail(script, line, "an action takes no test or block");
+            }
+            let flagsOk = o.flags == NONE || ext.flags;
+            if (script.nameIs(c, "stop") || script.nameIs(c, "discard")) {
+                if (o.count != 0 || o.flags != NONE) {
+                    return fail(script, line, "stop and discard take no arguments");
+                }
+            } else if (script.nameIs(c, "keep")) {
+                if (o.count != 0 || !flagsOk) {
+                    return fail(script, line, "bad keep");
+                }
+            } else if (script.nameIs(c, "fileinto")) {
+                if (!ext.fileinto || o.count != 1 || positionalKind(script, o, 0) != ARG_STRINGS || !flagsOk ||
+                    (o.copy && !ext.copy) || script.args[o.positional[0]].count != 1) {
+                    return fail(script, line, "bad fileinto (require \"fileinto\")");
+                }
+            } else if (script.nameIs(c, "redirect")) {
+                if (o.count != 1 || positionalKind(script, o, 0) != ARG_STRINGS || (o.copy && !ext.copy) ||
+                    script.args[o.positional[0]].count != 1 || o.flags != NONE) {
+                    return fail(script, line, "bad redirect");
+                }
+                if (!oneMailbox(firstString(script, o.positional[0]))?) {
+                    return fail(script, line, "redirect needs one address");
+                }
+            } else if (script.nameIs(c, "vacation")) {
+                if (!ext.vacation || o.count != 1 || positionalKind(script, o, 0) != ARG_STRINGS) {
+                    return fail(script, line, "bad vacation (require \"vacation\")");
+                }
+            } else if (script.nameIs(c, "setflag") || script.nameIs(c, "addflag") || script.nameIs(c, "removeflag")) {
+                if (!ext.flags || o.count != 1 || positionalKind(script, o, 0) != ARG_STRINGS) {
+                    return fail(script, line, "bad flag command (require \"imap4flags\")");
+                }
+            } else {
+                return fail(script, line, "unknown command");
+            }
+        }
+        afterIf = wasIf;
+        c = script.nodes[c].next;
+    }
+    return Ok(true);
+}
+
+fn validateTest(
+    script: borrow mut Script,
+    t: usize,
+    ext: Extensions,
+) -> Result<bool, AllocError> {
+    let line = script.nodes[t].line;
+    let o = optionsOf(script, t);
+    if (o.bad) {
+        return fail(script, line, "bad test arguments");
+    }
+    let child = script.nodes[t].firstChild;
+    if (script.nameIs(t, "true") || script.nameIs(t, "false")) {
+        if (o.count != 0 || child != NONE) {
+            return fail(script, line, "true and false take no arguments");
+        }
+    } else if (script.nameIs(t, "not")) {
+        if (o.count != 0 || child == NONE || script.nodes[child].next != NONE) {
+            return fail(script, line, "not takes one test");
+        }
+        return validateTest(script, child, ext);
+    } else if (script.nameIs(t, "anyof") || script.nameIs(t, "allof")) {
+        if (o.count != 0 || child == NONE) {
+            return fail(script, line, "anyof and allof take a test list");
+        }
+        var k = child;
+        while (k != NONE) {
+            if (!validateTest(script, k, ext)?) {
+                return Ok(false);
+            }
+            k = script.nodes[k].next;
+        }
+    } else if (script.nameIs(t, "header") || script.nameIs(t, "address") || script.nameIs(t, "envelope")) {
+        if (o.count != 2 || positionalKind(
+            script,
+            o,
+            0,
+        ) != ARG_STRINGS || positionalKind(script, o, 1) != ARG_STRINGS ||
+            child != NONE) {
+            return fail(script, line, "this test takes a header list and a key list");
+        }
+        if (script.nameIs(t, "envelope") && !ext.envelope) {
+            return fail(script, line, "envelope needs require \"envelope\"");
+        }
+    } else if (script.nameIs(t, "exists")) {
+        if (o.count != 1 || positionalKind(script, o, 0) != ARG_STRINGS) {
+            return fail(script, line, "exists takes a header list");
+        }
+    } else if (script.nameIs(t, "size")) {
+        if (o.count != 1 || positionalKind(script, o, 0) != ARG_NUMBER || o.over == o.under) {
+            return fail(script, line, "size takes :over or :under and a number");
+        }
+    } else if (script.nameIs(t, "hasflag")) {
+        if (!ext.flags || o.count != 1 || positionalKind(script, o, 0) != ARG_STRINGS) {
+            return fail(script, line, "hasflag needs require \"imap4flags\"");
+        }
+    } else {
+        return fail(script, line, "unknown test");
+    }
+    return Ok(true);
+}
+
+// ---- Matching ----
+
+fn lower(c: u8) -> u8 => if (c >= 0x41 && c <= 0x5a) c + 0x20 else c;
+
+fn sameByte(a: u8, b: u8, octet: bool) -> bool => if (octet) a == b else lower(a) == lower(b);
+
+fn equalBytes(a: Slice<u8>, b: Slice<u8>, octet: bool) -> bool {
+    if (a.length != b.length) {
+        return false;
+    }
+    for (i in 0..a.length) {
+        if (!sameByte(a[i], b[i], octet)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn containsBytes(haystack: Slice<u8>, needle: Slice<u8>, octet: bool) -> bool {
+    if (needle.length == 0) {
+        return true;
+    }
+    if (needle.length > haystack.length) {
+        return false;
+    }
+    for (i in 0..haystack.length - needle.length + 1) {
+        if (equalBytes(haystack[i..i + needle.length], needle, octet)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// `:matches`: `*` any run, `?` one character (one UTF-8 character), `\` escapes. Iterative, with one backtrack
+/// point, so a hostile pattern costs O(n·m), never exponential.
+fn globMatch(text: Slice<u8>, pattern: Slice<u8>, octet: bool) -> bool {
+    var t: usize = 0;
+    var p: usize = 0;
+    var starP = NONE;
+    var starT: usize = 0;
+    while (t < text.length) {
+        if (p < pattern.length && pattern[p] == 0x2a) {
+            starP = p;
+            starT = t;
+            p += 1;
+            continue;
+        }
+        if (p < pattern.length && pattern[p] == 0x3f) {
+            p += 1;
+            t += charLength(text, t);
+            continue;
+        }
+        if (p < pattern.length) {
+            var pc = pattern[p];
+            var step: usize = 1;
+            if (pc == 0x5c && p + 1 < pattern.length) {
+                pc = pattern[p + 1];
+                step = 2;
+            }
+            if (sameByte(pc, text[t], octet)) {
+                p += step;
+                t += 1;
+                continue;
+            }
+        }
+        if (starP != NONE) {
+            p = starP + 1;
+            starT += charLength(text, starT);
+            t = starT;
+            continue;
+        }
+        return false;
+    }
+    while (p < pattern.length && pattern[p] == 0x2a) {
+        p += 1;
+    }
+    return p == pattern.length;
+}
+
+/// The length of the UTF-8 character at `at` (1 for an invalid byte).
+fn charLength(text: Slice<u8>, at: usize) -> usize {
+    let c = text[at];
+    var n: usize = 1;
+    if (c >= 0xf0) {
+        n = 4;
+    } else if (c >= 0xe0) {
+        n = 3;
+    } else if (c >= 0xc0) {
+        n = 2;
+    }
+    if (at + n > text.length) {
+        return 1;
+    }
+    for (k in 1..n) {
+        if ((text[at + k] & 0xc0) != 0x80) {
+            return 1;
+        }
+    }
+    return n;
+}
+
+fn matches(value: Slice<u8>, key: Slice<u8>, o: Options) -> bool {
+    if (o.matchType == MATCH_IS) {
+        return equalBytes(value, key, o.octet);
+    }
+    if (o.matchType == MATCH_CONTAINS) {
+        return containsBytes(value, key, o.octet);
+    }
+    return globMatch(value, key, o.octet);
+}
+
+fn anyKey(script: borrow Script, value: Slice<u8>, keys: Arg, o: Options) -> bool {
+    for (k in 0..keys.count) {
+        if (matches(value, script.string(keys.first + k), o)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// ---- Headers ----
+
+/// Each value of the header fields called `name`, in order, decoded (RFC 2047) and unfolded, into `into` (NUL-
+/// separated). Gives how many.
+fn headerValues(
+    header: Slice<u8>,
+    name: Slice<u8>,
+    decode: bool,
+    into: borrow mut Vector<u8>,
+) -> Result<usize, AllocError> {
+    into.clear();
+    var count: usize = 0;
+    var at: usize = 0;
+    while (at < header.length) {
+        let start = at;
+        var end = start;
+        loop {
+            match (header[end..].indexOfByte(0x0a)) {
+                Some(lf) => { end = end + lf + 1; }
+                null => {
+                    end = header.length;
+                    break;
+                }
+            }
+            if (end >= header.length || (header[end] != 0x20 && header[end] != 0x09)) {
+                break;
+            }
+        }
+        at = end;
+        let field = header[start..end];
+        let colon = match (field.indexOfByte(0x3a)) {
+            Some(c) => c,
+            null => { continue; }
+        };
+        var nameEnd = colon;
+        while (nameEnd > 0 && (field[nameEnd - 1] == 0x20 || field[nameEnd - 1] == 0x09)) {
+            nameEnd -= 1;
+        }
+        if (!field[0..nameEnd].equalsIgnoreAsciiCase(name)) {
+            continue;
+        }
+        if (count > 0) {
+            into.push(0)?;
+        }
+        if (decode) {
+            decodeHeader(field[colon + 1..], into)?;
+        } else {
+            into.extend(field[colon + 1..])?;
+        }
+        count += 1;
+    }
+    return Ok(count);
+}
+
+/// Calls `test` on each NUL-separated value.
+fn eachValue(values: Slice<u8>, count: usize, script: borrow Script, keys: Arg, o: Options) -> bool {
+    if (count == 0) {
+        return false;
+    }
+    var at: usize = 0;
+    while (at <= values.length) {
+        var end = at;
+        while (end < values.length && values[end] != 0) {
+            end += 1;
+        }
+        if (anyKey(script, values[at..end], keys, o)) {
+            return true;
+        }
+        at = end + 1;
+    }
+    return false;
+}
+
+/// The address part `part` of `local@domain`.
+/// Whether address `i` is a real one: mmime writes Dovecot's placeholders for a missing or broken part.
+fn realAddress(list: borrow AddressList, i: usize) -> bool {
+    match (list.host(i)) {
+        Some(h) => {
+            if (h.length == 0 || equalBytes(
+                h,
+                "MISSING_DOMAIN".bytes(),
+                true,
+            ) || equalBytes(h, "SYNTAX_ERROR".bytes(), true)) {
+                return false;
+            }
+        }
+        null => { return false; }
+    }
+    match (list.mailbox(i)) {
+        Some(m) => { return m.length > 0 && !equalBytes(m, "MISSING_MAILBOX".bytes(), true); }
+        null => { return false; }
+    }
+}
+
+fn trimSpace(v: Slice<u8>) -> Slice<u8> {
+    var a: usize = 0;
+    var b = v.length;
+    while (a < b && (v[a] == 0x20 || v[a] == 0x09 || v[a] == 0x0d || v[a] == 0x0a)) {
+        a += 1;
+    }
+    while (b > a && (v[b - 1] == 0x20 || v[b - 1] == 0x09 || v[b - 1] == 0x0d || v[b - 1] == 0x0a)) {
+        b -= 1;
+    }
+    return v[a..b];
+}
+
+/// Whether `address` is one mailbox, `local@domain` (RFC 5228 §4.2).
+fn oneMailbox(address: Slice<u8>) -> Result<bool, AllocError> {
+    var list = AddressList.create();
+    parseAddressList(address, mut list)?;
+    return Ok(list.count() == 1 && list.host(0) != null && address.indexOfByte(0x40) != null);
+}
+
+fn addressPart(local: Slice<u8>, domain: Slice<u8>, part: u8, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    out.clear();
+    if (part == PART_LOCAL) {
+        return out.extend(local);
+    }
+    if (part == PART_DOMAIN) {
+        return out.extend(domain);
+    }
+    out.extend(local)?;
+    if (domain.length > 0) {
+        out.push(0x40)?;
+        out.extend(domain)?;
+    }
+    return Ok();
+}
+
+// ---- Running ----
+
+@noncopy
+struct Run {
+    actions: Vector<SieveAction>;
+    implicitKeep: bool;
+    flags: Vector<u8>;
+    stopped: bool;
+    redirects: usize;
+    error: String;
+}
+
+/// Runs `script` (parsed and validated) on `message`, into `result`.
+public fn runScript<region r>(
+    script: borrow Script,
+    message: SieveMessage<r>,
+    result: borrow mut SieveResult,
+) -> Result<void, AllocError> {
+    var run = Run {
+        actions: Vector<SieveAction>.create(),
+        implicitKeep: true,
+        flags: Vector<u8>.create(),
+        stopped: false,
+        redirects: 0,
+        error: String.create(),
+    };
+    runCommands(script, script.first, message, mut run)?;
+    result.actions.clear();
+    result.error.clear();
+    result.implicitFlags.clear();
+    if (run.error.length > 0) {
+        // A runtime error: the actions so far are dropped and the message kept (RFC 5228 §2.10.6).
+        result.implicitKeep = true;
+        result.error.append(run.error.view())?;
+        return Ok();
+    }
+    var i: usize = 0;
+    while (i < run.actions.length) {
+        result.actions.push(takeAction(mut run.actions, i))?;
+        i += 1;
+    }
+    result.implicitKeep = run.implicitKeep;
+    result.implicitFlags.append(StringView.fromUtf8(run.flags.view())!)?;
+    return Ok();
+}
+
+fn takeAction(list: borrow mut Vector<SieveAction>, i: usize) -> SieveAction {
+    var a = action(list[i].kind);
+    let source = borrow list[i];
+    match (a.target.append(source.target.view())) {
+        Ok() => {}
+        Err(_) => {}
+    }
+    match (a.flags.append(source.flags.view())) {
+        Ok() => {}
+        Err(_) => {}
+    }
+    a.days = source.days;
+    a.mime = source.mime;
+    match (a.subject.append(source.subject.view())) {
+        Ok() => {}
+        Err(_) => {}
+    }
+    match (a.from.append(source.from.view())) {
+        Ok() => {}
+        Err(_) => {}
+    }
+    match (a.reason.append(source.reason.view())) {
+        Ok() => {}
+        Err(_) => {}
+    }
+    match (a.handle.append(source.handle.view())) {
+        Ok() => {}
+        Err(_) => {}
+    }
+    match (a.addresses.append(source.addresses.view())) {
+        Ok() => {}
+        Err(_) => {}
+    }
+    return a;
+}
+
+fn runCommands<region r>(
+    script: borrow Script,
+    first: usize,
+    m: SieveMessage<r>,
+    run: borrow mut Run,
+) -> Result<void, AllocError> {
+    var c = first;
+    var skipElse = false;
+    while (c != NONE && !run.stopped && run.error.length == 0) {
+        let isIf = script.nameIs(c, "if");
+        let isElsif = script.nameIs(c, "elsif");
+        let isElse = script.nameIs(c, "else");
+        if (isIf || isElsif || isElse) {
+            if (isIf) {
+                skipElse = false;
+            }
+            if (!skipElse) {
+                let taken = isElse || testHolds(script, testOf(script, c), m, run)?;
+                if (taken) {
+                    skipElse = true;
+                    runCommands(script, blockOf(script, c), m, run)?;
+                }
+            }
+        } else {
+            skipElse = false;
+            runAction(script, c, m, run)?;
+        }
+        c = script.nodes[c].next;
+    }
+    return Ok();
+}
+
+/// A string argument's first (only) string as text.
+fn firstString(script: borrow Script, arg: usize) -> Slice<u8> => script.string(script.args[arg].first);
+
+fn appendStrings(script: borrow Script, arg: usize, out: borrow mut String) -> Result<void, AllocError> {
+    let a = script.args[arg];
+    for (k in 0..a.count) {
+        if (out.length > 0) {
+            out.append(" ")?;
+        }
+        match (StringView.fromUtf8(script.string(a.first + k))) {
+            Some(t) => { out.append(t)?; }
+            null => {}
+        }
+    }
+    return Ok();
+}
+
+/// The flags of a flag list, lowercased system flags as Pigeonhole writes them, one space between.
+fn flagList(script: borrow Script, arg: usize, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    let a = script.args[arg];
+    for (k in 0..a.count) {
+        // A string may itself hold several space-separated flags (RFC 5232 §3).
+        let s = script.string(a.first + k);
+        var at: usize = 0;
+        while (at < s.length) {
+            while (at < s.length && s[at] == 0x20) {
+                at += 1;
+            }
+            var end = at;
+            while (end < s.length && s[end] != 0x20) {
+                end += 1;
+            }
+            if (end > at) {
+                addFlag(out, s[at..end])?;
+            }
+            at = end;
+        }
+    }
+    return Ok();
+}
+
+/// Adds `flag` to the space-separated set `out`, once (case-insensitive).
+fn addFlag(out: borrow mut Vector<u8>, flag: Slice<u8>) -> Result<void, AllocError> {
+    if (hasFlagIn(out.view(), flag)) {
+        return Ok();
+    }
+    if (out.length > 0) {
+        out.push(0x20)?;
+    }
+    for (c in flag) {
+        out.push(if (flag[0] == 0x5c) lower(c) else c)?;
+    }
+    return Ok();
+}
+
+fn hasFlagIn(set: Slice<u8>, flag: Slice<u8>) -> bool {
+    var at: usize = 0;
+    while (at < set.length) {
+        var end = at;
+        while (end < set.length && set[end] != 0x20) {
+            end += 1;
+        }
+        if (set[at..end].equalsIgnoreAsciiCase(flag)) {
+            return true;
+        }
+        at = end + 1;
+    }
+    return false;
+}
+
+fn removeFlags(set: borrow mut Vector<u8>, remove: borrow Vector<u8>) -> Result<void, AllocError> {
+    var kept = Vector<u8>.create();
+    let s = set.view();
+    var at: usize = 0;
+    while (at < s.length) {
+        var end = at;
+        while (end < s.length && s[end] != 0x20) {
+            end += 1;
+        }
+        if (!hasFlagIn(remove.view(), s[at..end])) {
+            addFlag(mut kept, s[at..end])?;
+        }
+        at = end + 1;
+    }
+    set.clear();
+    return set.extend(kept.view());
+}
+
+fn addAction(run: borrow mut Run, a: SieveAction) -> Result<void, AllocError> {
+    if (run.actions.length >= MAX_ACTIONS) {
+        run.error.append("too many actions")?;
+        return Ok();
+    }
+    return run.actions.push(a);
+}
+
+fn runAction<region r>(
+    script: borrow Script,
+    c: usize,
+    m: SieveMessage<r>,
+    run: borrow mut Run,
+) -> Result<void, AllocError> {
+    let o = optionsOf(script, c);
+    if (script.nameIs(c, "require")) {
+        return Ok();
+    }
+    if (script.nameIs(c, "stop")) {
+        run.stopped = true;
+        return Ok();
+    }
+    if (script.nameIs(c, "discard")) {
+        run.implicitKeep = false;
+        return Ok();
+    }
+    if (script.nameIs(c, "setflag") || script.nameIs(c, "addflag") || script.nameIs(c, "removeflag")) {
+        var given = Vector<u8>.create();
+        flagList(script, o.positional[0], mut given)?;
+        if (script.nameIs(c, "setflag")) {
+            run.flags.clear();
+            run.flags.extend(given.view())?;
+        } else if (script.nameIs(c, "addflag")) {
+            let s = given.view();
+            var at: usize = 0;
+            while (at < s.length) {
+                var end = at;
+                while (end < s.length && s[end] != 0x20) {
+                    end += 1;
+                }
+                addFlag(mut run.flags, s[at..end])?;
+                at = end + 1;
+            }
+        } else {
+            removeFlags(mut run.flags, given)?;
+        }
+        return Ok();
+    }
+    if (script.nameIs(c, "keep") || script.nameIs(c, "fileinto")) {
+        var a = action(if (script.nameIs(c, "keep")) ACTION_KEEP else ACTION_FILEINTO);
+        if (script.nameIs(c, "keep")) {
+            a.target.append("INBOX")?;
+        } else {
+            match (StringView.fromUtf8(firstString(script, o.positional[0]))) {
+                Some(t) => { a.target.append(t)?; }
+                null => {
+                    run.error.append("mailbox name is not UTF-8")?;
+                    return Ok();
+                }
+            }
+            if (a.target.view().equalsIgnoreAsciiCase("INBOX")) {
+                a.target.clear();
+                a.target.append("INBOX")?;
+            }
+        }
+        var flags = Vector<u8>.create();
+        if (o.flags != NONE) {
+            flagList(script, o.flags, mut flags)?;
+        } else {
+            flags.extend(run.flags.view())?;
+        }
+        a.flags.append(StringView.fromUtf8(flags.view())!)?;
+        if (!o.copy) {
+            run.implicitKeep = false;
+        }
+        // The same mailbox twice is one copy (the later flags win, as Pigeonhole merges them).
+        for (i in 0..run.actions.length) {
+            let k = run.actions[i].kind;
+            if ((k == ACTION_KEEP || k == ACTION_FILEINTO) && run.actions[i].target.view() == a.target.view()) {
+                run.actions[i].flags.clear();
+                run.actions[i].flags.append(a.flags.view())?;
+                return Ok();
+            }
+        }
+        return addAction(run, a);
+    }
+    if (script.nameIs(c, "redirect")) {
+        if (run.redirects >= MAX_REDIRECTS) {
+            run.error.append("too many redirects")?;
+            return Ok();
+        }
+        var a = action(ACTION_REDIRECT);
+        match (StringView.fromUtf8(firstString(script, o.positional[0]))) {
+            Some(t) => { a.target.append(t)?; }
+            null => {}
+        }
+        for (i in 0..run.actions.length) {
+            if (run.actions[i].kind == ACTION_REDIRECT && run.actions[i].target.view().equalsIgnoreAsciiCase(
+                a.target.view(),
+            )) {
+                if (!o.copy) {
+                    run.implicitKeep = false;
+                }
+                return Ok();
+            }
+        }
+        run.redirects += 1;
+        if (!o.copy) {
+            run.implicitKeep = false;
+        }
+        return addAction(run, a);
+    }
+    // vacation
+    for (i in 0..run.actions.length) {
+        if (run.actions[i].kind == ACTION_VACATION) {
+            run.error.append("only one vacation per script")?;
+            return Ok();
+        }
+    }
+    var a = action(ACTION_VACATION);
+    a.days = if (o.days < 1) 1 else o.days;
+    a.mime = o.mime;
+    match (StringView.fromUtf8(firstString(script, o.positional[0]))) {
+        Some(t) => { a.reason.append(t)?; }
+        null => {}
+    }
+    if (o.subject != NONE) {
+        match (StringView.fromUtf8(firstString(script, o.subject))) {
+            Some(t) => { a.subject.append(t)?; }
+            null => {}
+        }
+    }
+    if (o.from != NONE) {
+        match (StringView.fromUtf8(firstString(script, o.from))) {
+            Some(t) => { a.from.append(t)?; }
+            null => {}
+        }
+    }
+    if (o.addresses != NONE) {
+        appendStrings(script, o.addresses, mut a.addresses)?;
+    }
+    if (o.handle != NONE) {
+        match (StringView.fromUtf8(firstString(script, o.handle))) {
+            Some(t) => { a.handle.append(t)?; }
+            null => {}
+        }
+    } else {
+        // The default handle: the reason, subject and from (RFC 5230 §4.2), as Pigeonhole forms it.
+        a.handle.append(a.reason.view())?;
+        a.handle.append(if (a.subject.length > 0) a.subject.view() else "<default-subject>")?;
+        a.handle.append(if (a.from.length > 0) a.from.view() else "<default-from>")?;
+        a.handle.append(if (a.mime) "<MIME>" else "<NO-MIME>")?;
+    }
+    return addAction(run, a);
+}
+
+fn testHolds<region r>(
+    script: borrow Script,
+    t: usize,
+    m: SieveMessage<r>,
+    run: borrow mut Run,
+) -> Result<bool, AllocError> {
+    let o = optionsOf(script, t);
+    if (script.nameIs(t, "true")) {
+        return Ok(true);
+    }
+    if (script.nameIs(t, "false")) {
+        return Ok(false);
+    }
+    if (script.nameIs(t, "not")) {
+        return Ok(!(testHolds(script, script.nodes[t].firstChild, m, run)?));
+    }
+    if (script.nameIs(t, "anyof") || script.nameIs(t, "allof")) {
+        let any = script.nameIs(t, "anyof");
+        var k = script.nodes[t].firstChild;
+        while (k != NONE) {
+            let holds = testHolds(script, k, m, run)?;
+            if (any && holds) {
+                return Ok(true);
+            }
+            if (!any && !holds) {
+                return Ok(false);
+            }
+            k = script.nodes[k].next;
+        }
+        return Ok(!any);
+    }
+    if (script.nameIs(t, "size")) {
+        let n = script.args[o.positional[0]].number;
+        return Ok(if (o.over) m.size > n else m.size < n);
+    }
+    if (script.nameIs(t, "exists")) {
+        let names = script.args[o.positional[0]];
+        var values = Vector<u8>.create();
+        for (k in 0..names.count) {
+            if (headerValues(m.header, script.string(names.first + k), false, mut values)? == 0) {
+                return Ok(false);
+            }
+        }
+        return Ok(true);
+    }
+    if (script.nameIs(t, "hasflag")) {
+        let keys = script.args[o.positional[0]];
+        var flags = Vector<u8>.create();
+        flags.extend(run.flags.view())?;
+        let s = flags.view();
+        var at: usize = 0;
+        while (at < s.length) {
+            var end = at;
+            while (end < s.length && s[end] != 0x20) {
+                end += 1;
+            }
+            if (anyKey(script, s[at..end], keys, o)) {
+                return Ok(true);
+            }
+            at = end + 1;
+        }
+        return Ok(false);
+    }
+    let names = script.args[o.positional[0]];
+    let keys = script.args[o.positional[1]];
+    var values = Vector<u8>.create();
+    if (script.nameIs(t, "header")) {
+        for (k in 0..names.count) {
+            let n = headerValues(m.header, script.string(names.first + k), true, mut values)?;
+            if (eachValue(values.view(), n, script, keys, o)) {
+                return Ok(true);
+            }
+        }
+        return Ok(false);
+    }
+    var part = Vector<u8>.create();
+    if (script.nameIs(t, "envelope")) {
+        for (k in 0..names.count) {
+            let which = script.string(names.first + k);
+            let address = if (which.equalsIgnoreAsciiCase(
+                "from".bytes(),
+            )) m.envelopeFrom else (if (which.equalsIgnoreAsciiCase("to".bytes())) m.envelopeTo else "".bytes());
+            if (!which.equalsIgnoreAsciiCase("from".bytes()) && !which.equalsIgnoreAsciiCase("to".bytes())) {
+                continue;
+            }
+            let at = match (address.lastIndexOf("@".bytes())) {
+                Some(a) => a,
+                null => address.length,
+            };
+            let domain = if (at < address.length) address[at + 1..] else "".bytes();
+            addressPart(address[0..at], domain, o.part, mut part)?;
+            if (anyKey(script, part.view(), keys, o)) {
+                return Ok(true);
+            }
+        }
+        return Ok(false);
+    }
+    // address
+    var list = AddressList.create();
+    for (k in 0..names.count) {
+        let n = headerValues(m.header, script.string(names.first + k), false, mut values)?;
+        if (n == 0) {
+            continue;
+        }
+        var at: usize = 0;
+        let all = values.view();
+        while (at <= all.length) {
+            var end = at;
+            while (end < all.length && all[end] != 0) {
+                end += 1;
+            }
+            parseAddressList(all[at..end], mut list)?;
+            var valid: usize = 0;
+            for (i in 0..list.count()) {
+                if (realAddress(list, i)) {
+                    valid += 1;
+                }
+            }
+            if (valid == 0 && o.part == PART_ALL) {
+                // Not an address (or an empty group): Pigeonhole compares the whole value.
+                if (anyKey(script, trimSpace(all[at..end]), keys, o)) {
+                    return Ok(true);
+                }
+            }
+            for (i in 0..list.count()) {
+                if (!realAddress(list, i)) {
+                    continue; // a group's start or end, or a broken address
+                }
+                addressPart(list.mailbox(i)!, list.host(i)!, o.part, mut part)?;
+                if (anyKey(script, part.view(), keys, o)) {
+                    return Ok(true);
+                }
+            }
+            at = end + 1;
+        }
+    }
+    return Ok(false);
+}

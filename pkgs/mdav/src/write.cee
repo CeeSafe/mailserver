@@ -1,0 +1,433 @@
+// GET and HEAD of objects, PUT (RFC 4791 §5.3.2, RFC 6352 §6.3.2), DELETE, MKCALENDAR (RFC 4791 §5.3.1), MKCOL
+// (RFC 5689's extended form too) and PROPPATCH of a collection's display name, color and description.
+
+import mhttp.Request;
+import mhttp.Response;
+import mpim.Collection;
+import mpim.KIND_ADDRESSBOOK;
+import mpim.KIND_CALENDAR;
+import mpim.ObjectFacts;
+import mpim.PimError;
+import mpim.PimObject;
+import mpim.PutOutcome;
+import mpim.createCollection;
+import mpim.deleteCollection;
+import mpim.deleteObject;
+import mpim.objectFacts;
+import mpim.objectNamed;
+import mpim.putObject;
+import mpim.updateCollection;
+import msmtp.SmtpContext;
+import mxml.XmlDocument;
+import mxml.XmlWriter;
+
+fn quotedEtag(etag: StringView, into: borrow mut String) -> Result<void, AllocError> {
+    into.clear();
+    into.append("\"")?;
+    into.append(etag)?;
+    return into.append("\"");
+}
+
+async fn getObject(
+    mail: borrow SmtpContext,
+    request: borrow Request,
+    target: borrow DavPath,
+    userId: i64,
+) -> Result<Response, AllocError> {
+    if (target.kind != T_CAL_OBJECT && target.kind != T_CARD) {
+        var r = Response.text(405, "Only calendar objects and vCards can be read with GET.")?;
+        r.header("Allow", "OPTIONS, PROPFIND, REPORT, PROPPATCH, DELETE, PUT")?;
+        return Ok(r);
+    }
+    var c = Collection.create();
+    match (await targetCollection(mail, userId, target, mut c)) {
+        Ok(true) => {}
+        Ok(false) => { return Response.text(404, "Not found."); }
+        Err(e) => { return pimAnswer(e); }
+    }
+    var o = PimObject.create();
+    match (await objectNamed(mail.store, c.id, target.href.view(), mut o)) {
+        Ok(true) => {}
+        Ok(false) => { return Response.text(404, "Not found."); }
+        Err(e) => { return pimAnswer(e); }
+    }
+    var etag = String.create();
+    quotedEtag(o.etag.view(), mut etag)?;
+    var unless = String.create();
+    etagHeader(request, "If-None-Match", mut unless)?;
+    if (unless.length > 0 && (unless.view() == o.etag.view() || unless.view() == "*")) {
+        var r = Response.create(304);
+        r.header("ETag", etag.view())?;
+        return Ok(r);
+    }
+    var body = Vector<u8>.create();
+    body.extend(o.data.view().bytes())?;
+    let mediaType = if (target.kind == T_CAL_OBJECT) "text/calendar; charset=utf-8" else "text/vcard; charset=utf-8";
+    var r = Response.of(200, mediaType, body)?;
+    r.header("ETag", etag.view())?;
+    return Ok(r);
+}
+
+async fn putResource(
+    mail: borrow SmtpContext,
+    request: borrow Request,
+    target: borrow DavPath,
+    userId: i64,
+) -> Result<Response, AllocError> {
+    if (target.kind != T_CAL_OBJECT && target.kind != T_CARD) {
+        return Response.text(405, "PUT makes calendar objects and vCards only.");
+    }
+    let calendar = target.kind == T_CAL_OBJECT;
+    let data = match (StringView.fromUtf8(request.body.view())) {
+        Some(d) => d,
+        null => {
+            return preconditionFailed(
+                403,
+                if (calendar) NS_CAL else NS_CARD,
+                if (calendar) "valid-calendar-data" else "valid-address-data",
+            );
+        }
+    };
+    var facts = ObjectFacts.create();
+    let valid = objectFacts(data.bytes(), mut facts)?;
+    let fits = if (calendar) facts.component.view() != "VCARD" else facts.component.view() == "VCARD";
+    if (!valid || !fits) {
+        return preconditionFailed(
+            403,
+            if (calendar) NS_CAL else NS_CARD,
+            if (calendar) "valid-calendar-data" else "valid-address-data",
+        );
+    }
+    var c = Collection.create();
+    var exists = match (await targetCollection(mail, userId, target, mut c)) {
+        Ok(f) => f,
+        Err(e) => { return pimAnswer(e); }
+    };
+    if (!exists) {
+        // As the C# server: a PUT into a collection that is not there makes it.
+        match (await createCollection(
+            mail.store,
+            userId,
+            target.kindName(),
+            target.collection.view(),
+            target.collection.view(),
+            null,
+            null,
+        )) {
+            Ok(_) => {}
+            Err(PimError.Exists) => {}
+            Err(e) => { return pimAnswer(e); }
+        }
+        exists = match (await targetCollection(mail, userId, target, mut c)) {
+            Ok(f) => f,
+            Err(e) => { return pimAnswer(e); }
+        };
+        if (!exists) {
+            return Response.text(409, "The collection could not be made.");
+        }
+    }
+    var ifMatch = String.create();
+    etagHeader(request, "If-Match", mut ifMatch)?;
+    var ifNone = String.create();
+    etagHeader(request, "If-None-Match", mut ifNone)?;
+    if (ifMatch.view() == "*") {
+        // Must exist, whatever its etag.
+        var current = PimObject.create();
+        match (await objectNamed(mail.store, c.id, target.href.view(), mut current)) {
+            Ok(true) => {}
+            Ok(false) => { return Response.text(412, "It does not exist."); }
+            Err(e) => { return pimAnswer(e); }
+        }
+        ifMatch.clear();
+    }
+    var outcome = PutOutcome.create();
+    match (await putObject(
+        mail.store,
+        userId,
+        c.id,
+        target.href.view(),
+        data,
+        ifMatch.view(),
+        ifNone.view() == "*",
+        mut outcome,
+    )) {
+        Ok() => {}
+        Err(PimError.UidConflict) => {
+            return preconditionFailed(409, if (calendar) NS_CAL else NS_CARD, "no-uid-conflict");
+        }
+        Err(PimError.Invalid) => {
+            return preconditionFailed(
+                403,
+                if (calendar) NS_CAL else NS_CARD,
+                if (calendar) "valid-calendar-data" else "valid-address-data",
+            );
+        }
+        Err(PimError.NotFound) => { return Response.text(409, "The collection is gone."); }
+        Err(e) => { return pimAnswer(e); }
+    }
+    var r = Response.create(if (outcome.created) 201 else 204);
+    var etag = String.create();
+    quotedEtag(outcome.etag.view(), mut etag)?;
+    r.header("ETag", etag.view())?;
+    return Ok(r);
+}
+
+async fn deleteResource(
+    mail: borrow SmtpContext,
+    request: borrow Request,
+    target: borrow DavPath,
+    userId: i64,
+) -> Result<Response, AllocError> {
+    let kind = target.kind;
+    if (kind != T_CAL_OBJECT && kind != T_CARD && kind != T_CALENDAR && kind != T_BOOK) {
+        return Response.text(403, "That cannot be deleted.");
+    }
+    var c = Collection.create();
+    match (await targetCollection(mail, userId, target, mut c)) {
+        Ok(true) => {}
+        Ok(false) => { return Response.text(404, "Not found."); }
+        Err(e) => { return pimAnswer(e); }
+    }
+    if (kind == T_CALENDAR || kind == T_BOOK) {
+        return match (await deleteCollection(mail.store, userId, c.id)) {
+            Ok() => Ok(Response.create(204)),
+            Err(e) => pimAnswer(e),
+        };
+    }
+    var ifMatch = String.create();
+    etagHeader(request, "If-Match", mut ifMatch)?;
+    if (ifMatch.view() == "*") {
+        ifMatch.clear();
+    }
+    return match (await deleteObject(mail.store, userId, c.id, target.href.view(), ifMatch.view())) {
+        Ok() => Ok(Response.create(204)),
+        Err(e) => pimAnswer(e),
+    };
+}
+
+/// The text of `<set><prop><space:local>` in a MKCALENDAR, MKCOL or PROPPATCH body; null when absent.
+fn setProperty<region r>(doc: borrow(r) XmlDocument, space: StringView, local: StringView) -> (StringView<r>)? {
+    var sets = Vector<usize>.create();
+    match (doc.findAll(doc.root(), NS_DAV, "set", mut sets)) {
+        Ok() => {}
+        Err(_) => { return null; }
+    }
+    for (s in sets.view()) {
+        match (doc.child(s, NS_DAV, "prop")) {
+            Some(prop) => {
+                match (doc.child(prop, space, local)) {
+                    Some(p) => { return doc.trimmed(p); }
+                    null => {}
+                }
+            }
+            null => {}
+        }
+    }
+    return null;
+}
+
+async fn makeCollection(
+    mail: borrow SmtpContext,
+    request: borrow Request,
+    target: borrow DavPath,
+    email: StringView,
+    userId: i64,
+) -> Result<Response, AllocError> {
+    if (target.kind != T_CALENDAR && target.kind != T_BOOK) {
+        return Response.text(403, "Collections are made inside the calendar or contacts home.");
+    }
+    let calendar = target.kind == T_CALENDAR;
+    if (request.isMethod("MKCALENDAR") && !calendar) {
+        return Response.text(403, "MKCALENDAR makes calendars, under /dav/calendars/.");
+    }
+    let parsed = match (bodyXml(request)) {
+        Ok(d) => d,
+        Err(_) => { return Response.text(400, "The body is not well-formed XML."); }
+    };
+    var display = String.create();
+    var description = String.create();
+    var color = String.create();
+    var hasDescription = false;
+    var hasColor = false;
+    match (borrow parsed) {
+        Some(doc) => {
+            // An extended MKCOL must make what its path says.
+            if (doc.is(doc.root(), NS_DAV, "mkcol")) {
+                match (doc.find(doc.root(), NS_DAV, "resourcetype")) {
+                    Some(rt) => {
+                        let wantsCalendar = doc.child(rt, NS_CAL, "calendar") != null;
+                        let wantsBook = doc.child(rt, NS_CARD, "addressbook") != null;
+                        if ((calendar && !wantsCalendar) || (!calendar && !wantsBook)) {
+                            return preconditionFailed(403, NS_DAV, "valid-resourcetype");
+                        }
+                    }
+                    null => {}
+                }
+            }
+            match (setProperty(doc, NS_DAV, "displayname")) {
+                Some(v) => { display.append(v)?; }
+                null => {}
+            }
+            let descriptionName = if (calendar) "calendar-description" else "addressbook-description";
+            match (setProperty(doc, if (calendar) NS_CAL else NS_CARD, descriptionName)) {
+                Some(v) => {
+                    description.append(v)?;
+                    hasDescription = true;
+                }
+                null => {}
+            }
+            match (setProperty(doc, NS_IC, "calendar-color")) {
+                Some(v) => {
+                    color.append(v)?;
+                    hasColor = calendar;
+                }
+                null => {}
+            }
+        }
+        null => {}
+    }
+    if (display.length == 0) {
+        display.append(target.collection.view())?;
+    }
+    match (await createCollection(
+        mail.store,
+        userId,
+        if (calendar) KIND_CALENDAR else KIND_ADDRESSBOOK,
+        target.collection.view(),
+        display.view(),
+        if (hasDescription) description.view() else null,
+        if (hasColor) color.view() else null,
+    )) {
+        Ok(_) => {}
+        Err(PimError.Exists) => {
+            var r = Response.text(405, "It exists already.")?;
+            r.header("Allow", ALLOW)?;
+            return Ok(r);
+        }
+        Err(e) => { return pimAnswer(e); }
+    }
+    var r = Response.create(201);
+    var location = String.create();
+    collectionHref(calendar, email, target.collection.view(), mut location)?;
+    r.header("Location", location.view())?;
+    return Ok(r);
+}
+
+/// A PROPPATCH change: the property and its new value (empty for a removal).
+struct Change {
+    space: String;
+    local: String;
+    value: String;
+    removal: bool;
+}
+
+/// PROPPATCH of a collection (RFC 4918 §9.2): display name, color and description are kept; Apple's and
+/// CalendarServer's other properties (calendar-order and the like) are accepted and not kept; anything else is
+/// refused, and then nothing changes (the others get 424).
+async fn proppatch(
+    mail: borrow SmtpContext,
+    request: borrow Request,
+    target: borrow DavPath,
+    email: StringView,
+    userId: i64,
+) -> Result<Response, AllocError> {
+    if (target.kind != T_CALENDAR && target.kind != T_BOOK) {
+        return Response.text(403, "Only calendars and address books have properties to change.");
+    }
+    let calendar = target.kind == T_CALENDAR;
+    let doc = match (bodyXml(request)) {
+        Ok(Some(d)) => d,
+        Ok(null) => { return Response.text(400, "PROPPATCH needs a body."); }
+        Err(_) => { return Response.text(400, "The body is not well-formed XML."); }
+    };
+    if (!doc.is(doc.root(), NS_DAV, "propertyupdate")) {
+        return Response.text(400, "Expected DAV:propertyupdate.");
+    }
+    var c = Collection.create();
+    match (await targetCollection(mail, userId, target, mut c)) {
+        Ok(true) => {}
+        Ok(false) => { return Response.text(404, "No such collection."); }
+        Err(e) => { return pimAnswer(e); }
+    }
+    var list = Vector<Change>.create();
+    var steps = Vector<usize>.create();
+    doc.children(doc.root(), mut steps)?;
+    for (step in steps.view()) {
+        let removal = doc.is(step, NS_DAV, "remove");
+        if (!removal && !doc.is(step, NS_DAV, "set")) {
+            continue;
+        }
+        match (doc.child(step, NS_DAV, "prop")) {
+            Some(prop) => {
+                var props = Vector<usize>.create();
+                doc.children(prop, mut props)?;
+                for (p in props.view()) {
+                    var change = Change {
+                        space: String.create(),
+                        local: String.create(),
+                        value: String.create(),
+                        removal: removal,
+                    };
+                    change.space.append(StringView.fromUtf8(doc.spaceName(p)) ?? "")?;
+                    change.local.append(StringView.fromUtf8(doc.localName(p)) ?? "")?;
+                    if (!removal) {
+                        change.value.append(doc.trimmed(p))?;
+                    }
+                    list.push(change)?;
+                }
+            }
+            null => {}
+        }
+    }
+    var display: StringView? = null;
+    var description: StringView? = null;
+    var color: StringView? = null;
+    var refused = false;
+    var statuses = Vector<u16>.create();
+    for (ch in list.view()) {
+        let space = ch.space.view();
+        let local = ch.local.view();
+        var status: u16 = 200;
+        if (space == NS_DAV && local == "displayname") {
+            display = if (ch.removal) c.name.view() else ch.value.view();
+        } else if (calendar && space == NS_IC && local == "calendar-color") {
+            color = ch.value.view();
+        } else if ((calendar && space == NS_CAL && local == "calendar-description") ||
+            (!calendar && space == NS_CARD && local == "addressbook-description")) {
+            description = ch.value.view();
+        } else if (space == NS_IC || space == NS_CS) {
+            // Accepted, not kept.
+        } else {
+            status = 403;
+            refused = true;
+        }
+        statuses.push(status)?;
+    }
+    if (!refused && (display != null || description != null || color != null)) {
+        match (await updateCollection(mail.store, userId, c.id, display, description, color)) {
+            Ok() => {}
+            Err(e) => { return pimAnswer(e); }
+        }
+    }
+    var w = multistatus();
+    w.start("D:response");
+    var href = String.create();
+    collectionHref(calendar, email, c.name.view(), mut href)?;
+    w.element("D:href", href.view());
+    for (i in 0..list.length) {
+        let status = if (refused && statuses[i] == 200) 424u16 else statuses[i];
+        w.start("D:propstat");
+        w.start("D:prop");
+        emptyNamed(mut w, list[i].space.view(), list[i].local.view())?;
+        w.end();
+        statusElement(
+            mut w,
+            if (status ==
+                200) "HTTP/1.1 200 OK" else if (status ==
+                403) "HTTP/1.1 403 Forbidden" else "HTTP/1.1 424 Failed Dependency",
+        );
+        w.end();
+    }
+    w.end();
+    return finishMultistatus(w);
+}

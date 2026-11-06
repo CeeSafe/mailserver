@@ -1,0 +1,26 @@
+size 36416
+envelope ("Sun, 30 Apr 1995 03:00:19 -0700" "Welcome to Ishmail" (("Hal Software Systems" NIL "support" "halsoft.com")) (("Hal Software Systems" NIL "support" "halsoft.com")) (("Hal Software Systems" NIL "support" "halsoft.com")) NIL NIL NIL NIL "<199504301000.DAA08377@gunwale.mcom.com>")
+bodystructure (("text" "enriched" ("charset" "us-ascii") NIL NIL "quoted-printable" 5475 160 NIL NIL NIL NIL) ("image" "gif" NIL NIL "Our company logo" "base64" 2616 NIL NIL NIL NIL) ("text" "enriched" ("charset" "us-ascii") NIL NIL "quoted-printable" 528 10 NIL NIL NIL NIL) ("audio" "basic" NIL NIL "A famous personality speaks out" "base64" 23376 NIL NIL NIL NIL) ("text" "enriched" ("charset" "us-ascii") NIL NIL "quoted-printable" 592 14 NIL NIL NIL NIL) ("message" "external-body" ("access-type" "local-file" "name" "/etc/passwd") NIL NIL "7bit" 71 NIL NIL NIL NIL) ("text" "enriched" ("charset" "us-ascii") NIL NIL "quoted-printable" 281 5 NIL NIL NIL NIL) ("message" "external-body" ("access-type" "anon-ftp" "name" "README.ftp" "site" "199.35.253.5" "directory" "halsoft/info" "mode" "ascii") NIL NIL "7bit" 71 NIL NIL NIL NIL) ("text" "enriched" ("charset" "us-ascii") NIL NIL "quoted-printable" 1103 34 NIL NIL NIL NIL) "mixed" ("boundary" "bODY.pART.bOUNDARY.2") NIL NIL NIL)
+body (("text" "enriched" ("charset" "us-ascii") NIL NIL "quoted-printable" 5475 160) ("image" "gif" NIL NIL "Our company logo" "base64" 2616) ("text" "enriched" ("charset" "us-ascii") NIL NIL "quoted-printable" 528 10) ("audio" "basic" NIL NIL "A famous personality speaks out" "base64" 23376) ("text" "enriched" ("charset" "us-ascii") NIL NIL "quoted-printable" 592 14) ("message" "external-body" ("access-type" "local-file" "name" "/etc/passwd") NIL NIL "7bit" 71) ("text" "enriched" ("charset" "us-ascii") NIL NIL "quoted-printable" 281 5) ("message" "external-body" ("access-type" "anon-ftp" "name" "README.ftp" "site" "199.35.253.5" "directory" "halsoft/info" "mode" "ascii") NIL NIL "7bit" 71) ("text" "enriched" ("charset" "us-ascii") NIL NIL "quoted-printable" 1103 34) "mixed")
+section HEADER 761 c808ab16c7bf96d1b4ab415d5918cffe2d26c6f39d1175eaba3e2c5665bbd1b6
+section TEXT 35655 48c95dce74109b2edf4c713eb8bece6fe80db51be0e612667856f4e5ba2dcb5c
+section HEADER.FIELDS 240 59891e1b1c159702800d6f0874308b45660f98fc7836cee8eb165780d9025ad2
+section HEADER.FIELDS.NOT 523 ab31015a32682dbde2f3e671a140cdac9e0acaa10adbf1f83138121e95f74819
+section 1 5475 3cc79ef760d6ac2fa0892d8f21aa9d2e7f62af1e923b1b30244d338d81e59446
+section 1.MIME 76 5fb90d46ea06771e9b22f7d84355fb1fc54634a966d429ca5f348680041f3ab1
+section 2 2616 b880b52b65a291b8b53fd90eab8b8bf90705054c983dae1755f4e0949d3fed2e
+section 2.MIME 101 a174b1d703318c1af98c6e1ae7ea20ea4702a6fc2b2c11e032cfa9972d7ae7d4
+section 3 528 2cf762e1e9a8c8d8317d76a66acf6dc766996c4533e2985311db58315af1e764
+section 3.MIME 76 5fb90d46ea06771e9b22f7d84355fb1fc54634a966d429ca5f348680041f3ab1
+section 4 23376 d3f619ee96966e2dc77c6b67df1b8fa130df8d60b984cd0ffad006c76b9c66be
+section 4.MIME 118 0cea6f93b03099d8527c6a0b9620199135133a090c0a015b10aae3ffea57ed03
+section 5 592 9db856acf9d8553f192c9e9c1965e3f48262650e4357e601c63433c6cc89cccb
+section 5.MIME 76 5fb90d46ea06771e9b22f7d84355fb1fc54634a966d429ca5f348680041f3ab1
+section 6 71 14a4468ab0b16dac95e848cb8a23278b5fb654a250dca07d3650809cba4ba581
+section 6.MIME 89 29910915c376fc1539f96ce402c7662900cb938cd35ac17432ddbf075b66867d
+section 7 281 37864eedb6a9c9c028d0fdf02d173a229bbdd7d60c3d75cb5292ef5f1c6d01d0
+section 7.MIME 76 5fb90d46ea06771e9b22f7d84355fb1fc54634a966d429ca5f348680041f3ab1
+section 8 71 4aa695bf62ed35d4257427e4f427632f1428ce55e6f56a4d0e096d5d0fcf2c1b
+section 8.MIME 153 b5e9d6aa40454a74857870da621e04d237e166499a12923fe8d82552dbd0889d
+section 9 1103 3058792099de252888fb206ae57c4c05c8c18e0354294c72375ec05b6c511ffb
+section 9.MIME 76 5fb90d46ea06771e9b22f7d84355fb1fc54634a966d429ca5f348680041f3ab1

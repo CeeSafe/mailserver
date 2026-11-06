@@ -1,0 +1,10 @@
+size 1095
+envelope ("Wed, 16 Apr 1997 16:57:13 -0700" "encrypted" (("Jamie Zawinski" NIL "jwz" "netscape.com")) (("Jamie Zawinski" NIL "jwz" "netscape.com")) (("Jamie Zawinski" NIL "jwz" "netscape.com")) (("Jamie Zawinski" NIL "jwz" "netscape.com")) NIL NIL NIL "<33556759.E69CC032@netscape.com>")
+bodystructure ("application" "x-pkcs7-mime" ("name" "smime.p7m") NIL "S/MIME Encrypted Message" "base64" 532 NIL ("attachment" ("filename" "smime.p7m")) NIL NIL)
+body ("application" "x-pkcs7-mime" ("name" "smime.p7m") NIL "S/MIME Encrypted Message" "base64" 532)
+section HEADER 563 be993a961e42d27f21b30b0f9bff87bd59204cd724162e028a19e30f79b03f52
+section TEXT 532 5d42ce3be106a18bf23fa39684354bf331a2f323c59e207db7f4c123cf76a8df
+section HEADER.FIELDS 245 370e0db1a1c955c4ae02786af99bba6b51d3b6fc98f09a75c076b5d638c40709
+section HEADER.FIELDS.NOT 320 70f524fa42a82b0289c3b25629189187edbba0cdb31da6ea0559fd129dd344fd
+section 1 532 5d42ce3be106a18bf23fa39684354bf331a2f323c59e207db7f4c123cf76a8df
+section 1.MIME 563 be993a961e42d27f21b30b0f9bff87bd59204cd724162e028a19e30f79b03f52

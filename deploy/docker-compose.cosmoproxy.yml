@@ -1,0 +1,28 @@
+# Behind CosmoProxy, as CosmoMailServer runs today (deployment/fresh-vps/deploy-stack.sh): CosmoProxy owns the public
+# ports, streams the mail ports to loopback ones with a PROXY v2 header, terminates HTTPS, and holds the
+# certificates. The mail server then takes:
+#   - the mail ports on the loopback ports CosmoProxy's tcp blocks proxy to (the same ones as before, so the
+#     CosmoProxyfile does not change at the cutover);
+#   - PROXY headers from the Docker bridge: in mailserver.toml, [proxy] from = "172.16.0.0/12";
+#   - CosmoProxy's certificate files for SMTPS, IMAPS and STARTTLS (reloaded when CosmoProxy renews them): [tls]
+#     certificate = "/certs/fullchain.pem", key = "/certs/key.pem", and [acme] directory = "";
+#   - everything CosmoProxy terminates HTTPS for, on the [http] proxied listener (127.0.0.1:9185), which trusts
+#     X-Forwarded-Host and X-Forwarded-For and has no admin API: autoconfig and autodiscover (@autodiscover,
+#     @autodiscoverv2, @autoconfig), MTA-STS (mta-sts.<domain>/.well-known/mta-sts.txt), and the groupware paths
+#     the C# api served: /Microsoft-Server-ActiveSync, /EWS/*, /dav/*, /.well-known/caldav, /.well-known/carddav.
+#     The admin listener (9184) is not published: only the admin UI container reaches it.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.cosmoproxy.yml up -d
+
+services:
+  mailserver:
+    ports: !override
+      - "127.0.0.1:25025:2525"
+      - "127.0.0.1:25587:2587"
+      - "127.0.0.1:25465:2465"
+      - "127.0.0.1:25993:2993"
+      - "127.0.0.1:25143:2143"
+      - "127.0.0.1:8980:8080"
+      - "127.0.0.1:9185:9185"
+    volumes:
+      - ${PROXY_CERT_DIR}:/certs:ro

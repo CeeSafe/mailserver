@@ -1,0 +1,100 @@
+// LIST and LSUB patterns (RFC 3501 §6.3.8): `*` matches anything, `%` anything but the hierarchy delimiter `/`.
+// INBOX is matched without case.
+
+/// The longest pattern matched; a longer one matches nothing (names are at most 1024 bytes).
+const MAX_PATTERN: usize = 4096;
+
+fn foldByte(c: u8) -> u8 => if (c >= 0x61 && c <= 0x7a) c - 0x20 else c;
+
+/// Whether `name` matches `pattern`. Dynamic programming over the name, so no pattern takes exponential time.
+public fn listMatches(pattern: Slice<u8>, name: Slice<u8>) -> bool {
+    if (pattern.length > MAX_PATTERN) {
+        return false;
+    }
+    // INBOX, and the INBOX part of names under it, compare without case.
+    var caseless: usize = 0;
+    if (name.length >= 5 && name[0..5].equalsIgnoreAsciiCase("INBOX".bytes()) &&
+        (name.length == 5 || name[5] == 0x2f)) {
+        caseless = 5;
+    }
+    var prev = Vector<bool>.create();
+    var cur = Vector<bool>.create();
+    match (prev.resize(name.length + 1, false)) {
+        Ok() => {}
+        Err(_) => { return false; }
+    }
+    match (cur.resize(name.length + 1, false)) {
+        Ok() => {}
+        Err(_) => { return false; }
+    }
+    prev[0] = true;
+    for (p in pattern) {
+        if (p == 0x2a) {
+            var any = false;
+            for (j in 0..name.length + 1) {
+                any = any || prev[j];
+                cur[j] = any;
+            }
+        } else if (p == 0x25) {
+            cur[0] = prev[0];
+            for (j in 1..name.length + 1) {
+                cur[j] = prev[j] || (cur[j - 1] && name[j - 1] != 0x2f);
+            }
+        } else {
+            cur[0] = false;
+            for (j in 1..name.length + 1) {
+                let c = name[j - 1];
+                let same = if (j <= caseless) foldByte(c) == foldByte(p) else c == p;
+                cur[j] = prev[j - 1] && same;
+            }
+        }
+        for (j in 0..name.length + 1) {
+            prev[j] = cur[j];
+        }
+    }
+    return prev[name.length];
+}
+
+/// Whether `name` has a mailbox under it among `names`: one that starts with `name/`.
+public fn isParentOf(name: Slice<u8>, other: Slice<u8>) -> bool =>
+    other.length > name.length + 1 && other[name.length] == 0x2f && other[0..name.length] == name;
+
+/// A CREATE name without its trailing delimiters (RFC 3501 §6.3.3: `foo/` creates `foo`).
+public fn trimDelimiter<region a>(name: Slice<a, u8>) -> Slice<a, u8> {
+    var end = name.length;
+    while (end > 0 && name[end - 1] == 0x2f) {
+        end -= 1;
+    }
+    return name[0..end];
+}
+
+/// A literal marker `{n}` or `{n+}` ending `line`: its size, and whether it is synchronizing.
+public struct TrailingLiteral {
+    public size: u64;
+    public synchronizing: bool;
+}
+
+public fn trailingLiteral(line: Slice<u8>) -> TrailingLiteral? {
+    var end = line.length;
+    if (end < 3 || line[end - 1] != 0x7d) {
+        return null;
+    }
+    end -= 1;
+    var synchronizing = true;
+    if (line[end - 1] == 0x2b) {
+        synchronizing = false;
+        end -= 1;
+    }
+    var start = end;
+    while (start > 0 && line[start - 1] >= 0x30 && line[start - 1] <= 0x39) {
+        start -= 1;
+    }
+    if (start == end || start == 0 || line[start - 1] != 0x7b || end - start > 10) {
+        return null;
+    }
+    var size: u64 = 0;
+    for (c in line[start..end]) {
+        size = size * 10 + ((c - 0x30) as u64);
+    }
+    return TrailingLiteral { size: size, synchronizing: synchronizing };
+}

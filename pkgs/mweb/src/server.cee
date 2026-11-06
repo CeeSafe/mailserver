@@ -1,0 +1,210 @@
+// The HTTP listeners: one task per connection, as msmtp's and mimap's, each serving requests in turn until the client
+// closes, idles out, or sends something malformed.
+
+import mhttp.ChallengeStore;
+import mhttp.HttpError;
+import mhttp.Request;
+import mhttp.RequestLimits;
+import mhttp.Response;
+import mhttp.readRequest;
+import mhttp.statusOf;
+import mhttp.writeResponse;
+import msmtp.Fault;
+import msmtp.SmtpContext;
+import msmtp.Wire;
+import msmtp.peerBytes;
+import mews.isStreamingRequest;
+import mews.streamEvents;
+
+/// How long a TLS handshake may take.
+const WEB_HANDSHAKE_MS: u64 = 15000;
+
+/// Which listener a connection came in on, which decides what it may reach.
+public enum WebMode {
+    /// Port 80: ACME challenges and client autoconfiguration.
+    Plain,
+    /// Port 443: as `Plain`, and the MTA-STS policies (which need HTTPS).
+    Tls,
+    /// The admin listener (loopback, for the admin UI's server and a reverse proxy): everything, and the admin API.
+    /// Requests here may carry `X-Forwarded-Host` for the host they were sent to.
+    Admin,
+    /// Plain HTTP from a TLS-terminating reverse proxy (CosmoProxy): as `Tls`, with the groupware protocols, and
+    /// `X-Forwarded-Host` and `X-Forwarded-For` trusted; never the admin API.
+    Proxied,
+}
+
+/// Whether requests in `mode` come through a reverse proxy, whose forwarded fields are trusted.
+public fn forwarded(mode: WebMode) -> bool => match (mode) {
+    WebMode.Admin => true,
+    WebMode.Proxied => true,
+    _ => false,
+};
+
+/// What the HTTP side needs besides the mail context.
+public struct WebSettings {
+    /// The port clients are told to use for IMAP (implicit TLS) and for submission (implicit TLS).
+    public imapPort: u16;
+    public submissionPort: u16;
+    public limits: RequestLimits;
+    /// Whether Outlook's POX autodiscover names the Exchange protocols (EWS) too. Off by default: macOS Mail then
+    /// sets the account up as Exchange rather than IMAP.
+    public advertiseExchange: bool;
+
+    public fn defaults() -> WebSettings =>
+        WebSettings { imapPort: 993, submissionPort: 465, limits: RequestLimits.defaults(), advertiseExchange: true };
+}
+
+/// Shared by every HTTP connection.
+@noncopy
+public struct WebContext {
+    public mail: Arc<SmtpContext>;
+    public settings: WebSettings;
+    /// The ACME HTTP-01 challenges being served.
+    public challenges: ChallengeStore;
+    public admin: AdminSettings;
+
+    public fn create(
+        mail: Arc<SmtpContext>,
+        settings: WebSettings,
+        admin: AdminSettings,
+    ) -> Result<WebContext, AllocError> =>
+        Ok(WebContext { mail: mail, settings: settings, challenges: ChallengeStore.create()?, admin: admin });
+}
+
+/// Serves HTTP connections from `listener` until cancelled, at most `limit` at once.
+public async fn serve(
+    listener: borrow AsyncTcpListener,
+    mode: WebMode,
+    context: Arc<WebContext>,
+    limit: u32,
+) -> Result<void, Fault> {
+    return await Async.tasks(limit, Fault.OutOfMemory, async (set) => {
+        loop {
+            let stream = match (await listener.accept()) {
+                Ok(s) => s,
+                Err(AsyncError.Cancelled) => { return Ok(); }
+                Err(_) => {
+                    match (await Timer.sleep(100)) {
+                        Ok() => {}
+                        Err(_) => { return Ok(); }
+                    }
+                    continue;
+                }
+            };
+            let shared = context.clone();
+            match (await set.spawnSend(async move () => await serveConnection(shared.get(), stream, mode))) {
+                Ok() => {}
+                Err(_) => { return Ok(); }
+            }
+        }
+    });
+}
+
+async fn openWire(ctx: borrow WebContext, stream: AsyncTcpStream, mode: WebMode) -> Wire? {
+    match (mode) {
+        WebMode.Tls => {
+            let current = ctx.mail.get().tlsConfig();
+            match (borrow current) {
+                Some(config) => {
+                    match (await Wire.implicitTls(stream, config, WEB_HANDSHAKE_MS)) {
+                        Ok(w) => { return w; }
+                        Err(_) => { return null; }
+                    }
+                }
+                null => { return null; }
+            }
+        }
+        _ => {
+            match (Wire.plain(stream)) {
+                Ok(w) => { return w; }
+                Err(_) => { return null; }
+            }
+        }
+    }
+}
+
+/// One connection: requests and responses in turn (HTTP/1.1 persistent connections, no pipelining in parallel).
+public async fn serveConnection(ctx: borrow WebContext, stream: AsyncTcpStream, mode: WebMode) -> Result<void, Fault> {
+    var wire = match (await openWire(ctx, stream, mode)) {
+        Some(w) => w,
+        null => { return Ok(); }
+    };
+    var request = Request.create();
+    let tcpPeer = peerBytes(wire.peer());
+    loop {
+        match (await readRequest(mut wire, mut request, ctx.settings.limits)) {
+            Ok() => {}
+            Err(HttpError.Closed) => { break; }
+            Err(HttpError.Wire(_)) => { break; }
+            Err(HttpError.OutOfMemory) => { break; }
+            Err(e) => {
+                // A malformed request: answer its status, then close, since where the next one starts is unknown.
+                match (Response.error(statusOf(e), reasonFor(e))) {
+                    Ok(r) => {
+                        match (await writeResponse(mut wire, r, false, false)) {
+                            Ok() => {}
+                            Err(_) => {}
+                        }
+                    }
+                    Err(_) => {}
+                }
+                break;
+            }
+        }
+        request.peer = if (forwarded(mode)) forwardedPeer(request, tcpPeer) else tcpPeer;
+        let keepAlive = request.keepAlive();
+        // EWS streaming notifications write their response as they go (mews).
+        if (streamable(mode) && isStreamingRequest(request)) {
+            if (await streamEvents(ctx.mail.get(), request, mut wire) && keepAlive) {
+                continue;
+            }
+            break;
+        }
+        let response = match (await route(ctx, mode, request)) {
+            Ok(r) => r,
+            Err(_) => {
+                match (Response.error(500, "The server could not answer.")) {
+                    Ok(r) => r,
+                    Err(_) => { break; }
+                }
+            }
+        };
+        let head = request.isMethod("HEAD");
+        match (await writeResponse(mut wire, response, keepAlive, head)) {
+            Ok() => {}
+            Err(_) => { break; }
+        }
+        if (!keepAlive) {
+            break;
+        }
+    }
+    await wire.close();
+    return Ok();
+}
+
+/// Whether the groupware protocols are served in `mode` (never over plain HTTP from the network).
+fn streamable(mode: WebMode) -> bool => match (mode) {
+    WebMode.Plain => false,
+    _ => true,
+};
+
+/// The client's address a reverse proxy forwarded (the first of `X-Forwarded-For`), else the connection's.
+fn forwardedPeer(request: borrow Request, tcpPeer: [u8; 16]) -> [u8; 16] {
+    let forwarded = match (request.header("X-Forwarded-For")) {
+        Some(v) => v.view(),
+        null => { return tcpPeer; }
+    };
+    let first = forwarded[0..forwarded.indexOf(",") ?? forwarded.length].trim();
+    return match (SocketAddresses.parseIp(first, 0)) {
+        Some(a) => peerBytes(a),
+        null => tcpPeer,
+    };
+}
+
+fn reasonFor(e: HttpError) -> StringView => match (e) {
+    HttpError.TooLarge => "The request body is too large.",
+    HttpError.HeadersTooLarge => "The request's header fields are too large.",
+    HttpError.NotImplemented => "That transfer coding is not supported.",
+    HttpError.BadVersion => "Only HTTP/1.0 and HTTP/1.1 are supported.",
+    _ => "The request is malformed.",
+};

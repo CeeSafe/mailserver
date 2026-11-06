@@ -1,0 +1,1246 @@
+import postgres.PgConfig;
+import postgres.PgConnection;
+import postgres.PgLease;
+import postgres.PgParams;
+import postgres.PgPool;
+import postgres.PgRows;
+
+/// IMAP system flags, as stored.
+public const FLAG_SEEN: u16 = 1;
+public const FLAG_ANSWERED: u16 = 2;
+public const FLAG_FLAGGED: u16 = 4;
+public const FLAG_DELETED: u16 = 8;
+public const FLAG_DRAFT: u16 = 16;
+
+/// The mail store: accounts, mailboxes and messages in Postgres, message content in a `BlobStore`. One is shared by
+/// every task of the server, on any worker.
+///
+/// Every operation that names a mailbox takes the user's id too, and finds nothing (`NotFound`, or no rows) when the
+/// mailbox is someone else's, so a session can only reach its own user's mail.
+@noncopy
+public struct MailStore {
+    private pool: PgPool;
+    private files: BlobStore;
+    private bus: NotifyBus;
+
+    /// Opens the store: a pool of `connections` to the database `config` names, with the schema brought up to date,
+    /// and blob files under `blobRoot`.
+    public async fn open(config: PgConfig, connections: usize, blobRoot: StringView) -> Result<MailStore, StoreError> {
+        let made: Result<BlobStore, StoreError> = await Async.blocking(() => BlobStore.create(blobRoot));
+        let blobStore = made?;
+        let pool = match (PgPool.create(config, connections)) {
+            Ok(p) => p,
+            Err(e) => { return Err(StoreError.Db(e)); }
+        };
+        {
+            var lease = await MailStore.lease(borrow pool)?;
+            await Migrations.apply(lease.connection())?;
+        }
+        let bus = match (NotifyBus.create()) {
+            Ok(b) => b,
+            Err(_) => { return Err(StoreError.OutOfMemory); }
+        };
+        return Ok(MailStore { pool: pool, files: blobStore, bus: bus });
+    }
+
+    async fn lease(pool: borrow PgPool) -> Result<PgLease, StoreError> {
+        match (await pool.acquire()) {
+            Ok(l) => { return Ok(l); }
+            Err(e) => { return Err(StoreError.Db(e)); }
+        }
+    }
+
+    /// The connection pool, for statements of the server's own.
+    public fn connections(borrow this) -> borrow PgPool => borrow this.pool;
+
+    /// Where message content is kept.
+    public fn blobs(borrow this) -> borrow BlobStore => borrow this.files;
+
+    /// The notify bus: every change this store makes to a mailbox (deliveries, flags, expunges, copies and moves,
+    /// creating, renaming and deleting mailboxes) wakes the watchers of the mailboxes involved once it is committed.
+    public fn notifications(borrow this) -> borrow NotifyBus => borrow this.bus;
+
+    /// Wakes the watchers of each delivery's mailbox.
+    async fn delivered(borrow this, targets: borrow Vector<Delivery>) {
+        for (t in targets.view()) {
+            await this.bus.raise(t.userId, t.mailboxId);
+        }
+    }
+
+    /// Runs one statement on a pooled connection.
+    async fn execute(borrow this, sql: StringView, params: borrow PgParams) -> Result<u64, StoreError> {
+        var lease = await MailStore.lease(borrow this.pool)?;
+        return await executeOn(lease.connection(), sql, params);
+    }
+
+    /// Runs one query on a pooled connection.
+    async fn query(
+        borrow this,
+        sql: StringView,
+        params: borrow PgParams,
+        rows: borrow mut PgRows,
+    ) -> Result<void, StoreError> {
+        var lease = await MailStore.lease(borrow this.pool)?;
+        return await queryOn(lease.connection(), sql, params, rows);
+    }
+
+    /// The first column of the first row as an id, or `NotFound`.
+    async fn id(borrow this, sql: StringView, params: borrow PgParams) -> Result<i64, StoreError> {
+        var rows = PgRows.create();
+        await this.query(sql, params, mut rows)?;
+        if (rows.rowCount() == 0) {
+            return Err(StoreError.NotFound);
+        }
+        match (rows.int64(0, 0)) {
+            Some(id) => { return Ok(id); }
+            null => { return Err(StoreError.NotFound); }
+        }
+    }
+
+    // ---- Domains and addresses ----
+
+    /// Adds a local domain, giving its id. `Exists` if it is there already.
+    public async fn createDomain(borrow this, name: StringView) -> Result<i64, StoreError> {
+        var params = PgParams.create();
+        bound(params.text(name))?;
+        bound(params.sqlNull())?;
+        return await this.id(sqlCreateDomain(), params);
+    }
+
+    /// Makes `alias` another name for the domain `domainId`: mail to user@alias goes to user@<that domain>.
+    public async fn addDomainAlias(borrow this, alias: StringView, domainId: i64) -> Result<void, StoreError> {
+        var params = PgParams.create();
+        bound(params.text(alias))?;
+        bound(params.int64(domainId))?;
+        await this.execute(sqlAddDomainAlias(), params)?;
+        return Ok();
+    }
+
+    /// Sends mail for unknown addresses of the domain to `address` (`null` turns it off).
+    public async fn setCatchall(borrow this, domainId: i64, address: StringView?) -> Result<void, StoreError> {
+        var params = PgParams.create();
+        bound(params.int64(domainId))?;
+        match (address) {
+            Some(a) => { bound(params.text(a))?; }
+            null => { bound(params.sqlNull())?; }
+        }
+        if (await this.execute(sqlSetCatchall(), params)? == 0) {
+            return Err(StoreError.NotFound);
+        }
+        return Ok();
+    }
+
+    /// Adds a user of a local domain with the standard mailboxes (INBOX, Sent, Drafts, Trash, Junk, Archive), giving
+    /// its id. `quota` in bytes, or `null` for the domain's default; 0 is unlimited. `NotFound` if the domain is not
+    /// local, `Exists` if the address is taken.
+    public async fn createUser(
+        borrow this,
+        email: StringView,
+        passwordHash: StringView,
+        quota: i64?,
+    ) -> Result<i64, StoreError> {
+        if (!email.contains("@")) {
+            return Err(StoreError.Invalid);
+        }
+        var params = PgParams.create();
+        bound(params.text(email))?;
+        bound(params.text(passwordHash))?;
+        match (quota) {
+            Some(q) => { bound(params.int64(q))?; }
+            null => { bound(params.sqlNull())?; }
+        }
+        return await this.id(sqlCreateUser(), params);
+    }
+
+    /// Adds an admin API account, or replaces its password: of the whole server, or (with `domain`) of one domain.
+    /// `NotFound` if the domain is not local.
+    public async fn setAdmin(
+        borrow this,
+        username: StringView,
+        passwordHash: StringView,
+        domain: StringView?,
+    ) -> Result<void, StoreError> {
+        var params = PgParams.create();
+        bound(params.text(username))?;
+        bound(params.text(passwordHash))?;
+        match (domain) {
+            Some(d) => { bound(params.text(d))?; }
+            null => { bound(params.sqlNull())?; }
+        }
+        var rows = PgRows.create();
+        await this.query(
+            """
+            INSERT INTO admin_users (username, password_hash, role, domain_id)
+            SELECT $1, $2, CASE WHEN $3::text IS NULL THEN 'server' ELSE 'domain' END, d.id
+            FROM (SELECT NULL) x LEFT JOIN domains d ON d.name = lower($3::text)
+            WHERE $3::text IS NULL OR d.id IS NOT NULL
+            ON CONFLICT (username) DO UPDATE SET password_hash = excluded.password_hash, role = excluded.role,
+                domain_id = excluded.domain_id, updated_at = now()
+            RETURNING id
+            """,
+            params,
+            mut rows,
+        )?;
+        if (rows.rowCount() == 0) {
+            return Err(StoreError.NotFound);
+        }
+        return Ok();
+    }
+
+    /// Replaces a user's password hash.
+    public async fn setPassword(borrow this, userId: i64, passwordHash: StringView) -> Result<void, StoreError> {
+        var params = PgParams.create();
+        bound(params.int64(userId))?;
+        bound(params.text(passwordHash))?;
+        if (await this.execute(sqlSetPassword(), params)? == 0) {
+            return Err(StoreError.NotFound);
+        }
+        return Ok();
+    }
+
+    /// Adds an alias of a local domain, delivering to `destination` (a local or a remote address).
+    public async fn addAlias(borrow this, address: StringView, destination: StringView) -> Result<void, StoreError> {
+        var params = PgParams.create();
+        bound(params.text(address))?;
+        bound(params.text(destination))?;
+        if (await this.execute(sqlAddAlias(), params)? == 0) {
+            return Err(StoreError.NotFound);
+        }
+        return Ok();
+    }
+
+    /// Looks up the account `email` signs in as, into `into`; false if there is none. The caller checks the
+    /// password against `into.passwordHash`, and should spend the same time on a dummy hash when there is no
+    /// account, so that timing does not reveal which addresses exist.
+    public async fn findLogin(
+        borrow this,
+        email: StringView,
+        into: borrow mut LoginRecord,
+    ) -> Result<bool, StoreError> {
+        var params = PgParams.create();
+        bound(params.text(email))?;
+        var rows = PgRows.create();
+        await this.query(sqlFindLogin(), params, mut rows)?;
+        into.clear();
+        if (rows.rowCount() == 0) {
+            return Ok(false);
+        }
+        into.userId = orElse(rows.int64(0, 0), 0);
+        grown(into.email.append(textOr(rows.text(0, 1))))?;
+        grown(into.passwordHash.append(textOr(rows.text(0, 2))))?;
+        into.active = orElse(rows.bool(0, 3), false);
+        return Ok(true);
+    }
+
+    /// Notes a successful sign-in.
+    public async fn recordLogin(borrow this, userId: i64) -> Result<void, StoreError> {
+        var params = PgParams.create();
+        bound(params.int64(userId))?;
+        await this.execute(sqlRecordLogin(), params)?;
+        return Ok();
+    }
+
+    /// Where mail for `address` goes, following domain aliases, aliases and catch-alls, into `into`.
+    public async fn resolve(borrow this, address: StringView, into: borrow mut Recipient) -> Result<void, StoreError> {
+        into.clear();
+        let at = match (address.lastIndexOf("@")) {
+            Some(a) => a,
+            null => {
+                into.kind = RecipientKind.NotLocal;
+                return Ok();
+            }
+        };
+        if (at == 0 || at + 1 == address.length) {
+            into.kind = RecipientKind.NotLocal;
+            return Ok();
+        }
+        var params = PgParams.create();
+        bound(params.text(address))?;
+        var rows = PgRows.create();
+        await this.query(sqlResolve(), params, mut rows)?;
+        if (rows.rowCount() == 0) {
+            into.kind = RecipientKind.NotLocal;
+            return Ok();
+        }
+        let kind = orElse(rows.int32(0, 0), 4);
+        into.userId = orElse(rows.int64(0, 1), 0);
+        grown(into.address.append(textOr(rows.text(0, 2))))?;
+        into.inboxId = orElse(rows.int64(0, 3), 0);
+        into.quota = orElse(rows.int64(0, 4), 0);
+        into.used = orElse(rows.int64(0, 5), 0);
+        match (rows.text(0, 6)) {
+            Some(script) => { grown(into.script.append(script))?; }
+            null => {}
+        }
+        if (kind == 4) {
+            into.kind = RecipientKind.UnknownUser;
+        } else if (into.userId != 0) {
+            into.kind = RecipientKind.User;
+        } else {
+            into.kind = RecipientKind.Remote;
+        }
+        return Ok();
+    }
+
+    /// The user's quota and the bytes their mail takes, as `[quota, used]`; a quota of 0 is unlimited.
+    public async fn quota(borrow this, userId: i64) -> Result<[i64; 2], StoreError> {
+        var params = PgParams.create();
+        bound(params.int64(userId))?;
+        var rows = PgRows.create();
+        await this.query(sqlQuota(), params, mut rows)?;
+        if (rows.rowCount() == 0) {
+            return Err(StoreError.NotFound);
+        }
+        return Ok([orElse(rows.int64(0, 0), 0), orElse(rows.int64(0, 1), 0)]);
+    }
+
+    /// The user's mailbox with the special use `specialUse` (such as `\Sent`), or `null`.
+    // ---- The relay queue (mqueue's workers) ----
+
+    /// Claims up to `limit` due queue rows for `seconds`, into `into`, with the token `claim` (a random number per
+    /// claim, so a worker whose claim ran out cannot settle a row another worker has since claimed).
+    public async fn claim(
+        borrow this,
+        limit: i64,
+        claim: i64,
+        seconds: i64,
+        into: borrow mut Vector<QueueItem>,
+    ) -> Result<void, StoreError> {
+        into.clear();
+        var params = PgParams.create();
+        bound(params.int64(limit))?;
+        bound(params.int64(claim))?;
+        bound(params.int64(seconds))?;
+        var rows = PgRows.create();
+        await this.query(sqlClaimQueue(), params, mut rows)?;
+        for (i in 0..rows.rowCount()) {
+            var item = QueueItem {
+                id: orElse(rows.int64(i, 0), 0),
+                blob: Vector<u8>.create(),
+                size: orElse(rows.int64(i, 2), 0),
+                sender: String.create(),
+                recipients: Vector<String>.create(),
+                attempts: orElse(rows.int32(i, 5), 0),
+                age: orElse(rows.int64(i, 6), 0),
+                claim: claim,
+                delayNotified: orElse(rows.bool(i, 7), false),
+            };
+            match (rows.bytea(i, 1, mut item.blob)) {
+                Ok(_) => {}
+                Err(e) => { return Err(StoreError.Db(e)); }
+            }
+            grown(item.sender.append(textOr(rows.text(i, 3))))?;
+            let list = textOr(rows.text(i, 4)).bytes();
+            var at: usize = 0;
+            while (at < list.length) {
+                var end = at;
+                while (end < list.length && list[end] != 0x0a) {
+                    end += 1;
+                }
+                if (end > at) {
+                    var r = String.create();
+                    grown(r.append(StringView.fromUtf8(list[at..end])!))?;
+                    grown(item.recipients.push(r))?;
+                }
+                at = end + 1;
+            }
+            grown(into.push(item))?;
+        }
+        return Ok();
+    }
+
+    /// Settles a claimed row in one transaction: the local `targets` get the queued blob, then the row is dropped,
+    /// or, when `remaining` recipients are left, put off for `delaySeconds` with `lastError`. False when the claim
+    /// had run out and another worker holds the row: then nothing changed.
+    public async fn settle(
+        borrow this,
+        item: borrow QueueItem,
+        targets: borrow Vector<Delivery>,
+        remaining: borrow Vector<String>,
+        delaySeconds: i64,
+        lastError: StringView,
+        into: borrow mut Vector<Delivered>,
+    ) -> Result<bool, StoreError> {
+        into.clear();
+        var lease = await MailStore.lease(borrow this.pool)?;
+        await batchOn(lease.connection(), "BEGIN")?;
+        match (await settleIn(lease.connection(), item, targets, remaining, delaySeconds, lastError, into)) {
+            Ok(true) => {
+                await batchOn(lease.connection(), "COMMIT")?;
+                await this.delivered(targets);
+                return Ok(true);
+            }
+            Ok(false) => {
+                into.clear();
+                await rollback(lease.connection());
+                return Ok(false);
+            }
+            Err(e) => {
+                into.clear();
+                await rollback(lease.connection());
+                return Err(e);
+            }
+        }
+    }
+
+    /// Seconds until the next queued row is due (0: now), or null when the queue is empty.
+    public async fn nextDue(borrow this) -> Result<i64?, StoreError> {
+        var params = PgParams.create();
+        var rows = PgRows.create();
+        await this.query(sqlNextDue(), params, mut rows)?;
+        if (rows.rowCount() == 0) {
+            return Ok(null);
+        }
+        return Ok(rows.int64(0, 0));
+    }
+
+    // ---- The suppression list ----
+
+    /// Suppresses `address` for `days` after `reply` (a 5.1.x failure).
+    public async fn suppress(
+        borrow this,
+        address: StringView,
+        reply: StringView,
+        days: i64,
+    ) -> Result<void, StoreError> {
+        var lowered = String.create();
+        lowerInto(address, mut lowered)?;
+        var params = PgParams.create();
+        bound(params.text(lowered.view()))?;
+        bound(params.text(reply))?;
+        bound(params.int64(days))?;
+        await this.execute(sqlSuppress(), params)?;
+        return Ok();
+    }
+
+    /// Whether `address` is suppressed now; its reply into `reply` when it is.
+    public async fn suppressed(borrow this, address: StringView, reply: borrow mut String) -> Result<bool, StoreError> {
+        reply.clear();
+        var lowered = String.create();
+        lowerInto(address, mut lowered)?;
+        var params = PgParams.create();
+        bound(params.text(lowered.view()))?;
+        var rows = PgRows.create();
+        await this.query(sqlSuppressed(), params, mut rows)?;
+        if (rows.rowCount() == 0) {
+            return Ok(false);
+        }
+        grown(reply.append(textOr(rows.text(0, 0))))?;
+        return Ok(true);
+    }
+
+    /// Lifts the suppression of `address`; false when it was not suppressed.
+    public async fn unsuppress(borrow this, address: StringView) -> Result<bool, StoreError> {
+        var lowered = String.create();
+        lowerInto(address, mut lowered)?;
+        var params = PgParams.create();
+        bound(params.text(lowered.view()))?;
+        return Ok(await this.execute(sqlUnsuppress(), params)? > 0);
+    }
+
+    /// Forgets suppressions that have run out.
+    public async fn forgetSuppressions(borrow this) -> Result<u64, StoreError> {
+        var params = PgParams.create();
+        return await this.execute(sqlForgetSuppressions(), params);
+    }
+
+    // ---- MTA-STS policies (RFC 8461) ----
+
+    /// The cached, unexpired MTA-STS policy of `domain`: its id into `id`, the policy file into `policy`, and when
+    /// it expires (Unix seconds); 0 when there is none.
+    public async fn stsPolicy(
+        borrow this,
+        domain: StringView,
+        id: borrow mut String,
+        policy: borrow mut String,
+    ) -> Result<i64, StoreError> {
+        id.clear();
+        policy.clear();
+        var lowered = String.create();
+        lowerInto(domain, mut lowered)?;
+        var params = PgParams.create();
+        bound(params.text(lowered.view()))?;
+        var rows = PgRows.create();
+        await this.query(sqlStsPolicy(), params, mut rows)?;
+        if (rows.rowCount() == 0) {
+            return Ok(0);
+        }
+        grown(id.append(textOr(rows.text(0, 0))))?;
+        grown(policy.append(textOr(rows.text(0, 1))))?;
+        return Ok(rows.int64(0, 2) ?? 0);
+    }
+
+    /// Caches `policy` (the file, as served) as `domain`'s MTA-STS policy `id`, for `maxAge` seconds.
+    public async fn saveStsPolicy(
+        borrow this,
+        domain: StringView,
+        id: StringView,
+        policy: StringView,
+        maxAge: i64,
+    ) -> Result<void, StoreError> {
+        var lowered = String.create();
+        lowerInto(domain, mut lowered)?;
+        var params = PgParams.create();
+        bound(params.text(lowered.view()))?;
+        bound(params.text(id))?;
+        bound(params.text(policy))?;
+        bound(params.int64(maxAge))?;
+        await this.execute(sqlSaveStsPolicy(), params)?;
+        return Ok();
+    }
+
+    /// Forgets the MTA-STS policies that have expired.
+    public async fn forgetStsPolicies(borrow this) -> Result<u64, StoreError> {
+        var params = PgParams.create();
+        return await this.execute(sqlForgetStsPolicies(), params);
+    }
+
+    // ---- DKIM keys ----
+
+    /// Adds a signing key for `domain` (any case), inactive.
+    public async fn addDkimKey(
+        borrow this,
+        domain: StringView,
+        selector: StringView,
+        privateKey: Slice<u8>,
+    ) -> Result<void, StoreError> {
+        var lowered = Vector<u8>.create();
+        for (c in domain.bytes()) {
+            grown(lowered.push(if (c >= 0x41 && c <= 0x5a) c + 0x20 else c))?;
+        }
+        var params = PgParams.create();
+        bound(params.text(StringView.fromUtf8(lowered.view())!))?;
+        bound(params.text(selector))?;
+        bound(params.bytes(privateKey))?;
+        await this.execute(sqlAddDkimKey(), params)?;
+        return Ok();
+    }
+
+    /// Makes `selector` the active key of `domain` (lowercase).
+    public async fn activateDkimKey(borrow this, domain: StringView, selector: StringView) -> Result<void, StoreError> {
+        var params = PgParams.create();
+        bound(params.text(domain))?;
+        bound(params.text(selector))?;
+        if (await this.execute(sqlActivateDkimKey(), params)? == 0) {
+            return Err(StoreError.NotFound);
+        }
+        return Ok();
+    }
+
+    /// The key of `domain` (lowercase) called `selector`, or its active key when `selector` is empty: its selector
+    /// into `selectorOut` and PKCS #8 DER into `keyOut`. False when there is none.
+    public async fn dkimKey(
+        borrow this,
+        domain: StringView,
+        selector: StringView,
+        selectorOut: borrow mut String,
+        keyOut: borrow mut Vector<u8>,
+    ) -> Result<bool, StoreError> {
+        selectorOut.clear();
+        keyOut.clear();
+        var params = PgParams.create();
+        bound(params.text(domain))?;
+        bound(params.text(selector))?;
+        var rows = PgRows.create();
+        await this.query(sqlDkimKey(), params, mut rows)?;
+        if (rows.rowCount() == 0) {
+            return Ok(false);
+        }
+        grown(selectorOut.append(textOr(rows.text(0, 0))))?;
+        match (rows.bytea(0, 1, keyOut)) {
+            Ok(_) => {}
+            Err(e) => { return Err(StoreError.Db(e)); }
+        }
+        return Ok(true);
+    }
+
+    // ---- The brute-force guard (persisted half; msmtp's AuthThrottle is the in-memory half) ----
+
+    /// Whether the client address `key` (msmtp's `guardKey`) is blocked from logging in now.
+    public async fn authBlocked(borrow this, key: StringView) -> Result<bool, StoreError> {
+        var params = PgParams.create();
+        bound(params.text(key))?;
+        var rows = PgRows.create();
+        await this.query(sqlAuthBlocked(), params, mut rows)?;
+        return Ok(rows.rowCount() > 0);
+    }
+
+    /// Notes a failed login from `key` for `login` (any case; empty when there was none). Gives whether the address
+    /// is now blocked.
+    public async fn authFailed(borrow this, key: StringView, login: StringView) -> Result<bool, StoreError> {
+        // ASCII lowercase, as the users table keeps addresses; UTF-8 stays valid.
+        var lowered = Vector<u8>.create();
+        for (c in login.bytes()) {
+            grown(lowered.push(if (c >= 0x41 && c <= 0x5a) c + 0x20 else c))?;
+        }
+        let name = StringView.fromUtf8(lowered.view())!;
+        var params = PgParams.create();
+        bound(params.text(key))?;
+        bound(params.text(name))?;
+        var rows = PgRows.create();
+        await this.query(sqlAuthFailed(), params, mut rows)?;
+        return Ok(rows.rowCount() > 0 && orElse(rows.bool(0, 0), false));
+    }
+
+    /// A good login from `key`: its failures are forgotten (a block stays).
+    public async fn authSucceeded(borrow this, key: StringView) -> Result<void, StoreError> {
+        var params = PgParams.create();
+        bound(params.text(key))?;
+        await this.execute(sqlAuthSucceeded(), params)?;
+        return Ok();
+    }
+
+    /// Blocks `key` for `hours`, or for good.
+    public async fn blockAddress(borrow this, key: StringView, hours: i64?) -> Result<void, StoreError> {
+        var params = PgParams.create();
+        bound(params.text(key))?;
+        match (hours) {
+            Some(h) => { bound(params.int64(h))?; }
+            null => { bound(params.sqlNull())?; }
+        }
+        await this.execute(sqlBlockAddress(), params)?;
+        return Ok();
+    }
+
+    /// Lifts any block of `key`, and forgets its failures.
+    public async fn unblockAddress(borrow this, key: StringView) -> Result<void, StoreError> {
+        var params = PgParams.create();
+        bound(params.text(key))?;
+        await this.execute(sqlUnblockAddress(), params)?;
+        return Ok();
+    }
+
+    /// Forgets old failure counts and blocks that have run out.
+    public async fn forgetAuthFailures(borrow this) -> Result<u64, StoreError> {
+        var params = PgParams.create();
+        return await this.execute(sqlForgetAuthFailures(), params);
+    }
+
+    // ---- Sieve ----
+
+    /// Stores the Sieve script `name` of a user and makes it their active one.
+    public async fn setSieve(
+        borrow this,
+        userId: i64,
+        name: StringView,
+        content: StringView,
+    ) -> Result<void, StoreError> {
+        var params = PgParams.create();
+        bound(params.int64(userId))?;
+        bound(params.text(name))?;
+        bound(params.text(content))?;
+        await this.execute(sqlSetSieve(), params)?;
+        return Ok();
+    }
+
+    /// Leaves the user with no active script.
+    public async fn clearSieve(borrow this, userId: i64) -> Result<void, StoreError> {
+        var params = PgParams.create();
+        bound(params.int64(userId))?;
+        await this.execute(sqlClearSieve(), params)?;
+        return Ok();
+    }
+
+    /// Whether a vacation reply to `sender` (lowercase) for `handle` is due, `days` after the last; when it is, it
+    /// is noted as sent, so call this only just before sending.
+    public async fn vacationDue(
+        borrow this,
+        userId: i64,
+        sender: StringView,
+        handle: StringView,
+        days: u64,
+    ) -> Result<bool, StoreError> {
+        var params = PgParams.create();
+        bound(params.int64(userId))?;
+        bound(params.text(sender))?;
+        bound(params.text(handle))?;
+        bound(params.int64(truncate<i64>(if (days > 365) 365 else days)))?;
+        var rows = PgRows.create();
+        await this.query(sqlVacationDue(), params, mut rows)?;
+        return Ok(rows.rowCount() > 0);
+    }
+
+    /// Forgets vacation replies older than a year.
+    public async fn forgetVacations(borrow this) -> Result<u64, StoreError> {
+        var params = PgParams.create();
+        return await this.execute(sqlForgetVacations(), params);
+    }
+
+    public async fn specialMailbox(borrow this, userId: i64, specialUse: StringView) -> Result<i64?, StoreError> {
+        var params = PgParams.create();
+        bound(params.int64(userId))?;
+        bound(params.text(specialUse))?;
+        var rows = PgRows.create();
+        await this.query(sqlSpecialMailbox(), params, mut rows)?;
+        if (rows.rowCount() == 0) {
+            return Ok(null);
+        }
+        return Ok(rows.int64(0, 0));
+    }
+
+    // ---- Mailboxes ----
+
+    /// The user's mailboxes, sorted by name, into `into`.
+    public async fn mailboxes(borrow this, userId: i64, into: borrow mut MailboxList) -> Result<void, StoreError> {
+        var params = PgParams.create();
+        bound(params.int64(userId))?;
+        return await this.query(sqlListMailboxes(), params, mut into.rows);
+    }
+
+    /// The user's mailbox `name` into `into` (row 0); false if there is none.
+    public async fn findMailbox(
+        borrow this,
+        userId: i64,
+        name: StringView,
+        into: borrow mut MailboxList,
+    ) -> Result<bool, StoreError> {
+        var params = PgParams.create();
+        bound(params.int64(userId))?;
+        bound(params.text(name))?;
+        await this.query(sqlFindMailbox(), params, mut into.rows)?;
+        return Ok(into.count() > 0);
+    }
+
+    /// The user's mailbox `mailboxId` into `into` (row 0); false if there is none. For a selected mailbox's counters
+    /// and UIDVALIDITY.
+    public async fn mailboxById(
+        borrow this,
+        userId: i64,
+        mailboxId: i64,
+        into: borrow mut MailboxList,
+    ) -> Result<bool, StoreError> {
+        var params = PgParams.create();
+        bound(params.int64(userId))?;
+        bound(params.int64(mailboxId))?;
+        await this.query(sqlMailboxById(), params, mut into.rows)?;
+        return Ok(into.count() > 0);
+    }
+
+    /// Creates a mailbox, giving its id. `specialUse` is an RFC 6154 attribute such as `\Archive`, or empty.
+    public async fn createMailbox(
+        borrow this,
+        userId: i64,
+        name: StringView,
+        specialUse: StringView,
+    ) -> Result<i64, StoreError> {
+        checkMailboxName(name)?;
+        var params = PgParams.create();
+        bound(params.int64(userId))?;
+        bound(params.text(name))?;
+        if (specialUse.length == 0) {
+            bound(params.sqlNull())?;
+        } else {
+            bound(params.text(specialUse))?;
+        }
+        let id = await this.id(sqlCreateMailbox(), params)?;
+        await this.bus.raise(userId, 0);
+        return Ok(id);
+    }
+
+    /// Renames a mailbox and every mailbox under it (`a` → `b` makes `a/x` `b/x`). INBOX is renamed by the IMAP
+    /// layer, which moves its messages instead (RFC 9051 §6.3.6), so it is refused here.
+    public async fn renameMailbox(
+        borrow this,
+        userId: i64,
+        from: StringView,
+        to: StringView,
+    ) -> Result<void, StoreError> {
+        checkMailboxName(to)?;
+        if (from.equalsIgnoreAsciiCase("INBOX")) {
+            return Err(StoreError.Invalid);
+        }
+        var params = PgParams.create();
+        bound(params.int64(userId))?;
+        bound(params.text(from))?;
+        bound(params.text(to))?;
+        if (await this.execute(sqlRenameMailbox(), params)? == 0) {
+            return Err(StoreError.NotFound);
+        }
+        await this.bus.raise(userId, 0);
+        return Ok();
+    }
+
+    /// Deletes a mailbox and its messages. INBOX cannot be deleted.
+    public async fn deleteMailbox(borrow this, userId: i64, mailboxId: i64) -> Result<void, StoreError> {
+        var params = PgParams.create();
+        bound(params.int64(userId))?;
+        bound(params.int64(mailboxId))?;
+        if (await this.execute(sqlDeleteMailbox(), params)? == 0) {
+            return Err(StoreError.NotFound);
+        }
+        await this.bus.raise(userId, 0);
+        return Ok();
+    }
+
+    /// Subscribes to a mailbox, or unsubscribes.
+    public async fn subscribe(borrow this, userId: i64, mailboxId: i64, on: bool) -> Result<void, StoreError> {
+        var params = PgParams.create();
+        bound(params.int64(userId))?;
+        bound(params.int64(mailboxId))?;
+        bound(params.bool(on))?;
+        if (await this.execute(sqlSubscribe(), params)? == 0) {
+            return Err(StoreError.NotFound);
+        }
+        return Ok();
+    }
+
+    // ---- Messages ----
+
+    /// Stores the finished blob `content` as a new message in each of `targets`, and gives each one's uid and
+    /// modseq in `into`, in order. All of them or none are delivered. The blob is written once however many
+    /// targets share it.
+    public async fn deliver(
+        borrow this,
+        content: borrow mut BlobWriter,
+        targets: borrow Vector<Delivery>,
+        into: borrow mut Vector<Delivered>,
+    ) -> Result<void, StoreError> {
+        let none = Outbound.create();
+        await this.accept(content, targets, none, into)?;
+        return Ok();
+    }
+
+    /// As `deliver`, and also queues the message for `outbound`'s remote recipients (when there are any), in the
+    /// same transaction: an SMTP server's 250 then means every copy is stored. Gives the queue id, or 0.
+    public async fn accept(
+        borrow this,
+        content: borrow mut BlobWriter,
+        targets: borrow Vector<Delivery>,
+        outbound: borrow Outbound,
+        into: borrow mut Vector<Delivered>,
+    ) -> Result<i64, StoreError> {
+        if (!content.isFinished()) {
+            return Err(StoreError.Invalid);
+        }
+        into.clear();
+        var lease = await MailStore.lease(borrow this.pool)?;
+        await batchOn(lease.connection(), "BEGIN")?;
+        match (await this.deliverIn(lease.connection(), content, targets, outbound, into)) {
+            Ok(queued) => {
+                await this.delivered(targets);
+                return Ok(queued);
+            }
+            Err(e) => {
+                into.clear();
+                await rollback(lease.connection());
+                return Err(e);
+            }
+        }
+    }
+
+    async fn deliverIn(
+        borrow this,
+        connection: borrow mut PgConnection,
+        content: borrow mut BlobWriter,
+        targets: borrow Vector<Delivery>,
+        outbound: borrow Outbound,
+        into: borrow mut Vector<Delivered>,
+    ) -> Result<i64, StoreError> {
+        var params = PgParams.create();
+        bound(params.bytes(content.hash()))?;
+        bound(params.int64(truncate<i64>(content.size())))?;
+        // The blob's row is locked from here to the commit, so the collector cannot remove its file meanwhile.
+        await executeOn(connection, sqlPinBlob(), params)?;
+        let store = borrow this.files;
+        let placed: Result<void, StoreError> = await Async.blocking(() => content.place(store));
+        match (placed) {
+            Ok() => {}
+            Err(e) => { return Err(e); }
+        }
+        await deliverBlob(connection, content.hash(), truncate<i64>(content.size()), targets, into)?;
+        var rows = PgRows.create();
+        var queued: i64 = 0;
+        if (outbound.recipients.length > 0) {
+            var list = Vector<u8>.create();
+            for (i in 0..outbound.recipients.length) {
+                if (i > 0) {
+                    grown(list.push(0x0a))?;
+                }
+                grown(list.extend(outbound.recipients[i].view().bytes()))?;
+            }
+            params.clear();
+            bound(params.bytes(content.hash()))?;
+            bound(params.int64(truncate<i64>(content.size())))?;
+            bound(params.text(outbound.sender.view()))?;
+            bound(params.text(StringView.fromUtf8(list.view())!))?;
+            if (outbound.userId == 0) {
+                bound(params.sqlNull())?;
+            } else {
+                bound(params.int64(outbound.userId))?;
+            }
+            await queryOn(connection, sqlEnqueue(), params, mut rows)?;
+            queued = orElse(rows.int64(0, 0), 0);
+        }
+        await batchOn(connection, "COMMIT")?;
+        return Ok(queued);
+    }
+
+    /// The mailbox's messages, by uid, into `into`: all of them, or with `changedSince` > 0 only those whose
+    /// modseq is greater (CONDSTORE).
+    public async fn messages(
+        borrow this,
+        userId: i64,
+        mailboxId: i64,
+        changedSince: i64,
+        into: borrow mut MessageList,
+    ) -> Result<void, StoreError> {
+        var params = PgParams.create();
+        bound(params.int64(userId))?;
+        bound(params.int64(mailboxId))?;
+        bound(params.int64(changedSince))?;
+        return await this.query(sqlListMessages(), params, mut into.rows);
+    }
+
+    /// The mailbox's messages whose uids are in `uids`, by uid, into `into` (FETCH): as `messages` gives them, and
+    /// with `withMeta` their part index too (`MessageList.meta`). One statement, however many messages.
+    public async fn fetchMessages(
+        borrow this,
+        userId: i64,
+        mailboxId: i64,
+        uids: borrow UidSet,
+        withMeta: bool,
+        into: borrow mut MessageList,
+    ) -> Result<void, StoreError> {
+        if (uids.isEmpty()) {
+            into.rows = PgRows.create();
+            return Ok();
+        }
+        var params = PgParams.create();
+        bound(params.int64(userId))?;
+        bound(params.int64(mailboxId))?;
+        bound(params.text(uids.text()))?;
+        bound(params.bool(withMeta))?;
+        return await this.query(sqlFetchMessages(), params, mut into.rows);
+    }
+
+    /// A message's stored metadata (the part index), into `into`; false if the message does not exist.
+    public async fn messageMeta(
+        borrow this,
+        userId: i64,
+        mailboxId: i64,
+        uid: i64,
+        into: borrow mut Vector<u8>,
+    ) -> Result<bool, StoreError> {
+        var params = PgParams.create();
+        bound(params.int64(userId))?;
+        bound(params.int64(mailboxId))?;
+        bound(params.int64(uid))?;
+        var rows = PgRows.create();
+        await this.query(sqlMessageMeta(), params, mut rows)?;
+        into.clear();
+        if (rows.rowCount() == 0) {
+            return Ok(false);
+        }
+        match (rows.bytea(0, 0, into)) {
+            Ok(_) => { return Ok(true); }
+            Err(e) => { return Err(StoreError.Db(e)); }
+        }
+    }
+
+    /// Changes flags (STORE). `change` says which; the messages that changed come back in `into` with their new
+    /// flags, keywords and modseq.
+    public async fn setFlags(
+        borrow this,
+        userId: i64,
+        mailboxId: i64,
+        uids: borrow UidSet,
+        change: borrow FlagChange,
+        into: borrow mut MessageList,
+    ) -> Result<void, StoreError> {
+        if (uids.isEmpty()) {
+            into.rows = PgRows.create();
+            return Ok();
+        }
+        var params = PgParams.create();
+        bound(params.int64(userId))?;
+        bound(params.int64(mailboxId))?;
+        bound(params.text(uids.text()))?;
+        bound(params.int32(change.add as i32))?;
+        bound(params.int32(change.remove as i32))?;
+        bound(params.bool(change.replace))?;
+        bound(params.text(change.addKeywords.view()))?;
+        bound(params.text(change.removeKeywords.view()))?;
+        bound(params.int64(change.unchangedSince))?;
+        await this.query(sqlSetFlags(), params, mut into.rows)?;
+        if (into.count() > 0) {
+            await this.bus.raise(userId, mailboxId);
+        }
+        return Ok();
+    }
+
+    /// Removes the messages flagged `\Deleted` (EXPUNGE), and gives their uids in ascending order.
+    public async fn expunge(
+        borrow this,
+        userId: i64,
+        mailboxId: i64,
+        into: borrow mut Vector<i64>,
+    ) -> Result<void, StoreError> => await this.expungeWhere(userId, mailboxId, null, into);
+
+    /// Removes the messages of `uids` flagged `\Deleted` (UID EXPUNGE), and gives their uids in ascending order.
+    public async fn expungeUids(
+        borrow this,
+        userId: i64,
+        mailboxId: i64,
+        uids: borrow UidSet,
+        into: borrow mut Vector<i64>,
+    ) -> Result<void, StoreError> {
+        if (uids.isEmpty()) {
+            into.clear();
+            return Ok();
+        }
+        return await this.expungeWhere(userId, mailboxId, uids.text(), into);
+    }
+
+    async fn expungeWhere(
+        borrow this,
+        userId: i64,
+        mailboxId: i64,
+        uids: StringView?,
+        into: borrow mut Vector<i64>,
+    ) -> Result<void, StoreError> {
+        var params = PgParams.create();
+        bound(params.int64(userId))?;
+        bound(params.int64(mailboxId))?;
+        match (uids) {
+            Some(set) => { bound(params.text(set))?; }
+            null => { bound(params.sqlNull())?; }
+        }
+        var rows = PgRows.create();
+        await this.query(sqlExpunge(), params, mut rows)?;
+        into.clear();
+        for (r in 0..rows.rowCount()) {
+            grown(into.push(orElse(rows.int64(r, 0), 0)))?;
+        }
+        if (into.length > 0) {
+            await this.bus.raise(userId, mailboxId);
+        }
+        return Ok();
+    }
+
+    /// Copies (or, with `moving`, moves) the messages `uids` from one of the user's mailboxes to another, and gives
+    /// the uid pairs and the target's UIDVALIDITY for COPYUID. Content is shared, not copied.
+    public async fn copy(
+        borrow this,
+        userId: i64,
+        from: i64,
+        to: i64,
+        uids: borrow UidSet,
+        moving: bool,
+        into: borrow mut CopyResult,
+    ) -> Result<void, StoreError> {
+        into.clear();
+        if (uids.isEmpty()) {
+            return Ok();
+        }
+        // A move to the same mailbox renumbers the messages in place (new UIDs, as RFC 6851 allows).
+        let within = moving && from == to;
+        var params = PgParams.create();
+        bound(params.int64(userId))?;
+        bound(params.int64(from))?;
+        if (!within) {
+            bound(params.int64(to))?;
+        }
+        bound(params.text(uids.text()))?;
+        if (!within) {
+            bound(params.bool(moving))?;
+        }
+        var rows = PgRows.create();
+        await this.query(if (within) sqlRenumberMessages() else sqlCopyMessages(), params, mut rows)?;
+        for (r in 0..rows.rowCount()) {
+            grown(into.source.push(orElse(rows.int64(r, 0), 0)))?;
+            grown(into.target.push(orElse(rows.int64(r, 1), 0)))?;
+            into.uidValidity = orElse(rows.int64(r, 2), 0);
+        }
+        if (into.source.length > 0) {
+            await this.bus.raise(userId, to);
+            if (moving) {
+                await this.bus.raise(userId, from);
+            }
+        }
+        return Ok();
+    }
+
+    // ---- Housekeeping ----
+
+    /// Removes up to `limit` blobs that no message has referenced for `graceSeconds`, files and rows, and gives how
+    /// many. Run it periodically; servers may run it at once (each takes different blobs).
+    public async fn collectBlobs(borrow this, graceSeconds: i64, limit: i64) -> Result<u64, StoreError> {
+        var lease = await MailStore.lease(borrow this.pool)?;
+        await batchOn(lease.connection(), "BEGIN")?;
+        match (await this.collectIn(lease.connection(), graceSeconds, limit)) {
+            Ok(n) => { return Ok(n); }
+            Err(e) => {
+                await rollback(lease.connection());
+                return Err(e);
+            }
+        }
+    }
+
+    async fn collectIn(
+        borrow this,
+        connection: borrow mut PgConnection,
+        graceSeconds: i64,
+        limit: i64,
+    ) -> Result<u64, StoreError> {
+        var params = PgParams.create();
+        bound(params.int64(graceSeconds))?;
+        bound(params.int64(limit))?;
+        var rows = PgRows.create();
+        await queryOn(connection, sqlReleasedBlobs(), params, mut rows)?;
+        var hash = Vector<u8>.create();
+        var removed: u64 = 0;
+        for (r in 0..rows.rowCount()) {
+            match (rows.bytea(r, 0, mut hash)) {
+                Ok(_) => {}
+                Err(e) => { return Err(StoreError.Db(e)); }
+            }
+            // The row stays locked until the commit, so no delivery can pin this blob before its file is gone.
+            let store = borrow this.files;
+            let key = hash.view();
+            let outcome: Result<void, StoreError> = await Async.blocking(() => store.remove(key));
+            match (outcome) {
+                Ok() => {}
+                Err(e) => { return Err(e); }
+            }
+            params.clear();
+            bound(params.bytes(hash.view()))?;
+            removed += await executeOn(connection, sqlDropBlob(), params)?;
+        }
+        await batchOn(connection, "COMMIT")?;
+        return Ok(removed);
+    }
+}
+
+/// Ends a failed transaction; a connection whose rollback fails is dropped by its lease, which ends it too.
+async fn settleIn(
+    connection: borrow mut PgConnection,
+    item: borrow QueueItem,
+    targets: borrow Vector<Delivery>,
+    remaining: borrow Vector<String>,
+    delaySeconds: i64,
+    lastError: StringView,
+    into: borrow mut Vector<Delivered>,
+) -> Result<bool, StoreError> {
+    // The row first: its lock keeps the blob referenced (and so on disk) while the local copies are added.
+    var params = PgParams.create();
+    bound(params.int64(item.id))?;
+    bound(params.int64(item.claim))?;
+    var changed: u64 = 0;
+    if (remaining.length == 0) {
+        changed = await executeOn(connection, sqlDropQueued(), params)?;
+    } else {
+        var list = Vector<u8>.create();
+        for (i in 0..remaining.length) {
+            if (i > 0) {
+                grown(list.push(0x0a))?;
+            }
+            grown(list.extend(remaining[i].view().bytes()))?;
+        }
+        bound(params.text(StringView.fromUtf8(list.view())!))?;
+        bound(params.int64(delaySeconds))?;
+        bound(params.text(lastError))?;
+        bound(params.bool(item.delayNotified))?;
+        changed = await executeOn(connection, sqlDeferQueued(), params)?;
+    }
+    if (changed == 0) {
+        return Ok(false);
+    }
+    if (targets.length > 0) {
+        // A dropped row released the blob; pin it again for the local copies.
+        params.clear();
+        bound(params.bytes(item.blob.view()))?;
+        bound(params.int64(item.size))?;
+        await executeOn(connection, sqlPinBlob(), params)?;
+        await deliverBlob(connection, item.blob.view(), item.size, targets, into)?;
+    }
+    return Ok(true);
+}
+
+/// `text` with ASCII letters lowercased, into `out`.
+fn lowerInto(text: StringView, out: borrow mut String) -> Result<void, StoreError> {
+    var bytes = Vector<u8>.create();
+    for (c in text.bytes()) {
+        grown(bytes.push(if (c >= 0x41 && c <= 0x5a) c + 0x20 else c))?;
+    }
+    return grown(out.append(StringView.fromUtf8(bytes.view())!));
+}
+
+/// Adds a message of the stored blob `hash` to each target, in the caller's transaction.
+async fn deliverBlob(
+    connection: borrow mut PgConnection,
+    hash: Slice<u8>,
+    size: i64,
+    targets: borrow Vector<Delivery>,
+    into: borrow mut Vector<Delivered>,
+) -> Result<void, StoreError> {
+    var params = PgParams.create();
+    var rows = PgRows.create();
+    for (i in 0..targets.length) {
+        let target = borrow targets[i];
+        params.clear();
+        bound(params.int64(target.userId))?;
+        bound(params.int64(target.mailboxId))?;
+        bound(params.int32(target.flags as i32))?;
+        bound(params.text(target.keywords.view()))?;
+        bound(params.int64(target.internalDate))?;
+        bound(params.int64(size))?;
+        bound(params.bytes(hash))?;
+        if (target.meta.length == 0) {
+            bound(params.sqlNull())?;
+        } else {
+            bound(params.bytes(target.meta.view()))?;
+        }
+        if (target.uid > 0) {
+            bound(params.int64(target.uid))?;
+            await queryOn(connection, sqlDeliverAt(), params, mut rows)?;
+        } else {
+            await queryOn(connection, sqlDeliver(), params, mut rows)?;
+        }
+        if (rows.rowCount() == 0) {
+            return Err(StoreError.NotFound);
+        }
+        grown(into.push(Delivered { uid: orElse(rows.int64(0, 0), 0), modseq: orElse(rows.int64(0, 1), 0) }))?;
+    }
+    return Ok();
+}
+
+async fn rollback(connection: borrow mut PgConnection) {
+    match (await connection.batch("ROLLBACK")) {
+        Ok(_) => {}
+        Err(_) => {}
+    }
+}
+
+/// A mailbox name the store accepts: not empty, no empty hierarchy level, no control characters.
+fn checkMailboxName(name: StringView) -> Result<void, StoreError> {
+    let bytes = name.bytes();
+    if (bytes.length == 0 || bytes.length > 1024 || bytes[0] == '/' || bytes[bytes.length - 1] == '/') {
+        return Err(StoreError.Invalid);
+    }
+    for (i in 0..bytes.length) {
+        let b = bytes[i];
+        if (b < 0x20 || b == 0x7f) {
+            return Err(StoreError.Invalid);
+        }
+        if (b == '/' && i > 0 && bytes[i - 1] == '/') {
+            return Err(StoreError.Invalid);
+        }
+    }
+    return Ok();
+}
+
+/// `value`, or `fallback` for `null`.
+fn orElse<T: Copy>(value: T?, fallback: T) -> T {
+    match (value) {
+        Some(v) => { return v; }
+        null => { return fallback; }
+    }
+}
+
+/// `value`, or empty for `null`.
+fn textOr(value: StringView?) -> StringView {
+    match (value) {
+        Some(v) => { return v; }
+        null => { return ""; }
+    }
+}

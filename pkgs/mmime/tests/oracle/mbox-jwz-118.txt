@@ -1,0 +1,10 @@
+size 11461
+envelope ("Sun, 23 Mar 1997 23:11:56 -0800" "testing out some new stuff" (("Lisa Repka" NIL "repka" "netscape.com")) ((NIL NIL "repka" "netscape.com")) (("Lisa Repka" NIL "repka" "netscape.com")) (("Jamie Zawinski" NIL "jwz" "netscape.com") ("Dan Hugo" NIL "dhugo" "netscape.com")) NIL NIL NIL "<3336293C.1A98A9A9@netscape.com>")
+bodystructure ("application" "x-pkcs7-mime" ("name" "smime.p7m") NIL NIL "base64" 10378 NIL ("attachment" ("filename" "smime.p7m")) NIL NIL)
+body ("application" "x-pkcs7-mime" ("name" "smime.p7m") NIL NIL "base64" 10378)
+section HEADER 1083 c4307f3fa098befe67dc9b62ce7cbb91eb0395c3533efa872d375d98279511d8
+section TEXT 10378 4808139c594775390dba176a1108dc8de87bc9662594178ea371cebe7b555dc8
+section HEADER.FIELDS 291 100c663f3cf52c22b14c5ed7b7f8bb1e80c7f2c6a768b6fb9f571ce9e5f33f11
+section HEADER.FIELDS.NOT 794 41ecbc3823938f6b54a4bd7d448735ae7da1e701f9af75b5cc432ff424687cba
+section 1 10378 4808139c594775390dba176a1108dc8de87bc9662594178ea371cebe7b555dc8
+section 1.MIME 1083 c4307f3fa098befe67dc9b62ce7cbb91eb0395c3533efa872d375d98279511d8

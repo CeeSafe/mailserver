@@ -1,0 +1,12 @@
+size 2448
+envelope ("27 May 1996 18:19:51 -0700" "Re: Layman's explanation for limits on escrowed encryption ..." (("Mark M." NIL "markm" "voicenet.com")) ((NIL NIL "daemon" "tera.mcom.com")) (("Mark M." NIL "markm" "voicenet.com")) NIL NIL NIL NIL "<Pine.LNX.3.93.960527203358.1163A-100000@gak>")
+bodystructure (("text" "plain" ("charset" "us-ascii") NIL NIL "quoted-printable" 1108 26 NIL NIL NIL NIL) ("application" "pgp-signature" NIL NIL NIL "7bit" 293 NIL NIL NIL NIL) "signed" ("boundary" "axb+h+IbI/zv+u" "protocol" "application/pgp-signature" "micalg" "pgp-md5") NIL NIL NIL)
+body (("text" "plain" ("charset" "us-ascii") NIL NIL "quoted-printable" 1108 26) ("application" "pgp-signature" NIL NIL NIL "7bit" 293) "signed")
+section HEADER 610 0bbdc4b0771240493139c4b2590dbeee13b229ba25901b76898eb2beb5eddf06
+section TEXT 1838 82726b4dd26e8f2fc6798d470a64e278e3de2577f9e06ac423d4ada17ccdea6a
+section HEADER.FIELDS 321 a535d9f79edfca08d60a52c26d4eeaafe34491f55315aeb4286d9110a5142b7d
+section HEADER.FIELDS.NOT 291 6c721d73e21cc0472631d4c7cf8932f2f914be0f58c981bbab003e665559d2a2
+section 1 1108 2df6db008cdce77b83830043cae9e264e0891b199c1293de9adc3b4c50d507d5
+section 1.MIME 47 64e328b249cf092f2081864bf4c355e3ee65017fddaf0e93e51958f70e3cd900
+section 2 293 5b0dd36574e85fd4aca73c5ffc89f21bbe14c065bbbd8061a574fad617b96b81
+section 2.MIME 43 87b0bd1dafc4a20e1ddeb377914a6d965b4dbce6d235bac3d72d46967199dc3a

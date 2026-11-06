@@ -1,0 +1,12 @@
+size 891
+envelope ("Tue, 12 Nov 2013 09:12:42 -0500" "xxxx xx x xxxxxx xxxxxxxxx xxxxxxx" ((NIL NIL "xxxxxxx" "xxxxxxx.xxx")) ((NIL NIL "xxxxxxx" "xxxxxxx.xxx")) ((NIL NIL "xxxxxxx" "xxxxxxx.xxx")) ((NIL NIL "xxxxxxx" "xxxxxxx.xxx")) NIL NIL NIL "<xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx@xxxxxxxxx.xxxxxxxxxxx>")
+bodystructure (("text" "plain" ("charset" "utf-8") NIL NIL "7bit" 27 1 NIL NIL NIL NIL) ("application" "octet-stream" ("name" "xxxxxxxxxxxxxx") NIL NIL "base64" 54 NIL ("attachment" ("filename" "xxxxxxxxxxxxxx")) NIL NIL) "mixed" ("boundary" "----=_NextPart_000_003F_01CE98CE.6E826F90") NIL NIL NIL)
+body (("text" "plain" ("charset" "utf-8") NIL NIL "7bit" 27 1) ("application" "octet-stream" ("name" "xxxxxxxxxxxxxx") NIL NIL "base64" 54) "mixed")
+section HEADER 363 4f1d0775adcaf4202fe7b98340f297dcf97041a394732956605e2bbb3a661668
+section TEXT 528 c0ee02daa43596b2338e6122958a12774f5d4bcca3449b5f2c7556e4931acc4d
+section HEADER.FIELDS 303 d04cec773c86e3288b4746b7e68201d1df91a6400eead7fbaf9e9aa553661152
+section HEADER.FIELDS.NOT 62 46c9a7a7d8abed8e39274953128689bd8fbe60f44ee702698f7205e0d91b14d6
+section 1 27 75c6547fcd7c7e4c9d9c6116c85fd212ce668179c960dc5473783a07c32c39b8
+section 1.MIME 76 1846c4d0060cddce97cb6de0c65f8c3b9b2f0fbd74673b1152866275be37c9ff
+section 2 54 2ec35596792ba1543b4c853a9fa66202dd945aab89bdbf0c1a7831d8ff584d8a
+section 2.MIME 160 5b1ccbfb0c44c016c6379c694ef9cc5b55d28362bf36ce3a6be0734ba22afdf9

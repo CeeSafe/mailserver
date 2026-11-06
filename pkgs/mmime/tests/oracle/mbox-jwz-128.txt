@@ -1,0 +1,12 @@
+size 5056
+envelope ("Mon, 07 Oct 1996 21:27:09 -0700" "A cert from deming software" (("Blake Ramsdell" NIL "blaker" "craswell.com")) ((NIL NIL "owner-smime-dev" "rsa.com")) (("Blake Ramsdell" NIL "blaker" "craswell.com")) ((NIL NIL "smime-dev" "rsa.com") (NIL NIL "smime-editor" "rsa.com")) ((NIL NIL "alex" "verisign.com")) NIL NIL "<3.0b33.32.19961007212705.0091cdb0@mail.craswell.com>")
+bodystructure (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 158 3 NIL NIL NIL NIL) ("application" "x-pkcs7-signature" ("name" "smime.p7s") NIL NIL "base64" 3970 NIL ("attachment" ("filename" "smime.p7s")) NIL NIL) "signed" ("boundary" "---=_=_ 10156253-385044-15062624 _=_=---" "micalg" "rsa-sha1" "protocol" "application/x-pkcs7-signature") NIL NIL NIL)
+body (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 158 3) ("application" "x-pkcs7-signature" ("name" "smime.p7s") NIL NIL "base64" 3970) "signed")
+section HEADER 566 7f7db989a21d8b53fbca16e381abcd9c1485ee12452c83fe92544265cd6eb6c8
+section TEXT 4490 1db609bf672a093ba14e850df79ac1fe3b6764c84fcd7ec4b4ad0de023c1cc78
+section HEADER.FIELDS 410 3124dfa7c4f44b7da9794c4c14ffa26f7c8b17e09ec191ae48f9f39ae2a269f8
+section HEADER.FIELDS.NOT 158 09fef3318e73a302547ed182c19a5738396f4c96551b325ca28a63c4f4c634b7
+section 1 158 cbfb11f1c8270c5772f41d6738bed891a5d43e1f8f4912cb20d15c1917b1c0e3
+section 1.MIME 67 4b33f090cf8929ce73b000a40600cd45cef03b36e7cb2e75b1fc19201d832063
+section 2 3970 1f4668dccf2671e87163f8ee73a97862cd1ba720689f08c84b0355d4a6dce12b
+section 2.MIME 155 3f494fd607c17db262e344f14322972ba00d06304621f71328434bf52fff5389

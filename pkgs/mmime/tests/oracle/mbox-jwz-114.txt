@@ -1,0 +1,10 @@
+size 8129
+envelope (NIL "encrypted and signed" (("Jamie Zawinski" NIL "jwz" "netscape.com")) (("Jamie Zawinski" NIL "jwz" "netscape.com")) (("Jamie Zawinski" NIL "jwz" "netscape.com")) ((NIL NIL "jwz" "netscape.com")) NIL NIL NIL NIL)
+bodystructure ("application" "x-pkcs7-mime" ("name" "smime.p7m") NIL NIL "base64" 7726 NIL ("attachment" ("filename" "smime.p7m")) NIL NIL)
+body ("application" "x-pkcs7-mime" ("name" "smime.p7m") NIL NIL "base64" 7726)
+section HEADER 403 6ecb6ae30fbaa12366c0addc9b5aff76c9a9038f67f8465c839ffe58955d00c4
+section TEXT 7726 3027901f3c960f0addb34a22001c0e07fa4c3874dd817698a33d3367dce28bd4
+section HEADER.FIELDS 154 a9fe3fa6ab8f9867217f560e9f8ed75a1b498e76ffad5cbb48c290c98c811709
+section HEADER.FIELDS.NOT 251 9cde4c834b018878f5907eb4f09177fe1e5be10c296d9eab25f1b48c476ff7a0
+section 1 7726 3027901f3c960f0addb34a22001c0e07fa4c3874dd817698a33d3367dce28bd4
+section 1.MIME 403 6ecb6ae30fbaa12366c0addc9b5aff76c9a9038f67f8465c839ffe58955d00c4

@@ -1,0 +1,221 @@
+// JSON (RFC 8259, with cases from JSONTestSuite's y_/n_ sets) and the HTTP/1.1 request parser (RFC 9112).
+
+fn parses(text: StringView) -> bool => match (JsonDocument.parse(text.bytes())) {
+    Ok(_) => true,
+    Err(_) => false,
+};
+
+fn written(w: JsonWriter) -> String {
+    var s = String.create();
+    let bytes = w.finish()!;
+    s.append(StringView.fromUtf8(bytes.view()) ?? "<not utf-8>")!;
+    return s;
+}
+
+@test
+fn writesJson() -> Result<void, TestFailure> {
+    var w = JsonWriter.create();
+    w.beginObject();
+    w.stringField("name", "a \"b\"\\\n\u{1}");
+    w.integerField("n", -42);
+    w.integerField("min", -9223372036854775807 - 1);
+    w.booleanField("ok", true);
+    w.nullField("none");
+    w.key("list");
+    w.beginArray();
+    w.integer(1);
+    w.beginObject();
+    w.endObject();
+    w.beginArray();
+    w.endArray();
+    w.string("x");
+    w.endArray();
+    w.optionalField("opt", null);
+    w.endObject();
+    let s = written(w);
+    let want =
+        "{\"name\":\"a \\\"b\\\"\\\\\\n\\u0001\",\"n\":-42,\"min\":-9223372036854775808,\"ok\":true,\"none\":null,\"list\":[1,{},[],\"x\"],\"opt\":null}";
+    Check.isTrue(s.view() == want, "the document")?;
+    Check.isTrue(parses(s.view()), "it parses back")?;
+    var bad = JsonWriter.create();
+    var raw = Vector<u8>.create();
+    raw.push(0x61)!;
+    raw.push(0xff)!;
+    bad.stringBytes(raw.view());
+    return Check.isTrue(written(bad).view() == "\"a\u{FFFD}\"", "bytes that are not UTF-8");
+}
+
+@test
+fn readsJson() -> Result<void, TestFailure> {
+    let doc = JsonDocument.parse(
+        " {\"a\": 1, \"b\": [true, false, null, \"x\\u00e9\\ud83d\\ude00\"], \"c\": {\"d\": -1.5e3}, \"a\": 2} ".bytes(),
+    )!;
+    let root = doc.root();
+    let a = doc.member(root, "a")!;
+    Check.isTrue((doc.integer(a) ?? 0) == 2, "a repeated member: the last")?;
+    let b = doc.member(root, "b")!;
+    var items = Vector<usize>.create();
+    doc.items(b, mut items)!;
+    Check.isTrue(items.length == 4, "four elements")?;
+    Check.isTrue((doc.boolean(items[0]) ?? false) && !(doc.boolean(items[1]) ?? true) && doc.isNull(items[2]), "literals")?;
+    var s = String.create();
+    Check.isTrue(doc.string(items[3], mut s)!, "a string")?;
+    Check.isTrue(s.view() == "x\u{e9}\u{1F600}", "escapes and a surrogate pair")?;
+    let c = doc.member(root, "c")!;
+    let d = doc.member(c, "d")!;
+    Check.isTrue(doc.integer(d) == null && (doc.numberText(d) ?? "") == "-1.5e3", "a fraction is not an integer")?;
+    Check.isTrue(doc.member(root, "z") == null && doc.member(b, "a") == null, "absent members")?;
+    var keys = Vector<usize>.create();
+    doc.keys(root, mut keys)!;
+    Check.isTrue(keys.length == 4, "keys in order")?;
+    let escapedKey = JsonDocument.parse("{\"\\u0061\": 7}".bytes())!;
+    Check.isTrue((escapedKey.integer(escapedKey.member(0, "a")!) ?? 0) == 7, "an escaped key")?;
+    return Ok();
+}
+
+@test
+fn refusesMalformedJson() -> Result<void, TestFailure> {
+    Check.isTrue(parses("[]") && parses("{}") && parses("0") && parses("\"\"") && parses("-0.0e+1"), "minimal values")?;
+    Check.isTrue(parses("[[[]]]") && parses("{\"a\":{\"b\":[1,{\"c\":[]}]}}"), "nesting")?;
+    Check.isTrue(!parses("") && !parses(" ") && !parses("[") && !parses("]") && !parses("{"), "incomplete")?;
+    Check.isTrue(!parses("[1,]") && !parses("{\"a\":1,}") && !parses("[,1]") && !parses("[1 2]"), "commas")?;
+    Check.isTrue(!parses("{a:1}") && !parses("{\"a\" 1}") && !parses("{\"a\":}") && !parses("{1:1}"), "members")?;
+    Check.isTrue(!parses("01") && !parses("1.") && !parses(".5") && !parses("+1") && !parses("1e") && !parses("-"), "numbers")?;
+    Check.isTrue(!parses("tru") && !parses("nul") && !parses("True") && !parses("NaN"), "literals")?;
+    Check.isTrue(!parses("\"\\x\"") && !parses("\"\\u12\"") && !parses("\"\u{1}\"") && !parses("\"abc"), "strings")?;
+    Check.isTrue(!parses("\"\\ud800\"") && !parses("\"\\udc00\"") && !parses("\"\\ud800\\u0041\""), "surrogates")?;
+    Check.isTrue(!parses("1 2") && !parses("[] []") && !parses("{}x"), "one value only")?;
+    var deep = String.create();
+    for (i in 0..65) {
+        deep.append("[")!;
+    }
+    for (i in 0..65) {
+        deep.append("]")!;
+    }
+    Check.isTrue(!parses(deep.view()), "too deep")?;
+    var bad = Vector<u8>.create();
+    bad.extend("\"a".bytes())!;
+    bad.push(0xc3)!;
+    bad.extend("\"".bytes())!;
+    return Check.isTrue(
+        match (JsonDocument.parse(bad.view())) {
+            Ok(_) => false,
+            Err(_) => true,
+        },
+        "not UTF-8",
+    );
+}
+
+fn requestOf(lines: StringView) -> Result<Request, HttpError> {
+    var r = Request.create();
+    var first = true;
+    for (line in lines.split("\r\n")) {
+        if (first) {
+            r.parseRequestLine(line.bytes())?;
+            first = false;
+        } else if (line.length > 0) {
+            r.parseHeaderLine(line.bytes())?;
+        }
+    }
+    return Ok(r);
+}
+
+fn fails(lines: StringView, want: u16) -> bool => match (requestOf(lines)) {
+    Ok(r) => match (r.framing()) {
+        Ok(_) => false,
+        Err(e) => statusOf(e) == want,
+    },
+    Err(e) => statusOf(e) == want,
+};
+
+@test
+fn parsesRequests() -> Result<void, TestFailure> {
+    let r = requestOf("GET /mail/config-v1.1.xml?emailaddress=a%40b.c&x=1+2 HTTP/1.1\r\nHost: Autoconfig.Example.COM.:8080\r\nConnection: keep-alive, Upgrade")!;
+    Check.isTrue(r.method.view() == "GET" && r.path.view() == "/mail/config-v1.1.xml", "method and path")?;
+    Check.isTrue(r.version == 11 && r.keepAlive(), "HTTP/1.1 keeps the connection")?;
+    var s = String.create();
+    r.host(mut s)!;
+    Check.isTrue(s.view() == "autoconfig.example.com", "the host, lowercased, no port or final dot")?;
+    Check.isTrue(r.param("emailaddress", mut s)! && s.view() == "a@b.c", "a decoded parameter")?;
+    Check.isTrue(r.param("x", mut s)! && s.view() == "1 2", "+ is a space")?;
+    Check.isTrue(!r.param("y", mut s)!, "an absent parameter")?;
+    Check.isTrue(r.headerHas("connection", "upgrade") && !r.headerHas("Connection", "close"), "tokens")?;
+    let closing = requestOf("POST /x HTTP/1.1\r\nHost: h\r\nConnection: close\r\nContent-Length: 5")!;
+    Check.isTrue(!closing.keepAlive(), "Connection: close")?;
+    Check.isTrue(
+        match (closing.framing()!) {
+            Framing.Length(n) => n == 5,
+            _ => false,
+        },
+        "Content-Length",
+    )?;
+    let old = requestOf("GET / HTTP/1.0")!;
+    Check.isTrue(old.version == 10 && !old.keepAlive(), "HTTP/1.0 closes by default")?;
+    let absolute = requestOf("GET http://h.example/a/b?q=1 HTTP/1.1\r\nHost: h.example")!;
+    Check.isTrue(absolute.path.view() == "/a/b" && absolute.query.view() == "q=1", "the absolute form")?;
+    let chunked = requestOf("POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked")!;
+    Check.isTrue(
+        match (chunked.framing()!) {
+            Framing.Chunked => true,
+            _ => false,
+        },
+        "chunked",
+    )?;
+    return Ok();
+}
+
+@test
+fn refusesBadRequests() -> Result<void, TestFailure> {
+    Check.isTrue(fails("GET /", 400) && fails("GET", 400) && fails(" / HTTP/1.1", 400), "the request line")?;
+    Check.isTrue(fails("GET / HTTP/2.0", 505) && fails("GET / FTP/1.1", 400), "versions")?;
+    Check.isTrue(fails("GET x HTTP/1.1", 400) && fails("G(T / HTTP/1.1", 400), "target and method")?;
+    Check.isTrue(fails("GET / HTTP/1.1\r\nHost : h", 400) && fails("GET / HTTP/1.1\r\n folded", 400), "field syntax")?;
+    Check.isTrue(fails("GET / HTTP/1.1\r\nNo colon", 400), "no colon")?;
+    Check.isTrue(fails("POST / HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 2", 400), "two lengths")?;
+    Check.isTrue(fails("POST / HTTP/1.1\r\nContent-Length: -1", 400) && fails("POST / HTTP/1.1\r\nContent-Length: 1x", 400), "a bad length")?;
+    Check.isTrue(fails("POST / HTTP/1.1\r\nTransfer-Encoding: gzip", 501), "another coding")?;
+    Check.isTrue(fails("POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nContent-Length: 3", 400), "both framings")?;
+    Check.isTrue((chunkSize("1a".bytes()) ?? 0) == 26 && (chunkSize("0;ext=1".bytes()) ?? 1) == 0, "chunk sizes")?;
+    Check.isTrue(chunkSize("".bytes()) == null && chunkSize("x".bytes()) == null, "bad chunk sizes")?;
+    Check.isTrue(chunkSize("1000000000000000".bytes()) == null, "a chunk too big")?;
+    var many = String.create();
+    many.append("GET / HTTP/1.1")!;
+    for (i in 0..101) {
+        many.append("\r\nX: y")!;
+    }
+    return Check.isTrue(fails(many.view(), 431), "too many fields");
+}
+
+@test
+fn pathsAndDecoding() -> Result<void, TestFailure> {
+    Check.isTrue((segment("/api/domains/7/aliases", 2) ?? "") == "7" && segment("/api/domains/7/aliases", 4) == null, "segments")?;
+    Check.isTrue(segmentCount("/api/domains/7/") == 3 && segmentCount("/") == 0 && segmentCount("/a") == 1, "counts")?;
+    var s = String.create();
+    percentDecode("a%2Fb%zz%4", false, mut s)!;
+    Check.isTrue(s.view() == "a/b%zz%4", "bad escapes stay")?;
+    s.clear();
+    percentDecode("a+b", false, mut s)!;
+    return Check.isTrue(s.view() == "a+b", "+ outside a query");
+}
+
+@test
+fn rendersResponses() -> Result<void, TestFailure> {
+    var r = Response.text(200, "hi")!;
+    r.header("Cache-Control", "max-age=600")!;
+    r.header("X-Bad", "a\r\nInjected: 1")!;
+    var out = Vector<u8>.create();
+    renderResponse(r, false, false, 784111777, mut out)!;
+    let text = StringView.fromUtf8(out.view())!;
+    Check.isTrue(text.startsWith("HTTP/1.1 200 OK\r\nDate: Sun, 06 Nov 1994 08:49:37 GMT\r\n"), "status and date")?;
+    Check.isTrue(text.indexOf("Content-Length: 2\r\n") != null && text.indexOf("Cache-Control: max-age=600\r\n") != null, "fields")?;
+    Check.isTrue(text.indexOf("Injected") == null, "CR LF in a value is refused")?;
+    Check.isTrue(text.endsWith("Connection: close\r\n\r\nhi"), "close and the body")?;
+    out.clear();
+    renderResponse(r, true, true, 0, mut out)!;
+    let head = StringView.fromUtf8(out.view())!;
+    Check.isTrue(head.endsWith("\r\n\r\n") && head.indexOf("Content-Length: 2") != null, "HEAD keeps the length")?;
+    let none = Response.create(204);
+    out.clear();
+    renderResponse(none, true, false, 0, mut out)!;
+    return Check.isTrue(StringView.fromUtf8(out.view())!.indexOf("Content-Length") == null, "204 has no length");
+}

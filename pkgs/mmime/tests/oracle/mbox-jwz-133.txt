@@ -1,0 +1,10 @@
+size 35250
+envelope ("28 Apr 1995 15:14:17 -0700" "Jumbo Bug Report" (("Tom Olin" NIL "tro" "partech.com")) (("Tom Olin" NIL "tro" "partech.com")) (("Tom Olin" NIL "tro" "partech.com")) NIL NIL NIL NIL NIL)
+bodystructure ("x-sun-attachment" "" NIL NIL NIL "7bit" 35086 NIL NIL NIL NIL)
+body ("x-sun-attachment" "" NIL NIL NIL "7bit" 35086)
+section HEADER 164 e53f0c2ab5be154d501c9bbc60fbc01a4f54974f7d9f9ed548f1ce75e748f4ca
+section TEXT 35086 5739e4155cbece21cd33805093ec0d70a945d2c9ade16f5c3a1bd673b579ebf6
+section HEADER.FIELDS 129 be39ca80145fb60da852f451d6aa175327a28eac13ad1de10b5e60f7b1005e92
+section HEADER.FIELDS.NOT 37 461c818d20b9e99cd30397aa1d8aaa366848671b40dc882456f1987b96f0ee44
+section 1 35086 5739e4155cbece21cd33805093ec0d70a945d2c9ade16f5c3a1bd673b579ebf6
+section 1.MIME 164 e53f0c2ab5be154d501c9bbc60fbc01a4f54974f7d9f9ed548f1ce75e748f4ca

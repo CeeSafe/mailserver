@@ -1,0 +1,424 @@
+// IMAP renderings of a parsed message (RFC 9051 §7.5.2): ENVELOPE, BODYSTRUCTURE and BODY. They are made once, at
+// ingest, and stored, so FETCH copies bytes and never parses.
+
+/// Appends an IMAP string: quoted when it can be, else a literal (CR, LF, NUL or 8-bit bytes).
+fn imapString(out: borrow mut Vector<u8>, value: Slice<u8>) -> Result<void, AllocError> {
+    var plain = true;
+    for (c in value) {
+        if (c == 0 || c == 0x0d || c == 0x0a || c >= 0x80) {
+            plain = false;
+            break;
+        }
+    }
+    if (plain) {
+        out.pushBE(0x22u8)?;
+        for (c in value) {
+            if (c == 0x22 || c == 0x5c) {
+                out.pushBE(0x5cu8)?;
+            }
+            out.pushBE(c)?;
+        }
+        return out.pushBE(0x22u8);
+    }
+    out.pushBE(0x7bu8)?; // '{'
+    appendNumber(out, value.length as u64)?;
+    out.extend("}\r\n".bytes())?;
+    return out.extend(value);
+}
+
+fn nstring(out: borrow mut Vector<u8>, value: Slice<u8>?) -> Result<void, AllocError> {
+    match (value) {
+        Some(v) => { return imapString(out, v); }
+        null => { return out.extend("NIL".bytes()); }
+    }
+}
+
+fn appendNumber(out: borrow mut Vector<u8>, value: u64) -> Result<void, AllocError> {
+    var digits = [0u8; 20];
+    var n = value;
+    var at: usize = 20;
+    loop {
+        at -= 1;
+        digits[at] = 0x30u8 + truncate<u8>(n % 10);
+        n = n / 10;
+        if (n == 0) {
+            break;
+        }
+    }
+    return out.extend(digits[at..]);
+}
+
+/// Renders messages and parts of one `MessageIndex`; its buffers are reused across calls.
+@noncopy
+public struct Renderer {
+    media: MediaType;
+    disposition: MediaType;
+    addresses: AddressList;
+    scratch: Vector<u8>;
+    children: Vector<usize>;
+
+    public fn create() -> Renderer => Renderer {
+        media: MediaType.create(),
+        disposition: MediaType.create(),
+        addresses: AddressList.create(),
+        scratch: Vector<u8>.create(),
+        children: Vector<usize>.create(),
+    };
+
+    /// The ENVELOPE of the message whose top level is `part` (0 for the message itself).
+    public fn envelope(
+        borrow mut this,
+        index: borrow MessageIndex,
+        part: usize,
+        out: borrow mut Vector<u8>,
+    ) -> Result<void, AllocError> {
+        let block = index.headerBlock(part);
+        out.pushBE(0x28u8)?;
+        this.unfolded(out, headerValue(block, "Date"))?;
+        out.pushBE(0x20u8)?;
+        match (headerValue(block, "Subject")) {
+            Some(v) => {
+                this.scratch.clear();
+                appendCollapsed(v, mut this.scratch)?;
+                imapString(out, this.scratch.view())?;
+            }
+            null => { out.extend("NIL".bytes())?; }
+        }
+        let from = headerValue(block, "From");
+        out.pushBE(0x20u8)?;
+        this.addressList(out, from)?;
+        out.pushBE(0x20u8)?;
+        this.addressListOr(out, headerValue(block, "Sender"), from)?;
+        out.pushBE(0x20u8)?;
+        this.addressListOr(out, headerValue(block, "Reply-To"), from)?;
+        out.pushBE(0x20u8)?;
+        this.addressList(out, headerValue(block, "To"))?;
+        out.pushBE(0x20u8)?;
+        this.addressList(out, headerValue(block, "Cc"))?;
+        out.pushBE(0x20u8)?;
+        this.addressList(out, headerValue(block, "Bcc"))?;
+        out.pushBE(0x20u8)?;
+        this.unfolded(out, headerValue(block, "In-Reply-To"))?;
+        out.pushBE(0x20u8)?;
+        this.unfolded(out, headerValue(block, "Message-ID"))?;
+        return out.pushBE(0x29u8);
+    }
+
+    fn unfolded(borrow mut this, out: borrow mut Vector<u8>, value: Slice<u8>?) -> Result<void, AllocError> {
+        match (value) {
+            Some(v) => {
+                this.scratch.clear();
+                appendUnfolded(v, mut this.scratch)?;
+                return imapString(out, this.scratch.view());
+            }
+            null => { return out.extend("NIL".bytes()); }
+        }
+    }
+
+    /// The address list of `value`, or of `fallback` when the field is absent or holds no address (RFC 3501 §7.4.2:
+    /// a Sender or Reply-To that is "absent ... or present but empty" is the From).
+    fn addressListOr(
+        borrow mut this,
+        out: borrow mut Vector<u8>,
+        value: Slice<u8>?,
+        fallback: Slice<u8>?,
+    ) -> Result<void, AllocError> {
+        match (value) {
+            Some(v) => {
+                parseAddressList(v, mut this.addresses)?;
+                if (this.addresses.count() > 0) {
+                    return this.addressList(out, value);
+                }
+            }
+            null => {}
+        }
+        return this.addressList(out, fallback);
+    }
+
+    fn addressList(borrow mut this, out: borrow mut Vector<u8>, value: Slice<u8>?) -> Result<void, AllocError> {
+        let v = match (value) {
+            Some(v) => v,
+            null => { return out.extend("NIL".bytes()); }
+        };
+        parseAddressList(v, mut this.addresses)?;
+        if (this.addresses.count() == 0) {
+            return out.extend("NIL".bytes());
+        }
+        out.pushBE(0x28u8)?;
+        for (i in 0..this.addresses.count()) {
+            out.pushBE(0x28u8)?;
+            match (this.addresses.name(i)) {
+                Some(name) => {
+                    this.scratch.clear();
+                    appendCollapsed(name, mut this.scratch)?;
+                    imapString(out, this.scratch.view())?;
+                }
+                null => { out.extend("NIL".bytes())?; }
+            }
+            out.pushBE(0x20u8)?;
+            nstring(out, this.addresses.route(i))?;
+            out.pushBE(0x20u8)?;
+            nstring(out, this.addresses.mailbox(i))?;
+            out.pushBE(0x20u8)?;
+            nstring(out, this.addresses.host(i))?;
+            out.pushBE(0x29u8)?;
+        }
+        return out.pushBE(0x29u8);
+    }
+
+    /// The BODYSTRUCTURE (`extensible`) or BODY of the message whose top level is `part`.
+    public fn structure(
+        borrow mut this,
+        index: borrow MessageIndex,
+        part: usize,
+        extensible: bool,
+        out: borrow mut Vector<u8>,
+    ) -> Result<void, AllocError> {
+        let p = index.parts[part];
+        if (p.kind == PART_MULTIPART) {
+            return this.multipart(index, part, extensible, out);
+        }
+        return this.leaf(index, part, extensible, out);
+    }
+
+    fn multipart(
+        borrow mut this,
+        index: borrow MessageIndex,
+        part: usize,
+        extensible: bool,
+        out: borrow mut Vector<u8>,
+    ) -> Result<void, AllocError> {
+        out.pushBE(0x28u8)?;
+        var kids = Vector<usize>.create();
+        index.children(part, mut kids)?;
+        for (i in 0..kids.length) {
+            this.structure(index, kids[i], extensible, out)?;
+        }
+        let block = index.headerBlock(part);
+        match (headerValue(block, "Content-Type")) {
+            Some(v) => { parseMediaType(v, mut this.media)?; }
+            null => { this.media.clear(); }
+        }
+        out.pushBE(0x20u8)?;
+        imapString(out, this.media.subtype.view())?;
+        if (extensible) {
+            out.pushBE(0x20u8)?;
+            paramList(out, this.media.params)?;
+            this.extension(out, block)?;
+        }
+        return out.pushBE(0x29u8);
+    }
+
+    fn leaf(
+        borrow mut this,
+        index: borrow MessageIndex,
+        part: usize,
+        extensible: bool,
+        out: borrow mut Vector<u8>,
+    ) -> Result<void, AllocError> {
+        let p = index.parts[part];
+        let block = index.headerBlock(part);
+        var present = false;
+        var typed = false;
+        match (headerValue(block, "Content-Type")) {
+            Some(v) => {
+                present = true;
+                typed = parseMediaType(v, mut this.media)?;
+            }
+            null => {}
+        }
+        out.pushBE(0x28u8)?;
+        var text = false;
+        if (p.kind == PART_MESSAGE) {
+            // Dovecot writes an encapsulated message's type in lowercase, however the header spelt it.
+            if (typed && this.media.isSubtype("global")) {
+                out.extend("\"message\" \"global\" ".bytes())?;
+            } else {
+                out.extend("\"message\" \"rfc822\" ".bytes())?;
+            }
+            if (typed) {
+                paramList(out, this.media.params)?;
+            } else {
+                out.extend("NIL".bytes())?;
+            }
+        } else if (typed) {
+            imapString(out, this.media.kind.view())?;
+            out.pushBE(0x20u8)?;
+            imapString(out, this.media.subtype.view())?;
+            out.pushBE(0x20u8)?;
+            text = this.media.isType("text");
+            if (text && !hasParam(this.media.params, "charset")) {
+                // A text part without a charset is US-ASCII (RFC 2045 §5.2); Dovecot adds it last.
+                out.pushBE(0x28u8)?;
+                for (i in 0..this.media.params.count()) {
+                    imapString(out, this.media.params.name(i))?;
+                    out.pushBE(0x20u8)?;
+                    imapString(out, this.media.params.value(i))?;
+                    out.pushBE(0x20u8)?;
+                }
+                out.extend("\"charset\" \"us-ascii\")".bytes())?;
+            } else {
+                paramList(out, this.media.params)?;
+            }
+        } else if (present) {
+            // A Content-Type that does not parse. A lone type without a subtype shows as (type, ""); anything else
+            // as empty strings. Both as Dovecot shows them.
+            if (this.loneType(block)?) {
+                imapString(out, this.scratch.view())?;
+                out.extend(" \"\" NIL".bytes())?;
+            } else {
+                out.extend("\"\" \"\" NIL".bytes())?;
+            }
+        } else if (p.digestChild) {
+            out.extend("\"message\" \"rfc822\" NIL".bytes())?;
+        } else {
+            out.extend("\"text\" \"plain\" (\"charset\" \"us-ascii\")".bytes())?;
+            text = true;
+        }
+        out.pushBE(0x20u8)?;
+        this.unfolded(out, headerValue(block, "Content-ID"))?;
+        out.pushBE(0x20u8)?;
+        this.unfolded(out, headerValue(block, "Content-Description"))?;
+        out.pushBE(0x20u8)?;
+        match (headerValue(block, "Content-Transfer-Encoding")) {
+            Some(v) => {
+                var lexer = Lexer.of(v);
+                lexer.skipSpace();
+                let start = lexer.token();
+                let token = v[start..lexer.at];
+                if (token.length == 0) {
+                    out.extend("\"7bit\"".bytes())?;
+                } else {
+                    imapString(out, token)?;
+                }
+            }
+            null => { out.extend("\"7bit\"".bytes())?; }
+        }
+        out.pushBE(0x20u8)?;
+        appendNumber(out, p.bodyEnd - p.bodyStart)?;
+        if (p.kind == PART_MESSAGE) {
+            let inner = part + 1; // the encapsulated message follows its part
+            out.pushBE(0x20u8)?;
+            this.envelope(index, inner, out)?;
+            out.pushBE(0x20u8)?;
+            this.structure(index, inner, extensible, out)?;
+            out.pushBE(0x20u8)?;
+            appendNumber(out, p.lines)?;
+        } else if (text) {
+            out.pushBE(0x20u8)?;
+            appendNumber(out, p.lines)?;
+        }
+        if (extensible) {
+            out.pushBE(0x20u8)?;
+            this.unfolded(out, headerValue(block, "Content-MD5"))?;
+            this.extension(out, block)?;
+        }
+        return out.pushBE(0x29u8);
+    }
+
+    /// Whether the Content-Type is one token alone; it goes into `scratch`.
+    fn loneType(borrow mut this, block: Slice<u8>) -> Result<bool, AllocError> {
+        let value = match (headerValue(block, "Content-Type")) {
+            Some(v) => v,
+            null => { return Ok(false); }
+        };
+        var lexer = Lexer.of(value);
+        lexer.skipSpace();
+        let start = lexer.token();
+        let end = lexer.at;
+        lexer.skipSpace();
+        if (end == start || !lexer.atEnd()) {
+            return Ok(false);
+        }
+        this.scratch.clear();
+        for (i in start..end) {
+            let c = value[i];
+            this.scratch.pushBE(c)?;
+        }
+        return Ok(true);
+    }
+
+    /// ` disposition language location`, shared by both kinds of part.
+    fn extension(borrow mut this, out: borrow mut Vector<u8>, block: Slice<u8>) -> Result<void, AllocError> {
+        out.pushBE(0x20u8)?;
+        let disposed = match (headerValue(block, "Content-Disposition")) {
+            Some(v) => parseDisposition(v, mut this.disposition)?,
+            null => false,
+        };
+        if (disposed) {
+            out.pushBE(0x28u8)?;
+            imapString(out, this.disposition.kind.view())?;
+            out.pushBE(0x20u8)?;
+            paramList(out, this.disposition.params)?;
+            out.pushBE(0x29u8)?;
+        } else {
+            out.extend("NIL".bytes())?;
+        }
+        out.pushBE(0x20u8)?;
+        match (headerValue(block, "Content-Language")) {
+            Some(v) => { this.languages(out, v)?; }
+            null => { out.extend("NIL".bytes())?; }
+        }
+        out.pushBE(0x20u8)?;
+        return this.unfolded(out, headerValue(block, "Content-Location"));
+    }
+
+    /// Content-Language: a list of tags, or NIL.
+    fn languages(borrow mut this, out: borrow mut Vector<u8>, value: Slice<u8>) -> Result<void, AllocError> {
+        var lexer = Lexer.of(value);
+        var tags = Vector<u8>.create();
+        var count: usize = 0;
+        loop {
+            lexer.skipSpace();
+            if (lexer.atEnd()) {
+                break;
+            }
+            if (lexer.peek() == 0x2c) {
+                lexer.at += 1;
+                continue;
+            }
+            let start = lexer.token();
+            let t = value[start..lexer.at];
+            if (t.length == 0) {
+                lexer.at += 1;
+                continue;
+            }
+            if (count > 0) {
+                tags.pushBE(0x20u8)?;
+            }
+            imapString(mut tags, t)?;
+            count += 1;
+        }
+        if (count == 0) {
+            return out.extend("NIL".bytes());
+        }
+        out.pushBE(0x28u8)?;
+        out.extend(tags.view())?;
+        return out.pushBE(0x29u8);
+    }
+}
+
+fn paramList(out: borrow mut Vector<u8>, params: borrow ParamList) -> Result<void, AllocError> {
+    if (params.count() == 0) {
+        return out.extend("NIL".bytes());
+    }
+    out.pushBE(0x28u8)?;
+    for (i in 0..params.count()) {
+        if (i > 0) {
+            out.pushBE(0x20u8)?;
+        }
+        imapString(out, params.name(i))?;
+        out.pushBE(0x20u8)?;
+        imapString(out, params.value(i))?;
+    }
+    return out.pushBE(0x29u8);
+}
+
+fn hasParam(params: borrow ParamList, name: StringView) -> bool {
+    for (i in 0..params.count()) {
+        if (params.name(i).equalsIgnoreAsciiCase(name.bytes())) {
+            return true;
+        }
+    }
+    return false;
+}

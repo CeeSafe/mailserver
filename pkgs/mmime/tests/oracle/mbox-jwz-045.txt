@@ -1,0 +1,12 @@
+size 77805
+envelope ("Fri, 29 Nov 91 07:13:36 EST" "A multipart with quoted-printable test" ((NIL NIL "nsb" "MISSING_DOMAIN")) ((NIL NIL "nsb" "MISSING_DOMAIN")) ((NIL NIL "nsb" "MISSING_DOMAIN")) NIL NIL NIL NIL NIL)
+bodystructure (("image" "gif" NIL NIL NIL "quoted-printable" 77489 NIL NIL NIL NIL) ("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 30 0 NIL NIL NIL NIL) "mixed" ("boundary" "horsespit") NIL NIL NIL)
+body (("image" "gif" NIL NIL NIL "quoted-printable" 77489) ("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 30 0) "mixed")
+section HEADER 167 3b7434381becc15280e69c10f1250257c0ece5ca8a2154720045f6a50e5bbaac
+section TEXT 77638 7db7dc616c8950150e5dc3c2a79e95d5eba439b8a8b9f3f4c321fa3ea16ec9c0
+section HEADER.FIELDS 148 2296883deec2268877b7652e0eb4ba8eafa9b8e91351f75517623ad28abd1331
+section HEADER.FIELDS.NOT 21 07a26ab8981ff3b1de28da29cf47f47e315b9c25685121dc5ebb60391005b2de
+section 1 77489 5a46f4e54af4b32067f66ca9eb7201be69cbf5d3ddbacbd923b544bf846b643e
+section 1.MIME 72 c86e8f90a3c9b95fefa00878048bc8301f45913b6b44f5dffd1ac69201767eed
+section 2 30 8dd339d03b5e37e3ef7dc6ec01e01bf534e0dc4c811d0cea89f929dafb2189f6
+section 2.MIME 2 7eb70257593da06f682a3ddda54a9d260d4fc514f645237f5ca74b08f8da61a6

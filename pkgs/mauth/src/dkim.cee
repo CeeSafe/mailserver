@@ -1,0 +1,769 @@
+// DKIM verification (RFC 6376, with RFC 8301's algorithm rules and RFC 8463's Ed25519). The verifier is fed the
+// message as it arrives: it keeps the header block, and from the blank line on it hashes the body for each
+// signature, in its canonicalization, as the bytes go by.
+
+import encoding.Base64;
+import mdns.DnsAnswer;
+import mdns.DnsError;
+import mdns.RCODE_NOERROR;
+import mdns.RCODE_NXDOMAIN;
+import mdns.Resolver;
+import mdns.TYPE_TXT;
+import pkey.Signatures;
+import pkey.Verdict;
+import sha256.Sha256;
+import sha256.constantTimeEqual;
+
+/// The most signatures checked per message, so a message with hundreds cannot cost hundreds of DNS lookups and
+/// RSA verifications.
+const MAX_SIGNATURES: usize = 5;
+/// The most header bytes kept to verify against.
+const MAX_HEADER: usize = 1024 * 1024;
+
+/// A signature's result (RFC 8601 §2.7.1).
+public enum DkimStatus {
+    Pass,
+    Fail,
+    /// Malformed or unusable: not a signature that could be checked.
+    Neutral,
+    /// Valid, but refused by policy: an algorithm or key too weak.
+    Policy,
+    TempError,
+    PermError,
+}
+
+public fn dkimName(s: DkimStatus) -> StringView => match (s) {
+    DkimStatus.Pass => "pass",
+    DkimStatus.Fail => "fail",
+    DkimStatus.Neutral => "neutral",
+    DkimStatus.Policy => "policy",
+    DkimStatus.TempError => "temperror",
+    DkimStatus.PermError => "permerror",
+};
+
+/// One signature's outcome, for Authentication-Results and DMARC.
+@noncopy
+public struct DkimResult {
+    public status: DkimStatus;
+    /// d=, s= and a= of the signature.
+    public domain: String;
+    public selector: String;
+    public algorithm: String;
+    /// The first characters of b=, which Authentication-Results gives as header.b to tell signatures apart.
+    public signaturePrefix: String;
+    /// Why it did not pass, briefly.
+    public reason: String;
+}
+
+/// Why a signature field cannot be used.
+const PROBLEMS: [StringView; 11] = [
+    "", "malformed tag", "malformed b=", "malformed bh=", "unknown canonicalization",
+    "malformed l=", "malformed x=", "missing required tag", "unsupported algorithm", "From is not signed",
+    "i= is not within d=",
+];
+const UNSUPPORTED: u8 = 8;
+
+const ALG_RSA: u8 = 1;
+const ALG_ED25519: u8 = 2;
+
+/// A DKIM-Signature field, parsed.
+@noncopy
+struct Signature {
+    /// Where the field is in the kept header block.
+    fieldAt: usize;
+    fieldEnd: usize;
+    /// The b= value's place in the field (relative to the block), deleted when hashing.
+    bAt: usize;
+    bEnd: usize;
+    algorithm: u8;
+    relaxedHeader: bool;
+    relaxedBody: bool;
+    domain: Vector<u8>;
+    selector: Vector<u8>;
+    algorithmName: Vector<u8>;
+    headers: Vector<u8>;
+    bodyHash: Vector<u8>;
+    signature: Vector<u8>;
+    signatureText: Vector<u8>;
+    /// l=, or -1 for the whole body.
+    length: i64;
+    expires: i64;
+    /// Set when the field cannot be used: the reason.
+    invalid: u8;
+}
+
+/// A body hash in one canonicalization.
+struct BodyHash {
+    sha: Sha256;
+    relaxed: bool;
+    limit: i64;
+    hashed: i64;
+    /// CRLFs seen and not yet hashed (they hash only when content follows: trailing empty lines vanish).
+    pendingLines: u64;
+    pendingSpace: bool;
+    sawCr: bool;
+    anyContent: bool;
+}
+
+fn bodyHash(relaxed: bool, limit: i64) -> BodyHash => BodyHash {
+    sha: Sha256.create(),
+    relaxed: relaxed,
+    limit: limit,
+    hashed: 0,
+    pendingLines: 0,
+    pendingSpace: false,
+    sawCr: false,
+    anyContent: false,
+};
+
+fn emit(h: borrow mut BodyHash, bytes: Slice<u8>) {
+    var n = truncate<i64>(bytes.length);
+    if (h.limit >= 0) {
+        let room = h.limit - h.hashed;
+        if (room <= 0) {
+            return;
+        }
+        if (n > room) {
+            n = room;
+        }
+    }
+    h.sha.update(bytes[0..truncate<usize>(n)]);
+    h.hashed += n;
+}
+
+fn content(h: borrow mut BodyHash, c: u8) {
+    while (h.pendingLines > 0) {
+        emit(h, "\r\n".bytes());
+        h.pendingLines -= 1;
+    }
+    if (h.pendingSpace) {
+        emit(h, " ".bytes());
+        h.pendingSpace = false;
+    }
+    let one = [c];
+    emit(h, one[..]);
+    h.anyContent = true;
+}
+
+fn feedBody(h: borrow mut BodyHash, bytes: Slice<u8>) {
+    for (c in bytes) {
+        if (h.sawCr) {
+            h.sawCr = false;
+            if (c == 0x0a) {
+                h.pendingSpace = false; // trailing whitespace on a line is dropped (relaxed)
+                h.pendingLines += 1;
+                continue;
+            }
+            content(h, 0x0d); // a lone CR is content
+        }
+        if (c == 0x0d) {
+            h.sawCr = true;
+            continue;
+        }
+        if (h.relaxed && (c == 0x20 || c == 0x09)) {
+            h.pendingSpace = true;
+            continue;
+        }
+        content(h, c);
+    }
+}
+
+/// The hash of the body: simple ends with one CRLF (an empty body is just CRLF); relaxed adds nothing to an empty
+/// body (RFC 6376 §3.4.3–3.4.4, errata 1384).
+fn finishBody(h: BodyHash) -> [u8; 32] {
+    var x = h;
+    if (x.sawCr) {
+        content(mut x, 0x0d);
+    }
+    if (x.anyContent || !x.relaxed) {
+        emit(mut x, "\r\n".bytes());
+    }
+    return x.sha.finish();
+}
+
+/// Verifies the DKIM signatures of a message fed to it.
+@noncopy
+public struct DkimVerifier {
+    header: Vector<u8>;
+    inHeader: bool;
+    overflow: bool;
+    /// How much of "\r\n\r\n" was last seen at the end of the header.
+    endMatch: u8;
+    signatures: Vector<Signature>;
+    hashes: Vector<BodyHash>;
+
+    public fn create() -> DkimVerifier => DkimVerifier {
+        header: Vector<u8>.create(),
+        inHeader: true,
+        overflow: false,
+        endMatch: 0,
+        signatures: Vector<Signature>.create(),
+        hashes: Vector<BodyHash>.create(),
+    };
+
+    /// The header block kept so far (the whole header once the body has started; empty if it was too large).
+    public fn headerBlock(borrow this) -> Slice<u8> => if (this.overflow) this.header[0..0] else this.header.view();
+
+    /// Whether the header ended (the blank line was seen).
+    public fn headerDone(borrow this) -> bool => !this.inHeader;
+
+    /// Takes the next bytes of the message, as received (CRLF line ends).
+    public fn feed(borrow mut this, bytes: Slice<u8>) -> Result<void, AllocError> {
+        var at: usize = 0;
+        if (this.inHeader) {
+            while (at < bytes.length) {
+                let c = bytes[at];
+                at += 1;
+                if (!this.overflow) {
+                    if (this.header.length < MAX_HEADER) {
+                        this.header.push(c)?;
+                    } else {
+                        this.overflow = true;
+                    }
+                }
+                let want = if (this.endMatch % 2 == 0) 0x0du8 else 0x0au8;
+                if (c == want) {
+                    this.endMatch += 1;
+                } else {
+                    this.endMatch = if (c == 0x0d) 1 else 0;
+                }
+                if (this.endMatch == 4) {
+                    this.inHeader = false;
+                    this.startBody()?;
+                    break;
+                }
+            }
+        }
+        if (!this.inHeader) {
+            for (i in 0..this.hashes.length) {
+                feedBody(mut this.hashes[i], bytes[at..]);
+            }
+        }
+        return Ok();
+    }
+
+    /// The header is complete: find the signatures and start their body hashes.
+    fn startBody(borrow mut this) -> Result<void, AllocError> {
+        if (this.overflow) {
+            return Ok();
+        }
+        var cursor = 0usize;
+        let block = this.header.view();
+        while (cursor < block.length && this.signatures.length < MAX_SIGNATURES) {
+            let start = cursor;
+            // A field runs to the CRLF not followed by whitespace.
+            var end = start;
+            loop {
+                match (block[end..].indexOfByte(0x0a)) {
+                    Some(lf) => { end = end + lf + 1; }
+                    null => {
+                        end = block.length;
+                        break;
+                    }
+                }
+                if (end >= block.length || (block[end] != 0x20 && block[end] != 0x09)) {
+                    break;
+                }
+            }
+            cursor = end;
+            let field = block[start..end];
+            if (field.length >= 15 && field[0..15].equalsIgnoreAsciiCase("DKIM-Signature:".bytes())) {
+                var sig = parseSignature(block, start, end)?;
+                let limit = sig.length;
+                let relaxed = sig.relaxedBody;
+                this.signatures.push(sig)?;
+                this.hashes.push(bodyHash(relaxed, limit))?;
+            }
+        }
+        return Ok();
+    }
+
+    /// Checks every signature (up to five), fetching keys with `resolver`, into `results`. Call it after the whole
+    /// message was fed.
+    public async fn verify(
+        borrow mut this,
+        resolver: borrow Resolver,
+        now: i64,
+        results: borrow mut Vector<DkimResult>,
+    ) -> Result<void, AllocError> {
+        results.clear();
+        for (i in 0..this.signatures.length) {
+            let digest = finishBody(this.hashes[i]);
+            let sig = borrow this.signatures[i];
+            var result = DkimResult {
+                status: DkimStatus.Neutral,
+                domain: String.create(),
+                selector: String.create(),
+                algorithm: String.create(),
+                signaturePrefix: String.create(),
+                reason: String.create(),
+            };
+            appendText(mut result.domain, sig.domain.view())?;
+            appendText(mut result.selector, sig.selector.view())?;
+            appendText(mut result.algorithm, sig.algorithmName.view())?;
+            let prefixLength = if (sig.signatureText.length > 8) 8 else sig.signatureText.length;
+            appendText(mut result.signaturePrefix, sig.signatureText[0..prefixLength])?;
+            if (sig.invalid != 0) {
+                result.status = if (sig.invalid == UNSUPPORTED) DkimStatus.Policy else DkimStatus.Neutral;
+                result.reason.append(PROBLEMS[sig.invalid as usize])?;
+            } else if (sig.expires > 0 && sig.expires < now) {
+                result.status = DkimStatus.Fail;
+                result.reason.append("signature expired")?;
+            } else if (!constantTimeEqual(digest[..], sig.bodyHash.view())) {
+                result.status = DkimStatus.Fail;
+                result.reason.append("body hash did not verify")?;
+            } else {
+                await this.check(resolver, i, mut result)?;
+            }
+            results.push(result)?;
+        }
+        return Ok();
+    }
+
+    /// Fetches the key and verifies signature `i`'s header hash.
+    async fn check(
+        borrow this,
+        resolver: borrow Resolver,
+        i: usize,
+        result: borrow mut DkimResult,
+    ) -> Result<void, AllocError> {
+        let sig = borrow this.signatures[i];
+        var name = Vector<u8>.create();
+        name.extend(sig.selector.view())?;
+        name.extend("._domainkey.".bytes())?;
+        name.extend(sig.domain.view())?;
+        var answer = DnsAnswer.create();
+        let text = match (StringView.fromUtf8(name.view())) {
+            Some(t) => t,
+            null => {
+                result.status = DkimStatus.PermError;
+                result.reason.append("bad key name")?;
+                return Ok();
+            }
+        };
+        match (await resolver.query(text, TYPE_TXT, mut answer)) {
+            Ok() => {}
+            Err(DnsError.BadName) => {
+                result.status = DkimStatus.PermError;
+                result.reason.append("bad key name")?;
+                return Ok();
+            }
+            Err(_) => {
+                result.status = DkimStatus.TempError;
+                result.reason.append("key unavailable")?;
+                return Ok();
+            }
+        }
+        if (answer.rcode != RCODE_NOERROR && answer.rcode != RCODE_NXDOMAIN) {
+            result.status = DkimStatus.TempError;
+            result.reason.append("key unavailable")?;
+            return Ok();
+        }
+        if (answer.count() == 0) {
+            result.status = DkimStatus.PermError;
+            result.reason.append("no key")?;
+            return Ok();
+        }
+        var key = Vector<u8>.create();
+        let keyKind = parseKey(answer.data(0), mut key)?;
+        if (keyKind == 0) {
+            result.status = DkimStatus.PermError;
+            result.reason.append("key unusable or revoked")?;
+            return Ok();
+        }
+        if (keyKind != sig.algorithm) {
+            result.status = DkimStatus.PermError;
+            result.reason.append("key type does not match")?;
+            return Ok();
+        }
+        var data = Vector<u8>.create();
+        this.headerData(i, mut data)?;
+        let digest = Sha256.hash(data.view());
+        let verdict = if (sig.algorithm == ALG_RSA) Signatures.verifyRsaSha256(
+            key.view(),
+            data.view(),
+            sig.signature.view(),
+        ) else Signatures.verifyEd25519(key.view(), digest[..], sig.signature.view());
+        match (verdict) {
+            Verdict.Good => { result.status = DkimStatus.Pass; }
+            Verdict.Bad => {
+                result.status = DkimStatus.Fail;
+                result.reason.append("signature did not verify")?;
+            }
+            Verdict.WeakKey => {
+                result.status = DkimStatus.Policy;
+                result.reason.append("key too short")?;
+            }
+            Verdict.BadKey => {
+                result.status = DkimStatus.PermError;
+                result.reason.append("key unusable or revoked")?;
+            }
+            Verdict.OutOfMemory => { return Err(AllocError.OutOfMemory); }
+        }
+        return Ok();
+    }
+
+    /// The signed header data of signature `i` (§3.7): the h= fields, picked from the bottom up, then the signature
+    /// field itself with its b= value removed and no final CRLF.
+    fn headerData(borrow this, i: usize, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+        let sig = borrow this.signatures[i];
+        let block = this.header.view();
+        // Each field: its start and end.
+        var starts = Vector<usize>.create();
+        var ends = Vector<usize>.create();
+        var used = Vector<bool>.create();
+        var cursor = 0usize;
+        while (cursor < block.length) {
+            let start = cursor;
+            var end = start;
+            loop {
+                match (block[end..].indexOfByte(0x0a)) {
+                    Some(lf) => { end = end + lf + 1; }
+                    null => {
+                        end = block.length;
+                        break;
+                    }
+                }
+                if (end >= block.length || (block[end] != 0x20 && block[end] != 0x09)) {
+                    break;
+                }
+            }
+            cursor = end;
+            if (end - start <= 2) {
+                break; // the blank line
+            }
+            starts.push(start)?;
+            ends.push(end)?;
+            used.push(false)?;
+        }
+        let names = sig.headers.view();
+        var at = 0usize;
+        while (at <= names.length) {
+            var stop = at;
+            while (stop < names.length && names[stop] != 0x3a) {
+                stop += 1;
+            }
+            let wanted = trimFws(names[at..stop]);
+            at = stop + 1;
+            if (wanted.length == 0) {
+                continue;
+            }
+            // The last unused instance (§5.4.2).
+            var k = starts.length;
+            while (k > 0) {
+                k -= 1;
+                if (used[k]) {
+                    continue;
+                }
+                let field = block[starts[k]..ends[k]];
+                let colon = match (field.indexOfByte(0x3a)) {
+                    Some(c) => c,
+                    null => { continue; }
+                };
+                if (trimFws(field[0..colon]).equalsIgnoreAsciiCase(wanted)) {
+                    used[k] = true;
+                    canonicalHeader(field, sig.relaxedHeader, true, out)?;
+                    break;
+                }
+            }
+        }
+        // The signature field, b= emptied.
+        var self = Vector<u8>.create();
+        self.extend(block[sig.fieldAt..sig.bAt])?;
+        self.extend(block[sig.bEnd..sig.fieldEnd])?;
+        return canonicalHeader(self.view(), sig.relaxedHeader, false, out);
+    }
+}
+
+/// Whether `a` is exactly `b`.
+fn same(a: Slice<u8>, b: StringView) -> bool => a.length == b.length && a.startsWith(b.bytes());
+
+fn appendText(into: borrow mut String, bytes: Slice<u8>) -> Result<void, AllocError> {
+    match (StringView.fromUtf8(bytes)) {
+        Some(t) => { return into.append(t); }
+        null => { return Ok(); }
+    }
+}
+
+fn isFws(c: u8) -> bool => c == 0x20 || c == 0x09 || c == 0x0d || c == 0x0a;
+
+fn trimFws(s: Slice<u8>) -> Slice<u8> {
+    var a: usize = 0;
+    var b = s.length;
+    while (a < b && isFws(s[a])) {
+        a += 1;
+    }
+    while (b > a && isFws(s[b - 1])) {
+        b -= 1;
+    }
+    return s[a..b];
+}
+
+/// Canonicalizes one header field (§3.4.1–3.4.2), with its CRLF when `withCrlf`.
+fn canonicalHeader(
+    field: Slice<u8>,
+    relaxed: bool,
+    withCrlf: bool,
+    out: borrow mut Vector<u8>,
+) -> Result<void, AllocError> {
+    if (!relaxed) {
+        if (!withCrlf && field.length >= 2 && field[field.length - 2] == 0x0d && field[field.length - 1] == 0x0a) {
+            return out.extend(field[0..field.length - 2]);
+        }
+        return out.extend(field);
+    }
+    let colon = match (field.indexOfByte(0x3a)) {
+        Some(c) => c,
+        null => field.length,
+    };
+    for (c in trimFws(field[0..colon])) {
+        out.push(if (c >= 0x41 && c <= 0x5a) c + 0x20 else c)?;
+    }
+    out.push(0x3a)?;
+    // The value: unfolded, whitespace runs one space, none at either end.
+    var space = false;
+    var any = false;
+    if (colon < field.length) {
+        for (c in field[colon + 1..]) {
+            if (c == 0x0d || c == 0x0a) {
+                continue;
+            }
+            if (c == 0x20 || c == 0x09) {
+                space = any;
+                continue;
+            }
+            if (space) {
+                out.push(0x20)?;
+                space = false;
+            }
+            out.push(c)?;
+            any = true;
+        }
+    }
+    if (withCrlf) {
+        out.extend("\r\n".bytes())?;
+    }
+    return Ok();
+}
+
+/// Parses the DKIM-Signature field at `[start, end)` of `block`.
+fn parseSignature(block: Slice<u8>, start: usize, end: usize) -> Result<Signature, AllocError> {
+    var sig = Signature {
+        fieldAt: start,
+        fieldEnd: end,
+        bAt: end,
+        bEnd: end,
+        algorithm: 0,
+        relaxedHeader: false,
+        relaxedBody: false,
+        domain: Vector<u8>.create(),
+        selector: Vector<u8>.create(),
+        algorithmName: Vector<u8>.create(),
+        headers: Vector<u8>.create(),
+        bodyHash: Vector<u8>.create(),
+        signature: Vector<u8>.create(),
+        signatureText: Vector<u8>.create(),
+        length: -1,
+        expires: 0,
+        invalid: 0,
+    };
+    var version = false;
+    var identity = Vector<u8>.create();
+    var hasB = false;
+    var hasBh = false;
+    var at = start + 15; // after "DKIM-Signature:"
+    var stripped = Vector<u8>.create();
+    while (at < end) {
+        var stop = at;
+        while (stop < end && block[stop] != 0x3b) {
+            stop += 1;
+        }
+        let tag = block[at..stop];
+        let eq = match (tag.indexOfByte(0x3d)) {
+            Some(e) => e,
+            null => {
+                if (trimFws(tag).length > 0) {
+                    sig.invalid = 1;
+                }
+                at = stop + 1;
+                continue;
+            }
+        };
+        let name = trimFws(tag[0..eq]);
+        let value = trimFws(tag[eq + 1..]);
+        if (same(name, "b")) {
+            // The whole value, surrounding whitespace included, goes when hashing (§3.5).
+            sig.bAt = at + eq + 1;
+            sig.bEnd = stop;
+            hasB = true;
+            stripped.clear();
+            for (c in value) {
+                if (!isFws(c)) {
+                    stripped.push(c)?;
+                }
+            }
+            sig.signatureText.extend(stripped.view())?;
+            match (Base64.decode(stripped.view(), mut sig.signature)) {
+                Ok() => {}
+                Err(_) => { sig.invalid = 2; }
+            }
+        } else if (same(name, "bh")) {
+            hasBh = true;
+            stripped.clear();
+            for (c in value) {
+                if (!isFws(c)) {
+                    stripped.push(c)?;
+                }
+            }
+            match (Base64.decode(stripped.view(), mut sig.bodyHash)) {
+                Ok() => {}
+                Err(_) => { sig.invalid = 3; }
+            }
+        } else if (same(name, "v")) {
+            version = same(value, "1");
+        } else if (same(name, "a")) {
+            sig.algorithmName.extend(value)?;
+            if (value.equalsIgnoreAsciiCase("rsa-sha256".bytes())) {
+                sig.algorithm = ALG_RSA;
+            } else if (value.equalsIgnoreAsciiCase("ed25519-sha256".bytes())) {
+                sig.algorithm = ALG_ED25519;
+            }
+        } else if (same(name, "c")) {
+            let slash = match (value.indexOfByte(0x2f)) {
+                Some(s) => s,
+                null => value.length,
+            };
+            let h = value[0..slash];
+            sig.relaxedHeader = h.equalsIgnoreAsciiCase("relaxed".bytes());
+            if (!sig.relaxedHeader && !h.equalsIgnoreAsciiCase("simple".bytes())) {
+                sig.invalid = 4;
+            }
+            if (slash < value.length) {
+                let b = value[slash + 1..];
+                sig.relaxedBody = b.equalsIgnoreAsciiCase("relaxed".bytes());
+                if (!sig.relaxedBody && !b.equalsIgnoreAsciiCase("simple".bytes())) {
+                    sig.invalid = 4;
+                }
+            }
+        } else if (same(name, "d")) {
+            sig.domain.extend(value)?;
+        } else if (same(name, "s")) {
+            sig.selector.extend(value)?;
+        } else if (same(name, "h")) {
+            sig.headers.extend(value)?;
+        } else if (same(name, "i")) {
+            identity.extend(value)?;
+        } else if (same(name, "l")) {
+            match (value.parseInt<i64>()) {
+                Some(n) => { sig.length = n; }
+                null => { sig.invalid = 5; }
+            }
+        } else if (same(name, "x")) {
+            match (value.parseInt<i64>()) {
+                Some(n) => { sig.expires = n; }
+                null => { sig.invalid = 6; }
+            }
+        }
+        at = stop + 1;
+    }
+    if (sig.invalid != 0) {
+        return Ok(sig);
+    }
+    if (!version || !hasB || !hasBh || sig.domain.length == 0 || sig.selector.length == 0 || sig.headers.length == 0) {
+        sig.invalid = 7;
+    } else if (sig.algorithm == 0) {
+        sig.invalid = 8; // rsa-sha1 among them (RFC 8301)
+    } else if (!signsFrom(sig.headers.view())) {
+        sig.invalid = 9;
+    } else if (identity.length > 0 && !identityInDomain(identity.view(), sig.domain.view())) {
+        sig.invalid = 10;
+    }
+    return Ok(sig);
+}
+
+fn signsFrom(names: Slice<u8>) -> bool {
+    var at = 0usize;
+    while (at <= names.length) {
+        var stop = at;
+        while (stop < names.length && names[stop] != 0x3a) {
+            stop += 1;
+        }
+        if (trimFws(names[at..stop]).equalsIgnoreAsciiCase("from".bytes())) {
+            return true;
+        }
+        at = stop + 1;
+    }
+    return false;
+}
+
+/// Whether the i= domain is d= or a subdomain of it.
+fn identityInDomain(identity: Slice<u8>, domain: Slice<u8>) -> bool {
+    let at = match (identity.lastIndexOf("@".bytes())) {
+        Some(a) => a,
+        null => { return false; }
+    };
+    let d = identity[at + 1..];
+    if (d.length == domain.length) {
+        return d.equalsIgnoreAsciiCase(domain);
+    }
+    return d.length > domain.length && d[d.length - domain.length - 1] == 0x2e &&
+        d[d.length - domain.length..].equalsIgnoreAsciiCase(domain);
+}
+
+/// Parses a key record (§3.6.1) into the decoded `p=`: gives the key type (ALG_RSA, ALG_ED25519), or 0 when the
+/// record is unusable (wrong version, revoked, unknown type, a service other than email).
+fn parseKey(record: Slice<u8>, key: borrow mut Vector<u8>) -> Result<u8, AllocError> {
+    var kind = ALG_RSA;
+    var hasP = false;
+    var at = 0usize;
+    var first = true;
+    var stripped = Vector<u8>.create();
+    while (at < record.length) {
+        var stop = at;
+        while (stop < record.length && record[stop] != 0x3b) {
+            stop += 1;
+        }
+        let tag = record[at..stop];
+        at = stop + 1;
+        let eq = match (tag.indexOfByte(0x3d)) {
+            Some(e) => e,
+            null => { continue; }
+        };
+        let name = trimFws(tag[0..eq]);
+        let value = trimFws(tag[eq + 1..]);
+        if (same(name, "v")) {
+            if (!first || !same(value, "DKIM1")) {
+                return Ok(0);
+            }
+        } else if (same(name, "k")) {
+            if (value.equalsIgnoreAsciiCase("rsa".bytes())) {
+                kind = ALG_RSA;
+            } else if (value.equalsIgnoreAsciiCase("ed25519".bytes())) {
+                kind = ALG_ED25519;
+            } else {
+                return Ok(0);
+            }
+        } else if (same(name, "s")) {
+            if (!(same(value, "*") || value.contains("email".bytes()))) {
+                return Ok(0);
+            }
+        } else if (same(name, "p")) {
+            hasP = true;
+            stripped.clear();
+            for (c in value) {
+                if (!isFws(c)) {
+                    stripped.push(c)?;
+                }
+            }
+            if (stripped.length == 0) {
+                return Ok(0); // revoked
+            }
+            match (Base64.decode(stripped.view(), key)) {
+                Ok() => {}
+                Err(_) => { return Ok(0); }
+            }
+        }
+        first = false;
+    }
+    return Ok(if (hasP) kind else 0);
+}

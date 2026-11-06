@@ -1,0 +1,12 @@
+size 891
+envelope ("Tue, 12 Nov 2013 09:12:42 -0500" "this is a simple multipart message" ((NIL NIL "mimekit" "example.com")) ((NIL NIL "mimekit" "example.com")) ((NIL NIL "mimekit" "example.com")) ((NIL NIL "mimekit" "example.com")) NIL NIL NIL "<54AD68C9E3B0184CAC6041320424FD1B5B81E74D@localhost.localdomain>")
+bodystructure (("text" "plain" ("charset" "utf-8") NIL NIL "7bit" 27 1 NIL NIL NIL NIL) ("application" "octet-stream" ("name" "attachment.txt") NIL NIL "base64" 54 NIL ("attachment" ("filename" "attachment.txt")) NIL NIL) "mixed" ("boundary" "----=_NextPart_000_003F_01CE98CE.6E826F90") NIL NIL NIL)
+body (("text" "plain" ("charset" "utf-8") NIL NIL "7bit" 27 1) ("application" "octet-stream" ("name" "attachment.txt") NIL NIL "base64" 54) "mixed")
+section HEADER 363 f787163b21121cb64eed56020be344390b52e682ee29c428b07f1deb4ab120f8
+section TEXT 528 e442b2187ba37b2a8b75c12f0c926fe8d786eff7d1a974bff3b30ef5dfae1bf2
+section HEADER.FIELDS 303 c17a1c22ce66246013d69cf5fbd5e908cb6c11df1f90447cb3f4bc19aceb27dd
+section HEADER.FIELDS.NOT 62 8d0ae3ff18a760dbb1cc2c639917d785bcdf38a0094ac02c43539fbf5a30d533
+section 1 27 271e157fddc5d111cdedc381414a4f7934aee1e5ccf1ebb131840efe3425754a
+section 1.MIME 76 1846c4d0060cddce97cb6de0c65f8c3b9b2f0fbd74673b1152866275be37c9ff
+section 2 54 c0e9b00ef16fe7df7df5a8e410550eb7ac1977cb58c202ead34a2ba4e660a69d
+section 2.MIME 160 ea31c4da3385b415dc6d6624c740e479cc526b5c61870850174fae0f27b3aee5

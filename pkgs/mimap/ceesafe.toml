@@ -1,0 +1,12 @@
+[package]
+name = "mimap"
+version = "0.1.0"
+kind = "library"
+tests = ["tests"]
+
+[dependencies]
+msmtp = { path = "../msmtp" }
+mstore = { path = "../mstore" }
+mmime = { path = "../mmime" }
+tls = { path = "../../../../CeeSafeLibs/tls" }
+diskio = { path = "../../../../CeeSafeLibs/diskio" }

@@ -1,0 +1,95 @@
+// `Wire` over a loopback connection: lines with a caller's limit, and exact reads (IMAP literals) that start in the
+// buffer and end in a later read.
+
+const WIRE_TIMEOUT: u64 = 5000;
+
+async fn expect(ok: bool, what: StringView) -> Result<void, AsyncError> {
+    if (!ok) {
+        match (await AsyncConsole.writeError(what)) {
+            Ok() => {}
+            Err(_) => {}
+        }
+        return Err(AsyncError.Io(IoError.BrokenPipe));
+    }
+    return Ok();
+}
+
+async fn wireServer(listener: borrow AsyncTcpListener) -> Result<void, AsyncError> {
+    let stream = await listener.accept()?;
+    var wire = match (Wire.plain(stream)) {
+        Ok(w) => w,
+        Err(_) => { return Err(AsyncError.Io(IoError.BrokenPipe)); }
+    };
+    var line = Vector<u8>.create();
+    var literal = Vector<u8>.create();
+    let fail = AsyncError.Io(IoError.BrokenPipe);
+    match (await wire.readLineWithin(mut line, 32, WIRE_TIMEOUT)) {
+        Ok() => {}
+        Err(_) => { return Err(fail); }
+    }
+    await expect(line.view() == "A1 APPEND INBOX {11}".bytes(), "the command line")?;
+    // A continuation request, sent before the wait for the rest of the literal.
+    match (wire.reply("+ go")) {
+        Ok() => {}
+        Err(_) => { return Err(fail); }
+    }
+    match (await wire.readExact(11, mut literal, WIRE_TIMEOUT)) {
+        Ok() => {}
+        Err(_) => { return Err(fail); }
+    }
+    await expect(literal.view() == "hello\r\nworl".bytes(), "the literal, across two reads")?;
+    match (await wire.readExact(0, mut literal, WIRE_TIMEOUT)) {
+        Ok() => {}
+        Err(_) => { return Err(fail); }
+    }
+    await expect(literal.length == 11, "an empty read appends nothing")?;
+    match (await wire.readLineWithin(mut line, 32, WIRE_TIMEOUT)) {
+        Ok() => {}
+        Err(_) => { return Err(fail); }
+    }
+    await expect(line.view() == "d".bytes(), "the line after the literal")?;
+    // Exactly the limit, then one byte over it.
+    match (await wire.readLineWithin(mut line, 32, WIRE_TIMEOUT)) {
+        Ok() => {}
+        Err(_) => { return Err(fail); }
+    }
+    await expect(line.length == 32, "a line of the limit")?;
+    match (await wire.readLineWithin(mut line, 32, WIRE_TIMEOUT)) {
+        Err(WireError.TooLong) => {}
+        _ => { return Err(fail); }
+    }
+    await wire.close();
+    return Ok();
+}
+
+async fn wireClient(port: u16) -> Result<void, AsyncError> {
+    let stream = await AsyncTcpStream.connect("127.0.0.1", port)?;
+    await stream.write("A1 APPEND INBOX {11}\r\nhello\r\n".bytes())?;
+    var reply = [0u8; 16];
+    let n = await stream.read(mut reply[..])?;
+    await expect(reply[0..n] == "+ go\r\n".bytes(), "the continuation request")?;
+    await stream.write("world\r\n".bytes())?;
+    await stream.write("01234567890123456789012345678901\r\n".bytes())?;
+    await stream.write("012345678901234567890123456789012\r\n".bytes())?;
+    // Wait for the server to close.
+    var rest = [0u8; 16];
+    let _ = await stream.read(mut rest[..]);
+    return Ok();
+}
+
+@test
+async fn readsLinesAndLiterals() -> Result<void, AsyncError> {
+    let listener = match (AsyncTcpListener.bind("127.0.0.1", 0)) {
+        Ok(l) => l,
+        Err(e) => { return Err(AsyncError.Io(e)); }
+    };
+    let port = match (listener.port()) {
+        Ok(p) => p,
+        Err(e) => { return Err(AsyncError.Io(e)); }
+    };
+    await Async.scope(AsyncError.Cancelled, (s) => {
+        s.spawn(async () => await wireServer(borrow listener));
+        s.spawn(async () => await wireClient(port));
+    })?;
+    return Ok();
+}

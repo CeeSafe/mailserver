@@ -1,0 +1,18 @@
+size 165905
+envelope ("Fri, 29 Nov 91 07:13:33 EST" "Testing Multipart messaging" (("Nathaniel S. Borenstein" NIL "nsb" "thumper.bellcore.com")) (("Nathaniel S. Borenstein" NIL "nsb" "thumper.bellcore.com")) (("Nathaniel S. Borenstein" NIL "nsb" "thumper.bellcore.com")) ((NIL NIL "nsb" "MISSING_DOMAIN")) NIL NIL NIL NIL)
+bodystructure (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 305 5 NIL NIL NIL NIL) (("image" "gif" NIL NIL NIL "base64" 3276 NIL NIL NIL NIL) ("audio" "basic" NIL NIL NIL "base64" 156706 NIL NIL NIL NIL) "parallel" ("boundary" "seconddivider") NIL NIL NIL) ("application" "atomicmail" NIL NIL NIL "7bit" 4915 NIL NIL NIL NIL) "mixed" ("boundary" "foobarbazola") NIL NIL NIL)
+body (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 305 5) (("image" "gif" NIL NIL NIL "base64" 3276) ("audio" "basic" NIL NIL NIL "base64" 156706) "parallel") ("application" "atomicmail" NIL NIL NIL "7bit" 4915) "mixed")
+section HEADER 247 b25f5ec5e9952534833d603960c3726ea766560960737ce95c16c4a90d5f52b7
+section TEXT 165658 398c3e1d272975a23f604e2267c766c7a518c8fc6735bbe4814b6315be4ba7ec
+section HEADER.FIELDS 196 a89fea9ce3e359596ce8b2baccd8affa6838ea22aad95b39fd7aa8c695b82355
+section HEADER.FIELDS.NOT 53 226ccbb256fbb6cc156220f2beab03be335136573fa6034a40b51ebb684cf756
+section 1 305 74efaaf4fdc18fb6154ac4108076530a1e2b025747b8fe817e49650f1f161c85
+section 1.MIME 2 7eb70257593da06f682a3ddda54a9d260d4fc514f645237f5ca74b08f8da61a6
+section 2 160228 571efdfedc1fcf3a207d2a2f829cd6820fce522a0a189a9cae02d656540123b9
+section 2.MIME 79 ba4506cc82184d1c358851bcf64d9bbe17bf83843e4ddca8953b307445c00099
+section 2.1 3276 1ef31568e0275f51cd7810b226f76258e36fc3301c18b06b9191804e6762c08a
+section 2.1.MIME 81 e99378eb0b7a60d24e829725989c731d9cdc64d396de3e4f4140184f16235b1a
+section 2.2 156706 c72873cb973e95451174a150043e7819f542147fe37c526882c93a6bf17dea0e
+section 2.2.MIME 108 92f549e0efdd3637782870fdd90088f21364fc4466a80a6b5f5a7289fdd4b356
+section 3 4915 41e2cb0689c32d1b40147cd59f24b9c3c85bb85c7ebdfc51ef138eef56cfba25
+section 3.MIME 59 0b365af693987a5c56b96f6347f181c53405a6595278301bd85d042626ce7784

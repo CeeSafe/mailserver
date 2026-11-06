@@ -1,0 +1,37 @@
+# Where mmime knowingly differs from Dovecot 2.4.5 (tools/differential.py allows these). `<message> <field>`, where
+# a field of `section` covers every section.
+
+# Dovecot rewrites stored bytes: a bare CR becomes CRLF and a NUL is replaced. mmime describes the bytes as they were
+# delivered; whether SMTP ingest should normalise them is a policy of the SMTP layer (msmtp), not of the parser.
+compliance-unexpected-null-bytes-in-body size
+compliance-unexpected-null-bytes-in-body bodystructure
+compliance-unexpected-null-bytes-in-body body
+compliance-unexpected-null-bytes-in-body section
+compliance-unexpected-null-bytes-in-headers section
+
+# `Content-Type: multipart/mixed;; Boundary="…"`: Dovecot drops every parameter after the empty one, loses the
+# boundary, and shows the message as one empty part. mmime skips the empty parameter and finds the parts, as
+# MimeKit and Thunderbird do: showing the user their mail is better than matching the oracle.
+mbox-content-length-000 bodystructure
+mbox-content-length-000 body
+mbox-content-length-000 section
+mbox-jwz-021 bodystructure
+mbox-jwz-021 body
+mbox-jwz-021 section
+
+# Dovecot shows `charset=US-ASCII` as "us-ascii" in this one message only (elsewhere it keeps the case, 132 times
+# in the corpus); mmime keeps the header's spelling.
+mbox-jwz-015 bodystructure
+mbox-jwz-015 body
+
+# Malformed addresses that Dovecot and mmime recover from differently (an embedded message's From with a phrase after
+# the address, VMS-style `IN%"…"` mailboxes, and a To holding a pasted encoded-word blob). Neither reading is right.
+mbox-jwz-051 bodystructure
+mbox-jwz-051 body
+mbox-jwz-087 envelope
+messages-stack-overflow envelope
+
+# A message that is all header (no blank line): Dovecot adds a blank line to HEADER.FIELDS when the last field is
+# selected, but not to HEADER.FIELDS.NOT, nor when the last line has no CRLF. mmime gives the blank line only when the
+# block has one, as HEADER (the whole block) does.
+compliance-missing-body-separator section HEADER.FIELDS

@@ -1,0 +1,111 @@
+// Per-domain circuit breakers: a domain whose MX hosts were all unusable (refused, silent, closing, a 4xx/5xx
+// greeting) several times in a row is left alone for a while, doubling each time, so a dead or tarpitting domain
+// does not hold the workers for a full connect timeout per message. Only whole-host failures count: a recipient's
+// 5xx says nothing about the domain's servers. In memory, per process.
+
+const MAX_DOMAINS: usize = 4096;
+
+struct BreakerState {
+    failures: u32;
+    openUntil: i64;
+    backoff: i64;
+}
+
+@noncopy
+struct DomainEntry {
+    domain: String;
+    state: BreakerState;
+}
+
+@noncopy
+struct DomainBreakers {
+    entries: AsyncMutex<Vector<DomainEntry>>;
+
+    fn create() -> Result<DomainBreakers, AllocError> =>
+        Ok(DomainBreakers { entries: AsyncMutex<Vector<DomainEntry>>.create(Vector<DomainEntry>.create())? });
+
+    /// Whether `domain` may be tried at `now` (Unix seconds).
+    async fn allows(borrow this, domain: StringView, now: i64) -> bool {
+        var guard = match (await this.entries.lock()) {
+            Ok(g) => g,
+            Err(_) => { return true; }
+        };
+        let list = guard.data();
+        for (i in 0..list.length) {
+            if (list[i].domain.view().equalsIgnoreAsciiCase(domain)) {
+                return list[i].state.openUntil <= now;
+            }
+        }
+        return true;
+    }
+
+    /// A delivery reached one of the domain's servers: its count is forgotten.
+    async fn succeeded(borrow this, domain: StringView) {
+        var guard = match (await this.entries.lock()) {
+            Ok(g) => g,
+            Err(_) => { return; }
+        };
+        let list = guard.data();
+        for (i in 0..list.length) {
+            if (list[i].domain.view().equalsIgnoreAsciiCase(domain)) {
+                let last = list.length - 1;
+                list.swap(i, last);
+                list.pop();
+                return;
+            }
+        }
+    }
+
+    /// No server of the domain was usable. Gives whether the breaker opened just now.
+    async fn failed(borrow this, domain: StringView, now: i64, settings: borrow RelaySettings) -> bool {
+        var guard = match (await this.entries.lock()) {
+            Ok(g) => g,
+            Err(_) => { return false; }
+        };
+        let list = guard.data();
+        var at = list.length;
+        for (i in 0..list.length) {
+            if (list[i].domain.view().equalsIgnoreAsciiCase(domain)) {
+                at = i;
+            }
+        }
+        if (at == list.length) {
+            if (list.length >= MAX_DOMAINS) {
+                // Forget the domain whose breaker closes soonest.
+                var oldest: usize = 0;
+                for (i in 1..list.length) {
+                    if (list[i].state.openUntil < list[oldest].state.openUntil) {
+                        oldest = i;
+                    }
+                }
+                let last = list.length - 1;
+                list.swap(oldest, last);
+                list.pop();
+            }
+            var name = String.create();
+            match (name.append(domain)) {
+                Ok() => {}
+                Err(_) => { return false; }
+            }
+            match (list.push(
+                DomainEntry { domain: name, state: BreakerState { failures: 0, openUntil: 0, backoff: 0 } },
+            )) {
+                Ok() => {}
+                Err(_) => { return false; }
+            }
+            at = list.length - 1;
+        }
+        let state = borrow mut list[at].state;
+        state.failures += 1;
+        if (state.failures < settings.breakerThreshold) {
+            return false;
+        }
+        state.failures = 0;
+        state.backoff = if (state.backoff == 0) settings.breakerBase else state.backoff * 2;
+        if (state.backoff > settings.breakerMax) {
+            state.backoff = settings.breakerMax;
+        }
+        state.openUntil = now + state.backoff;
+        return true;
+    }
+}

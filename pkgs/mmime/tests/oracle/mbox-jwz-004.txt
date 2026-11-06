@@ -1,0 +1,24 @@
+size 24397
+envelope ("Fri, 28 Aug 92 15:12:35 EDT" "mew-law encoding?" ((NIL NIL "beatty" "cosmos.vlsi.cs.cmu.edu")) ((NIL NIL "beatty" "cosmos.vlsi.cs.cmu.edu")) ((NIL NIL "beatty" "cosmos.vlsi.cs.cmu.edu")) ((NIL NIL "nsb" "flash.bellcore.com")) NIL NIL NIL "<9208281913.AA24840@flash.bellcore.com>")
+bodystructure (("text" "richtext" ("charset" "us-ascii") NIL NIL "quoted-printable" 436 12 NIL NIL NIL NIL) ("message" "rfc822" NIL NIL NIL "7bit" 22444 ("Wed, 26 Aug 92 22:13:24 EDT" "mail from Wacky" (("Derek Beatty" NIL "beatty" "sqhilton.pc.cs.cmu.edu")) (("Derek Beatty" NIL "beatty" "sqhilton.pc.cs.cmu.edu")) (("Derek Beatty" NIL "beatty" "sqhilton.pc.cs.cmu.edu")) ((NIL NIL "dragel" "sqhilton.pc.cs.cmu.edu") (NIL NIL "beatty" "sqhilton.pc.cs.cmu.edu")) NIL NIL NIL "<9208270213.AA21178@sqhilton.pc.cs.cmu.edu>") (("text" "plain" ("type" "microsoft-rtf" "name" "index.rtf" "charset" "us-ascii") NIL NIL "7bit" 110 6 NIL NIL NIL NIL) ("audio" "basic" ("name" "VoiceMail_beatty0.vox") NIL NIL "base64" 20910 NIL NIL NIL NIL) ("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 0 0 NIL NIL NIL NIL) "mixed" ("boundary" "n2m-MIME-boundary----------") NIL NIL NIL) 325 NIL NIL NIL NIL) ("text" "richtext" ("charset" "us-ascii") NIL NIL "quoted-printable" 111 4 NIL NIL NIL NIL) "mixed" ("boundary" "PART.BOUNDARY.2418.16114.COSMOS.VLSI.CS.CMU.EDU.715029153.2") NIL NIL NIL)
+body (("text" "richtext" ("charset" "us-ascii") NIL NIL "quoted-printable" 436 12) ("message" "rfc822" NIL NIL NIL "7bit" 22444 ("Wed, 26 Aug 92 22:13:24 EDT" "mail from Wacky" (("Derek Beatty" NIL "beatty" "sqhilton.pc.cs.cmu.edu")) (("Derek Beatty" NIL "beatty" "sqhilton.pc.cs.cmu.edu")) (("Derek Beatty" NIL "beatty" "sqhilton.pc.cs.cmu.edu")) ((NIL NIL "dragel" "sqhilton.pc.cs.cmu.edu") (NIL NIL "beatty" "sqhilton.pc.cs.cmu.edu")) NIL NIL NIL "<9208270213.AA21178@sqhilton.pc.cs.cmu.edu>") (("text" "plain" ("type" "microsoft-rtf" "name" "index.rtf" "charset" "us-ascii") NIL NIL "7bit" 110 6) ("audio" "basic" ("name" "VoiceMail_beatty0.vox") NIL NIL "base64" 20910) ("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 0 0) "mixed") 325) ("text" "richtext" ("charset" "us-ascii") NIL NIL "quoted-printable" 111 4) "mixed")
+section HEADER 765 a0afd89af7bd7586c8d044067cb847cb34f19b4612ac7e3f05466dcd3a87a95b
+section TEXT 23632 579cd0cdac9821ca2bb5b86b11420644a162301f2bfff404180d543a5fca202e
+section HEADER.FIELDS 288 19ff719bcd9e92c7e11e24624c6f0c92fb3d34fd374a371cad4677c59a419b01
+section HEADER.FIELDS.NOT 479 e17b6a4d457c0bf3cd1647e392d2482f85de1d7d5cf04c83b6dfa8d0d5567b39
+section 1 436 eed318846ac5a942bcd7bf225f850f51155e5b19ad3aebd6c7d329158ddb2d34
+section 1.MIME 76 7712e776f2993a93b185dfb1c41705d43d20df049e3a88fcbbd6a81e4f5f5077
+section 2 22444 0bab0574d02b1a3a6b3d5b2b880d5dd3e0f777a42862bad8a7ef445fda790db0
+section 2.MIME 32 b877528c3494e577355ecd2cefe181b49f8d34fb0f432c1db33c2776902a6a31
+section 2.HEADER 852 bc341a6b771d8be48d72dd03cbddcfe06a08edc655de693d3202f0852d7889b9
+section 2.TEXT 21592 2e78c842b436a0033a6acf7770a55b3bd91082ad6a02c5d47e367ac287d349ec
+section 2.HEADER.FIELDS 307 fdf461d94a117695533590efd57b3d053fbc9346c92b2a95d573d7193a854a1b
+section 2.HEADER.FIELDS.NOT 547 286c87d54a821cfb131f96fa419f944e4fb22eab15dc3e4b890d6390f4e6c996
+section 2.1 110 fd75f70eb7e851fa5a66ac04b5bc6de8a9a179421e4f5223503f06e01d7e19cc
+section 2.1.MIME 97 7b7faa5a50578783da80fd012645fe6b53d8190c30a7921b9b9eb8dec1121316
+section 2.2 20910 86305d37463985ff2746de98f6da5d439777c0cc8e5aede2a1106e137e065c1d
+section 2.2.MIME 92 32e367d269e88602de57f853d0b012cf12fecc3a2be885d2965074fe335de046
+section 2.3 0 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+section 2.3.MIME 0 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+section 3 111 6e1d85de5dcdc2e8e0f5ae15c3e76ca0227c1e94473f1dffdbbfc59cc04f0263
+section 3.MIME 76 7712e776f2993a93b185dfb1c41705d43d20df049e3a88fcbbd6a81e4f5f5077

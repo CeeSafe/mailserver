@@ -1,0 +1,424 @@
+// An HTTP/1.1 client for the server's own outbound requests (ACME): one request per connection, over TLS for
+// https URLs with the certificate checked against `config`'s roots, and a response read whole into memory.
+
+import msmtp.Wire;
+import msmtp.WireError;
+import tls.TlsConfig;
+
+/// Why a request failed.
+public enum ClientError {
+    /// Not an http or https URL this client can use.
+    BadUrl,
+    /// The host has no address.
+    Resolve,
+    /// No address accepted the connection.
+    Connect,
+    /// The TLS handshake failed (including a certificate that does not verify).
+    Tls,
+    /// The connection failed or timed out midway.
+    Io,
+    /// The response is not HTTP/1.x, or is malformed.
+    Protocol,
+    /// The response is bigger than allowed.
+    TooLarge,
+    OutOfMemory,
+}
+
+/// A parsed `http://` or `https://` URL.
+@noncopy
+public struct Url {
+    public secure: bool;
+    /// The host, as written (a name, or an IP literal without brackets).
+    public host: String;
+    public port: u16;
+    /// The path and query, starting with `/`.
+    public target: String;
+    /// `host` or `host:port` (port only when not the scheme's), for the Host field.
+    public authority: String;
+}
+
+/// Parses `text`. Null when it is not http(s), has user info, or a bad port.
+public fn parseUrl(text: StringView) -> Url? {
+    let secure = text.startsWith("https://");
+    if (!secure && !text.startsWith("http://")) {
+        return null;
+    }
+    let rest = text[if (secure) 8 else 7..];
+    let slash = rest.indexOf("/") ?? rest.length;
+    let query = rest.indexOf("?") ?? rest.length;
+    let end = if (query < slash) query else slash;
+    let authority = rest[0..end];
+    let target = rest[end..];
+    if (authority.length == 0 || authority.indexOf("@") != null) {
+        return null;
+    }
+    var port: u16 = if (secure) 443 else 80;
+    let hasPort = if (authority.startsWith("[")) {
+        authority.indexOf("]:") != null
+    } else {
+        authority.indexOf(":") != null
+    };
+    let hostEnd = if (authority.startsWith(
+        "[",
+    )) authority.indexOf("]") ?? authority.length else authority.indexOf(":") ?? authority.length;
+    let hostText = if (authority.startsWith("[")) authority[1..hostEnd] else authority[0..hostEnd];
+    if (hasPort) {
+        let colon = if (authority.startsWith("[")) hostEnd + 1 else hostEnd;
+        let digits = authority[colon + 1..];
+        let n = digits.parseInt<u32>() ?? 0;
+        if (n == 0 || n > 65535) {
+            return null;
+        }
+        port = truncate<u16>(n);
+    }
+    if (hostText.length == 0) {
+        return null;
+    }
+    var url = Url {
+        secure: secure,
+        host: String.create(),
+        port: port,
+        target: String.create(),
+        authority: String.create(),
+    };
+    match (url.host.append(hostText)) {
+        Ok() => {}
+        Err(_) => { return null; }
+    }
+    let path = if (target.length == 0) "/" else target;
+    if (!path.startsWith("/")) {
+        match (url.target.append("/")) {
+            Ok() => {}
+            Err(_) => { return null; }
+        }
+    }
+    match (url.target.append(path)) {
+        Ok() => {}
+        Err(_) => { return null; }
+    }
+    match (url.authority.append(authority)) {
+        Ok() => {}
+        Err(_) => { return null; }
+    }
+    return url;
+}
+
+/// A response: status, header fields and the whole body.
+@noncopy
+public struct ClientResponse {
+    public status: u16;
+    headers: Vector<Header>;
+    public body: Vector<u8>;
+
+    public fn create() -> ClientResponse =>
+        ClientResponse { status: 0, headers: Vector<Header>.create(), body: Vector<u8>.create() };
+
+    fn reset(borrow mut this) {
+        this.status = 0;
+        this.headers.clear();
+        this.body.clear();
+    }
+
+    /// The first field named `name` (any case).
+    public fn header(borrow this, name: StringView) -> borrow(this) String? {
+        for (i in 0..this.headers.length) {
+            if (this.headers[i].name.view().equalsIgnoreAsciiCase(name)) {
+                return borrow this.headers[i].value;
+            }
+        }
+        return null;
+    }
+
+    /// The field `name`'s value copied into `into`; false when absent.
+    public fn headerInto(borrow this, name: StringView, into: borrow mut String) -> Result<bool, AllocError> {
+        into.clear();
+        match (this.header(name)) {
+            Some(v) => {
+                into.append(v.view())?;
+                return Ok(true);
+            }
+            null => { return Ok(false); }
+        }
+    }
+
+    /// Every value of the fields named `name`, in order, as node-free copies into `into`.
+    public fn headerValues(borrow this, name: StringView, into: borrow mut Vector<String>) -> Result<void, AllocError> {
+        into.clear();
+        for (h in this.headers.view()) {
+            if (h.name.view().equalsIgnoreAsciiCase(name)) {
+                var copy = String.create();
+                copy.append(h.value.view())?;
+                into.push(copy)?;
+            }
+        }
+        return Ok();
+    }
+}
+
+/// Limits for a request.
+public struct ClientLimits {
+    /// The whole exchange, connecting included.
+    public timeoutMs: u64;
+    public maxBody: usize;
+
+    public fn defaults() -> ClientLimits => ClientLimits { timeoutMs: 30000, maxBody: 1048576 };
+}
+
+/// Sends `method` to `url` with `body` (of `contentType`, when there is a body) and reads the whole response into
+/// `response`. Redirects are not followed.
+public async fn httpRequest(
+    config: borrow TlsConfig,
+    method: StringView,
+    url: StringView,
+    contentType: StringView,
+    body: Slice<u8>,
+    response: borrow mut ClientResponse,
+    limits: ClientLimits,
+) -> Result<void, ClientError> {
+    return await httpRequestWith(config, method, url, contentType, "".bytes(), body, response, limits);
+}
+
+/// As `httpRequest`, with more header fields: `fields` is `Name: value\r\n` lines (an S3 request's signature).
+public async fn httpRequestWith(
+    config: borrow TlsConfig,
+    method: StringView,
+    url: StringView,
+    contentType: StringView,
+    fields: Slice<u8>,
+    body: Slice<u8>,
+    response: borrow mut ClientResponse,
+    limits: ClientLimits,
+) -> Result<void, ClientError> {
+    response.reset();
+    let target = match (parseUrl(url)) {
+        Some(u) => u,
+        null => { return Err(ClientError.BadUrl); }
+    };
+    var head = Vector<u8>.create();
+    match (requestHead(method, target, contentType, fields, body.length, mut head)) {
+        Ok() => {}
+        Err(_) => { return Err(ClientError.OutOfMemory); }
+    }
+    return await Async.timeout(
+        limits.timeoutMs,
+        ClientError.Io,
+        async () => await exchange(config, target, head.view(), body, response, limits.maxBody),
+    );
+}
+
+fn requestHead(
+    method: StringView,
+    url: borrow Url,
+    contentType: StringView,
+    fields: Slice<u8>,
+    length: usize,
+    out: borrow mut Vector<u8>,
+) -> Result<void, AllocError> {
+    out.extend(method.bytes())?;
+    out.extend(" ".bytes())?;
+    out.extend(url.target.bytes())?;
+    out.extend(" HTTP/1.1\r\nHost: ".bytes())?;
+    out.extend(url.authority.bytes())?;
+    out.extend("\r\nUser-Agent: mailserver\r\nAccept: */*\r\nConnection: close\r\n".bytes())?;
+    out.extend(fields)?;
+    if (contentType.length > 0) {
+        out.extend("Content-Type: ".bytes())?;
+        out.extend(contentType.bytes())?;
+        out.extend("\r\n".bytes())?;
+    }
+    if (length > 0 || method == "POST" || method == "PUT") {
+        var digits = String.create();
+        digits.appendNumber(length as u64)?;
+        out.extend("Content-Length: ".bytes())?;
+        out.extend(digits.bytes())?;
+        out.extend("\r\n".bytes())?;
+    }
+    return out.extend("\r\n".bytes());
+}
+
+async fn connect(url: borrow Url) -> Result<AsyncTcpStream, ClientError> {
+    let addresses = match (await AsyncDns.resolve(url.host.view(), url.port)) {
+        Ok(a) => a,
+        Err(_) => { return Err(ClientError.Resolve); }
+    };
+    for (a in addresses.view()) {
+        match (await AsyncTcpStream.connectTo(a)) {
+            Ok(s) => { return Ok(s); }
+            Err(_) => {}
+        }
+    }
+    return Err(ClientError.Connect);
+}
+
+fn wireError(e: WireError) -> ClientError => match (e) {
+    WireError.OutOfMemory => ClientError.OutOfMemory,
+    WireError.Tls => ClientError.Tls,
+    WireError.TooLong => ClientError.TooLarge,
+    _ => ClientError.Io,
+};
+
+async fn exchange(
+    config: borrow TlsConfig,
+    url: borrow Url,
+    head: Slice<u8>,
+    body: Slice<u8>,
+    response: borrow mut ClientResponse,
+    maxBody: usize,
+) -> Result<void, ClientError> {
+    let stream = await connect(url)?;
+    let plain = match (Wire.plain(stream)) {
+        Ok(w) => w,
+        Err(e) => { return Err(wireError(e)); }
+    };
+    // The overall timeout bounds every wait; these are only each read's.
+    let waitMs: u64 = 3600000;
+    var wire = if (url.secure) {
+        match (await plain.startTlsClient(config, url.host.view(), waitMs)) {
+            Ok(w) => w,
+            Err(e) => { return Err(wireError(e)); }
+        }
+    } else {
+        plain
+    };
+    match (wire.send(head)) {
+        Ok() => {}
+        Err(e) => { return Err(wireError(e)); }
+    }
+    match (wire.send(body)) {
+        Ok() => {}
+        Err(e) => { return Err(wireError(e)); }
+    }
+    var line = Vector<u8>.create();
+    // Interim 1xx responses (100 Continue) are skipped.
+    loop {
+        match (await wire.readLineWithin(mut line, 8192, waitMs)) {
+            Ok() => {}
+            Err(e) => { return Err(wireError(e)); }
+        }
+        let status = statusOfLine(line.view()) ?? 0;
+        if (status == 0) {
+            return Err(ClientError.Protocol);
+        }
+        response.headers.clear();
+        loop {
+            match (await wire.readLineWithin(mut line, 8192, waitMs)) {
+                Ok() => {}
+                Err(e) => { return Err(wireError(e)); }
+            }
+            if (line.length == 0) {
+                break;
+            }
+            if (response.headers.length >= 100) {
+                return Err(ClientError.Protocol);
+            }
+            addHeader(mut response.headers, line.view())?;
+        }
+        if (status >= 200) {
+            response.status = status;
+            break;
+        }
+    }
+    let bodiless = response.status == 204 || response.status == 304;
+    if (bodiless) {
+        await wire.close();
+        return Ok();
+    }
+    var chunked = false;
+    var length: u64? = null;
+    for (h in response.headers.view()) {
+        if (h.name.view().equalsIgnoreAsciiCase("Transfer-Encoding")) {
+            chunked = hasToken(h.value.view(), "chunked");
+        } else if (h.name.view().equalsIgnoreAsciiCase("Content-Length")) {
+            length = h.value.view().parseInt<u64>();
+            if (length == null) {
+                return Err(ClientError.Protocol);
+            }
+        }
+    }
+    if (chunked) {
+        loop {
+            match (await wire.readLineWithin(mut line, 8192, waitMs)) {
+                Ok() => {}
+                Err(e) => { return Err(wireError(e)); }
+            }
+            let size = match (chunkSize(line.view())) {
+                Some(n) => n,
+                null => { return Err(ClientError.Protocol); }
+            };
+            if (size == 0) {
+                break;
+            }
+            if (response.body.length as u64 + size > maxBody as u64) {
+                return Err(ClientError.TooLarge);
+            }
+            match (await wire.readExact(truncate<usize>(size), mut response.body, waitMs)) {
+                Ok() => {}
+                Err(e) => { return Err(wireError(e)); }
+            }
+            match (await wire.readLineWithin(mut line, 0, waitMs)) {
+                Ok() => {}
+                Err(e) => { return Err(wireError(e)); }
+            }
+        }
+        // Trailers, if any, are left: the connection closes.
+    } else {
+        match (length) {
+            Some(n) => {
+                if (n > maxBody as u64) {
+                    return Err(ClientError.TooLarge);
+                }
+                match (await wire.readExact(truncate<usize>(n), mut response.body, waitMs)) {
+                    Ok() => {}
+                    Err(e) => { return Err(wireError(e)); }
+                }
+            }
+            null => {
+                match (await wire.readToEnd(mut response.body, maxBody, waitMs)) {
+                    Ok() => {}
+                    Err(e) => { return Err(wireError(e)); }
+                }
+            }
+        }
+    }
+    await wire.close();
+    return Ok();
+}
+
+/// The status of `HTTP/1.x NNN reason`, or null.
+fn statusOfLine(line: Slice<u8>) -> u16? {
+    let text = StringView.fromUtf8(line) ?? "";
+    if (!text.startsWith("HTTP/1.") || text.length < 12 || text.bytes()[8] != 0x20) {
+        return null;
+    }
+    let n = text[9..12].parseInt<u32>() ?? 0;
+    if (n < 100 || n > 599) {
+        return null;
+    }
+    return truncate<u16>(n);
+}
+
+fn addHeader(headers: borrow mut Vector<Header>, line: Slice<u8>) -> Result<void, ClientError> {
+    let text = match (StringView.fromUtf8(line)) {
+        Some(t) => t,
+        null => { return Err(ClientError.Protocol); }
+    };
+    let colon = match (text.indexOf(":")) {
+        Some(i) => i,
+        null => { return Err(ClientError.Protocol); }
+    };
+    var h = Header { name: String.create(), value: String.create() };
+    let ok = match (h.name.append(text[0..colon].trim())) {
+        Ok() => match (h.value.append(text[colon + 1..].trim())) {
+            Ok() => match (headers.push(h)) {
+                Ok() => true,
+                Err(_) => false,
+            },
+            Err(_) => false,
+        },
+        Err(_) => false,
+    };
+    if (!ok) {
+        return Err(ClientError.OutOfMemory);
+    }
+    return Ok();
+}

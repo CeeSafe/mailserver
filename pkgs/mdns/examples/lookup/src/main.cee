@@ -1,0 +1,91 @@
+// lookup NAME TYPE: asks the system's resolvers (/etc/resolv.conf) and prints each record's data, one per line, as
+// `dig +short` would. TYPE is A, AAAA, MX, TXT, PTR or CNAME.
+
+import mdns.DnsAnswer;
+import mdns.Resolver;
+import mdns.TYPE_A;
+import mdns.TYPE_AAAA;
+import mdns.TYPE_CNAME;
+import mdns.TYPE_MX;
+import mdns.TYPE_PTR;
+import mdns.TYPE_TXT;
+import mdns.IpAddress;
+import mdns.appendIp;
+import mdns.parseIp;
+
+fn main() {
+    let name = Process.argument(1)!;
+    let kindText = Process.argument(2)!;
+    var kind = TYPE_A;
+    if (kindText == "AAAA") {
+        kind = TYPE_AAAA;
+    } else if (kindText == "MX") {
+        kind = TYPE_MX;
+    } else if (kindText == "TXT") {
+        kind = TYPE_TXT;
+    } else if (kindText == "PTR") {
+        kind = TYPE_PTR;
+    } else if (kindText == "CNAME") {
+        kind = TYPE_CNAME;
+    }
+    // An optional third argument: the server to ask instead of /etc/resolv.conf's.
+    var resolver = Resolver.fromSystem()!;
+    match (Process.argument(3)) {
+        Some(server) => {
+            var servers = Vector<IpAddress>.create();
+            servers.push(parseIp(server.bytes())!)!;
+            resolver = Resolver.create(servers, 53)!;
+        }
+        null => {}
+    }
+    var answer = DnsAnswer.create();
+    match (Async.run(resolver.query(name, kind, mut answer))) {
+        Ok() => {}
+        Err(_) => {
+            Console.writeLine(";; no answer");
+            Process.exit(1);
+        }
+    }
+    for (i in 0..answer.count()) {
+        var out = Vector<u8>.create();
+        if (kind == TYPE_A || kind == TYPE_AAAA) {
+            var bytes = [0u8; 16];
+            let data = answer.data(i);
+            if (kind == TYPE_A) {
+                bytes[10] = 0xff;
+                bytes[11] = 0xff;
+                bytes[12..16].copyFrom(data);
+            } else {
+                bytes[..].copyFrom(data);
+            }
+            appendIp(mut out, IpAddress { bytes: bytes })!;
+        } else if (kind == TYPE_MX) {
+            var p = answer.preference(i);
+            var digits = Vector<u8>.create();
+            loop {
+                digits.push(0x30 + truncate<u8>(p % 10))!;
+                p = p / 10;
+                if (p == 0) {
+                    break;
+                }
+            }
+            var k = digits.length;
+            while (k > 0) {
+                k -= 1;
+                out.push(digits[k])!;
+            }
+            out.push(0x20)!;
+            out.extend(answer.data(i))!;
+            out.push(0x2e)!;
+        } else if (kind == TYPE_TXT) {
+            out.push(0x22)!;
+            out.extend(answer.data(i))!;
+            out.push(0x22)!;
+        } else {
+            out.extend(answer.data(i))!;
+            out.push(0x2e)!;
+        }
+        Console.writeBytes(out.view());
+        Console.writeLine("");
+    }
+}

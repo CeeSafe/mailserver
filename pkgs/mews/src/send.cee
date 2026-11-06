@@ -1,0 +1,430 @@
+// CreateItem: a message to save (SaveOnly: Drafts, or the SavedItemFolderId) or to send (SendOnly, and
+// SendAndSaveCopy with a copy in Sent or the SavedItemFolderId). The content is the request's MIME, or for clients
+// that send fields instead a plain message made from Subject, Body and the recipients.
+//
+// Sending is what SMTP submission does with an accepted message, in one transaction (MailStore.accept): local
+// recipients get it in their INBOX, remote ones through the queue (which DKIM-signs at relay time), and the copy goes
+// to the sender's folder. Recipients come from the To, Cc and Bcc fields and the request's recipient lists; Bcc is
+// taken out of the content. Sieve is not run for local recipients of mail sent this way.
+
+import encoding.Base64;
+import mmime.AddressList;
+import mmime.HeaderCursor;
+import mmime.MessageIndex;
+import mmime.MimeScanner;
+import mmime.Renderer;
+import mmime.encodeMeta;
+import mmime.parseAddressList;
+import mhttp.appendIsoTime;
+import mpim.Account;
+import msmtp.SmtpContext;
+import msmtp.appendDate;
+import mstore.BlobStore;
+import mstore.BlobWriter;
+import mstore.Delivered;
+import mstore.Delivery;
+import mstore.FLAG_DRAFT;
+import mstore.FLAG_SEEN;
+import mstore.Outbound;
+import mstore.Recipient;
+import mstore.StoreError;
+import mxml.XmlDocument;
+import mxml.XmlWriter;
+
+fn writeBlobOf(blobs: borrow BlobStore, content: Slice<u8>) -> Result<BlobWriter, StoreError> {
+    var writer = blobs.begin()?;
+    match (writer.write(content)) {
+        Ok() => {}
+        Err(e) => {
+            writer.discard();
+            return Err(e);
+        }
+    }
+    match (writer.finish()) {
+        Ok() => {}
+        Err(e) => {
+            writer.discard();
+            return Err(e);
+        }
+    }
+    return Ok(writer);
+}
+
+/// Where the header block of `message` ends (after its blank line), or its length.
+fn headerEnd(message: Slice<u8>) -> usize {
+    var i: usize = 0;
+    while (i + 1 < message.length) {
+        if (message[i] == 0x0a && message[i + 1] == 0x0a) {
+            return i + 2;
+        }
+        if (i + 3 < message.length && message[i] == 0x0d &&
+            message[i + 1] == 0x0a && message[i + 2] == 0x0d && message[i + 3] == 0x0a) {
+            return i + 4;
+        }
+        i += 1;
+    }
+    return message.length;
+}
+
+/// `message` with CRLF line ends and without its Bcc fields; their addresses (and those of To and Cc) into
+/// `recipients`.
+fn prepare(
+    message: Slice<u8>,
+    out: borrow mut Vector<u8>,
+    recipients: borrow mut Vector<String>,
+) -> Result<void, AllocError> {
+    var normal = Vector<u8>.create();
+    for (i in 0..message.length) {
+        let c = message[i];
+        if (c == 0x0a && (i == 0 || message[i - 1] != 0x0d)) {
+            normal.push(0x0d)?;
+        }
+        normal.push(c)?;
+    }
+    let block = normal.view()[0..headerEnd(normal.view())];
+    out.clear();
+    var cursor = HeaderCursor.start();
+    var list = AddressList.create();
+    var last: usize = 0;
+    loop {
+        let field = match (cursor.next(block)) {
+            Some(f) => f,
+            null => { break; }
+        };
+        let name = block[field.nameStart..field.nameEnd];
+        let isBcc = name.equalsIgnoreAsciiCase("Bcc".bytes());
+        if (isBcc || name.equalsIgnoreAsciiCase("To".bytes()) || name.equalsIgnoreAsciiCase("Cc".bytes())) {
+            parseAddressList(block[field.valueStart..field.valueEnd], mut list)?;
+            for (k in 0..list.count()) {
+                match (list.mailbox(k)) {
+                    Some(m) => {
+                        match (list.host(k)) {
+                            Some(h) => {
+                                var a = String.create();
+                                a.append(StringView.fromUtf8(m) ?? "")?;
+                                a.append("@")?;
+                                a.append(StringView.fromUtf8(h) ?? "")?;
+                                addRecipient(recipients, a)?;
+                            }
+                            null => {}
+                        }
+                    }
+                    null => {}
+                }
+            }
+        }
+        if (isBcc) {
+            out.extend(block[last..field.nameStart])?;
+            last = field.valueEnd;
+        }
+    }
+    out.extend(normal.view()[last..])?;
+    return Ok();
+}
+
+fn addRecipient(list: borrow mut Vector<String>, address: String) -> Result<void, AllocError> {
+    for (r in list.view()) {
+        if (r.view().equalsIgnoreAsciiCase(address.view())) {
+            return Ok();
+        }
+    }
+    return list.push(address);
+}
+
+/// The addresses of a request's ToRecipients, CcRecipients and BccRecipients.
+fn xmlRecipients(doc: borrow XmlDocument, message: usize, into: borrow mut Vector<String>) -> Result<void, AllocError> {
+    for (list in ["ToRecipients", "CcRecipients", "BccRecipients"]) {
+        match (findLocal(doc, message, list)) {
+            Some(l) => {
+                var emails = Vector<usize>.create();
+                findAllLocal(doc, l, "EmailAddress", mut emails)?;
+                for (e in emails.view()) {
+                    var a = String.create();
+                    a.append(doc.trimmed(e))?;
+                    if (a.length > 0) {
+                        addRecipient(into, a)?;
+                    }
+                }
+            }
+            null => {}
+        }
+    }
+    return Ok();
+}
+
+/// A message made from the request's fields, for clients that send no MimeContent.
+fn composed(
+    doc: borrow XmlDocument,
+    message: usize,
+    sender: StringView,
+    out: borrow mut Vector<u8>,
+) -> Result<void, AllocError> {
+    out.clear();
+    out.extend("From: ".bytes())?;
+    out.extend(sender.bytes())?;
+    out.extend("\r\n".bytes())?;
+    for (pair in [["ToRecipients", "To"], ["CcRecipients", "Cc"], ["BccRecipients", "Bcc"]]) {
+        match (findLocal(doc, message, pair[0])) {
+            Some(l) => {
+                var emails = Vector<usize>.create();
+                findAllLocal(doc, l, "EmailAddress", mut emails)?;
+                if (emails.length > 0) {
+                    out.extend(pair[1].bytes())?;
+                    out.extend(": ".bytes())?;
+                    for (k in 0..emails.length) {
+                        if (k > 0) {
+                            out.extend(", ".bytes())?;
+                        }
+                        out.extend(doc.trimmed(emails[k]).bytes())?;
+                    }
+                    out.extend("\r\n".bytes())?;
+                }
+            }
+            null => {}
+        }
+    }
+    var subject = String.create();
+    match (findLocal(doc, message, "Subject")) {
+        Some(s) => { subject.append(doc.trimmed(s))?; }
+        null => {}
+    }
+    out.extend("Subject: ".bytes())?;
+    encodedWord(subject.view(), out)?;
+    out.extend("\r\nDate: ".bytes())?;
+    appendDate(out, Clock.unixMillis() / 1000)?;
+    out.extend("\r\nMIME-Version: 1.0\r\n".bytes())?;
+    var html = false;
+    var body = Vector<u8>.create();
+    match (findLocal(doc, message, "Body")) {
+        Some(b) => {
+            html = doc.attributeIs(b, "BodyType", "HTML");
+            doc.allText(b, mut body)?;
+        }
+        null => {}
+    }
+    out.extend(
+        if (html) "Content-Type: text/html; charset=utf-8\r\n".bytes() else "Content-Type: text/plain; charset=utf-8\r\n".bytes(),
+    )?;
+    out.extend("Content-Transfer-Encoding: base64\r\n\r\n".bytes())?;
+    var encoded = Vector<u8>.create();
+    Base64.encode(body.view(), mut encoded)?;
+    var at: usize = 0;
+    while (at < encoded.length) {
+        let end = if (at + 76 < encoded.length) at + 76 else encoded.length;
+        out.extend(encoded.view()[at..end])?;
+        out.extend("\r\n".bytes())?;
+        at = end;
+    }
+    return Ok();
+}
+
+/// `text` as is when it is ASCII, else as one RFC 2047 base64 word.
+fn encodedWord(text: StringView, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    var ascii = true;
+    for (c in text.bytes()) {
+        if (c >= 0x80 || c < 0x20) {
+            ascii = false;
+        }
+    }
+    if (ascii) {
+        return out.extend(text.bytes());
+    }
+    out.extend("=?UTF-8?B?".bytes())?;
+    Base64.encode(text.bytes(), out)?;
+    return out.extend("?=".bytes());
+}
+
+fn stored(r: Result<void, StoreError>) -> Result<void, EwsError> => match (r) {
+    Ok() => Ok(),
+    Err(StoreError.OutOfMemory) => Err(EwsError.OutOfMemory),
+    Err(_) => Err(EwsError.Unavailable),
+};
+
+async fn createItem(
+    mail: borrow SmtpContext,
+    account: borrow Account,
+    doc: borrow XmlDocument,
+    op: usize,
+    w: borrow mut XmlWriter,
+) -> Result<void, EwsError> {
+    var disposition = String.create();
+    mem(attributeOf(doc, op, "MessageDisposition", mut disposition))?;
+    if (disposition.length == 0) {
+        mem(disposition.append("SendAndSaveCopy"))?;
+    }
+    let send = disposition.view() == "SendOnly" || disposition.view() == "SendAndSaveCopy";
+    let save = disposition.view() == "SaveOnly" || disposition.view() == "SendAndSaveCopy";
+    let message = match (findLocal(doc, op, "Message")) {
+        Some(m) => m,
+        null => {
+            // Calendar items, contacts and the rest are not kept here (as in the C# server): an empty success.
+            beginEnvelope(w, "CreateItem");
+            beginSuccess(w, "CreateItem");
+            w.empty("m:Items");
+            w.end();
+            endEnvelope(w);
+            return Ok();
+        }
+    };
+    var raw = Vector<u8>.create();
+    match (findLocal(doc, message, "MimeContent")) {
+        Some(m) => {
+            match (Base64.decodeIgnoringSpace(doc.text(m), mut raw)) {
+                Ok() => {}
+                Err(_) => {
+                    beginEnvelope(w, "CreateItem");
+                    failure(
+                        w,
+                        "CreateItem",
+                        "ErrorMimeContentInvalidBase64String",
+                        "The MIME content is not valid base64.",
+                    );
+                    endEnvelope(w);
+                    return Ok();
+                }
+            }
+        }
+        null => { mem(composed(doc, message, account.email.view(), mut raw))?; }
+    }
+    var recipients = Vector<String>.create();
+    var content = Vector<u8>.create();
+    mem(prepare(raw.view(), mut content, mut recipients))?;
+    mem(xmlRecipients(doc, message, mut recipients))?;
+    // The folder the copy goes to.
+    var folderId: i64 = 0;
+    if (save) {
+        match (findLocal(doc, op, "SavedItemFolderId")) {
+            Some(s) => {
+                match (await resolveFolderIn(mail, account, doc, s)?) {
+                    Some(f) => { folderId = f.id; }
+                    null => {}
+                }
+            }
+            null => {}
+        }
+        if (folderId <= 0) {
+            let fallback = if (send) await specialFolder(
+                mail,
+                account.userId,
+                "\\Sent",
+                "Sent",
+            )? else await specialFolder(
+                mail,
+                account.userId,
+                "\\Drafts",
+                "Drafts",
+            )?;
+            match (fallback) {
+                Some(f) => { folderId = f.id; }
+                null => {}
+            }
+        }
+    }
+    if (send && recipients.length == 0) {
+        beginEnvelope(w, "CreateItem");
+        failure(w, "CreateItem", "ErrorInvalidRecipients", "The message has no recipients.");
+        endEnvelope(w);
+        return Ok();
+    }
+    // Recipients: local users get it in their INBOX (one copy each), the rest go to the queue.
+    var meta = Vector<u8>.create();
+    mem(indexOf(content.view(), mut meta))?;
+    let now = Clock.unixMillis();
+    var targets = Vector<Delivery>.create();
+    var outbound = Outbound.create();
+    var users = Vector<i64>.create();
+    if (send) {
+        for (r in recipients.view()) {
+            var to = Recipient.create();
+            match (await mail.store.resolve(r.view(), mut to)) {
+                Ok() => {}
+                Err(_) => { return Err(EwsError.Unavailable); }
+            }
+            if (to.isUser() && to.inboxId > 0) {
+                if (contains(users, to.userId)) {
+                    continue;
+                }
+                mem(users.push(to.userId))?;
+                var d = Delivery.to(to.userId, to.inboxId, now);
+                mem(d.meta.extend(meta.view()))?;
+                mem(targets.push(d))?;
+            } else if (to.isRemote() || to.isNotLocal()) {
+                var copy = String.create();
+                mem(copy.append(if (to.isRemote()) to.address.view() else r.view()))?;
+                mem(outbound.recipients.push(copy))?;
+            } else {
+                beginEnvelope(w, "CreateItem");
+                var text = String.create();
+                mem(text.append("No such recipient: "))?;
+                mem(text.append(r.view()))?;
+                failure(w, "CreateItem", "ErrorInvalidRecipients", text.view());
+                endEnvelope(w);
+                return Ok();
+            }
+        }
+    }
+    if (folderId > 0) {
+        var d = Delivery.to(account.userId, folderId, now);
+        d.flags = if (send) FLAG_SEEN else FLAG_SEEN | FLAG_DRAFT;
+        mem(d.meta.extend(meta.view()))?;
+        mem(targets.push(d))?;
+    }
+    if (targets.length == 0 && outbound.recipients.length == 0) {
+        beginEnvelope(w, "CreateItem");
+        beginSuccess(w, "CreateItem");
+        w.empty("m:Items");
+        w.end();
+        endEnvelope(w);
+        return Ok();
+    }
+    mem(outbound.sender.append(account.email.view()))?;
+    outbound.userId = account.userId;
+    let blobs = mail.store.blobs();
+    let bytes = content.view();
+    let written: Result<BlobWriter, StoreError> = await Async.blocking(() => writeBlobOf(blobs, bytes));
+    var writer = match (written) {
+        Ok(wr) => wr,
+        Err(_) => { return Err(EwsError.Unavailable); }
+    };
+    var done = Vector<Delivered>.create();
+    match (await mail.store.accept(mut writer, targets, outbound, mut done)) {
+        Ok(_) => {}
+        Err(_) => {
+            let wr = borrow mut writer;
+            await Async.blocking(() => wr.discard());
+            return Err(EwsError.Unavailable);
+        }
+    }
+    beginEnvelope(w, "CreateItem");
+    beginSuccess(w, "CreateItem");
+    // The saved copy's id: without it macOS Mail takes the save as failed and sends again.
+    if (folderId > 0 && done.length == targets.length && done.length > 0) {
+        let uid = done[done.length - 1].uid;
+        var id = String.create();
+        mem(itemId(folderId, uid, mut id))?;
+        var key = String.create();
+        mem(messageChangeKey(targets[targets.length - 1].flags, "", mut key))?;
+        w.start("m:Items");
+        w.start("t:Message");
+        w.start("t:ItemId");
+        w.attribute("Id", id.view());
+        w.attribute("ChangeKey", key.view());
+        w.end();
+        w.end();
+        w.end();
+    } else {
+        w.empty("m:Items");
+    }
+    w.end();
+    endEnvelope(w);
+    return Ok();
+}
+
+fn indexOf(message: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    var scanner = MimeScanner.create();
+    scanner.feed(message)?;
+    var index = MessageIndex.create();
+    scanner.finish(mut index)?;
+    var renderer = Renderer.create();
+    return encodeMeta(index, mut renderer, out);
+}

@@ -1,0 +1,30 @@
+size 515
+envelope ("Sat, 24 Mar 2007 23:00:00 +0200" NIL ((NIL NIL "user" "domain.org")) ((NIL NIL "user" "domain.org")) ((NIL NIL "user" "domain.org")) NIL NIL NIL NIL NIL)
+bodystructure ("message" "rfc822" NIL NIL NIL "7bit" 358 ("Sun, 12 Aug 2012 12:34:56 +0300" "submsg" ((NIL NIL "sub" "domain.org")) ((NIL NIL "sub" "domain.org")) ((NIL NIL "sub" "domain.org")) NIL NIL NIL NIL NIL) (("message" "rfc822" NIL NIL NIL "7bit" 46 (NIL "m1" ((NIL NIL "m1" "example.com")) ((NIL NIL "m1" "example.com")) ((NIL NIL "m1" "example.com")) NIL NIL NIL NIL NIL) ("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 9 1 NIL NIL NIL NIL) 4 NIL NIL NIL NIL) ("message" "rfc822" NIL NIL NIL "7bit" 46 (NIL "m2" ((NIL NIL "m2" "example.com")) ((NIL NIL "m2" "example.com")) ((NIL NIL "m2" "example.com")) NIL NIL NIL NIL NIL) ("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 9 1 NIL NIL NIL NIL) 4 NIL NIL NIL NIL) "digest" ("boundary" "foo") NIL NIL NIL) 28 NIL NIL NIL NIL)
+body ("message" "rfc822" NIL NIL NIL "7bit" 358 ("Sun, 12 Aug 2012 12:34:56 +0300" "submsg" ((NIL NIL "sub" "domain.org")) ((NIL NIL "sub" "domain.org")) ((NIL NIL "sub" "domain.org")) NIL NIL NIL NIL NIL) (("message" "rfc822" NIL NIL NIL "7bit" 46 (NIL "m1" ((NIL NIL "m1" "example.com")) ((NIL NIL "m1" "example.com")) ((NIL NIL "m1" "example.com")) NIL NIL NIL NIL NIL) ("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 9 1) 4) ("message" "rfc822" NIL NIL NIL "7bit" 46 (NIL "m2" ((NIL NIL "m2" "example.com")) ((NIL NIL "m2" "example.com")) ((NIL NIL "m2" "example.com")) NIL NIL NIL NIL NIL) ("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 9 1) 4) "digest") 28)
+section HEADER 157 0c7fb757b363388e41011a6ce24179d92680b2cb3c0f1e3cab747e037e7aa9ec
+section TEXT 358 a34caf29c805f1af98a9022c729cd22e6e4d182f818c41220b742cd0105ecd99
+section HEADER.FIELDS 94 9e45507050a0cb4fc30fa79bcdc3933bbd25e40e009e6e2fa9a4981579db9fb2
+section HEADER.FIELDS.NOT 65 1c05ae1b8f285d4b13ec8ae05938f9a0a3bf6ab328b570c1383296a59ab7b559
+section 1 358 a34caf29c805f1af98a9022c729cd22e6e4d182f818c41220b742cd0105ecd99
+section 1.MIME 157 0c7fb757b363388e41011a6ce24179d92680b2cb3c0f1e3cab747e037e7aa9ec
+section 1.HEADER 128 8ce5dae0c8ae1f3283ec75270fa4dc25cc6a8701c595afb303f6659567a5e2ad
+section 1.TEXT 230 5212ba59b053500f718237f71060d98cb372c23de3a9e7ec736ce2574f8aa453
+section 1.HEADER.FIELDS 128 8ce5dae0c8ae1f3283ec75270fa4dc25cc6a8701c595afb303f6659567a5e2ad
+section 1.HEADER.FIELDS.NOT 2 7eb70257593da06f682a3ddda54a9d260d4fc514f645237f5ca74b08f8da61a6
+section 1.1 46 ed47c55d85f8a848f0a5c837ed4107df95f33ae08a2bbd61cd6cf4052c93cbdb
+section 1.1.MIME 32 94984f8e29692f32be6724e812f5568ad06604428ccd4509df6c3a1c966800a0
+section 1.1.HEADER 37 91f885bc938aed79298fbc46cff59576398eafdde781f018aa00bb5a2f745f3b
+section 1.1.TEXT 9 bd5386f3e840ca817eb34860de2a07480796e4ad33e42a897ee7d802a347da91
+section 1.1.HEADER.FIELDS 37 91f885bc938aed79298fbc46cff59576398eafdde781f018aa00bb5a2f745f3b
+section 1.1.HEADER.FIELDS.NOT 2 7eb70257593da06f682a3ddda54a9d260d4fc514f645237f5ca74b08f8da61a6
+section 1.1.1 9 bd5386f3e840ca817eb34860de2a07480796e4ad33e42a897ee7d802a347da91
+section 1.1.1.MIME 37 91f885bc938aed79298fbc46cff59576398eafdde781f018aa00bb5a2f745f3b
+section 1.2 46 fd7bffbcfaf4a6215f2e1a8b4795ccb72201ed9901bae703295244f4d025b4c6
+section 1.2.MIME 51 7d358d3c1e975554a11f451d798a6aaf40a888bc76d04f5e2558b096166b0a9e
+section 1.2.HEADER 37 5b54da559e39aee6263ca104227f5599d023ef560bfad156bd0cf2a71f95f2e3
+section 1.2.TEXT 9 4fbf6121df23d1e2c985e62d35b8ccd930a11227b572ab71f15fefe794166564
+section 1.2.HEADER.FIELDS 37 5b54da559e39aee6263ca104227f5599d023ef560bfad156bd0cf2a71f95f2e3
+section 1.2.HEADER.FIELDS.NOT 2 7eb70257593da06f682a3ddda54a9d260d4fc514f645237f5ca74b08f8da61a6
+section 1.2.1 9 4fbf6121df23d1e2c985e62d35b8ccd930a11227b572ab71f15fefe794166564
+section 1.2.1.MIME 37 5b54da559e39aee6263ca104227f5599d023ef560bfad156bd0cf2a71f95f2e3

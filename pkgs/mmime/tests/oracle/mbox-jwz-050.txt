@@ -1,0 +1,10 @@
+size 52361
+envelope ("Wed, 28 Oct 92 11:47:04 -0500" "Thanks! (part 2 of 2)" (("T. V. Raman" NIL "raman" "cs.cornell.edu")) (("T. V. Raman" NIL "raman" "cs.cornell.edu")) (("T. V. Raman" NIL "raman" "cs.cornell.edu")) ((NIL NIL "nsb" "thumper.bellcore.com")) ((NIL NIL "raman" "cs.cornell.edu")) NIL NIL "<9210281647.AA23428@freyr.cs.cornell.edu>")
+bodystructure ("message" "partial" ("id" "703.23422.720290813.freyr" "number" "2" "total" "2") NIL NIL "7bit" 51405 NIL NIL NIL NIL)
+body ("message" "partial" ("id" "703.23422.720290813.freyr" "number" "2" "total" "2") NIL NIL "7bit" 51405)
+section HEADER 956 127798af061212b0c438eef0bdb28e1db412a76be37cecec04093a189ac45f5f
+section TEXT 51405 65d41528ea5b3b37b8dcc01455760977e613fdf5e8c2da478ce4bc414d95a201
+section HEADER.FIELDS 305 3b8feeeabe8dcfc12234857f88cc45a95bf1a06f4a1681d42f54693f5e94e804
+section HEADER.FIELDS.NOT 653 f1579e76635b0884f8e877d7a7123c81a1774f08b584bb7286543f171c890a8b
+section 1 51405 65d41528ea5b3b37b8dcc01455760977e613fdf5e8c2da478ce4bc414d95a201
+section 1.MIME 956 127798af061212b0c438eef0bdb28e1db412a76be37cecec04093a189ac45f5f

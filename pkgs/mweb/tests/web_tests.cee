@@ -1,0 +1,98 @@
+// JWTs (RFC 7515 Appendix A.1's HS256 example), the MTA-STS policy text, and the XML helpers.
+
+import encoding.Base64;
+
+fn rfcKey() -> Vector<u8> {
+    var key = Vector<u8>.create();
+    Base64.decodeUrl(
+        "AyM1SysPpbyDfgZld3umj1qzKObwVMkoqQ-EstJQLr_T-1qS0gZH75aKtMN3Yj0iPS4hcgUuTwjAzZr1Z9CAow".bytes(),
+        mut key,
+    )!;
+    return key;
+}
+
+const RFC_TOKEN: StringView =
+    "eyJ0eXAiOiJKV1QiLA0KICJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJqb2UiLA0KICJleHAiOjEzMDA4MTkzODAsDQogImh0dHA6Ly9leGFtcGxlLmNvbS9pc19yb290Ijp0cnVlfQ.dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+
+fn refused(r: Result<mhttp.JsonDocument, JwtError>, want: JwtError) -> bool => match (r) {
+    Ok(_) => false,
+    Err(e) => match (want) {
+        JwtError.Malformed => match (e) {
+            JwtError.Malformed => true,
+            _ => false,
+        },
+        JwtError.BadSignature => match (e) {
+            JwtError.BadSignature => true,
+            _ => false,
+        },
+        JwtError.Expired => match (e) {
+            JwtError.Expired => true,
+            _ => false,
+        },
+        JwtError.OutOfMemory => false,
+    },
+};
+
+@test
+fn verifiesTheRfcExample() -> Result<void, TestFailure> {
+    let key = rfcKey();
+    let claims = verifyJwt(key.view(), RFC_TOKEN.bytes(), 1300819379)!;
+    var iss = String.create();
+    Check.isTrue(claims.string(claims.member(0, "iss")!, mut iss)! && iss.view() == "joe", "its claims")?;
+    Check.isTrue(refused(verifyJwt(key.view(), RFC_TOKEN.bytes(), 1300819380), JwtError.Expired), "expired at exp")?;
+    var wrong = rfcKey();
+    wrong[0] = wrong[0] ^ 1;
+    Check.isTrue(refused(verifyJwt(wrong.view(), RFC_TOKEN.bytes(), 0), JwtError.BadSignature), "another key")?;
+    var tampered = String.create();
+    tampered.append(RFC_TOKEN)!;
+    tampered.append("x")!;
+    Check.isTrue(refused(verifyJwt(key.view(), tampered.bytes(), 0), JwtError.BadSignature), "a changed signature")?;
+    return Ok();
+}
+
+@test
+fn signsAndRefuses() -> Result<void, TestFailure> {
+    let secret = "0123456789abcdef0123456789abcdef".bytes();
+    var token = Vector<u8>.create();
+    signJwt(secret, "{\"sub\":\"7\",\"exp\":2000000000}".bytes(), mut token)!;
+    let claims = verifyJwt(secret, token.view(), 1900000000)!;
+    var sub = String.create();
+    Check.isTrue(claims.string(claims.member(0, "sub")!, mut sub)! && sub.view() == "7", "a round trip")?;
+    // alg none: refused whatever the signature.
+    let none = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJzdWIiOiI3IiwiZXhwIjoyMDAwMDAwMDAwfQ.";
+    Check.isTrue(refused(verifyJwt(secret, none.bytes(), 0), JwtError.Malformed), "alg none")?;
+    signJwt(secret, "{\"sub\":\"7\"}".bytes(), mut token)!;
+    Check.isTrue(refused(verifyJwt(secret, token.view(), 0), JwtError.Expired), "no exp")?;
+    Check.isTrue(refused(verifyJwt(secret, "a.b".bytes(), 0), JwtError.Malformed), "two parts")?;
+    Check.isTrue(refused(verifyJwt(secret, "..".bytes(), 0), JwtError.Malformed), "empty parts")?;
+    return Ok();
+}
+
+@test
+fn mtaStsPolicyText() -> Result<void, TestFailure> {
+    var out = Vector<u8>.create();
+    writeMtaStsPolicy("enforce", 604800, "", "example.org", mut out)!;
+    Check.isTrue(
+        out.view() == "version: STSv1\r\nmode: enforce\r\nmx: mail.example.org\r\nmax_age: 604800\r\n".bytes(),
+        "the default mx",
+    )?;
+    out.clear();
+    writeMtaStsPolicy("testing", 1, " a.example ,b.example\tc.example ", "x", mut out)!;
+    return Check.isTrue(
+        out.view() == "version: STSv1\r\nmode: testing\r\nmx: a.example\r\nmx: b.example\r\nmx: c.example\r\nmax_age: 1\r\n".bytes(),
+        "patterns",
+    );
+}
+
+@test
+fn xmlElements() -> Result<void, TestFailure> {
+    let xml =
+        "<a:Request><a:EMailAddress> x@y.z </a:EMailAddress><a:AcceptableResponseSchema>s</a:AcceptableResponseSchema></a:Request>";
+    Check.isTrue(elementText(xml, "EMailAddress") == "x@y.z", "a prefixed element")?;
+    Check.isTrue(elementText("<EMailAddress>q</EMailAddress>", "EMailAddress") == "q", "unprefixed")?;
+    Check.isTrue(elementText("<EMailAddressX>q</EMailAddressX>", "EMailAddress") == "", "a longer name")?;
+    Check.isTrue(elementText("</EMailAddress><EMailAddress>r</EMailAddress>", "EMailAddress") == "r", "after a close")?;
+    var out = Vector<u8>.create();
+    appendXml(mut out, "<a href=\"x\">&'")!;
+    return Check.isTrue(out.view() == "&lt;a href=&quot;x&quot;&gt;&amp;&apos;".bytes(), "escaping");
+}

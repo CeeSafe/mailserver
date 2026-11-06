@@ -1,0 +1,18 @@
+size 6432
+envelope ("Fri, 12 Jun 1992 13:29:05 -0400 (EDT)" "MIME & int'l mail" (("Nathaniel Borenstein" NIL "nsb" "MISSING_DOMAIN")) (("Nathaniel Borenstein" NIL "nsb" "MISSING_DOMAIN")) (("Nathaniel Borenstein" NIL "nsb" "MISSING_DOMAIN")) (("Ned Freed" NIL "ned" "innosoft.com") ("Yutaka Sato =?ISO-2022-JP?B?GyRAOjRGI0stGyhK?=" NIL "ysato" "etl.go.jp")) NIL NIL NIL "<UeCBvVq0M2Yt4oUA83@thumper.bellcore.com>")
+bodystructure (("text" "plain" ("charset" "US-ASCII") NIL NIL "7bit" 239 6 NIL NIL NIL NIL) (("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 149 3 NIL NIL NIL NIL) ("image" "gif" NIL NIL "Some international characters" "base64" 4432 NIL NIL NIL NIL) ("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 48 3 NIL NIL NIL NIL) "mixed" ("boundary" "Alternative.Boundary.IeCBvV20M2Yt4oU=wd") NIL NIL NIL) "alternative" ("boundary" "Interpart.Boundary.IeCBvV20M2YtEoUA0A") NIL NIL NIL)
+body (("text" "plain" ("charset" "US-ASCII") NIL NIL "7bit" 239 6) (("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 149 3) ("image" "gif" NIL NIL "Some international characters" "base64" 4432) ("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 48 3) "mixed") "alternative")
+section HEADER 661 3a625f1c0a629dfd120e668ff34b142a8e2b8c1e1d6d70afea12467aa6d951e8
+section TEXT 5771 9e53c269a918133454faadb0cef2d19bc587316db3ceb397c3b30522da111d5a
+section HEADER.FIELDS 360 add0b359a51c92c8f8b549d35fe489ce965637d3698471d1da7e593a069440a4
+section HEADER.FIELDS.NOT 303 77d1b10cabb112470b2faee76078295db12ebb62fbc080aa57cc2df9bfdb00d0
+section 1 239 cd042b4b9919393fa775d9711a3a2d2508ee8ae2edc6c9033a088f9772b9df0a
+section 1.MIME 46 b3532c649b28a23803c77a2acc4907f5048ea77b89e0c51dcf7f271f2db4bfa6
+section 2 5111 c60133e8c2913f9874838980603853deac4a51b7dbfee82714c7562a4912730f
+section 2.MIME 88 462d72579bc7329ea73c6c3f9282fd41df93a88f6f2358c179581808fc60ac2f
+section 2.1 149 b21debf376bcba24d59c3b355a73a8eba8f776e04d0efdbbc866c8fea5baf6c2
+section 2.1.MIME 94 7d35d8c48d3869c4391f6ff71123bfb4c8466e5b04f02d64c3961f23d7d8bf61
+section 2.2 4432 42685b120af89eff3bacdb7d0b721d6d8788d7e792d6749ee0b6ed54910a47ad
+section 2.2.MIME 114 9ecf24168304390c2ac325003dbdf2d2d47307bfd60924c97475473e50c1d694
+section 2.3 48 c666bacec651be5024a2af030a485f3fbe8d16548f2d2c0e616b38978e77c5cb
+section 2.3.MIME 94 7d35d8c48d3869c4391f6ff71123bfb4c8466e5b04f02d64c3961f23d7d8bf61

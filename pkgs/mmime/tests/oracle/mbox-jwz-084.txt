@@ -1,0 +1,10 @@
+size 552848
+envelope ("Thu, 12 Mar 1992 09:27:38 +1000" "Re: Barbershop MIME" (("Harold A. Miller" NIL "Hal.Miller" "mel.dit.csiro.au")) (("Harold A. Miller" NIL "Hal.Miller" "mel.dit.csiro.au")) (("Harold A. Miller" NIL "Hal.Miller" "mel.dit.csiro.au")) ((NIL NIL "nsb" "thumper.bellcore.com")) NIL NIL NIL "<199203112327.AA03185@shark.mel.dit.csiro.au>")
+bodystructure ("audio" "basic" NIL NIL NIL "base64" 552090 NIL NIL NIL NIL)
+body ("audio" "basic" NIL NIL NIL "base64" 552090)
+section HEADER 758 53dad48c1f874ed224b91ca1f08bbc3dbed0cf96f35d33be08c2d77515eeb332
+section TEXT 552090 8318c2ea3bd1f3c9acb9ce0037e1fd118c729086277dd343049a489e34f7af6f
+section HEADER.FIELDS 250 931378080e44e711deae1fe817586b945d329d751444358549612bada1cf55f0
+section HEADER.FIELDS.NOT 510 db074227d868223a084ede0f569e702192165948d3cb3014bb1e8b676f0ad2e4
+section 1 552090 8318c2ea3bd1f3c9acb9ce0037e1fd118c729086277dd343049a489e34f7af6f
+section 1.MIME 758 53dad48c1f874ed224b91ca1f08bbc3dbed0cf96f35d33be08c2d77515eeb332

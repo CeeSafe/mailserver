@@ -1,0 +1,616 @@
+// Calendars and address books (schema version 11): collections of iCalendar or vCard objects, for CalDAV/CardDAV,
+// ActiveSync and EWS alike. Every change raises its collection's modseq and stamps the object with it; deletions
+// leave tombstones, so `changes` since a modseq is exact. Each change is one statement, with its preconditions
+// (If-Match, If-None-Match, a UID already used) inside it, and wakes the user's watchers (`-collection id` on the
+// notify bus) once committed.
+
+import mstore.MailStore;
+import postgres.PgError;
+import postgres.PgParams;
+import postgres.PgRows;
+
+public const KIND_CALENDAR: StringView = "calendar";
+public const KIND_ADDRESSBOOK: StringView = "addressbook";
+
+/// The name of the collection each user has from the start, as the C# server named it.
+public const DEFAULT_COLLECTION: StringView = "Default";
+
+/// Why a store call failed.
+public enum PimError {
+    /// The database could not be reached, or refused the statement.
+    Unavailable,
+    NotFound,
+    /// A collection by that name exists.
+    Exists,
+    /// Another object in the collection has this UID (CalDAV's no-uid-conflict).
+    UidConflict,
+    /// If-Match or If-None-Match did not hold.
+    Precondition,
+    /// Not a calendar object or vCard, or none with a UID.
+    Invalid,
+    OutOfMemory,
+}
+
+fn oomPim(r: Result<void, AllocError>) -> Result<void, PimError> => match (r) {
+    Ok() => Ok(),
+    Err(_) => Err(PimError.OutOfMemory),
+};
+
+fn boundPim(r: Result<void, PgError>) -> Result<void, PimError> => match (r) {
+    Ok() => Ok(),
+    Err(_) => Err(PimError.OutOfMemory),
+};
+
+/// A calendar or address book.
+public struct Collection {
+    public id: i64;
+    public kind: String;
+    /// The URL segment.
+    public name: String;
+    public displayName: String;
+    public description: String;
+    public color: String;
+    /// Calendars: the components it holds, comma-separated (VEVENT,VTODO).
+    public components: String;
+    /// Raised by every change: the CTag and sync token.
+    public modseq: i64;
+
+    public fn create() -> Collection => Collection {
+        id: 0,
+        kind: String.create(),
+        name: String.create(),
+        displayName: String.create(),
+        description: String.create(),
+        color: String.create(),
+        components: String.create(),
+        modseq: 0,
+    };
+
+    public fn isCalendar(borrow this) -> bool => this.kind.view() == KIND_CALENDAR;
+}
+
+/// An object in a collection.
+public struct PimObject {
+    public id: i64;
+    public collectionId: i64;
+    public href: String;
+    public uid: String;
+    public component: String;
+    public etag: String;
+    /// Empty unless asked for, and for tombstones.
+    public data: String;
+    public createdModseq: i64;
+    public modseq: i64;
+    public deleted: bool;
+    /// Seconds since the epoch; see `ObjectFacts`.
+    public start: i64?;
+    public end: i64?;
+
+    public fn create() -> PimObject => PimObject {
+        id: 0,
+        collectionId: 0,
+        href: String.create(),
+        uid: String.create(),
+        component: String.create(),
+        etag: String.create(),
+        data: String.create(),
+        createdModseq: 0,
+        modseq: 0,
+        deleted: false,
+        start: null,
+        end: null,
+    };
+}
+
+/// What `putObject` did.
+public struct PutOutcome {
+    public id: i64;
+    /// A new object (or one that replaced a tombstone), not an update.
+    public created: bool;
+    public etag: String;
+    public modseq: i64;
+
+    public fn create() -> PutOutcome => PutOutcome { id: 0, created: false, etag: String.create(), modseq: 0 };
+}
+
+async fn run(store: borrow MailStore, sql: StringView, params: borrow PgParams, rows: borrow mut PgRows) -> Result<void, PimError> {
+    var lease = match (await store.connections().acquire()) {
+        Ok(l) => l,
+        Err(_) => { return Err(PimError.Unavailable); }
+    };
+    match (await lease.connection().query(sql, params)) {
+        Ok(r) => {
+            rows = r;
+            return Ok();
+        }
+        Err(_) => { return Err(PimError.Unavailable); }
+    }
+}
+
+fn textAt(rows: borrow PgRows, row: usize, column: usize, into: borrow mut String) -> Result<void, PimError> {
+    into.clear();
+    return oomPim(into.append(rows.text(row, column) ?? ""));
+}
+
+const COLLECTION_COLUMNS: StringView = "id, kind, name, display_name, coalesce(description, ''), coalesce(color, ''), components, modseq";
+
+fn collectionAt(rows: borrow PgRows, row: usize, into: borrow mut Collection) -> Result<void, PimError> {
+    into.id = rows.int64(row, 0) ?? 0;
+    textAt(rows, row, 1, mut into.kind)?;
+    textAt(rows, row, 2, mut into.name)?;
+    textAt(rows, row, 3, mut into.displayName)?;
+    textAt(rows, row, 4, mut into.description)?;
+    textAt(rows, row, 5, mut into.color)?;
+    textAt(rows, row, 6, mut into.components)?;
+    into.modseq = rows.int64(row, 7) ?? 0;
+    return Ok();
+}
+
+fn sqlEnsureDefault() -> StringView =>
+    "INSERT INTO dav_collections (user_id, kind, name, display_name, color) SELECT $1, $2, 'Default', CASE WHEN $2 = 'calendar' THEN 'Calendar' ELSE 'Contacts' END, CASE WHEN $2 = 'calendar' THEN '#0078D4' END WHERE NOT EXISTS (SELECT 1 FROM dav_collections WHERE user_id = $1 AND kind = $2) ON CONFLICT DO NOTHING";
+
+/// Makes the user's default collection of `kind` when the user has none of that kind.
+public async fn ensureDefault(store: borrow MailStore, userId: i64, kind: StringView) -> Result<void, PimError> {
+    var params = PgParams.create();
+    boundPim(params.int64(userId))?;
+    boundPim(params.text(kind))?;
+    var rows = PgRows.create();
+    return await run(store, sqlEnsureDefault(), params, mut rows);
+}
+
+/// The user's collections of `kind` (making the default one first, when there are none), by name.
+public async fn collections(
+    store: borrow MailStore,
+    userId: i64,
+    kind: StringView,
+    into: borrow mut Vector<Collection>,
+) -> Result<void, PimError> {
+    await ensureDefault(store, userId, kind)?;
+    into.clear();
+    var params = PgParams.create();
+    boundPim(params.int64(userId))?;
+    boundPim(params.text(kind))?;
+    var sql = String.create();
+    oomPim(sql.append("SELECT "))?;
+    oomPim(sql.append(COLLECTION_COLUMNS))?;
+    oomPim(sql.append(" FROM dav_collections WHERE user_id = $1 AND kind = $2 ORDER BY name"))?;
+    var rows = PgRows.create();
+    await run(store, sql.view(), params, mut rows)?;
+    for (r in 0..rows.rowCount()) {
+        var c = Collection.create();
+        collectionAt(rows, r, mut c)?;
+        oomPim(into.push(c))?;
+    }
+    return Ok();
+}
+
+/// Every collection of the user's, calendars first.
+public async fn allCollections(store: borrow MailStore, userId: i64, into: borrow mut Vector<Collection>) -> Result<void, PimError> {
+    await ensureDefault(store, userId, KIND_CALENDAR)?;
+    await ensureDefault(store, userId, KIND_ADDRESSBOOK)?;
+    into.clear();
+    var params = PgParams.create();
+    boundPim(params.int64(userId))?;
+    var sql = String.create();
+    oomPim(sql.append("SELECT "))?;
+    oomPim(sql.append(COLLECTION_COLUMNS))?;
+    oomPim(sql.append(" FROM dav_collections WHERE user_id = $1 ORDER BY kind DESC, name"))?;
+    var rows = PgRows.create();
+    await run(store, sql.view(), params, mut rows)?;
+    for (r in 0..rows.rowCount()) {
+        var c = Collection.create();
+        collectionAt(rows, r, mut c)?;
+        oomPim(into.push(c))?;
+    }
+    return Ok();
+}
+
+/// The user's collection of `kind` named `name`; false when there is none.
+public async fn collectionNamed(
+    store: borrow MailStore,
+    userId: i64,
+    kind: StringView,
+    name: StringView,
+    into: borrow mut Collection,
+) -> Result<bool, PimError> {
+    if (name == DEFAULT_COLLECTION) {
+        await ensureDefault(store, userId, kind)?;
+    }
+    var params = PgParams.create();
+    boundPim(params.int64(userId))?;
+    boundPim(params.text(kind))?;
+    boundPim(params.text(name))?;
+    var sql = String.create();
+    oomPim(sql.append("SELECT "))?;
+    oomPim(sql.append(COLLECTION_COLUMNS))?;
+    oomPim(sql.append(" FROM dav_collections WHERE user_id = $1 AND kind = $2 AND name = $3"))?;
+    var rows = PgRows.create();
+    await run(store, sql.view(), params, mut rows)?;
+    if (rows.rowCount() == 0) {
+        return Ok(false);
+    }
+    collectionAt(rows, 0, into)?;
+    return Ok(true);
+}
+
+/// The user's collection `id`; false when it is not the user's or does not exist.
+public async fn collectionById(
+    store: borrow MailStore,
+    userId: i64,
+    id: i64,
+    into: borrow mut Collection,
+) -> Result<bool, PimError> {
+    var params = PgParams.create();
+    boundPim(params.int64(userId))?;
+    boundPim(params.int64(id))?;
+    var sql = String.create();
+    oomPim(sql.append("SELECT "))?;
+    oomPim(sql.append(COLLECTION_COLUMNS))?;
+    oomPim(sql.append(" FROM dav_collections WHERE user_id = $1 AND id = $2"))?;
+    var rows = PgRows.create();
+    await run(store, sql.view(), params, mut rows)?;
+    if (rows.rowCount() == 0) {
+        return Ok(false);
+    }
+    collectionAt(rows, 0, into)?;
+    return Ok(true);
+}
+
+fn optionalText(params: borrow mut PgParams, value: StringView?) -> Result<void, PimError> => match (value) {
+    Some(v) => boundPim(params.text(v)),
+    null => boundPim(params.sqlNull()),
+};
+
+/// Makes a collection; its id. `Exists` when the user has one of that kind and name.
+public async fn createCollection(
+    store: borrow MailStore,
+    userId: i64,
+    kind: StringView,
+    name: StringView,
+    displayName: StringView,
+    description: StringView?,
+    color: StringView?,
+) -> Result<i64, PimError> {
+    var params = PgParams.create();
+    boundPim(params.int64(userId))?;
+    boundPim(params.text(kind))?;
+    boundPim(params.text(name))?;
+    boundPim(params.text(displayName))?;
+    optionalText(mut params, description)?;
+    optionalText(mut params, color)?;
+    var rows = PgRows.create();
+    await run(
+        store,
+        "INSERT INTO dav_collections (user_id, kind, name, display_name, description, color) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING RETURNING id",
+        params,
+        mut rows,
+    )?;
+    if (rows.rowCount() == 0) {
+        return Err(PimError.Exists);
+    }
+    let id = rows.int64(0, 0) ?? 0;
+    await store.notifications().raise(userId, 0 - id);
+    return Ok(id);
+}
+
+/// Changes a collection's display name, description or color (null: unchanged). Raises its modseq, so clients
+/// read its properties again.
+public async fn updateCollection(
+    store: borrow MailStore,
+    userId: i64,
+    id: i64,
+    displayName: StringView?,
+    description: StringView?,
+    color: StringView?,
+) -> Result<void, PimError> {
+    var params = PgParams.create();
+    boundPim(params.int64(userId))?;
+    boundPim(params.int64(id))?;
+    optionalText(mut params, displayName)?;
+    optionalText(mut params, description)?;
+    optionalText(mut params, color)?;
+    var rows = PgRows.create();
+    await run(
+        store,
+        "UPDATE dav_collections SET display_name = coalesce($3, display_name), description = coalesce($4, description), color = coalesce($5, color), modseq = modseq + 1, updated_at = now() WHERE user_id = $1 AND id = $2 RETURNING id",
+        params,
+        mut rows,
+    )?;
+    if (rows.rowCount() == 0) {
+        return Err(PimError.NotFound);
+    }
+    await store.notifications().raise(userId, 0 - id);
+    return Ok();
+}
+
+/// Deletes a collection and everything in it.
+public async fn deleteCollection(store: borrow MailStore, userId: i64, id: i64) -> Result<void, PimError> {
+    var params = PgParams.create();
+    boundPim(params.int64(userId))?;
+    boundPim(params.int64(id))?;
+    var rows = PgRows.create();
+    await run(store, "DELETE FROM dav_collections WHERE user_id = $1 AND id = $2 RETURNING id", params, mut rows)?;
+    if (rows.rowCount() == 0) {
+        return Err(PimError.NotFound);
+    }
+    await store.notifications().raise(userId, 0);
+    return Ok();
+}
+
+// ---- Objects ----
+
+const OBJECT_COLUMNS: StringView =
+    "id, collection_id, href, uid, component, etag, created_modseq, modseq, deleted, extract(epoch FROM dtstart)::int8, extract(epoch FROM dtend)::int8";
+
+fn objectAt(rows: borrow PgRows, row: usize, withData: bool, into: borrow mut PimObject) -> Result<void, PimError> {
+    into.id = rows.int64(row, 0) ?? 0;
+    into.collectionId = rows.int64(row, 1) ?? 0;
+    textAt(rows, row, 2, mut into.href)?;
+    textAt(rows, row, 3, mut into.uid)?;
+    textAt(rows, row, 4, mut into.component)?;
+    textAt(rows, row, 5, mut into.etag)?;
+    into.createdModseq = rows.int64(row, 6) ?? 0;
+    into.modseq = rows.int64(row, 7) ?? 0;
+    into.deleted = rows.bool(row, 8) ?? false;
+    into.start = rows.int64(row, 9);
+    into.end = rows.int64(row, 10);
+    into.data.clear();
+    if (withData) {
+        textAt(rows, row, 11, mut into.data)?;
+    }
+    return Ok();
+}
+
+fn objectSql(withData: bool, rest: StringView, into: borrow mut String) -> Result<void, PimError> {
+    oomPim(into.append("SELECT "))?;
+    oomPim(into.append(OBJECT_COLUMNS))?;
+    if (withData) {
+        oomPim(into.append(", data"))?;
+    }
+    oomPim(into.append(" FROM dav_objects WHERE "))?;
+    oomPim(into.append(rest))?;
+    return Ok();
+}
+
+async fn objectRows(
+    store: borrow MailStore,
+    sql: StringView,
+    params: borrow PgParams,
+    withData: bool,
+    into: borrow mut Vector<PimObject>,
+) -> Result<void, PimError> {
+    into.clear();
+    var rows = PgRows.create();
+    await run(store, sql, params, mut rows)?;
+    for (r in 0..rows.rowCount()) {
+        var o = PimObject.create();
+        objectAt(rows, r, withData, mut o)?;
+        oomPim(into.push(o))?;
+    }
+    return Ok();
+}
+
+/// The objects of collection `collectionId` (not tombstones), by href; with their data when `withData`.
+public async fn objects(
+    store: borrow MailStore,
+    collectionId: i64,
+    withData: bool,
+    into: borrow mut Vector<PimObject>,
+) -> Result<void, PimError> {
+    var params = PgParams.create();
+    boundPim(params.int64(collectionId))?;
+    var sql = String.create();
+    objectSql(withData, "collection_id = $1 AND NOT deleted ORDER BY href", mut sql)?;
+    return await objectRows(store, sql.view(), params, withData, into);
+}
+
+/// The objects of a calendar that may overlap `start..end` (seconds; null: unbounded), of `component` (empty:
+/// any). Times with a TZID were stored as if UTC, so the range is widened by 14 hours each way; callers that need
+/// exactness check each object.
+public async fn objectsInRange(
+    store: borrow MailStore,
+    collectionId: i64,
+    start: i64?,
+    end: i64?,
+    component: StringView,
+    withData: bool,
+    into: borrow mut Vector<PimObject>,
+) -> Result<void, PimError> {
+    var params = PgParams.create();
+    boundPim(params.int64(collectionId))?;
+    match (start) {
+        Some(s) => { boundPim(params.int64(s - 50400))?; }
+        null => { boundPim(params.sqlNull())?; }
+    }
+    match (end) {
+        Some(e) => { boundPim(params.int64(e + 50400))?; }
+        null => { boundPim(params.sqlNull())?; }
+    }
+    boundPim(params.text(component))?;
+    var sql = String.create();
+    objectSql(
+        withData,
+        "collection_id = $1 AND NOT deleted AND ($4 = '' OR component = $4) AND ($2::int8 IS NULL OR dtend IS NULL OR dtend > to_timestamp($2::int8::float8) OR (dtstart IS NOT NULL AND dtend = dtstart AND dtstart >= to_timestamp($2::int8::float8))) AND ($3::int8 IS NULL OR dtstart IS NULL OR dtstart < to_timestamp($3::int8::float8)) ORDER BY href",
+        mut sql,
+    )?;
+    return await objectRows(store, sql.view(), params, withData, into);
+}
+
+/// The objects (tombstones too) changed since `modseq`, oldest change first, without data.
+public async fn changes(
+    store: borrow MailStore,
+    collectionId: i64,
+    modseq: i64,
+    into: borrow mut Vector<PimObject>,
+) -> Result<void, PimError> {
+    var params = PgParams.create();
+    boundPim(params.int64(collectionId))?;
+    boundPim(params.int64(modseq))?;
+    var sql = String.create();
+    objectSql(false, "collection_id = $1 AND modseq > $2 ORDER BY modseq, id", mut sql)?;
+    return await objectRows(store, sql.view(), params, false, into);
+}
+
+/// The object `href` of a collection (not a tombstone), with its data; false when there is none.
+public async fn objectNamed(
+    store: borrow MailStore,
+    collectionId: i64,
+    href: StringView,
+    into: borrow mut PimObject,
+) -> Result<bool, PimError> {
+    var params = PgParams.create();
+    boundPim(params.int64(collectionId))?;
+    boundPim(params.text(href))?;
+    var sql = String.create();
+    objectSql(true, "collection_id = $1 AND href = $2 AND NOT deleted", mut sql)?;
+    var rows = PgRows.create();
+    await run(store, sql.view(), params, mut rows)?;
+    if (rows.rowCount() == 0) {
+        return Ok(false);
+    }
+    objectAt(rows, 0, true, into)?;
+    return Ok(true);
+}
+
+/// Object `id` (not a tombstone), with its data, if it is in one of the user's collections.
+public async fn objectById(store: borrow MailStore, userId: i64, id: i64, into: borrow mut PimObject) -> Result<bool, PimError> {
+    var params = PgParams.create();
+    boundPim(params.int64(id))?;
+    boundPim(params.int64(userId))?;
+    var sql = String.create();
+    objectSql(
+        true,
+        "id = $1 AND NOT deleted AND collection_id IN (SELECT id FROM dav_collections WHERE user_id = $2)",
+        mut sql,
+    )?;
+    var rows = PgRows.create();
+    await run(store, sql.view(), params, mut rows)?;
+    if (rows.rowCount() == 0) {
+        return Ok(false);
+    }
+    objectAt(rows, 0, true, into)?;
+    return Ok(true);
+}
+
+fn sqlPut() -> StringView =>
+    """
+    WITH cur AS (
+        SELECT id, etag, deleted FROM dav_objects WHERE collection_id = $1 AND href = $2 FOR UPDATE
+    ), checks AS (
+        SELECT NOT EXISTS (SELECT 1 FROM dav_objects
+                           WHERE collection_id = $1 AND uid = $3 AND href <> $2 AND NOT deleted) AS free,
+               (CASE WHEN $8 = '' THEN TRUE ELSE EXISTS (SELECT 1 FROM cur WHERE NOT deleted AND etag = $8) END)
+               AND (NOT $9 OR NOT EXISTS (SELECT 1 FROM cur WHERE NOT deleted)) AS allowed
+    ), bump AS (
+        UPDATE dav_collections SET modseq = modseq + 1, updated_at = now()
+        WHERE id = $1 AND (SELECT free AND allowed FROM checks) RETURNING modseq
+    ), put AS (
+        INSERT INTO dav_objects (collection_id, href, uid, component, data, etag, dtstart, dtend, created_modseq, modseq)
+        SELECT $1, $2, $3, $4, $5, $6, to_timestamp($7::int8::float8), to_timestamp($10::int8::float8), bump.modseq, bump.modseq
+        FROM bump
+        ON CONFLICT (collection_id, href) DO UPDATE SET
+            uid = EXCLUDED.uid, component = EXCLUDED.component, data = EXCLUDED.data, etag = EXCLUDED.etag,
+            dtstart = EXCLUDED.dtstart, dtend = EXCLUDED.dtend, modseq = EXCLUDED.modseq,
+            created_modseq = CASE WHEN dav_objects.deleted THEN EXCLUDED.created_modseq ELSE dav_objects.created_modseq END,
+            deleted = FALSE, updated_at = now()
+        RETURNING id, created_modseq = modseq AS created, modseq
+    )
+    SELECT (SELECT free FROM checks), (SELECT allowed FROM checks), (SELECT id FROM put), (SELECT created FROM put),
+           (SELECT modseq FROM put)
+    """;
+
+/// Stores `data` as object `href` of collection `collectionId` (the caller has checked the collection is the
+/// user's): created or replaced. `ifMatch` (an etag, without quotes; empty: none) must be the current one;
+/// `ifNoneMatch` (If-None-Match: *) means it must not exist.
+public async fn putObject(
+    store: borrow MailStore,
+    userId: i64,
+    collectionId: i64,
+    href: StringView,
+    data: StringView,
+    ifMatch: StringView,
+    ifNoneMatch: bool,
+    outcome: borrow mut PutOutcome,
+) -> Result<void, PimError> {
+    var facts = ObjectFacts.create();
+    match (objectFacts(data.bytes(), mut facts)) {
+        Ok(true) => {}
+        Ok(false) => { return Err(PimError.Invalid); }
+        Err(_) => { return Err(PimError.OutOfMemory); }
+    }
+    oomPim(etagOf(data.bytes(), mut outcome.etag))?;
+    var params = PgParams.create();
+    boundPim(params.int64(collectionId))?;
+    boundPim(params.text(href))?;
+    boundPim(params.text(facts.uid.view()))?;
+    boundPim(params.text(facts.component.view()))?;
+    boundPim(params.text(data))?;
+    boundPim(params.text(outcome.etag.view()))?;
+    match (facts.start) {
+        Some(s) => { boundPim(params.int64(s))?; }
+        null => { boundPim(params.sqlNull())?; }
+    }
+    boundPim(params.text(ifMatch))?;
+    boundPim(params.bool(ifNoneMatch))?;
+    match (facts.end) {
+        Some(e) => { boundPim(params.int64(e))?; }
+        null => { boundPim(params.sqlNull())?; }
+    }
+    var rows = PgRows.create();
+    await run(store, sqlPut(), params, mut rows)?;
+    if (rows.rowCount() == 0) {
+        return Err(PimError.Unavailable);
+    }
+    if (!(rows.bool(0, 0) ?? false)) {
+        return Err(PimError.UidConflict);
+    }
+    if (!(rows.bool(0, 1) ?? false)) {
+        return Err(PimError.Precondition);
+    }
+    match (rows.int64(0, 2)) {
+        Some(id) => { outcome.id = id; }
+        null => { return Err(PimError.NotFound); } // the collection went
+    }
+    outcome.created = rows.bool(0, 3) ?? false;
+    outcome.modseq = rows.int64(0, 4) ?? 0;
+    await store.notifications().raise(userId, 0 - collectionId);
+    return Ok();
+}
+
+fn sqlDelete() -> StringView =>
+    """
+    WITH cur AS (
+        SELECT id, etag FROM dav_objects WHERE collection_id = $1 AND href = $2 AND NOT deleted FOR UPDATE
+    ), bump AS (
+        UPDATE dav_collections SET modseq = modseq + 1, updated_at = now()
+        WHERE id = $1 AND EXISTS (SELECT 1 FROM cur WHERE $3 = '' OR etag = $3) RETURNING modseq
+    ), gone AS (
+        UPDATE dav_objects o SET deleted = TRUE, data = '', modseq = bump.modseq, updated_at = now()
+        FROM bump, cur WHERE o.id = cur.id RETURNING o.id
+    )
+    SELECT EXISTS (SELECT 1 FROM cur), (SELECT id FROM gone)
+    """;
+
+/// Deletes object `href` (leaving a tombstone); `ifMatch` as for `putObject`.
+public async fn deleteObject(
+    store: borrow MailStore,
+    userId: i64,
+    collectionId: i64,
+    href: StringView,
+    ifMatch: StringView,
+) -> Result<void, PimError> {
+    var params = PgParams.create();
+    boundPim(params.int64(collectionId))?;
+    boundPim(params.text(href))?;
+    boundPim(params.text(ifMatch))?;
+    var rows = PgRows.create();
+    await run(store, sqlDelete(), params, mut rows)?;
+    if (rows.rowCount() == 0 || !(rows.bool(0, 0) ?? false)) {
+        return Err(PimError.NotFound);
+    }
+    if (rows.int64(0, 1) == null) {
+        return Err(PimError.Precondition);
+    }
+    await store.notifications().raise(userId, 0 - collectionId);
+    return Ok();
+}

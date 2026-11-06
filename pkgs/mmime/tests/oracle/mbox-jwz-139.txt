@@ -1,0 +1,10 @@
+size 1296
+envelope (NIL "test of URLs in text/plain messages" ((NIL NIL "jwz" "MISSING_DOMAIN")) ((NIL NIL "jwz" "MISSING_DOMAIN")) ((NIL NIL "jwz" "MISSING_DOMAIN")) NIL NIL NIL NIL NIL)
+bodystructure ("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 1237 28 NIL NIL NIL NIL)
+body ("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 1237 28)
+section HEADER 59 19a7f798cf8f52d4baf1b7d42b6dbef3485212295a201fc942a0a7225efc4f50
+section TEXT 1237 e05285db9293b22f787b859b68201381fe84a4cbd9fabcd6616598e5bbfcb2ae
+section HEADER.FIELDS 59 19a7f798cf8f52d4baf1b7d42b6dbef3485212295a201fc942a0a7225efc4f50
+section HEADER.FIELDS.NOT 2 7eb70257593da06f682a3ddda54a9d260d4fc514f645237f5ca74b08f8da61a6
+section 1 1237 e05285db9293b22f787b859b68201381fe84a4cbd9fabcd6616598e5bbfcb2ae
+section 1.MIME 59 19a7f798cf8f52d4baf1b7d42b6dbef3485212295a201fc942a0a7225efc4f50

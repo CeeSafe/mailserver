@@ -1,0 +1,10 @@
+size 582
+envelope ("Wed, 22 Jul 2015 01:02:29 +0900" "=?ISO-2022-JP?B?GyRCRnxLXDhsJWEhPCVrJUYlOSVIGyhCICh0ZXN0aW5nIEph?= =?ISO-2022-JP?B?cGFuZXNlIGVtYWlscyk=?=" (("Atsushi Eno" NIL "x" "x.com")) (("Atsushi Eno" NIL "x" "x.com")) (("Atsushi Eno" NIL "x" "x.com")) (("Jeffrey Stedfast" NIL "x" "x.com")) NIL NIL NIL "<55AE6D15.4010805@veritas-vos-liberabit.com>")
+bodystructure ("text" "plain" ("charset" "ISO-2022-JP") NIL NIL "7bit" 117 6 NIL NIL NIL NIL)
+body ("text" "plain" ("charset" "ISO-2022-JP") NIL NIL "7bit" 117 6)
+section HEADER 465 ac47b0a37e134f5e236b1cba3859a7f4d46ef768a68dd84e22682296842342c8
+section TEXT 117 afa07b94d2fd62b90e1cc3ff6a29786cc2e5dff8b0af27e3c2554f80f2c18844
+section HEADER.FIELDS 325 1f9e3ee29ea45fe0aebdc4b168051515307fe80dd0588cc1c332910d324a1c16
+section HEADER.FIELDS.NOT 142 caf7465fcba5b7625264f079025c49339f201b9e41f17637c328243a9d814fd1
+section 1 117 afa07b94d2fd62b90e1cc3ff6a29786cc2e5dff8b0af27e3c2554f80f2c18844
+section 1.MIME 465 ac47b0a37e134f5e236b1cba3859a7f4d46ef768a68dd84e22682296842342c8

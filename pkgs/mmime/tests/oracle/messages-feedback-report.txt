@@ -1,0 +1,20 @@
+size 1679
+envelope ("Thu, 8 Mar 2005 17:40:36 EDT" "FW: Earn money" NIL NIL NIL ((NIL NIL "abuse" "example.net")) NIL NIL NIL NIL)
+bodystructure (("text" "plain" ("charset" "US-ASCII") NIL NIL "7bit" 194 3 NIL NIL NIL NIL) ("message" "feedback-report" NIL NIL NIL "7bit" 475 NIL NIL NIL NIL) ("message" "rfc822" NIL NIL NIL "7bit" 447 ("Thu, 2 Sep 2004 12:31:03 -0500" "Earn money" ((NIL NIL "somespammer" "example.net")) ((NIL NIL "somespammer" "example.net")) ((NIL NIL "somespammer" "example.net")) ((NIL NIL "Undisclosed" "SYNTAX_ERROR")) NIL NIL NIL "8787KJKJ3K4J3K4J3K4J3.mail@example.net") ("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 62 3 NIL NIL NIL NIL) 14 NIL ("inline" NIL) NIL NIL) "report" ("report-type" "feedback-report" "boundary" "part1_13d.2e68ed54_boundary") NIL NIL NIL)
+body (("text" "plain" ("charset" "US-ASCII") NIL NIL "7bit" 194 3) ("message" "feedback-report" NIL NIL NIL "7bit" 475) ("message" "rfc822" NIL NIL NIL "7bit" 447 ("Thu, 2 Sep 2004 12:31:03 -0500" "Earn money" ((NIL NIL "somespammer" "example.net")) ((NIL NIL "somespammer" "example.net")) ((NIL NIL "somespammer" "example.net")) ((NIL NIL "Undisclosed" "SYNTAX_ERROR")) NIL NIL NIL "8787KJKJ3K4J3K4J3K4J3.mail@example.net") ("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 62 3) 14) "report")
+section HEADER 248 71c83d0916545c512fbcca6ee9db5699fbf6d94f0faedb2e9dc77d34dc2482fe
+section TEXT 1431 2a2e5e4c745e19a2fd4712175a669584a02394687f4071607a6ca1c6b7a6d6fe
+section HEADER.FIELDS 195 1a25eb70b4afcce8368c12348844605e49992bd86daff405f22e39e1f0d1d2be
+section HEADER.FIELDS.NOT 55 f2be3649be8e798f8561b388992eb822723ca431324777696fdd1ca06f37735d
+section 1 194 8bb6f6217a6e719b41b8ef542fe49e3b35504add70b09a4f4c11683939199b9c
+section 1.MIME 81 417757f71c6d3bc751d8a34a9b1beae13fcd738a16d2d740e7f6b0a6d0577298
+section 2 475 3fa9818b4eac130527e21c1e0e08809fd84d250c601d45e7749c0e2e8d1d1e0d
+section 2.MIME 41 5fa2d3e437df382275fcf6ef4fc7226fe840434eb56656d3a0f11238d2ea104b
+section 3 447 f663e154c63a768c2992922267fbdfe0acaead34921c509974bbc5681e88a644
+section 3.MIME 61 97e018d5cbdfbbc8061a7750192d20b890ca1dd8e1e4e5deaaaaa0c2b789ba4c
+section 3.HEADER 385 68c68a97f639baff77b45ff2029686cfe88427acf2f786c64ba5650b4312352d
+section 3.TEXT 62 90763e93c385eaff1d4587f35bb34cd66143103aa8a823026e9a85a41327fb7b
+section 3.HEADER.FIELDS 202 45e44e73b3cd0f84b9d64065fa91773daf5cf07946b6c2b52c62bec56f90215d
+section 3.HEADER.FIELDS.NOT 185 17852604b3d173a56587df14ac51b912212914c6180efe3192d20bdb8d170fb3
+section 3.1 62 90763e93c385eaff1d4587f35bb34cd66143103aa8a823026e9a85a41327fb7b
+section 3.1.MIME 385 68c68a97f639baff77b45ff2029686cfe88427acf2f786c64ba5650b4312352d

@@ -1,0 +1,22 @@
+size 3782
+envelope ("Wed, 11 Mar 1992 16:27:37 -0500 (EST)" "Barbershop MIME" (("Nathaniel Borenstein" NIL "nsb" "MISSING_DOMAIN")) (("Nathaniel Borenstein" NIL "nsb" "MISSING_DOMAIN")) (("Nathaniel Borenstein" NIL "nsb" "MISSING_DOMAIN")) ((NIL NIL "ietf-822" "dimacs.rutgers.edu") (NIL NIL "info-metamail" "MISSING_DOMAIN")) (("John Lamb" NIL "lamb" "MISSING_DOMAIN") ("Michael Littman" NIL "mlittman" "MISSING_DOMAIN") ("David A. Braun" NIL "braun" "MISSING_DOMAIN")) NIL NIL "<Edjbh9O0M2YtQL5uct@thumper.bellcore.com>")
+bodystructure (("text" "plain" ("charset" "US-ASCII") NIL NIL "7bit" 832 15 NIL NIL NIL NIL) (("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 501 10 NIL NIL NIL NIL) ("message" "external-body" ("access-type" "anon-ftp" "site" "thumper.bellcore.com" "directory" "pub/nsb" "name" "quartet.au") NIL "Let Me Sing You Email (audio)" "7bit" 33 NIL NIL NIL NIL) ("text" "plain" ("charset" "US-ASCII") NIL NIL "quoted-printable" 5 2 NIL NIL NIL NIL) ("message" "external-body" ("access-type" "anon-ftp" "site" "thumper.bellcore.com" "directory" "pub/nsb" "name" "quartet.gif") NIL "The Telephone Chords, A Moment Immortalized" "7bit" 31 NIL NIL NIL NIL) ("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 229 7 NIL NIL NIL NIL) "mixed" ("boundary" "Alternative.Boundary.Qdjbh920M2YtQL5uQz") NIL NIL NIL) "alternative" ("boundary" "Interpart.Boundary.Qdjbh920M2Yt4L5uUD") NIL NIL NIL)
+body (("text" "plain" ("charset" "US-ASCII") NIL NIL "7bit" 832 15) (("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 501 10) ("message" "external-body" ("access-type" "anon-ftp" "site" "thumper.bellcore.com" "directory" "pub/nsb" "name" "quartet.au") NIL "Let Me Sing You Email (audio)" "7bit" 33) ("text" "plain" ("charset" "US-ASCII") NIL NIL "quoted-printable" 5 2) ("message" "external-body" ("access-type" "anon-ftp" "site" "thumper.bellcore.com" "directory" "pub/nsb" "name" "quartet.gif") NIL "The Telephone Chords, A Moment Immortalized" "7bit" 31) ("text" "richtext" ("charset" "US-ASCII") NIL NIL "quoted-printable" 229 7) "mixed") "alternative")
+section HEADER 780 e6bb015afad42480b85230989afaf735f517f69e3b4932393aeeaaf5a1e511ea
+section TEXT 3002 fbba2c9d1d20668689afa7e8470864e0b80e6046541f62bca6a8b588b592e93b
+section HEADER.FIELDS 376 c48d4d2005a6422c35a4472c8827ef28d2d92a38a219009756b4d18a5d46f200
+section HEADER.FIELDS.NOT 406 06ce099ffd6afa714a574df2632b5f5e380fe8a62bc3ecfdf6a75e1a539401b6
+section 1 832 3aa29bab8f3d10b0af18cfc3b38a9b6b5302f250e1632d5ad24b8166df4674d2
+section 1.MIME 46 b3532c649b28a23803c77a2acc4907f5048ea77b89e0c51dcf7f271f2db4bfa6
+section 2 1749 7e797c0da13367df1dae606de3637599c39902eb29bd4d5a0ff2bbe102926f49
+section 2.MIME 88 1c2972044b4167eed4d499cefb4916e881d512912b28f9c6bfd7fbd83fd7d5b7
+section 2.1 501 c87397565a997e6755240acb2fad4a25728d5e2b664fd28a5e3c95437667c6d4
+section 2.1.MIME 94 7d35d8c48d3869c4391f6ff71123bfb4c8466e5b04f02d64c3961f23d7d8bf61
+section 2.2 33 a6d325f6c2ed752ed5f3cb9020ed8412cbf0b1cd307e1c2d4d7c5956c245115d
+section 2.2.MIME 193 6abcffe86a96a77e0c5f25948e53366c47f67d7c4ef29e57cec04279f942159a
+section 2.3 5 2e4daa8d8fc917f0fb0b89082e3259bf96d8d531b517320f6c67d25d83be2ddf
+section 2.3.MIME 91 d0bbf4c2077be2852d24687e83fdf099ead9f2ff1ea6251abc1c300a4aecefad
+section 2.4 31 d70f20c47bd19d41e9a9466735d05249b2d58047be60be692ab4f43f6b0e7839
+section 2.4.MIME 208 98b045ac53eafa69bd364c25c6b7d361904bae77eb3ecb958b74d255c931d2e2
+section 2.5 229 2018096898270f1ef003a8c45d051dd69dd8ace9e3690bc393bd09d63c926386
+section 2.5.MIME 94 7d35d8c48d3869c4391f6ff71123bfb4c8466e5b04f02d64c3961f23d7d8bf61

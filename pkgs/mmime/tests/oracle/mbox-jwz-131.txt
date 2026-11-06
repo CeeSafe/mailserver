@@ -1,0 +1,18 @@
+size 2442
+envelope ("Mon, 29 Jul 1996 02:13:08 -0700" "email delivery error" (("The Post Office" NIL "postmaster" "mm1.sprynet.com")) (("The Post Office" NIL "postmaster" "mm1.sprynet.com")) (("The Post Office" NIL "postmaster" "mm1.sprynet.com")) ((NIL NIL "unlisted-recipients" NIL) (NIL NIL NIL NIL)) (("The Postmaster" NIL "postmaster" "mm1.sprynet.com")) NIL NIL "<96Jul29.022158-0700pdt.148226-12799+708@mm1.sprynet.com>")
+bodystructure (("message" "delivery-status" NIL NIL NIL "7bit" 194 NIL NIL NIL NIL) ("message" "rfc822" NIL NIL NIL "7bit" 832 ("Mon, 29 Jul 1996 02:04:52 -0700" "unsubscribe" (("Jamie Zawinski" NIL "jwz" "netscape.com")) ((NIL NIL "jwz" "netscape.com")) (("Jamie Zawinski" NIL "jwz" "netscape.com")) ((NIL NIL "newsletter-request" "imusic.com")) NIL NIL NIL "<31FC7EB4.41C6@netscape.com>") ("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 11 0 NIL NIL NIL NIL) 15 NIL NIL NIL NIL) "report" ("report-type" "delivery-status" "boundary" "A41C7.838631588=_/mm1") NIL NIL NIL)
+body (("message" "delivery-status" NIL NIL NIL "7bit" 194) ("message" "rfc822" NIL NIL NIL "7bit" 832 ("Mon, 29 Jul 1996 02:04:52 -0700" "unsubscribe" (("Jamie Zawinski" NIL "jwz" "netscape.com")) ((NIL NIL "jwz" "netscape.com")) (("Jamie Zawinski" NIL "jwz" "netscape.com")) ((NIL NIL "newsletter-request" "imusic.com")) NIL NIL NIL "<31FC7EB4.41C6@netscape.com>") ("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 11 0) 15) "report")
+section HEADER 1145 8fbd7b23b8a4453f0da8e83ccb86522e5c8ec7e3535ddc27b5f98bd06b8d9116
+section TEXT 1297 6a80ab567c6981896470d2c366261fdf196f8adc5d6ca9a5bcd396cfe257493d
+section HEADER.FIELDS 390 c265a9416ebfa158acf1dfbc41a6058aed80d37b89ff5fb56901873f03aabd2c
+section HEADER.FIELDS.NOT 757 277b05f011e98c4bb3f5c7103c17902ff156f9f691ec0836761bb8fc88d9c487
+section 1 194 6ada081950359427eaa787a41a8bda4b08493c3d0d58871a81413cbd6e17f66d
+section 1.MIME 41 ac3f707be26d1ced18b7c61c482c6de1e9efb866c0804cfab299612eae1d0c0b
+section 2 832 e123f41515f46e904ba28578b367f883afaad34df4cb7b2d7169f6081e1bba04
+section 2.MIME 32 94984f8e29692f32be6724e812f5568ad06604428ccd4509df6c3a1c966800a0
+section 2.HEADER 821 562f6c97365bb7ed8d559a490414dac8f3183e4331154d2dd73ec72645aeaae7
+section 2.TEXT 11 613752495dfab4548b637e642c37cf1770b4d3accca287615f82fa872b1fdaef
+section 2.HEADER.FIELDS 225 d11de0e81a129ef543e50802b3f558c1b41d3993e7507c6751b3c02ec680f831
+section 2.HEADER.FIELDS.NOT 598 2ddba61340f6a72737cb7acd68fbd94ddff41d7faae04c099088420e23829529
+section 2.1 11 613752495dfab4548b637e642c37cf1770b4d3accca287615f82fa872b1fdaef
+section 2.1.MIME 821 562f6c97365bb7ed8d559a490414dac8f3183e4331154d2dd73ec72645aeaae7

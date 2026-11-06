@@ -1,0 +1,12 @@
+size 913
+envelope ("Tue, 12 Nov 2013 09:12:42 -0500" "test of a message containing unexpected null bytes in the content" ((NIL NIL "mimekit" "example.com")) ((NIL NIL "mimekit" "example.com")) ((NIL NIL "mimekit" "example.com")) ((NIL NIL "mimekit" "example.com")) NIL NIL NIL "<54AD68C9E3B0184CAC6041320424FD1B5B81E74D@localhost.localdomain>")
+bodystructure (("text" "plain" ("charset" "utf-8") NIL NIL "7bit" 67 1 NIL NIL NIL NIL) ("application" "octet-stream" ("name" "binary.bin") NIL NIL "7bit" 258 NIL ("attachment" ("filename" "binary.bin")) NIL NIL) "mixed" ("boundary" "=-27MUdiQ128zfX4m9KVfVFw==") NIL NIL NIL)
+body (("text" "plain" ("charset" "utf-8") NIL NIL "7bit" 67 1) ("application" "octet-stream" ("name" "binary.bin") NIL NIL "7bit" 258) "mixed")
+section HEADER 336 ac654d007107772cf0182c6f2b06d68220a8ef4ae4d24877f7259ee5640c458e
+section TEXT 577 f3e6006953fa35ac281500ea2b5c665d816cd4eee3cbd5a0363e503322d1af9d
+section HEADER.FIELDS 317 9cc56afdeb2dc6500f3162f773a729685b395a93e07e20d6ddb189b6889e5e9d
+section HEADER.FIELDS.NOT 21 07a26ab8981ff3b1de28da29cf47f47e315b9c25685121dc5ebb60391005b2de
+section 1 67 2cf772049edb6f75e131d6fdb3bd703b0be32ab827516ccf9786b1521ceba4f3
+section 1.MIME 43 898726ecfd03d1be63b954310c21c8a7603e00979b91fb78949c88de26d728fb
+section 2 258 d523ee89362a2a19d9d64518fad23f2270e25a5b4b1f5158436dbc8c5736183d
+section 2.MIME 113 090163e30e44c10e71e620c2eb53cb3c6ea74861e2644c8bda0b076346986496

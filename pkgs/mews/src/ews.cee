@@ -1,0 +1,737 @@
+// Exchange Web Services (SOAP 1.1) at /EWS/Exchange.asmx, as the C# server served it (EwsController): enough of
+// EWS for macOS Mail and Outlook to sync folders and messages, read, flag, move, delete and send. Mail folders are
+// the user's mailboxes, all children of a virtual root; Calendar, Contacts, Tasks, Notes, Journal and Outbox are
+// virtual and empty, as there. Every request carries Basic credentials (mpim's basicLogin and its cache).
+
+import mhttp.Request;
+import mhttp.Response;
+import mpim.Account;
+import mpim.basicLogin;
+import mpim.loginAnswer;
+import msmtp.SmtpContext;
+import mstore.MailboxList;
+import mxml.XmlDocument;
+import mxml.XmlWriter;
+import mxml.parseXml;
+import postgres.PgParams;
+import postgres.PgRows;
+
+/// Why an operation could not be answered at all (a SOAP fault, not an error response message).
+public enum EwsError {
+    OutOfMemory,
+    /// The store failed.
+    Unavailable,
+}
+
+fn mem(r: Result<void, AllocError>) -> Result<void, EwsError> => match (r) {
+    Ok() => Ok(),
+    Err(_) => Err(EwsError.OutOfMemory),
+};
+
+/// Answers a request to `/EWS/Exchange.asmx`.
+public async fn serveEws(mail: borrow SmtpContext, request: borrow Request) -> Result<Response, AllocError> {
+    if (request.isMethod("GET") || request.isMethod("HEAD")) {
+        var r = Response.text(200, "CosmoMail EWS endpoint")?;
+        r.header("X-EWS-Version", "Exchange2016")?;
+        return Ok(r);
+    }
+    if (!request.isMethod("POST")) {
+        var r = Response.text(405, "Method not allowed.")?;
+        r.header("Allow", "GET, HEAD, POST")?;
+        return Ok(r);
+    }
+    var account = Account.create();
+    match (await basicLogin(mail, request, mut account)) {
+        Ok() => {}
+        Err(f) => { return loginAnswer(f, "CosmoMail"); }
+    }
+    let doc = match (parseXml(request.body.view())) {
+        Ok(d) => d,
+        Err(_) => { return faultResponse("Client", "Invalid SOAP request"); }
+    };
+    let op = match (operationOf(doc)) {
+        Some(o) => o,
+        null => { return faultResponse("Client", "Invalid SOAP request"); }
+    };
+    var name = String.create();
+    name.append(StringView.fromUtf8(doc.localName(op)) ?? "")?;
+    var w = XmlWriter.document();
+    let outcome = await dispatch(mail, account, doc, op, name.view(), mut w);
+    match (outcome) {
+        Ok() => { return xmlResponse(w); }
+        Err(EwsError.OutOfMemory) => { return faultResponse("Server", "Out of memory"); }
+        Err(EwsError.Unavailable) => {
+            return faultResponse("Server", "The mail store is unavailable; try again later");
+        }
+    }
+}
+
+async fn dispatch(
+    mail: borrow SmtpContext,
+    account: borrow Account,
+    doc: borrow XmlDocument,
+    op: usize,
+    name: StringView,
+    w: borrow mut XmlWriter,
+) -> Result<void, EwsError> {
+    if (name == "GetFolder") {
+        return await getFolder(mail, account, doc, op, w);
+    }
+    if (name == "FindFolder") {
+        return await findFolder(mail, account, doc, op, w);
+    }
+    if (name == "SyncFolderHierarchy") {
+        return await syncFolderHierarchy(mail, account, doc, op, w);
+    }
+    if (name == "SyncFolderItems") {
+        return await syncFolderItems(mail, account, doc, op, w);
+    }
+    if (name == "FindItem") {
+        return await findItem(mail, account, doc, op, w);
+    }
+    if (name == "GetItem") {
+        return await getItem(mail, account, doc, op, w);
+    }
+    if (name == "UpdateItem") {
+        return await updateItem(mail, account, doc, op, w);
+    }
+    if (name == "CreateItem") {
+        return await createItem(mail, account, doc, op, w);
+    }
+    if (name == "DeleteItem") {
+        return await deleteItem(mail, account, doc, op, w);
+    }
+    if (name == "MoveItem" || name == "CopyItem") {
+        return await transferItem(mail, account, doc, op, name, w);
+    }
+    if (name == "Subscribe") {
+        return subscribe(account, doc, op, w);
+    }
+    if (name == "GetEvents") {
+        return getEvents(doc, op, w);
+    }
+    if (name == "GetStreamingEvents") {
+        // Served by streamEvents before routing; reached only if that hook is missing.
+        beginEnvelope(w, name);
+        failure(w, name, "ErrorInvalidRequest", "Streaming notifications need a streaming connection.");
+        endEnvelope(w);
+        return Ok();
+    }
+    // GetServiceConfiguration, ResolveNames, GetUserConfiguration, GetUserAvailability, GetInboxRules, FindPeople,
+    // ConvertId, Unsubscribe and the rest: an empty success, as the C# server answered.
+    beginEnvelope(w, name);
+    success(w, name);
+    endEnvelope(w);
+    return Ok();
+}
+
+// ---- Folders ----
+
+const ROOT: i64 = -1;
+const CALENDAR: i64 = -2;
+const CONTACTS: i64 = -3;
+const TASKS: i64 = -4;
+const NOTES: i64 = -5;
+const JOURNAL: i64 = -6;
+const OUTBOX: i64 = -7;
+/// The mailbox's true root (DistinguishedFolderId `root`), whose child is ROOT (`msgfolderroot`, the top of the
+/// information store) as in Exchange; Apple Mail builds its folder tree from these parents, so none may be its own.
+const TOP: i64 = -8;
+
+/// The folders besides the mailboxes that GetFolder knows, and that the hierarchy therefore lists too: a client
+/// that resolves a distinguished folder's id must find it in the hierarchy it synced (Apple Mail asserts so).
+const VIRTUAL_FOLDERS: [i64; 6] = [CALENDAR, CONTACTS, TASKS, NOTES, JOURNAL, OUTBOX];
+
+/// The extended MAPI properties a FolderShape asks for that we answer: PR_ENTRYID (0x0FFF), PR_ATTR_HIDDEN
+/// (0x10F4) and PR_CONTAINER_CLASS (0x3613). Others are left out, as Exchange leaves out properties not set.
+struct FolderProps {
+    entryId: bool;
+    hidden: bool;
+    containerClass: bool;
+
+    fn none() -> FolderProps => FolderProps { entryId: false, hidden: false, containerClass: false };
+}
+
+fn hexTag(text: Slice<u8>) -> i64? {
+    if (text.length < 3 || text[0] != 0x30 || (text[1] != 0x78 && text[1] != 0x58)) {
+        return null;
+    }
+    var v: i64 = 0;
+    for (c in text[2..]) {
+        let d: i64 =
+            if (c >= 0x30 &&
+                c <= 0x39) (c - 0x30) as i64 else if (c >= 0x61 &&
+                c <= 0x66) (c - 0x61 + 10) as i64 else if (c >= 0x41 && c <= 0x46) (c - 0x41 + 10) as i64 else -1;
+        if (d < 0 || v > 0xffffff) {
+            return null;
+        }
+        v = v * 16 + d;
+    }
+    return v;
+}
+
+/// The extended properties `op`'s FolderShape asks for.
+fn folderProps(doc: borrow XmlDocument, op: usize) -> FolderProps {
+    var props = FolderProps.none();
+    let stop = doc.end(op);
+    for (at in (op + 1)..stop) {
+        if (!doc.isElement(at) || doc.localName(at) != "ExtendedFieldURI".bytes()) {
+            continue;
+        }
+        match (doc.attribute(at, "PropertyTag")) {
+            Some(a) => {
+                let tag = hexTag(doc.value(a)) ?? -1;
+                if (tag == 0x0fff) {
+                    props.entryId = true;
+                } else if (tag == 0x10f4) {
+                    props.hidden = true;
+                } else if (tag == 0x3613) {
+                    props.containerClass = true;
+                }
+            }
+            null => {}
+        }
+    }
+    return props;
+}
+
+fn isVirtual(id: i64) -> bool => id < 0 && id >= TOP;
+
+/// A folder: a mailbox, or a virtual one (negative id).
+struct Folder {
+    id: i64;
+    name: String;
+    uidValidity: i64;
+    highestModseq: i64;
+    total: i64;
+    unread: i64;
+}
+
+fn virtualFolder(id: i64) -> Result<Folder, AllocError> {
+    var name = String.create();
+    name.append(
+        if (id ==
+            ROOT) "Top of Information Store" else if (id ==
+            TOP) "Root" else if (id ==
+            CALENDAR) "Calendar" else if (id ==
+            CONTACTS) "Contacts" else if (id ==
+            TASKS) "Tasks" else if (id == NOTES) "Notes" else if (id == JOURNAL) "Journal" else "Outbox",
+    )?;
+    return Ok(Folder { id: id, name: name, uidValidity: 1, highestModseq: 0, total: 0, unread: 0 });
+}
+
+fn folderAt(list: borrow MailboxList, i: usize) -> Result<Folder, AllocError> {
+    var name = String.create();
+    name.append(list.name(i))?;
+    return Ok(Folder {
+        id: list.id(i),
+        name: name,
+        uidValidity: list.uidValidity(i),
+        highestModseq: list.highestModseq(i),
+        total: list.messages(i),
+        unread: list.unseen(i),
+    });
+}
+
+/// The user's mailbox `id`.
+async fn mailboxFolder(mail: borrow SmtpContext, userId: i64, id: i64) -> Result<Folder?, EwsError> {
+    var list = MailboxList.create();
+    match (await mail.store.mailboxById(userId, id, mut list)) {
+        Ok(true) => {}
+        Ok(false) => { return Ok(null); }
+        Err(_) => { return Err(EwsError.Unavailable); }
+    }
+    return match (folderAt(list, 0)) {
+        Ok(f) => Ok(f),
+        Err(_) => Err(EwsError.OutOfMemory),
+    };
+}
+
+/// The user's mailbox with special use `special`, else named `name`.
+async fn specialFolder(
+    mail: borrow SmtpContext,
+    userId: i64,
+    special: StringView,
+    name: StringView,
+) -> Result<Folder?, EwsError> {
+    match (await mail.store.specialMailbox(userId, special)) {
+        Ok(Some(id)) => { return await mailboxFolder(mail, userId, id); }
+        Ok(null) => {}
+        Err(_) => { return Err(EwsError.Unavailable); }
+    }
+    var list = MailboxList.create();
+    match (await mail.store.findMailbox(userId, name, mut list)) {
+        Ok(true) => {}
+        Ok(false) => { return Ok(null); }
+        Err(_) => { return Err(EwsError.Unavailable); }
+    }
+    return match (folderAt(list, 0)) {
+        Ok(f) => Ok(f),
+        Err(_) => Err(EwsError.OutOfMemory),
+    };
+}
+
+fn lowerAscii(text: StringView, into: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    into.clear();
+    for (c in text.bytes()) {
+        into.push(if (c >= 0x41 && c <= 0x5a) c + 0x20 else c)?;
+    }
+    return Ok();
+}
+
+/// The folder a `DistinguishedFolderId` or `FolderId` element names; null when it is not the user's.
+async fn resolveFolderElement(
+    mail: borrow SmtpContext,
+    account: borrow Account,
+    doc: borrow XmlDocument,
+    element: usize,
+) -> Result<Folder?, EwsError> {
+    var id = String.create();
+    mem(attributeOf(doc, element, "Id", mut id))?;
+    let userId = account.userId;
+    if (doc.localName(element) == "DistinguishedFolderId".bytes()) {
+        var lower = Vector<u8>.create();
+        mem(lowerAscii(id.view(), mut lower))?;
+        let n = StringView.fromUtf8(lower.view()) ?? "";
+        let virtualId: i64 =
+            if (n == "root") TOP else if (n ==
+                "msgfolderroot") ROOT else if (n ==
+                "calendar") CALENDAR else if (n ==
+                "contacts") CONTACTS else if (n ==
+                "tasks") TASKS else if (n ==
+                "notes") NOTES else if (n == "journal") JOURNAL else if (n == "outbox") OUTBOX else 0;
+        if (virtualId != 0) {
+            return match (virtualFolder(virtualId)) {
+                Ok(f) => Ok(f),
+                Err(_) => Err(EwsError.OutOfMemory),
+            };
+        }
+        if (n == "inbox") {
+            return await specialFolder(mail, userId, "\\Inbox", "INBOX");
+        }
+        if (n == "sentitems") {
+            return await specialFolder(mail, userId, "\\Sent", "Sent");
+        }
+        if (n == "drafts") {
+            return await specialFolder(mail, userId, "\\Drafts", "Drafts");
+        }
+        if (n == "deleteditems") {
+            return await specialFolder(mail, userId, "\\Trash", "Trash");
+        }
+        if (n == "junkemail") {
+            return await specialFolder(mail, userId, "\\Junk", "Spam");
+        }
+        if (n == "archive" || n == "archivemsgfolderroot") {
+            return await specialFolder(mail, userId, "\\Archive", "Archive");
+        }
+        return Ok(null);
+    }
+    if (isRootFolderId(id.view().bytes())) {
+        return match (virtualFolder(ROOT)) {
+            Ok(f) => Ok(f),
+            Err(_) => Err(EwsError.OutOfMemory),
+        };
+    }
+    match (parseFolderId(id.view().bytes())) {
+        Some(m) => {
+            if (m < 0) {
+                if (!isVirtual(m)) {
+                    return Ok(null);
+                }
+                return match (virtualFolder(m)) {
+                    Ok(f) => Ok(f),
+                    Err(_) => Err(EwsError.OutOfMemory),
+                };
+            }
+            // A forged id for someone else's mailbox is simply not found.
+            return await mailboxFolder(mail, userId, m);
+        }
+        null => {}
+    }
+    return Ok(null);
+}
+
+/// The first folder named inside `container` (a ParentFolderIds, SyncFolderId, ToFolderId or SavedItemFolderId).
+async fn resolveFolderIn(
+    mail: borrow SmtpContext,
+    account: borrow Account,
+    doc: borrow XmlDocument,
+    container: usize,
+) -> Result<Folder?, EwsError> {
+    let stop = doc.end(container);
+    for (at in (container + 1)..stop) {
+        if (doc.isElement(
+            at,
+        ) && (doc.localName(at) == "DistinguishedFolderId".bytes() || doc.localName(at) == "FolderId".bytes())) {
+            return await resolveFolderElement(mail, account, doc, at);
+        }
+    }
+    return Ok(null);
+}
+
+fn folderClass(f: borrow Folder) -> StringView =>
+    if (f.id ==
+        CALENDAR) "IPF.Appointment" else if (f.id ==
+        CONTACTS) "IPF.Contact" else if (f.id ==
+        TASKS) "IPF.Task" else if (f.id ==
+        NOTES) "IPF.StickyNote" else if (f.id == JOURNAL) "IPF.Journal" else "IPF.Note";
+
+/// A folder's id: the per-user root's for ROOT (`msgfolderroot`), else `f:<id>` (negative for virtual folders).
+fn folderIdOf(f: borrow Folder, userId: i64, out: borrow mut String) -> Result<void, AllocError> =>
+    if (f.id == ROOT) rootFolderId(userId, out) else folderId(f.id, out);
+
+/// A `t:Folder`, its members in schema order (Apple's EWS deserializer aborts on any other order): FolderId,
+/// ParentFolderId, FolderClass, DisplayName, TotalCount, ChildFolderCount, ExtendedProperty, UnreadCount. Every
+/// folder's parent is ROOT, ROOT's is TOP, and TOP has none: no folder is its own parent.
+fn writeFolder(
+    w: borrow mut XmlWriter,
+    f: borrow Folder,
+    userId: i64,
+    children: i64,
+    props: FolderProps,
+) -> Result<void, AllocError> {
+    var id = String.create();
+    folderIdOf(f, userId, mut id)?;
+    var key = String.create();
+    folderChangeKey(f.uidValidity, mut key)?;
+    var parent = String.create();
+    if (f.id == ROOT) {
+        folderId(TOP, mut parent)?;
+    } else if (f.id != TOP) {
+        rootFolderId(userId, mut parent)?;
+    }
+    w.start("t:Folder");
+    w.start("t:FolderId");
+    w.attribute("Id", id.view());
+    w.attribute("ChangeKey", key.view());
+    w.end();
+    if (parent.length > 0) {
+        w.start("t:ParentFolderId");
+        w.attribute("Id", parent.view());
+        w.attribute("ChangeKey", "AAAA");
+        w.end();
+    }
+    w.element("t:FolderClass", folderClass(f));
+    w.element("t:DisplayName", f.name.view());
+    w.number("t:TotalCount", f.total);
+    w.number("t:ChildFolderCount", children);
+    if (props.entryId) {
+        // An opaque, stable entry id: four flag bytes, then the folder id's text.
+        var entry = Vector<u8>.create();
+        entry.extend([0u8, 0u8, 0u8, 0u8][..])?;
+        entry.extend(id.view().bytes())?;
+        var value = String.create();
+        base64Of(entry.view(), mut value)?;
+        extendedProperty(w, "0xfff", "Binary", value.view());
+    }
+    if (props.hidden) {
+        extendedProperty(w, "0x10f4", "Boolean", "false");
+    }
+    if (props.containerClass) {
+        extendedProperty(w, "0x3613", "String", folderClass(f));
+    }
+    w.number("t:UnreadCount", f.unread);
+    w.end();
+    return Ok();
+}
+
+fn extendedProperty(w: borrow mut XmlWriter, tag: StringView, kind: StringView, value: StringView) {
+    w.start("t:ExtendedProperty");
+    w.start("t:ExtendedFieldURI");
+    w.attribute("PropertyTag", tag);
+    w.attribute("PropertyType", kind);
+    w.end();
+    w.element("t:Value", value);
+    w.end();
+}
+
+/// How many folders ROOT holds: the mailboxes and the virtual folders.
+fn rootChildren(mailboxes: i64) -> i64 => mailboxes + truncate<i64>(VIRTUAL_FOLDERS.length);
+
+async fn mailboxCount(mail: borrow SmtpContext, userId: i64) -> Result<i64, EwsError> {
+    var list = MailboxList.create();
+    match (await mail.store.mailboxes(userId, mut list)) {
+        Ok() => { return Ok(truncate<i64>(list.count())); }
+        Err(_) => { return Err(EwsError.Unavailable); }
+    }
+}
+
+async fn getFolder(
+    mail: borrow SmtpContext,
+    account: borrow Account,
+    doc: borrow XmlDocument,
+    op: usize,
+    w: borrow mut XmlWriter,
+) -> Result<void, EwsError> {
+    let ids = findLocal(doc, op, "FolderIds") ?? op;
+    beginEnvelope(w, "GetFolder");
+    var any = false;
+    let stop = doc.end(ids);
+    for (at in (ids + 1)..stop) {
+        if (!doc.isElement(
+            at,
+        ) || (doc.localName(at) != "DistinguishedFolderId".bytes() && doc.localName(at) != "FolderId".bytes())) {
+            continue;
+        }
+        any = true;
+        match (await resolveFolderElement(mail, account, doc, at)?) {
+            Some(f) => {
+                var children: i64 = 0;
+                if (f.id == ROOT) {
+                    children = rootChildren(await mailboxCount(mail, account.userId)?);
+                } else if (f.id == TOP) {
+                    children = 1;
+                }
+                beginSuccess(w, "GetFolder");
+                w.start("m:Folders");
+                mem(writeFolder(w, f, account.userId, children, folderProps(doc, op)))?;
+                w.end();
+                w.end();
+            }
+            null => { failure(w, "GetFolder", "ErrorItemNotFound", "Folder not found"); }
+        }
+    }
+    if (!any) {
+        failure(w, "GetFolder", "ErrorItemNotFound", "No folders specified");
+    }
+    endEnvelope(w);
+    return Ok();
+}
+
+async fn findFolder(
+    mail: borrow SmtpContext,
+    account: borrow Account,
+    doc: borrow XmlDocument,
+    op: usize,
+    w: borrow mut XmlWriter,
+) -> Result<void, EwsError> {
+    // Every mail folder is a child of the root (the C# server's flat hierarchy), as are the virtual folders; TOP's
+    // only child is the root; other folders have none.
+    var parentIsRoot = true;
+    var parentIsTop = false;
+    match (findLocal(doc, op, "ParentFolderIds")) {
+        Some(p) => {
+            match (await resolveFolderIn(mail, account, doc, p)?) {
+                Some(f) => {
+                    parentIsRoot = f.id == ROOT;
+                    parentIsTop = f.id == TOP;
+                }
+                null => {
+                    beginEnvelope(w, "FindFolder");
+                    failure(w, "FindFolder", "ErrorItemNotFound", "Folder not found");
+                    endEnvelope(w);
+                    return Ok();
+                }
+            }
+        }
+        null => {}
+    }
+    var list = MailboxList.create();
+    if (parentIsRoot) {
+        match (await mail.store.mailboxes(account.userId, mut list)) {
+            Ok() => {}
+            Err(_) => { return Err(EwsError.Unavailable); }
+        }
+    }
+    beginEnvelope(w, "FindFolder");
+    beginSuccess(w, "FindFolder");
+    w.start("m:RootFolder");
+    let props = folderProps(doc, op);
+    let total = if (parentIsRoot) rootChildren(truncate<i64>(list.count())) else if (parentIsTop) 1 else 0;
+    var count = String.create();
+    mem(count.appendNumber(total))?;
+    w.attribute("TotalItemsInView", count.view());
+    w.attribute("IncludesLastItemInRange", "true");
+    w.start("t:Folders");
+    for (i in 0..list.count()) {
+        let f = match (folderAt(list, i)) {
+            Ok(f) => f,
+            Err(_) => { return Err(EwsError.OutOfMemory); }
+        };
+        mem(writeFolder(w, f, account.userId, 0, props))?;
+    }
+    if (parentIsRoot) {
+        for (v in VIRTUAL_FOLDERS) {
+            let f = match (virtualFolder(v)) {
+                Ok(f) => f,
+                Err(_) => { return Err(EwsError.OutOfMemory); }
+            };
+            mem(writeFolder(w, f, account.userId, 0, props))?;
+        }
+    }
+    if (parentIsTop) {
+        let f = match (virtualFolder(ROOT)) {
+            Ok(f) => f,
+            Err(_) => { return Err(EwsError.OutOfMemory); }
+        };
+        mem(writeFolder(w, f, account.userId, rootChildren(truncate<i64>(list.count())), props))?;
+    }
+    w.end();
+    w.end();
+    w.end();
+    endEnvelope(w);
+    return Ok();
+}
+
+/// The folder ids a hierarchy sync state names: ours (`h:1,2,3`), or the C# server's JSON (`{"Ids":[1,2,3]}`),
+/// whose ids are the old server's and are all reported deleted. False when the state is not one of these.
+fn hierarchyState(state: StringView, into: borrow mut Vector<i64>) -> Result<bool, AllocError> {
+    into.clear();
+    if (state.length == 0) {
+        return Ok(true);
+    }
+    var raw = Vector<u8>.create();
+    if (!unbase64(state.bytes(), mut raw)) {
+        return Ok(false);
+    }
+    let r = raw.view();
+    var from: usize = 0;
+    if (r.length >= 2 && r[0] == 0x68 && r[1] == 0x3a) {
+        from = 2;
+    } else if (r.length >= 1 && r[0] == 0x7b) {
+        from = 1;
+    } else {
+        return Ok(false);
+    }
+    var n: i64 = 0;
+    var negative = false;
+    var inNumber = false;
+    for (i in from..r.length) {
+        let c = r[i];
+        if (c >= 0x30 && c <= 0x39) {
+            n = n * 10 + (c - 0x30) as i64;
+            inNumber = true;
+        } else {
+            if (inNumber) {
+                into.push(if (negative) 0 - n else n)?;
+            }
+            n = 0;
+            inNumber = false;
+            negative = c == 0x2d;
+        }
+    }
+    if (inNumber) {
+        into.push(if (negative) 0 - n else n)?;
+    }
+    return Ok(true);
+}
+
+fn contains(list: borrow Vector<i64>, value: i64) -> bool {
+    for (v in list.view()) {
+        if (v == value) {
+            return true;
+        }
+    }
+    return false;
+}
+
+async fn syncFolderHierarchy(
+    mail: borrow SmtpContext,
+    account: borrow Account,
+    doc: borrow XmlDocument,
+    op: usize,
+    w: borrow mut XmlWriter,
+) -> Result<void, EwsError> {
+    var state = String.create();
+    mem(localText(doc, op, "SyncState", mut state))?;
+    var previous = Vector<i64>.create();
+    let known = match (hierarchyState(state.view(), mut previous)) {
+        Ok(k) => k,
+        Err(_) => { return Err(EwsError.OutOfMemory); }
+    };
+    if (!known) {
+        beginEnvelope(w, "SyncFolderHierarchy");
+        failure(w, "SyncFolderHierarchy", "ErrorInvalidSyncStateData", "The sync state is not valid.");
+        endEnvelope(w);
+        return Ok();
+    }
+    var list = MailboxList.create();
+    match (await mail.store.mailboxes(account.userId, mut list)) {
+        Ok() => {}
+        Err(_) => { return Err(EwsError.Unavailable); }
+    }
+    var current = Vector<i64>.create();
+    var raw = Vector<u8>.create();
+    mem(raw.extend("h:".bytes()))?;
+    for (i in 0..list.count()) {
+        mem(current.push(list.id(i)))?;
+        if (i > 0) {
+            mem(raw.push(0x2c))?;
+        }
+        mem(decimal(mut raw, list.id(i)))?;
+    }
+    for (v in VIRTUAL_FOLDERS) {
+        mem(current.push(v))?;
+        if (raw.length > 2) {
+            mem(raw.push(0x2c))?;
+        }
+        mem(decimal(mut raw, v))?;
+    }
+    var next = String.create();
+    mem(base64Of(raw.view(), mut next))?;
+    beginEnvelope(w, "SyncFolderHierarchy");
+    beginSuccess(w, "SyncFolderHierarchy");
+    w.element("m:SyncState", next.view());
+    w.element("m:IncludesLastFolderInRange", "true");
+    let props = folderProps(doc, op);
+    w.start("m:Changes");
+    for (i in 0..list.count()) {
+        if (!contains(previous, list.id(i))) {
+            let f = match (folderAt(list, i)) {
+                Ok(f) => f,
+                Err(_) => { return Err(EwsError.OutOfMemory); }
+            };
+            w.start("t:Create");
+            mem(writeFolder(w, f, account.userId, 0, props))?;
+            w.end();
+        }
+    }
+    for (v in VIRTUAL_FOLDERS) {
+        if (!contains(previous, v)) {
+            let f = match (virtualFolder(v)) {
+                Ok(f) => f,
+                Err(_) => { return Err(EwsError.OutOfMemory); }
+            };
+            w.start("t:Create");
+            mem(writeFolder(w, f, account.userId, 0, props))?;
+            w.end();
+        }
+    }
+    var id = String.create();
+    for (p in previous.view()) {
+        if (!contains(current, p)) {
+            mem(folderId(p, mut id))?;
+            w.start("t:Delete");
+            w.start("t:FolderId");
+            w.attribute("Id", id.view());
+            w.end();
+            w.end();
+        }
+    }
+    w.end();
+    w.end();
+    endEnvelope(w);
+    return Ok();
+}
+
+// ---- Shared ----
+
+/// Runs one query on a pooled connection.
+async fn ewsQuery(
+    mail: borrow SmtpContext,
+    sql: StringView,
+    params: borrow PgParams,
+    rows: borrow mut PgRows,
+) -> Result<void, EwsError> {
+    var lease = match (await mail.store.connections().acquire()) {
+        Ok(l) => l,
+        Err(_) => { return Err(EwsError.Unavailable); }
+    };
+    match (await lease.connection().query(sql, params)) {
+        Ok(r) => {
+            rows = r;
+            return Ok();
+        }
+        Err(_) => { return Err(EwsError.Unavailable); }
+    }
+}

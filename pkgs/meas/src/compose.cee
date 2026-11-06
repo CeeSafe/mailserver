@@ -1,0 +1,544 @@
+// Sending (MS-ASCMD SendMail, SmartReply, SmartForward): the device's MIME message goes where SMTP submission sends
+// it, in one transaction: local recipients' INBOXes, the queue for the others, and the sender's Sent folder when
+// asked. The envelope sender is the account; Bcc is taken out of the header. A SmartForward carries the original
+// message as an attachment (unless the device included it, ReplaceMime); the original is flagged \Answered or
+// $Forwarded.
+
+import mhttp.Request;
+import mmime.AddressList;
+import mmime.MessageIndex;
+import mmime.MimeScanner;
+import mmime.Renderer;
+import mmime.encodeMeta;
+import mmime.headerOf;
+import mmime.parseAddressList;
+import mstore.BlobStore;
+import mstore.BlobWriter;
+import mstore.Delivered;
+import mstore.Delivery;
+import mstore.FLAG_ANSWERED;
+import mstore.FLAG_SEEN;
+import mstore.FlagChange;
+import mstore.MessageList;
+import mstore.Outbound;
+import mstore.Recipient;
+import mstore.StoreError;
+import mstore.UidSet;
+import mhttp.Response;
+import msmtp.SmtpContext;
+import mxml.XmlDocument;
+
+fn writeBlob(blobs: borrow BlobStore, content: Slice<u8>) -> Result<BlobWriter, StoreError> {
+    var writer = blobs.begin()?;
+    match (writer.write(content)) {
+        Ok() => {}
+        Err(e) => {
+            writer.discard();
+            return Err(e);
+        }
+    }
+    match (writer.finish()) {
+        Ok() => {}
+        Err(e) => {
+            writer.discard();
+            return Err(e);
+        }
+    }
+    return Ok(writer);
+}
+
+/// The end of the header block of `m` (the index after its blank line), or its length.
+fn headerEnd(m: Slice<u8>) -> usize {
+    var i: usize = 0;
+    while (i + 1 < m.length) {
+        if (m[i] == 0x0a && (m[i + 1] == 0x0a || (m[i + 1] == 0x0d && i + 2 < m.length && m[i + 2] == 0x0a))) {
+            return if (m[i + 1] == 0x0a) i + 2 else i + 3;
+        }
+        i += 1;
+    }
+    return m.length;
+}
+
+fn startsField(line: Slice<u8>, name: StringView) -> bool {
+    let n = name.bytes();
+    return line.length > n.length && line[n.length] == 0x3a && line[0..n.length].equalsIgnoreAsciiCase(n);
+}
+
+/// The message to store and send: CRLF line ends, no Bcc field, and From, Date and Message-ID when missing.
+fn outgoing(mime: Slice<u8>, sender: StringView, into: borrow mut Vector<u8>) -> Result<void, EasFail> {
+    into.clear();
+    var crlf = Vector<u8>.create();
+    for (i in 0..mime.length) {
+        let b = mime[i];
+        if (b == 0x0a && (i == 0 || mime[i - 1] != 0x0d)) {
+            mem(crlf.push(0x0d))?;
+        }
+        mem(crlf.push(b))?;
+    }
+    let m = crlf.view();
+    let end = headerEnd(m);
+    var hasFrom = false;
+    var hasDate = false;
+    var hasId = false;
+    var header = Vector<u8>.create();
+    var at: usize = 0;
+    var skipping = false;
+    while (at < end) {
+        var e = at;
+        while (e < end && m[e] != 0x0a) {
+            e += 1;
+        }
+        let lineEnd = if (e < end) e + 1 else e;
+        let line = m[at..lineEnd];
+        let continuation = line.length > 0 && (line[0] == 0x20 || line[0] == 0x09);
+        if (!continuation) {
+            skipping = startsField(line, "Bcc");
+            if (startsField(line, "From")) {
+                hasFrom = true;
+            }
+            if (startsField(line, "Date")) {
+                hasDate = true;
+            }
+            if (startsField(line, "Message-ID")) {
+                hasId = true;
+            }
+        }
+        if (!skipping) {
+            mem(header.extend(line))?;
+        }
+        at = lineEnd;
+    }
+    if (!hasFrom) {
+        mem(into.extend("From: ".bytes()))?;
+        mem(into.extend(sender.bytes()))?;
+        mem(into.extend("\r\n".bytes()))?;
+    }
+    if (!hasDate) {
+        var date = Vector<u8>.create();
+        mem(msmtp.appendDate(mut date, Clock.unixMillis() / 1000))?;
+        mem(into.extend("Date: ".bytes()))?;
+        mem(into.extend(date.view()))?;
+        mem(into.extend("\r\n".bytes()))?;
+    }
+    if (!hasId) {
+        var id = String.create();
+        newUid(mut id)?;
+        mem(into.extend("Message-ID: <".bytes()))?;
+        mem(into.extend(id.view().bytes()))?;
+        mem(into.push(0x40))?;
+        let domain = sender[(sender.indexOf("@") ?? 0)..];
+        mem(into.extend(if (domain.length > 1) domain[1..].bytes() else "localhost".bytes()))?;
+        mem(into.extend(">\r\n".bytes()))?;
+    }
+    mem(into.extend(header.view()))?;
+    mem(into.extend(m[end..]))?;
+    return Ok();
+}
+
+/// Every address of the To, Cc and Bcc fields of `mime`.
+fn recipientsOf(mime: Slice<u8>, into: borrow mut Vector<String>) -> Result<void, EasFail> {
+    into.clear();
+    var scanner = MimeScanner.create();
+    let head = mime[0..headerEnd(mime)];
+    mem(scanner.feed(head))?;
+    var index = MessageIndex.create();
+    mem(scanner.finish(mut index))?;
+    let block = index.headerBlock(0);
+    // Each occurrence of each field.
+    var at: usize = 0;
+    var current = Vector<u8>.create();
+    var taking = false;
+    while (at <= block.length) {
+        var e = at;
+        while (e < block.length && block[e] != 0x0a) {
+            e += 1;
+        }
+        let line = block[at..e];
+        let continuation = line.length > 0 && (line[0] == 0x20 || line[0] == 0x09);
+        if (!continuation || at == block.length) {
+            if (taking) {
+                addAddresses(current.view(), into)?;
+            }
+            current.clear();
+            taking = startsField(line, "To") || startsField(line, "Cc") || startsField(line, "Bcc");
+            if (taking) {
+                let colon = (StringView.fromUtf8(line) ?? ":").indexOf(":") ?? 0;
+                mem(current.extend(line[(colon + 1)..]))?;
+            }
+        } else if (taking) {
+            mem(current.extend(line))?;
+        }
+        if (e >= block.length) {
+            if (taking) {
+                addAddresses(current.view(), into)?;
+            }
+            break;
+        }
+        at = e + 1;
+    }
+    return Ok();
+}
+
+fn addAddresses(value: Slice<u8>, into: borrow mut Vector<String>) -> Result<void, EasFail> {
+    var list = AddressList.create();
+    mem(parseAddressList(value, mut list))?;
+    for (i in 0..list.count()) {
+        match (list.mailbox(i)) {
+            Some(mailbox) => {
+                match (list.host(i)) {
+                    Some(host) => {
+                        var a = String.create();
+                        var bytes = Vector<u8>.create();
+                        mem(bytes.extend(mailbox))?;
+                        mem(bytes.push(0x40))?;
+                        for (b in host) {
+                            mem(bytes.push(if (b >= 0x41 && b <= 0x5a) b + 0x20 else b))?;
+                        }
+                        mem(a.append(StringView.fromUtf8(bytes.view()) ?? ""))?;
+                        var seen = false;
+                        for (x in into.view()) {
+                            if (x.view().equalsIgnoreAsciiCase(a.view())) {
+                                seen = true;
+                            }
+                        }
+                        if (!seen && a.length > 2) {
+                            mem(into.push(a))?;
+                        }
+                    }
+                    null => {}
+                }
+            }
+            null => {}
+        }
+    }
+    return Ok();
+}
+
+/// Sends `mime` as the account. False when it names no recipient.
+async fn submit(
+    mail: borrow SmtpContext,
+    s: borrow Session,
+    mime: Slice<u8>,
+    saveInSent: bool,
+) -> Result<bool, EasFail> {
+    var message = Vector<u8>.create();
+    outgoing(mime, s.email.view(), mut message)?;
+    var addresses = Vector<String>.create();
+    recipientsOf(mime, mut addresses)?;
+    if (addresses.length == 0) {
+        return Ok(false);
+    }
+    let store = borrow mail.store;
+    var scanner = MimeScanner.create();
+    mem(scanner.feed(message.view()))?;
+    var index = MessageIndex.create();
+    mem(scanner.finish(mut index))?;
+    var renderer = Renderer.create();
+    var meta = Vector<u8>.create();
+    mem(encodeMeta(index, mut renderer, mut meta))?;
+    let now = Clock.unixMillis();
+    var targets = Vector<Delivery>.create();
+    var outbound = Outbound.create();
+    var users = Vector<i64>.create();
+    for (a in addresses.view()) {
+        var to = Recipient.create();
+        match (await store.resolve(a.view(), mut to)) {
+            Ok() => {}
+            Err(_) => { return Err(EasFail.Unavailable); }
+        }
+        if (to.isUser()) {
+            var known = false;
+            for (u in users.view()) {
+                if (u == to.userId) {
+                    known = true;
+                }
+            }
+            if (!known && to.inboxId != 0) {
+                mem(users.push(to.userId))?;
+                var d = Delivery.to(to.userId, to.inboxId, now);
+                mem(d.meta.extend(meta.view()))?;
+                mem(targets.push(d))?;
+            }
+        } else if (to.isRemote() || to.isNotLocal()) {
+            var r = String.create();
+            mem(r.append(if (to.isRemote()) to.address.view() else a.view()))?;
+            mem(outbound.recipients.push(r))?;
+        }
+        // An unknown local address is dropped, as SMTP would refuse it.
+    }
+    if (saveInSent) {
+        match (await store.specialMailbox(s.userId, "\\Sent")) {
+            Ok(Some(sent)) => {
+                var d = Delivery.to(s.userId, sent, now);
+                d.flags = FLAG_SEEN;
+                mem(d.meta.extend(meta.view()))?;
+                mem(targets.push(d))?;
+            }
+            Ok(null) => {}
+            Err(_) => { return Err(EasFail.Unavailable); }
+        }
+    }
+    mem(outbound.sender.append(s.email.view()))?;
+    outbound.userId = s.userId;
+    let blobs = store.blobs();
+    let bytes = message.view();
+    let made: Result<BlobWriter, StoreError> = await Async.blocking(() => writeBlob(blobs, bytes));
+    var writer = match (made) {
+        Ok(w) => w,
+        Err(_) => { return Err(EasFail.Unavailable); }
+    };
+    var done = Vector<Delivered>.create();
+    match (await store.accept(mut writer, targets, outbound, mut done)) {
+        Ok(_) => {}
+        Err(_) => { return Err(EasFail.Unavailable); }
+    }
+    return Ok(true);
+}
+
+/// The original of a SmartReply or SmartForward: its mailbox and uid, from Source (14.0) or the query (12.1).
+fn sourceOf(doc: borrow XmlDocument, present: bool, s: borrow Session) -> [i64; 2]? {
+    let folder = s.collectionId.view();
+    let item = s.itemId.view();
+    if (present) {
+        match (doc.find(doc.root(), NS_COMPOSE, "Source")) {
+            Some(src) => {
+                let f = childValue(doc, src, NS_COMPOSE, "FolderId");
+                let i = childValue(doc, src, NS_COMPOSE, "ItemId");
+                let l = childValue(doc, src, NS_COMPOSE, "LongId");
+                if (i.length > 0) {
+                    let parsed = parseFolderId(f)?;
+                    let colon = i.lastIndexOf(":")?;
+                    return [parsed[1], i[(colon + 1)..].parseInt<i64>()?];
+                }
+                if (l.length > 0) {
+                    return longIdOf(l);
+                }
+            }
+            null => {}
+        }
+    }
+    if (folder.length == 0 && item.length > 0) {
+        return longIdOf(item);
+    }
+    let parsed = parseFolderId(folder)?;
+    let colon = item.lastIndexOf(":")?;
+    return [parsed[1], item[(colon + 1)..].parseInt<i64>()?];
+}
+
+/// `m5:123`: mailbox 5, uid 123.
+fn longIdOf(id: StringView) -> [i64; 2]? {
+    let colon = id.indexOf(":")?;
+    let parsed = parseFolderId(id[0..colon])?;
+    if (parsed[0] != KIND_MAILBOX as i64) {
+        return null;
+    }
+    let rest = id[(colon + 1)..];
+    let end = rest.indexOf(":") ?? rest.length;
+    return [parsed[1], rest[0..end].parseInt<i64>()?];
+}
+
+/// The original message's bytes; false when it is not there.
+async fn originalMessage(
+    mail: borrow SmtpContext,
+    s: borrow Session,
+    mailbox: i64,
+    uid: i64,
+    into: borrow mut LoadedMessage,
+) -> Result<bool, EasFail> {
+    var uids = UidSet.create();
+    match (uids.add(uid)) {
+        Ok() => {}
+        Err(_) => { return Err(EasFail.Memory); }
+    }
+    var list = MessageList.create();
+    match (await mail.store.fetchMessages(s.userId, mailbox, uids, false, mut list)) {
+        Ok() => {}
+        Err(_) => { return Err(EasFail.Unavailable); }
+    }
+    if (list.count() == 0) {
+        return Ok(false);
+    }
+    var hash = Vector<u8>.create();
+    match (list.blob(0, mut hash)) {
+        Ok() => {}
+        Err(_) => { return Err(EasFail.Memory); }
+    }
+    return await loadMessage(borrow mail.store, hash.view(), into);
+}
+
+/// `mime` with `original` attached as message/rfc822: a multipart/mixed whose first part is `mime`'s own content.
+fn withAttachment(mime: Slice<u8>, original: Slice<u8>, into: borrow mut Vector<u8>) -> Result<void, EasFail> {
+    into.clear();
+    let end = headerEnd(mime);
+    var boundary = String.create();
+    mem(boundary.append("=_forward_"))?;
+    var id = String.create();
+    newUid(mut id)?;
+    mem(boundary.append(id.view()))?;
+    // The outer header: the message's fields but its MIME ones; the inner part: those, and the body.
+    var outer = Vector<u8>.create();
+    var inner = Vector<u8>.create();
+    var at: usize = 0;
+    var toInner = false;
+    while (at < end) {
+        var e = at;
+        while (e < end && mime[e] != 0x0a) {
+            e += 1;
+        }
+        let lineEnd = if (e < end) e + 1 else e;
+        let line = mime[at..lineEnd];
+        let continuation = line.length > 0 && (line[0] == 0x20 || line[0] == 0x09);
+        if (!continuation) {
+            toInner = startsField(line, "Content-Type") || startsField(line, "Content-Transfer-Encoding") ||
+                startsField(line, "Content-Disposition");
+        }
+        if (line.length <= 2 && (line.length == 0 || line[0] == 0x0d || line[0] == 0x0a)) {
+            at = lineEnd;
+            continue; // the blank line
+        }
+        if (startsField(line, "MIME-Version")) {
+            at = lineEnd;
+            continue;
+        }
+        mem(if (toInner) inner.extend(line) else outer.extend(line))?;
+        at = lineEnd;
+    }
+    mem(into.extend(outer.view()))?;
+    mem(into.extend("MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"".bytes()))?;
+    mem(into.extend(boundary.view().bytes()))?;
+    mem(into.extend("\"\r\n\r\n--".bytes()))?;
+    mem(into.extend(boundary.view().bytes()))?;
+    mem(into.extend("\r\n".bytes()))?;
+    if (inner.length == 0) {
+        mem(into.extend("Content-Type: text/plain; charset=utf-8\r\n".bytes()))?;
+    }
+    mem(into.extend(inner.view()))?;
+    mem(into.extend("\r\n".bytes()))?;
+    mem(into.extend(mime[end..]))?;
+    mem(into.extend("\r\n--".bytes()))?;
+    mem(into.extend(boundary.view().bytes()))?;
+    mem(
+        into.extend(
+            "\r\nContent-Type: message/rfc822\r\nContent-Disposition: attachment; filename=\"forwarded.eml\"\r\n\r\n".bytes(),
+        ),
+    )?;
+    mem(into.extend(original))?;
+    mem(into.extend("\r\n--".bytes()))?;
+    mem(into.extend(boundary.view().bytes()))?;
+    mem(into.extend("--\r\n".bytes()))?;
+    return Ok();
+}
+
+fn composeStatus(command: StringView, code: StringView) -> Result<Response, EasFail> {
+    var w = WbxmlWriter.create();
+    let name =
+        if (command == "smartreply") "SmartReply" else if (command == "smartforward") "SmartForward" else "SendMail";
+    w.start(PAGE_COMPOSE, name);
+    w.element(PAGE_COMPOSE, "Status", code);
+    w.end();
+    return written(w);
+}
+
+async fn composeMail(
+    mail: borrow SmtpContext,
+    request: borrow Request,
+    s: borrow Session,
+) -> Result<Response, EasFail> {
+    let command = s.command.view();
+    let raw = request.body.view();
+    let isWbxml = match (request.header("Content-Type")) {
+        Some(t) => t.view().indexOf("wbxml") != null,
+        null => false,
+    } || (raw.length > 4 && raw[0] == 0x03 && raw[1] == 0x01);
+    var mime = Vector<u8>.create();
+    var saveInSent = s.saveInSent;
+    var replace = false;
+    var doc = emptyDocument()?;
+    if (isWbxml) {
+        doc = match (decodeWbxml(raw)) {
+            Ok(d) => d,
+            Err(_) => { return composeStatus(command, "103"); }
+        };
+        match (doc.find(doc.root(), NS_COMPOSE, "Mime")) {
+            Some(m) => { mem(mime.extend(doc.text(m)))?; }
+            null => { return composeStatus(command, "103"); }
+        }
+        saveInSent = doc.find(doc.root(), NS_COMPOSE, "SaveInSentItems") != null;
+        replace = doc.find(doc.root(), NS_COMPOSE, "ReplaceMime") != null;
+    } else {
+        mem(mime.extend(raw))?;
+    }
+    if (mime.length == 0) {
+        return composeStatus(command, "103");
+    }
+    var message = Vector<u8>.create();
+    var source: [i64; 2]? = null;
+    if (command == "smartreply" || command == "smartforward") {
+        source = sourceOf(doc, isWbxml, s);
+    }
+    if (command == "smartforward" && !replace) {
+        match (source) {
+            Some(src) => {
+                var original = emptyMessage();
+                if (await originalMessage(mail, s, src[0], src[1], mut original)?) {
+                    withAttachment(mime.view(), original.bytes.view(), mut message)?;
+                } else {
+                    mem(message.extend(mime.view()))?;
+                }
+            }
+            null => { mem(message.extend(mime.view()))?; }
+        }
+    } else {
+        mem(message.extend(mime.view()))?;
+    }
+    if (!(await submit(mail, s, message.view(), saveInSent)?)) {
+        return composeStatus(command, "103");
+    }
+    match (source) {
+        Some(src) => {
+            var uids = UidSet.create();
+            match (uids.add(src[1])) {
+                Ok() => {}
+                Err(_) => { return Err(EasFail.Memory); }
+            }
+            var change = FlagChange.create();
+            if (command == "smartreply") {
+                change.add = FLAG_ANSWERED;
+            } else {
+                mem(change.addKeywords.append("$Forwarded"))?;
+            }
+            var changed = MessageList.create();
+            match (await mail.store.setFlags(s.userId, src[0], uids, change, mut changed)) {
+                Ok() => {}
+                Err(_) => {}
+            }
+        }
+        null => {}
+    }
+    return emptyOk();
+}
+
+/// The headers a REPLY to an invitation carries, and its body, sent as the account.
+async fn sendCalendarReply(
+    mail: borrow SmtpContext,
+    s: borrow Session,
+    to: Slice<u8>,
+    subject: Slice<u8>,
+    ics: Slice<u8>,
+) -> Result<void, EasFail> {
+    var m = Vector<u8>.create();
+    mem(m.extend("From: ".bytes()))?;
+    mem(m.extend(s.email.view().bytes()))?;
+    mem(m.extend("\r\nTo: ".bytes()))?;
+    mem(m.extend(to))?;
+    mem(m.extend("\r\nSubject: ".bytes()))?;
+    mem(m.extend(subject))?;
+    mem(
+        m.extend(
+            "\r\nMIME-Version: 1.0\r\nContent-Type: text/calendar; method=REPLY; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n".bytes(),
+        ),
+    )?;
+    mem(m.extend(ics))?;
+    await submit(mail, s, m.view(), false)?;
+    return Ok();
+}

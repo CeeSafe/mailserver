@@ -1,0 +1,18 @@
+size 2442
+envelope ("Mon, 29 Jul 1996 02:13:08 -0700" "xxxxx xxxxxxxx xxxxx" (("xxx xxxx xxxxxx" NIL "xxxxxxxxxx" "xxx.xxxxxxx.xxx")) (("xxx xxxx xxxxxx" NIL "xxxxxxxxxx" "xxx.xxxxxxx.xxx")) (("xxx xxxx xxxxxx" NIL "xxxxxxxxxx" "xxx.xxxxxxx.xxx")) ((NIL NIL "xxxxxxxxxxxxxxxxxxx" NIL) (NIL NIL NIL NIL)) (("xxx xxxxxxxxxx" NIL "xxxxxxxxxx" "xxx.xxxxxxx.xxx")) NIL NIL "<xxxxxxx.xxxxxxxxxxxxxx.xxxxxxxxxxxxxxxx@xxx.xxxxxxx.xxx>")
+bodystructure (("message" "delivery-status" NIL NIL NIL "7bit" 194 NIL NIL NIL NIL) ("message" "rfc822" NIL NIL NIL "7bit" 832 ("Mon, 29 Jul 1996 02:04:52 -0700" "xxxxxxxxxxx" (("xxxxx xxxxxxxx" NIL "xxx" "xxxxxxxx.xxx")) ((NIL NIL "xxx" "xxxxxxxx.xxx")) (("xxxxx xxxxxxxx" NIL "xxx" "xxxxxxxx.xxx")) ((NIL NIL "xxxxxxxxxxxxxxxxxx" "xxxxxx.xxx")) NIL NIL NIL "<xxxxxxxx.xxxx@xxxxxxxx.xxx>") ("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 11 0 NIL NIL NIL NIL) 15 NIL NIL NIL NIL) "report" ("report-type" "xxxxxxxxxxxxxxx" "boundary" "A41C7.838631588=_/mm1") NIL NIL NIL)
+body (("message" "delivery-status" NIL NIL NIL "7bit" 194) ("message" "rfc822" NIL NIL NIL "7bit" 832 ("Mon, 29 Jul 1996 02:04:52 -0700" "xxxxxxxxxxx" (("xxxxx xxxxxxxx" NIL "xxx" "xxxxxxxx.xxx")) ((NIL NIL "xxx" "xxxxxxxx.xxx")) (("xxxxx xxxxxxxx" NIL "xxx" "xxxxxxxx.xxx")) ((NIL NIL "xxxxxxxxxxxxxxxxxx" "xxxxxx.xxx")) NIL NIL NIL "<xxxxxxxx.xxxx@xxxxxxxx.xxx>") ("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 11 0) 15) "report")
+section HEADER 1145 9dd5328f9db5dbdee0172f587099b04c342360c7c3947b7809bb3b6b9411de78
+section TEXT 1297 304b28cde604db0f6b1649c2e088507e9259a60a1eb196558fa9999218c7cc7d
+section HEADER.FIELDS 390 e287c0b8aa8dade598f559cc849804e4d3cdcdb408621ea042b1924c2b8803e2
+section HEADER.FIELDS.NOT 757 065d32427e2ab719e8b104c83ac59648b9e740dd3d8513bf6e30a787d8864184
+section 1 194 6509ab306016d1fad9d9a40621615955d257e9134a0b21d5b3af3dd488bb9ad5
+section 1.MIME 41 ac3f707be26d1ced18b7c61c482c6de1e9efb866c0804cfab299612eae1d0c0b
+section 2 832 1a3e4331941204b1f3ba155f0fe8c792f738a7918b390ac9ec105587bc36ae86
+section 2.MIME 32 94984f8e29692f32be6724e812f5568ad06604428ccd4509df6c3a1c966800a0
+section 2.HEADER 821 51034ca6eeeaf75b10283b0c1c9654d8f2424bcf7ecee8d7b64a182a014da183
+section 2.TEXT 11 7668d2cd32a37eb45b51f002690d1b9a7c03f2da91791f96227ba9a61952fce8
+section 2.HEADER.FIELDS 225 bf5e3e40fec53f56692c6b04d477f148c3445b5c6d3e5aa32d75d13122a56832
+section 2.HEADER.FIELDS.NOT 598 0dc7ea9dbd652473c9b4e6133bd9a216b08b14cedc793df1486bdb4d6ee42f72
+section 2.1 11 7668d2cd32a37eb45b51f002690d1b9a7c03f2da91791f96227ba9a61952fce8
+section 2.1.MIME 821 51034ca6eeeaf75b10283b0c1c9654d8f2424bcf7ecee8d7b64a182a014da183

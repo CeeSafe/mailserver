@@ -1,0 +1,10 @@
+size 253424
+envelope ("Wed, 28 Oct 92 11:46:54 -0500" "Thanks! (part 1 of several)" (("T. V. Raman" NIL "raman" "cs.cornell.edu")) (("T. V. Raman" NIL "raman" "cs.cornell.edu")) (("T. V. Raman" NIL "raman" "cs.cornell.edu")) ((NIL NIL "nsb" "thumper.bellcore.com")) ((NIL NIL "raman" "cs.cornell.edu")) NIL NIL "<9210281646.AA23424@freyr.cs.cornell.edu>")
+bodystructure ("message" "partial" ("id" "703.23422.720290813.freyr" "number" "1") NIL NIL "7bit" 252471 NIL NIL NIL NIL)
+body ("message" "partial" ("id" "703.23422.720290813.freyr" "number" "1") NIL NIL "7bit" 252471)
+section HEADER 953 1a2a90159e34510ef8037e4d675f2f18f815279519f88eb60152f9c53a489b9f
+section TEXT 252471 8907e36eec5ba683232b7cfdcaf0a498c754ba6c273a3e998a6a88b34ea1f360
+section HEADER.FIELDS 302 bd96ebc6a76011fbaee523d4f40fa814e4462c1fe70b90308abb2001f9992f73
+section HEADER.FIELDS.NOT 653 e9a573ced7d2424787d8e5e45a1a39a03860fd14e0cf9f91a41a20c57cad714d
+section 1 252471 8907e36eec5ba683232b7cfdcaf0a498c754ba6c273a3e998a6a88b34ea1f360
+section 1.MIME 953 1a2a90159e34510ef8037e4d675f2f18f815279519f88eb60152f9c53a489b9f

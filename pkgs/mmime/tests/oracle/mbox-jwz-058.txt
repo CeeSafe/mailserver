@@ -1,0 +1,18 @@
+size 27436
+envelope ("Tue, 14 May 1996 10:59:03 -0700" "[Fwd: Netsurfer Digest: Vol. 02, #14 (HTML)]" (("Lou Montulli" NIL "montulli" "mozilla.com")) ((NIL NIL "montulli" "strumpet.mcom.com")) (("Lou Montulli" NIL "montulli" "mozilla.com")) ((NIL NIL "jwz" "strumpet.mcom.com")) NIL NIL NIL "<3198C9E7.3F54@mozilla.com>")
+bodystructure (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 383 13 NIL NIL NIL NIL) ("message" "rfc822" NIL NIL NIL "7bit" 25940 ("Tue, 14 May 1996 09:20:12 -0700 (PDT)" "Netsurfer Digest: Vol. 02, #14 (HTML)" ((NIL NIL "editor-bounce" "netsurf.com")) ((NIL NIL "editor-bounce" "netsurf.com")) ((NIL NIL "editor-bounce" "netsurf.com")) NIL NIL NIL NIL "<199605141620.JAA02498@zocalo.net>") ("text" "html" ("charset" "us-ascii") NIL NIL "7bit" 24858 463 NIL NIL NIL NIL) 477 NIL ("inline" NIL) NIL NIL) "mixed" ("boundary" "------------FF6ABD31DF") NIL NIL NIL)
+body (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 383 13) ("message" "rfc822" NIL NIL NIL "7bit" 25940 ("Tue, 14 May 1996 09:20:12 -0700 (PDT)" "Netsurfer Digest: Vol. 02, #14 (HTML)" ((NIL NIL "editor-bounce" "netsurf.com")) ((NIL NIL "editor-bounce" "netsurf.com")) ((NIL NIL "editor-bounce" "netsurf.com")) NIL NIL NIL NIL "<199605141620.JAA02498@zocalo.net>") ("text" "html" ("charset" "us-ascii") NIL NIL "7bit" 24858 463) 477) "mixed")
+section HEADER 808 99a2786dbe33230925459f85dbe92d41709212e2b625af5bfc2c838af5cb9024
+section TEXT 26628 dd7b480a3ecffb8050e4da6dde0a42d72a2c76934dc143337fd18ae4994f791b
+section HEADER.FIELDS 273 9298b2df28ec190376914ae04df453c54de9ed5fee89e29e00cea3f38e71efec
+section HEADER.FIELDS.NOT 537 db1ad6d9f4ed26880a684288c949fd2c98a915aa97d6bfaa6d387a0e7ceb5131
+section 1 383 a787c8d489e578335dbf964c107fc2fbb73dcc1a632b8cb9f076893e70df7fbd
+section 1.MIME 79 0c7232bcecc3ffb84bb1ae647f2ba1256591d4391f0f1b8a41938a97660cddcb
+section 2 25940 42b924422929813e760b48eb65f22d101b90e2a24f70973f2754777e32c0bbd5
+section 2.MIME 94 e5dc4a3fedd181b4ba79347b44e0fd26ac9dc293e7c8769fbd5393131e58efe1
+section 2.HEADER 1082 5f55ede73742f98cefeab2aa57747f7b67fdd02a78b36a1adc2f36b9253a76dd
+section 2.TEXT 24858 5dfe28d5278cc00af64799e6ba1020add0c80f0f920c3cdd821ffc36d9441494
+section 2.HEADER.FIELDS 201 f51c290185f7c499a8b5020eff93da7643e262f6c72053a17bd3487506697dcd
+section 2.HEADER.FIELDS.NOT 883 70fb33abf030800a3bc4d7ac487ca5bfdae1f9de5dbd403e4a97baa35d391ddf
+section 2.1 24858 5dfe28d5278cc00af64799e6ba1020add0c80f0f920c3cdd821ffc36d9441494
+section 2.1.MIME 1082 5f55ede73742f98cefeab2aa57747f7b67fdd02a78b36a1adc2f36b9253a76dd

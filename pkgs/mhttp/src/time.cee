@@ -1,0 +1,119 @@
+// Times as JSON and ACME write them: RFC 3339 in UTC, `2026-11-06T08:49:37Z`.
+
+/// Appends `unixSeconds` as RFC 3339 UTC.
+public fn appendIsoTime(out: borrow mut Vector<u8>, unixSeconds: i64) -> Result<void, AllocError> {
+    let days = floorDiv(unixSeconds, 86400);
+    let secs = unixSeconds - days * 86400;
+    // Civil from days (Howard Hinnant's algorithm), as msmtp's dates.
+    let z = days + 719468;
+    let era = floorDiv(z, 146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if (mp < 10) mp + 3 else mp - 9;
+    let year = yoe + era * 400 + (if (month <= 2) 1i64 else 0i64);
+    digits(out, year, 4)?;
+    out.push(0x2d)?;
+    digits(out, month, 2)?;
+    out.push(0x2d)?;
+    digits(out, day, 2)?;
+    out.push(0x54)?;
+    digits(out, secs / 3600, 2)?;
+    out.push(0x3a)?;
+    digits(out, (secs / 60) % 60, 2)?;
+    out.push(0x3a)?;
+    digits(out, secs % 60, 2)?;
+    return out.push(0x5a);
+}
+
+/// Parses RFC 3339 (`2026-11-06T08:49:37Z`, with fractions and offsets) into Unix seconds; null when malformed.
+public fn parseIsoTime(text: StringView) -> i64? {
+    let b = text.bytes();
+    if (b.length < 20 || b[4] != 0x2d || b[7] != 0x2d || (b[10] != 0x54 && b[10] != 0x74 && b[10] != 0x20) ||
+        b[13] != 0x3a || b[16] != 0x3a) {
+        return null;
+    }
+    let year = number(b, 0, 4) ?? -1;
+    let month = number(b, 5, 2) ?? -1;
+    let day = number(b, 8, 2) ?? -1;
+    let hour = number(b, 11, 2) ?? -1;
+    let minute = number(b, 14, 2) ?? -1;
+    let second = number(b, 17, 2) ?? -1;
+    if (year < 0 || month < 1 || month > 12 || day < 1 || day > 31 || hour < 0 || hour > 23 || minute < 0 ||
+        minute > 59 || second < 0 || second > 60) {
+        return null;
+    }
+    var at: usize = 19;
+    if (b[at] == 0x2e) {
+        at += 1;
+        while (at < b.length && b[at] >= 0x30 && b[at] <= 0x39) {
+            at += 1;
+        }
+    }
+    if (at >= b.length) {
+        return null;
+    }
+    var offset: i64 = 0;
+    if (b[at] == 0x5a || b[at] == 0x7a) {
+        at += 1;
+    } else if ((b[at] == 0x2b || b[at] == 0x2d) && at + 6 == b.length && b[at + 3] == 0x3a) {
+        let oh = number(b, at + 1, 2) ?? -1;
+        let om = number(b, at + 4, 2) ?? -1;
+        if (oh < 0 || om < 0) {
+            return null;
+        }
+        offset = (oh * 60 + om) * 60;
+        if (b[at] == 0x2d) {
+            offset = 0 - offset;
+        }
+        at += 6;
+    } else {
+        return null;
+    }
+    if (at != b.length) {
+        return null;
+    }
+    // Days from civil (Hinnant).
+    let y = if (month <= 2) year - 1 else year;
+    let era = floorDiv(y, 400);
+    let yoe = y - era * 400;
+    let mp = if (month > 2) month - 3 else month + 9;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    return days * 86400 + hour * 3600 + minute * 60 + second - offset;
+}
+
+fn number(b: Slice<u8>, at: usize, n: usize) -> i64? {
+    var v: i64 = 0;
+    for (i in 0..n) {
+        let c = b[at + i];
+        if (c < 0x30 || c > 0x39) {
+            return null;
+        }
+        v = v * 10 + (c - 0x30) as i64;
+    }
+    return v;
+}
+
+fn digits(out: borrow mut Vector<u8>, value: i64, width: usize) -> Result<void, AllocError> {
+    var buffer = [0u8; 20];
+    var v = if (value < 0) 0 else value;
+    var at: usize = 20;
+    loop {
+        at -= 1;
+        buffer[at] = 0x30u8 + truncate<u8>(v % 10);
+        v = v / 10;
+        if (v == 0 && 20 - at >= width) {
+            break;
+        }
+    }
+    return out.extend(buffer[at..]);
+}
+
+fn floorDiv(a: i64, b: i64) -> i64 {
+    let q = a / b;
+    return if ((a % b != 0) && ((a < 0) != (b < 0))) q - 1 else q;
+}

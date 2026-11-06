@@ -1,0 +1,10 @@
+size 75954
+envelope ("Fri, 29 Nov 91 07:13:38 EST" "Binary (octet-stream) test" (("Nathaniel Borenstein" NIL "nsb" "thumper.bellcore.com")) (("Nathaniel Borenstein" NIL "nsb" "thumper.bellcore.com")) (("Nathaniel Borenstein" NIL "nsb" "thumper.bellcore.com")) NIL NIL NIL NIL NIL)
+bodystructure ("application" "octet-stream" NIL NIL "This is really audio data" "base64" 75682 NIL NIL NIL NIL)
+body ("application" "octet-stream" NIL NIL "This is really audio data" "base64" 75682)
+section HEADER 272 383790d84bea72f36cbf5f73d61537a0259358f62f3a70edb08a93ff6929c2c4
+section TEXT 75682 fbe3893f7bf112405a790faa8b786e9f2ebe6d6ca012d95e782862b373fc182b
+section HEADER.FIELDS 169 a157148c43397034393be10f25247e30e7b1dbc8e816f3a5fd3ed113982d6ea3
+section HEADER.FIELDS.NOT 105 2589c0442f347190b9dae6c75ca96e58fc221c7ce620e0528ebcf3a2e553d9e4
+section 1 75682 fbe3893f7bf112405a790faa8b786e9f2ebe6d6ca012d95e782862b373fc182b
+section 1.MIME 272 383790d84bea72f36cbf5f73d61537a0259358f62f3a70edb08a93ff6929c2c4

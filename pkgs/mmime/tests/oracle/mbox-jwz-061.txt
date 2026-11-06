@@ -1,0 +1,10 @@
+size 261108
+envelope ("Tue, 4 Feb 92 09:57:27 EST" "Re: a response to MIME" (("Chris Schmandt" NIL "geek" "media-lab.media.mit.edu")) (("Chris Schmandt" NIL "geek" "media-lab.media.mit.edu")) (("Chris Schmandt" NIL "geek" "media-lab.media.mit.edu")) ((NIL NIL "nsb" "thumper.bellcore.com")) NIL NIL NIL "<9202041457.AA10456@honeygraham.media.mit.edu>")
+bodystructure ("audio" "basic" NIL NIL NIL "base64" 260296 NIL NIL NIL NIL)
+body ("audio" "basic" NIL NIL NIL "base64" 260296)
+section HEADER 812 908e4fda5c1732b30810f9820180055fe502fa9f08669577da107104c73ee4cd
+section TEXT 260296 0f5287e102f78ffe6cf3741970b0b299b08afb678595deb4ef4249a6c5507d9e
+section HEADER.FIELDS 240 69a66ca5c9715ff2026e0e910cfdc35c614d9f1cddddd2e44b81931a3065fa73
+section HEADER.FIELDS.NOT 574 c05bfd72fa0ad6c47329559409d1673f947b5410dca1a82a2fa2e6f20115614e
+section 1 260296 0f5287e102f78ffe6cf3741970b0b299b08afb678595deb4ef4249a6c5507d9e
+section 1.MIME 812 908e4fda5c1732b30810f9820180055fe502fa9f08669577da107104c73ee4cd

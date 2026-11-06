@@ -1,0 +1,10 @@
+size 10244
+envelope ("Sun, 15 Nov 1992 15:09:59 +0100 (MET)" "MIME letter with ISO-8859-1" (("Patrik F¥dltstr¥vm" NIL "paf" "nada.kth.se")) (("Patrik F¥dltstr¥vm" NIL "paf" "nada.kth.se")) (("Patrik F¥dltstr¥vm" NIL "paf" "nada.kth.se")) (("Brad Huntting" NIL "huntting" "advtech.uswest.com")) ((NIL NIL "info-metamail" "thumper.bellcore.com") (NIL NIL "mh-mime" "dbc.mtview.ca.us")) NIL NIL "<Pine.3.80.9211151559.B2317-e100000@joker.nada.kth.se>")
+bodystructure ("TEXT" "PLAIN" ("charset" "ISO-8859-1") NIL NIL "QUOTED-PRINTABLE" 9425 226 NIL NIL NIL NIL)
+body ("TEXT" "PLAIN" ("charset" "ISO-8859-1") NIL NIL "QUOTED-PRINTABLE" 9425 226)
+section HEADER 819 5f022ba333b9db7e936857694c44464722d3ad336586ae3928ca651535250bf8
+section TEXT 9425 4b52d3ce385bd4c3846596b1e21be741e0326ad39494aa3db990fa5ca832a948
+section HEADER.FIELDS 360 a5c561b330c650366e3677befbdb5198efd546f3483f6a4dc29e5c874b09aae5
+section HEADER.FIELDS.NOT 461 33cfb4bfd6093afb0899b6069bd2a5a31ebda615ce3f6b12e397702a6a5e8373
+section 1 9425 4b52d3ce385bd4c3846596b1e21be741e0326ad39494aa3db990fa5ca832a948
+section 1.MIME 819 5f022ba333b9db7e936857694c44464722d3ad336586ae3928ca651535250bf8

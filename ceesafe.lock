@@ -1,0 +1,97 @@
+# Written by ceesafec fetch (spec/tooling.md §4.3). Commit it with ceesafe.toml.
+
+[[package]]
+name = "bcrypt"
+source = "path+../../CeeSafeLibs/bcrypt"
+
+[[package]]
+name = "diskio"
+source = "path+../../CeeSafeLibs/diskio"
+
+[[package]]
+name = "encoding"
+source = "path+../../CeeSafeLibs/encoding"
+
+[[package]]
+name = "macme"
+source = "path+pkgs/macme"
+
+[[package]]
+name = "mauth"
+source = "path+pkgs/mauth"
+
+[[package]]
+name = "mdav"
+source = "path+pkgs/mdav"
+
+[[package]]
+name = "mdns"
+source = "path+pkgs/mdns"
+
+[[package]]
+name = "meas"
+source = "path+pkgs/meas"
+
+[[package]]
+name = "mews"
+source = "path+pkgs/mews"
+
+[[package]]
+name = "mhttp"
+source = "path+pkgs/mhttp"
+
+[[package]]
+name = "mimap"
+source = "path+pkgs/mimap"
+
+[[package]]
+name = "mmime"
+source = "path+pkgs/mmime"
+
+[[package]]
+name = "mpim"
+source = "path+pkgs/mpim"
+
+[[package]]
+name = "mqueue"
+source = "path+pkgs/mqueue"
+
+[[package]]
+name = "mscan"
+source = "path+pkgs/mscan"
+
+[[package]]
+name = "msieve"
+source = "path+pkgs/msieve"
+
+[[package]]
+name = "msmtp"
+source = "path+pkgs/msmtp"
+
+[[package]]
+name = "mstore"
+source = "path+pkgs/mstore"
+
+[[package]]
+name = "mweb"
+source = "path+pkgs/mweb"
+
+[[package]]
+name = "mxml"
+source = "path+pkgs/mxml"
+
+[[package]]
+name = "pkey"
+source = "path+../../CeeSafeLibs/pkey"
+
+[[package]]
+name = "postgres"
+source = "path+../PostgresClient"
+
+[[package]]
+name = "sha256"
+source = "path+../../CeeSafeLibs/sha256"
+
+[[package]]
+name = "tls"
+source = "path+../../CeeSafeLibs/tls"

@@ -1,0 +1,14 @@
+size 85466
+envelope ("Fri, 24 May 91 10:40:25 EDT" "A cheap digitizer test" (("Stephen A Uhler" NIL "sau" "sleepy.bellcore.com")) (("Stephen A Uhler" NIL "sau" "sleepy.bellcore.com")) (("Stephen A Uhler" NIL "sau" "sleepy.bellcore.com")) ((NIL NIL "nsb" "sleepy.bellcore.com")) ((NIL NIL "sau" "sleepy.bellcore.com")) NIL NIL "<9105241440.AA08935@sleepy.bellcore.com>")
+bodystructure (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 21 0 NIL NIL NIL NIL) ("image" "pgm" NIL NIL NIL "base64" 84174 NIL NIL NIL NIL) ("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 267 8 NIL NIL NIL NIL) "mixed" ("boundary" "mail.sleepy.sau.144.8891") NIL NIL NIL)
+body (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 21 0) ("image" "pgm" NIL NIL NIL "base64" 84174) ("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 267 8) "mixed")
+section HEADER 723 d332c4c78aadb445ea7650ef2df19f2c91332e66d6df2c3092154b948ff3253f
+section TEXT 84743 61a68360039b196f531fb04db01197161f2290bb543026f316f1c1d275172ea7
+section HEADER.FIELDS 299 f931464f6f5c19f555ac251a44e9f3fefdde1962ad9ff2173fad1df108c16ca0
+section HEADER.FIELDS.NOT 426 fa7aa36587e3dc02fbabb4e6707abe14321aca5ef742d076f087dca15877ded0
+section 1 21 dc4d797e9340c5da7fb59ed81b82b3c330881a47f82d481631f28569a3b6fffb
+section 1.MIME 2 7eb70257593da06f682a3ddda54a9d260d4fc514f645237f5ca74b08f8da61a6
+section 2 84174 0bc0cf87d57f748ba2097f4607573939794a1eb1b7e75a439362464e0e7c3a03
+section 2.MIME 157 c6388fade6a5a4b352544b9e37ee764959f992de852d6d7fd71fca7fabf7f807
+section 3 267 53eb94cfdc7b7b34ae44662fdfe70d97f5f47a8bfdb305f435a9b366f0c75eca
+section 3.MIME 2 7eb70257593da06f682a3ddda54a9d260d4fc514f645237f5ca74b08f8da61a6

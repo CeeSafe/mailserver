@@ -1,0 +1,12 @@
+size 6155
+envelope ("Thu, 4 Feb 93 17:27:10 EST" "sending files via email" ((NIL NIL "bob" "sarad.cs.su.oz.au")) ((NIL NIL "bob" "sarad.cs.su.oz.au")) ((NIL NIL "bob" "sarad.cs.su.oz.au")) ((NIL NIL "ggm" "cc.uq.oz.au") (NIL NIL "nsb" "thumper.bellcore.com")) ((NIL NIL "bob" "MISSING_DOMAIN")) NIL NIL "<9302042227.AA17392@thumper.bellcore.com>")
+bodystructure (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 84 6 NIL NIL NIL NIL) ("image" "gif" NIL NIL NIL "base64" 5234 NIL NIL NIL NIL) "mixed" ("boundary" "qwertyuiop123") NIL NIL NIL)
+body (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 84 6) ("image" "gif" NIL NIL NIL "base64" 5234) "mixed")
+section HEADER 686 bc88fff4a2a993c14cae50b112a3e07cd8c37e1aa34cdd1d391db0cfb0aab344
+section TEXT 5469 7dc39190630d5358c38151ea0eb7689d241abb7ec489d739e754870b0808f350
+section HEADER.FIELDS 268 bcb79ceeae019f05b0d65ac41193b13a0fb674a53892c785e71d0aba501babf9
+section HEADER.FIELDS.NOT 420 c9edfd363062481c77ce67fb57a2a13d30b371fa43c848dc9a0841dda0dd5015
+section 1 84 d2d081043ef6249c5ebfb640247b6ce4fa158df9b6e6d008b29cf6fd68da4b46
+section 1.MIME 29 d196504d9ca2212f409776af58d2fd6118a241226b64e9620c611beb55f001b2
+section 2 5234 542fdc0ddb3b08315f502eafa51312a4b6ef567237ed75a4eaa2c6f8ebcd5342
+section 2.MIME 63 d47ca1dd0e97680d21d0df6dde2b1225823878b5d7ebf034fe84cae624c0e165

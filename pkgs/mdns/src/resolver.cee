@@ -1,0 +1,390 @@
+// A stub resolver: it asks recursive resolvers (from /etc/resolv.conf or the configuration) over UDP, retries over
+// TCP when an answer is truncated, and caches answers for their TTL. One `Resolver` is shared by every task.
+
+/// Why a query got no answer.
+public enum DnsError {
+    /// No server answered in time.
+    Timeout,
+    /// The name is not a valid DNS name.
+    BadName,
+    /// No servers are configured.
+    NoServers,
+    OutOfMemory,
+}
+
+const BUCKETS: usize = 1024;
+const BUCKET_LIMIT: usize = 16;
+/// TTLs are capped: a day for answers, 15 minutes for negative answers (RFC 2308 suggests hours; mail wants
+/// newly published records seen soon).
+const MAX_TTL: u32 = 86400;
+const MAX_NEGATIVE_TTL: u32 = 900;
+
+@noncopy
+struct CacheEntry {
+    key: Vector<u8>;
+    expires: i64;
+    answer: DnsAnswer;
+}
+
+@noncopy
+public struct Resolver {
+    servers: Vector<IpAddress>;
+    port: u16;
+    timeoutMs: u64;
+    cache: AsyncMutex<Vector<Vector<CacheEntry>>>;
+
+    /// A resolver asking `servers` on `port` (53 normally).
+    public fn create(servers: Vector<IpAddress>, port: u16) -> Result<Resolver, DnsError> {
+        var buckets = Vector<Vector<CacheEntry>>.create();
+        for (i in 0..BUCKETS) {
+            match (buckets.push(Vector<CacheEntry>.create())) {
+                Ok() => {}
+                Err(_) => { return Err(DnsError.OutOfMemory); }
+            }
+        }
+        let cache = match (AsyncMutex<Vector<Vector<CacheEntry>>>.create(buckets)) {
+            Ok(c) => c,
+            Err(_) => { return Err(DnsError.OutOfMemory); }
+        };
+        return Ok(Resolver { servers: servers, port: port, timeoutMs: 2000, cache: cache });
+    }
+
+    /// A resolver for the `nameserver` lines of /etc/resolv.conf (link-local addresses with a zone are skipped).
+    /// Reads a file: call it before the async world starts.
+    public fn fromSystem() -> Result<Resolver, DnsError> {
+        var servers = Vector<IpAddress>.create();
+        match (File.open("/etc/resolv.conf")) {
+            Ok(file) => {
+                var f = file;
+                var text = Vector<u8>.create();
+                var buffer = [0u8; 4096];
+                loop {
+                    let n = match (f.read(mut buffer[..])) {
+                        Ok(n) => n,
+                        Err(_) => 0,
+                    };
+                    if (n == 0) {
+                        break;
+                    }
+                    match (text.extend(buffer[0..n])) {
+                        Ok() => {}
+                        Err(_) => { return Err(DnsError.OutOfMemory); }
+                    }
+                }
+                serversFrom(text.view(), mut servers)?;
+            }
+            Err(_) => {}
+        }
+        return Resolver.create(servers, 53);
+    }
+
+    /// Sets how long one server is waited for (2 s by default).
+    public fn timeout(borrow mut this, ms: u64) {
+        this.timeoutMs = ms;
+    }
+
+    /// Answers `name` and `kind` into `into`, from the cache when it can. A SERVFAIL comes back as an answer with
+    /// that rcode, which callers treat as a temporary failure.
+    public async fn query(
+        borrow this,
+        name: StringView,
+        kind: u16,
+        into: borrow mut DnsAnswer,
+    ) -> Result<void, DnsError> {
+        var key = Vector<u8>.create();
+        cacheKey(name, kind, mut key)?;
+        let now = Clock.unixMillis();
+        if (await this.cached(key.view(), now, into)) {
+            return Ok();
+        }
+        await this.ask(name, kind, into)?;
+        if (into.rcode == RCODE_NOERROR || into.rcode == RCODE_NXDOMAIN) {
+            var ttl = into.cacheTtl();
+            let cap = if (into.count() == 0) MAX_NEGATIVE_TTL else MAX_TTL;
+            if (ttl > cap) {
+                ttl = cap;
+            }
+            if (ttl > 0) {
+                await this.store(key, now + (ttl as i64) * 1000, into);
+            }
+        }
+        return Ok();
+    }
+
+    async fn cached(borrow this, key: Slice<u8>, now: i64, into: borrow mut DnsAnswer) -> bool {
+        var guard = match (await this.cache.lock()) {
+            Ok(g) => g,
+            Err(_) => { return false; }
+        };
+        let buckets = guard.data();
+        let bucket = borrow buckets[bucketOf(key)];
+        for (i in 0..bucket.length) {
+            let entry = borrow bucket[i];
+            if (entry.key.length == key.length && entry.key.view().startsWith(key)) {
+                if (entry.expires <= now) {
+                    return false;
+                }
+                match (entry.answer.copyInto(into)) {
+                    Ok() => { return true; }
+                    Err(_) => { return false; }
+                }
+            }
+        }
+        return false;
+    }
+
+    async fn store(borrow this, key: Vector<u8>, expires: i64, answer: borrow DnsAnswer) {
+        var copy = DnsAnswer.create();
+        match (answer.copyInto(mut copy)) {
+            Ok() => {}
+            Err(_) => { return; }
+        }
+        var guard = match (await this.cache.lock()) {
+            Ok(g) => g,
+            Err(_) => { return; }
+        };
+        let buckets = guard.data();
+        let b = bucketOf(key.view());
+        let bucket = borrow mut buckets[b];
+        // Replace the same key, else the entry expiring first when the bucket is full.
+        var slot = bucket.length;
+        for (i in 0..bucket.length) {
+            if (bucket[i].key.length == key.length && bucket[i].key.view().startsWith(key.view())) {
+                slot = i;
+            }
+        }
+        if (slot == bucket.length && bucket.length >= BUCKET_LIMIT) {
+            slot = 0;
+            for (i in 1..bucket.length) {
+                if (bucket[i].expires < bucket[slot].expires) {
+                    slot = i;
+                }
+            }
+        }
+        let entry = CacheEntry { key: key, expires: expires, answer: copy };
+        if (slot == bucket.length) {
+            match (bucket.push(entry)) {
+                Ok() => {}
+                Err(_) => {}
+            }
+        } else {
+            bucket[slot] = entry;
+        }
+    }
+
+    /// Asks the servers in turn, twice round, until one answers.
+    async fn ask(borrow this, name: StringView, kind: u16, into: borrow mut DnsAnswer) -> Result<void, DnsError> {
+        if (this.servers.length == 0) {
+            return Err(DnsError.NoServers);
+        }
+        var query = Vector<u8>.create();
+        var idBytes = [0u8; 2];
+        match (Random.fill(mut idBytes[..])) {
+            Ok() => {}
+            Err(_) => {}
+        }
+        let id = idBytes[..].readBE<u16>(0);
+        match (buildQuery(mut query, id, name, kind)) {
+            Ok(true) => {}
+            Ok(false) => { return Err(DnsError.BadName); }
+            Err(_) => { return Err(DnsError.OutOfMemory); }
+        }
+        for (round in 0..2) {
+            for (s in 0..this.servers.length) {
+                let server = this.servers[s].socket(this.port);
+                let answered: Result<bool, AsyncError> = await Async.timeout(
+                    this.timeoutMs,
+                    AsyncError.TimedOut,
+                    async () => await udpExchange(server, query.view(), id, name, kind, into),
+                );
+                match (answered) {
+                    Ok(true) => {
+                        if (!into.truncated) {
+                            return Ok();
+                        }
+                        // Truncated: the same server over TCP (RFC 7766).
+                        let viaTcp: Result<bool, AsyncError> = await Async.timeout(
+                            this.timeoutMs * 2,
+                            AsyncError.TimedOut,
+                            async () => await tcpExchange(server, query.view(), id, name, kind, into),
+                        );
+                        match (viaTcp) {
+                            Ok(true) => { return Ok(); }
+                            _ => {}
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(AsyncError.Cancelled) => { return Err(DnsError.Timeout); }
+                    Err(_) => {}
+                }
+            }
+        }
+        return Err(DnsError.Timeout);
+    }
+}
+
+/// One UDP exchange: false when the server's answer cannot be used. Datagrams from other addresses, or not
+/// answering our question, are ignored, so a spoofer must also guess the random id and source port.
+async fn udpExchange(
+    server: SocketAddress,
+    query: Slice<u8>,
+    id: u16,
+    name: StringView,
+    kind: u16,
+    into: borrow mut DnsAnswer,
+) -> Result<bool, AsyncError> {
+    let local = match (server) {
+        SocketAddress.V4(_, _) => SocketAddress.V4([0u8; 4], 0),
+        SocketAddress.V6(_, _, _) => SocketAddress.V6([0u8; 16], 0, 0),
+    };
+    // A new socket per query: the kernel picks a random source port.
+    let socket = match (AsyncUdpSocket.bind(local, UdpOptions.defaults())) {
+        Ok(s) => s,
+        Err(_) => { return Ok(false); }
+    };
+    await socket.sendTo(query, server)?;
+    var buffer = [0u8; 4096];
+    loop {
+        let datagram = await socket.recvFrom(mut buffer[..])?;
+        if (!sameEndpoint(datagram.from, server)) {
+            continue;
+        }
+        match (parseResponse(buffer[0..datagram.length], id, name, kind, into)) {
+            Ok() => {
+                if (datagram.truncated) {
+                    into.truncated = true;
+                }
+                return Ok(true);
+            }
+            Err(ParseError.Mismatch) => { continue; }
+            Err(_) => { return Ok(false); }
+        }
+    }
+}
+
+/// One TCP exchange (two-byte length framing, RFC 1035 §4.2.2).
+async fn tcpExchange(
+    server: SocketAddress,
+    query: Slice<u8>,
+    id: u16,
+    name: StringView,
+    kind: u16,
+    into: borrow mut DnsAnswer,
+) -> Result<bool, AsyncError> {
+    let stream = await AsyncTcpStream.connectTo(server)?;
+    var framed = Vector<u8>.create();
+    match (framed.pushBE(truncate<u16>(query.length))) {
+        Ok() => {}
+        Err(_) => { return Ok(false); }
+    }
+    match (framed.extend(query)) {
+        Ok() => {}
+        Err(_) => { return Ok(false); }
+    }
+    await stream.write(framed.view())?;
+    var length = [0u8; 2];
+    if (!(await readExact(stream, mut length[..])?)) {
+        return Ok(false);
+    }
+    var message = Vector<u8>.create();
+    match (message.resize(length[..].readBE<u16>(0) as usize, 0)) {
+        Ok() => {}
+        Err(_) => { return Ok(false); }
+    }
+    if (!(await readExact(stream, mut message[..])?)) {
+        return Ok(false);
+    }
+    match (parseResponse(message.view(), id, name, kind, into)) {
+        Ok() => { return Ok(!into.truncated); }
+        Err(_) => { return Ok(false); }
+    }
+}
+
+async fn readExact(stream: borrow AsyncTcpStream, out: SliceMut<u8>) -> Result<bool, AsyncError> {
+    var done: usize = 0;
+    while (done < out.length) {
+        let n = await stream.read(mut out[done..])?;
+        if (n == 0) {
+            return Ok(false);
+        }
+        done += n;
+    }
+    return Ok(true);
+}
+
+fn sameEndpoint(a: SocketAddress, b: SocketAddress) -> bool {
+    match (a) {
+        SocketAddress.V4(x, p) => {
+            match (b) {
+                SocketAddress.V4(y, q) => {
+                    return p == q && x[0] == y[0] && x[1] == y[1] && x[2] == y[2] && x[3] == y[3];
+                }
+                _ => { return false; }
+            }
+        }
+        SocketAddress.V6(x, p, _) => {
+            match (b) {
+                SocketAddress.V6(y, q, _) => { return p == q && IpAddress { bytes: x }.equals(IpAddress { bytes: y }); }
+                _ => { return false; }
+            }
+        }
+    }
+}
+
+fn cacheKey(name: StringView, kind: u16, out: borrow mut Vector<u8>) -> Result<void, DnsError> {
+    let bytes = name.bytes();
+    var end = bytes.length;
+    if (end > 0 && bytes[end - 1] == 0x2e) {
+        end -= 1;
+    }
+    for (i in 0..end) {
+        let c = bytes[i];
+        match (out.pushBE(if (c >= 0x41 && c <= 0x5a) c + 0x20 else c)) {
+            Ok() => {}
+            Err(_) => { return Err(DnsError.OutOfMemory); }
+        }
+    }
+    match (out.pushBE(0u8)) {
+        Ok() => {}
+        Err(_) => { return Err(DnsError.OutOfMemory); }
+    }
+    match (out.pushBE(kind)) {
+        Ok() => { return Ok(); }
+        Err(_) => { return Err(DnsError.OutOfMemory); }
+    }
+}
+
+fn bucketOf(key: Slice<u8>) -> usize {
+    var h: u64 = 0xcbf29ce484222325;
+    for (b in key) {
+        h = (h ^ (b as u64)).wrappingMul(0x100000001b3);
+    }
+    return truncate<usize>(h % (BUCKETS as u64));
+}
+
+/// The `nameserver` addresses of a resolv.conf.
+fn serversFrom(text: Slice<u8>, into: borrow mut Vector<IpAddress>) -> Result<void, DnsError> {
+    var start: usize = 0;
+    while (start < text.length) {
+        var end = start;
+        while (end < text.length && text[end] != 0x0a) {
+            end += 1;
+        }
+        let line = text[start..end].trim();
+        start = end + 1;
+        if (!line.startsWith("nameserver".bytes())) {
+            continue;
+        }
+        let value = line["nameserver".length..].trim();
+        match (parseIp(value)) {
+            Some(ip) => {
+                match (into.push(ip)) {
+                    Ok() => {}
+                    Err(_) => { return Err(DnsError.OutOfMemory); }
+                }
+            }
+            null => {} // a zone (fe80::1%en0) or junk
+        }
+    }
+    return Ok();
+}

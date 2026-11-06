@@ -1,0 +1,12 @@
+size 5248
+envelope ("Tue, 29 Oct 1996 15:12:00 -0500" "Signed SHA1 with VeriSign certification" (("John T. Gildred" NIL "jgildred" "opensoft.com")) ((NIL NIL "owner-smime-dev" "rsa.com")) (("John T. Gildred" NIL "jgildred" "opensoft.com")) (("'smime-dev@rsa.com'" NIL "smime-dev" "rsa.com")) NIL NIL NIL "MSG961029151201#15@server1.opensoft.com")
+bodystructure (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 78 4 NIL NIL NIL NIL) ("application" "x-pkcs7-signature" NIL NIL NIL "base64" 3774 NIL NIL NIL NIL) "signed" ("protocol" "application/x-pkcs7-signature" "micalg" "rsa-sha" "boundary" "===OpenSoft===247233737===5===") NIL NIL NIL)
+body (("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 78 4) ("application" "x-pkcs7-signature" NIL NIL NIL "base64" 3774) "signed")
+section HEADER 1123 f0d02f51d51c8a04bc451af4a52c0910bd9239dce170f489502136f40a78cc62
+section TEXT 4125 83ec58c526ac28ebba5638f20269c919689f9edd5b69f24e94452af63223361a
+section HEADER.FIELDS 369 dc88991aaab8e70447aa7d0c138eeaf8e439ab879881eb24f17468968843360c
+section HEADER.FIELDS.NOT 756 b4fea1efd8f593054025119cac1598713a95bf9a472f59941ddea6c5c1b8516c
+section 1 78 74a543dba6efe65b2a875cedb6e23f0cec90aeb75b2c4d292b25147006a86341
+section 1.MIME 81 f26fb21f606dcc0df4fb8e7861550aa9fe574913a41f8e3ed05c05f0d9d5ce6a
+section 2 3774 b9459666eeb22b5e1c1292e973a4700b1bf761b9f7d1dd7f70cfb28a82545b25
+section 2.MIME 82 af8b694dbc1b5e2815df2ee1f9d95cbd0fdb1f8e4b090d554726052ef7099ebe

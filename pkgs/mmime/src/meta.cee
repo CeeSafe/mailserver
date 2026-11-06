@@ -1,0 +1,265 @@
+// The stored form of a parsed message: what IMAP needs to answer FETCH without reading MIME again. It is made once
+// at delivery and kept in mstore's `messages.meta` column.
+//
+// Layout, every number an unsigned LEB128 varint:
+//   "MM" 1                                       magic and version
+//   size, part count
+//   per part: parent + 1 (0 for none), kind, flags (1 message, 2 digest child), headerStart,
+//             bodyStart - headerStart, bodyEnd - bodyStart, lines
+//   ENVELOPE, BODYSTRUCTURE, BODY: each a length, then its bytes
+//
+// `MessageMeta.of` checks every offset against the message size and every parent link, so a damaged row is refused,
+// never trusted.
+
+const META_VERSION: u8 = 1;
+
+fn putVarint(out: borrow mut Vector<u8>, value: u64) -> Result<void, AllocError> {
+    var n = value;
+    loop {
+        let low = truncate<u8>(n & 0x7f);
+        n = n >> 7;
+        if (n == 0) {
+            return out.pushBE(low);
+        }
+        out.pushBE(low | 0x80)?;
+    }
+}
+
+/// Encodes `index` with its renderings into `out` (cleared first).
+public fn encodeMeta(
+    index: borrow MessageIndex,
+    renderer: borrow mut Renderer,
+    out: borrow mut Vector<u8>,
+) -> Result<void, AllocError> {
+    out.clear();
+    out.extend("MM".bytes())?;
+    out.pushBE(META_VERSION)?;
+    putVarint(out, index.size)?;
+    putVarint(out, index.parts.length as u64)?;
+    for (i in 0..index.parts.length) {
+        let p = index.parts[i];
+        putVarint(out, if (p.parent == NO_PART) 0u64 else (p.parent as u64) + 1)?;
+        putVarint(out, p.kind as u64)?;
+        var flags: u64 = 0;
+        if (p.isMessage) {
+            flags = flags | 1;
+        }
+        if (p.digestChild) {
+            flags = flags | 2;
+        }
+        putVarint(out, flags)?;
+        putVarint(out, p.headerStart)?;
+        putVarint(out, p.bodyStart - p.headerStart)?;
+        putVarint(out, p.bodyEnd - p.bodyStart)?;
+        putVarint(out, p.lines)?;
+    }
+    var text = Vector<u8>.create();
+    renderer.envelope(index, 0, mut text)?;
+    putVarint(out, text.length as u64)?;
+    out.extend(text.view())?;
+    text.clear();
+    renderer.structure(index, 0, true, mut text)?;
+    putVarint(out, text.length as u64)?;
+    out.extend(text.view())?;
+    text.clear();
+    renderer.structure(index, 0, false, mut text)?;
+    putVarint(out, text.length as u64)?;
+    return out.extend(text.view());
+}
+
+/// One part as stored.
+public struct MetaPart {
+    public parent: usize;
+    public kind: u8;
+    public isMessage: bool;
+    public headerStart: u64;
+    public bodyStart: u64;
+    public bodyEnd: u64;
+    public lines: u64;
+}
+
+/// A decoded meta value: the parts, and where the renderings are in the stored bytes.
+@noncopy
+public struct MessageMeta {
+    public size: u64;
+    public parts: Vector<MetaPart>;
+    envelopeAt: usize;
+    envelopeLength: usize;
+    structureAt: usize;
+    structureLength: usize;
+    bodyAt: usize;
+    bodyLength: usize;
+
+    public fn create() -> MessageMeta => MessageMeta {
+        size: 0,
+        parts: Vector<MetaPart>.create(),
+        envelopeAt: 0,
+        envelopeLength: 0,
+        structureAt: 0,
+        structureLength: 0,
+        bodyAt: 0,
+        bodyLength: 0,
+    };
+
+    /// Decodes `bytes` into this value; false (and empty) if they are not a valid meta value.
+    public fn read(borrow mut this, bytes: Slice<u8>) -> Result<bool, AllocError> {
+        this.parts.clear();
+        this.size = 0;
+        var r = MetaReader { at: 0, bad: false };
+        if (bytes.length < 3 || bytes[0] != 0x4d || bytes[1] != 0x4d || bytes[2] != META_VERSION) {
+            return Ok(false);
+        }
+        r.at = 3;
+        let size = r.varint(bytes);
+        let count = r.varint(bytes);
+        // Each part takes at least seven bytes, which bounds the count by the input.
+        if (r.bad || count == 0 || count > (bytes.length as u64)) {
+            return Ok(false);
+        }
+        for (i in 0..count) {
+            let parent = r.varint(bytes);
+            let kind = r.varint(bytes);
+            let flags = r.varint(bytes);
+            let headerStart = r.varint(bytes);
+            let headerLength = r.varint(bytes);
+            let bodyLength = r.varint(bytes);
+            let lines = r.varint(bytes);
+            let bodyStart = headerStart + headerLength;
+            let bodyEnd = bodyStart + bodyLength;
+            let index = i;
+            // Parents come first; offsets stay inside the message, and inside the parent.
+            if (r.bad || kind > 2 || bodyStart < headerStart || bodyEnd < bodyStart || bodyEnd > size ||
+                headerStart > size || (i == 0) != (parent == 0) || parent > index) {
+                this.parts.clear();
+                return Ok(false);
+            }
+            let parentIndex = if (parent == 0) NO_PART else truncate<usize>(parent - 1);
+            if (parentIndex != NO_PART) {
+                let up = this.parts[parentIndex];
+                if (up.kind == PART_LEAF || headerStart < up.bodyStart || bodyEnd > up.bodyEnd) {
+                    this.parts.clear();
+                    return Ok(false);
+                }
+            }
+            this.parts.push(MetaPart {
+                parent: parentIndex,
+                kind: truncate<u8>(kind),
+                isMessage: (flags & 1) != 0,
+                headerStart: headerStart,
+                bodyStart: bodyStart,
+                bodyEnd: bodyEnd,
+                lines: lines,
+            })?;
+        }
+        let envelopeLength = r.varint(bytes);
+        let envelopeAt = r.at;
+        r.skip(bytes, envelopeLength);
+        let structureLength = r.varint(bytes);
+        let structureAt = r.at;
+        r.skip(bytes, structureLength);
+        let bodyLength = r.varint(bytes);
+        let bodyAt = r.at;
+        r.skip(bytes, bodyLength);
+        if (r.bad || r.at != bytes.length) {
+            this.parts.clear();
+            return Ok(false);
+        }
+        this.size = size;
+        this.envelopeAt = envelopeAt;
+        this.envelopeLength = truncate<usize>(envelopeLength);
+        this.structureAt = structureAt;
+        this.structureLength = truncate<usize>(structureLength);
+        this.bodyAt = bodyAt;
+        this.bodyLength = truncate<usize>(bodyLength);
+        return Ok(true);
+    }
+
+    /// The parts numbered directly under `part` (`NO_PART`: the message), as `numberedChildren` gives them.
+    public fn numbered(borrow this, part: usize, into: borrow mut Vector<usize>) -> Result<void, AllocError> {
+        into.clear();
+        var holder = part;
+        if (part == NO_PART) {
+            holder = 0;
+            if (this.parts[0].kind != PART_MULTIPART) {
+                return into.push(0);
+            }
+        } else {
+            let p = this.parts[part];
+            if (p.kind == PART_LEAF) {
+                return Ok();
+            }
+            if (p.kind == PART_MESSAGE) {
+                holder = part + 1;
+                if (holder >= this.parts.length) {
+                    return Ok();
+                }
+                if (this.parts[holder].kind != PART_MULTIPART) {
+                    return into.push(holder);
+                }
+            }
+        }
+        for (i in holder + 1..this.parts.length) {
+            if (this.parts[i].parent == holder) {
+                into.push(i)?;
+            }
+        }
+        return Ok();
+    }
+
+    /// The part a section number names (`[1, 2]` for `1.2`), or `NO_PART`.
+    public fn partAt(borrow this, numbers: Slice<u32>) -> Result<usize, AllocError> {
+        var part = NO_PART;
+        var kids = Vector<usize>.create();
+        for (n in numbers) {
+            this.numbered(part, mut kids)?;
+            if (n == 0 || (n as usize) > kids.length) {
+                return Ok(NO_PART);
+            }
+            part = kids[(n as usize) - 1];
+        }
+        return Ok(part);
+    }
+}
+
+struct MetaReader {
+    at: usize;
+    bad: bool;
+
+    fn varint(borrow mut this, bytes: Slice<u8>) -> u64 {
+        var value: u64 = 0;
+        var shift: u32 = 0;
+        loop {
+            if (this.at >= bytes.length || shift > 63) {
+                this.bad = true;
+                return 0;
+            }
+            let b = bytes[this.at];
+            this.at += 1;
+            value = value | (((b & 0x7f) as u64) << shift);
+            if ((b & 0x80) == 0) {
+                return value;
+            }
+            shift += 7;
+        }
+    }
+
+    fn skip(borrow mut this, bytes: Slice<u8>, length: u64) {
+        if (this.bad || length > ((bytes.length - this.at) as u64)) {
+            this.bad = true;
+            return;
+        }
+        this.at += truncate<usize>(length);
+    }
+}
+
+/// The message's ENVELOPE, in the bytes `meta` was read from.
+public fn metaEnvelope<region a>(meta: borrow MessageMeta, bytes: Slice<a, u8>) -> Slice<a, u8> =>
+    bytes[meta.envelopeAt..meta.envelopeAt + meta.envelopeLength];
+
+/// Its BODYSTRUCTURE.
+public fn metaBodyStructure<region a>(meta: borrow MessageMeta, bytes: Slice<a, u8>) -> Slice<a, u8> =>
+    bytes[meta.structureAt..meta.structureAt + meta.structureLength];
+
+/// Its BODY (BODYSTRUCTURE without extension data).
+public fn metaBody<region a>(meta: borrow MessageMeta, bytes: Slice<a, u8>) -> Slice<a, u8> =>
+    bytes[meta.bodyAt..meta.bodyAt + meta.bodyLength];

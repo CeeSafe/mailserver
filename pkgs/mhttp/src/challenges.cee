@@ -1,0 +1,82 @@
+// ACME HTTP-01 challenges (RFC 8555 §8.3) waiting to be fetched: the ACME client publishes a token's key
+// authorization, the HTTP server answers `/.well-known/acme-challenge/<token>` with it, and the client withdraws it
+// once the order is decided. Shared by every task on every worker thread.
+
+@noncopy
+struct Challenge {
+    token: String;
+    keyAuthorization: String;
+}
+
+/// The challenges published now. A handful at most, so a list.
+@noncopy
+public struct ChallengeStore {
+    private list: AsyncMutex<Vector<Challenge>>;
+
+    public fn create() -> Result<ChallengeStore, AllocError> {
+        let empty = Vector<Challenge>.create();
+        return Ok(ChallengeStore { list: AsyncMutex<Vector<Challenge>>.create(empty)? });
+    }
+
+    /// Serves `keyAuthorization` for `token` until withdrawn. False when cancelled or out of memory.
+    public async fn publish(borrow this, token: StringView, keyAuthorization: StringView) -> bool {
+        var c = Challenge { token: String.create(), keyAuthorization: String.create() };
+        match (c.token.append(token)) {
+            Ok() => {}
+            Err(_) => { return false; }
+        }
+        match (c.keyAuthorization.append(keyAuthorization)) {
+            Ok() => {}
+            Err(_) => { return false; }
+        }
+        var guard = match (await this.list.lock()) {
+            Ok(g) => g,
+            Err(_) => { return false; }
+        };
+        let list = guard.data();
+        removeToken(list, token);
+        return match (list.push(c)) {
+            Ok() => true,
+            Err(_) => false,
+        };
+    }
+
+    /// Stops serving `token`.
+    public async fn withdraw(borrow this, token: StringView) {
+        var guard = match (await this.list.lock()) {
+            Ok(g) => g,
+            Err(_) => { return; }
+        };
+        removeToken(guard.data(), token);
+    }
+
+    /// The key authorization for `token`, into `into`. False when it is not published.
+    public async fn lookup(borrow this, token: StringView, into: borrow mut String) -> Result<bool, AllocError> {
+        into.clear();
+        var guard = match (await this.list.lock()) {
+            Ok(g) => g,
+            Err(_) => { return Ok(false); }
+        };
+        let list = guard.data();
+        for (c in list.view()) {
+            if (c.token.view() == token) {
+                into.append(c.keyAuthorization.view())?;
+                return Ok(true);
+            }
+        }
+        return Ok(false);
+    }
+}
+
+fn removeToken(list: borrow mut Vector<Challenge>, token: StringView) {
+    var i: usize = 0;
+    while (i < list.length) {
+        if (list[i].token.view() == token) {
+            let last = list.length - 1;
+            list.swap(i, last);
+            let gone = list.pop();
+        } else {
+            i += 1;
+        }
+    }
+}

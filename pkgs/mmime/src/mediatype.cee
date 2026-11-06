@@ -1,0 +1,288 @@
+// Content-Type and Content-Disposition (RFC 2045 §5.1, RFC 2183): a value and `; name=value` parameters, with
+// comments and quoted strings. Parameters are kept as written, as IMAP's BODYSTRUCTURE shows them; `decodeParam`
+// (decode.cee) reads a parameter for people, merging RFC 2231 continuations.
+
+/// A parameter of a structured header, as `ParamList.name`/`value` give it.
+public struct ParamEntry {
+    nameAt: usize;
+    nameLength: usize;
+    valueAt: usize;
+    valueLength: usize;
+}
+
+/// Parameters in the order they appear. Names and values are kept in one buffer.
+@noncopy
+public struct ParamList {
+    bytes: Vector<u8>;
+    entries: Vector<ParamEntry>;
+
+    public fn create() -> ParamList => ParamList { bytes: Vector<u8>.create(), entries: Vector<ParamEntry>.create() };
+
+    public fn count(borrow this) -> usize => this.entries.length;
+
+    public fn name(borrow this, i: usize) -> Slice<u8> {
+        let e = this.entries[i];
+        return this.bytes[e.nameAt..e.nameAt + e.nameLength];
+    }
+
+    public fn value(borrow this, i: usize) -> Slice<u8> {
+        let e = this.entries[i];
+        return this.bytes[e.valueAt..e.valueAt + e.valueLength];
+    }
+
+    public fn clear(borrow mut this) {
+        this.bytes.clear();
+        this.entries.clear();
+    }
+
+    fn add(borrow mut this, name: Slice<u8>, value: Slice<u8>) -> Result<void, AllocError> {
+        let nameAt = this.bytes.length;
+        this.bytes.extend(name)?;
+        let valueAt = this.bytes.length;
+        this.bytes.extend(value)?;
+        return this.entries.push(ParamEntry {
+            nameAt: nameAt,
+            nameLength: name.length,
+            valueAt: valueAt,
+            valueLength: value.length,
+        });
+    }
+}
+
+/// The value of the parameter `name` (any case) in `params`, or `null`.
+fn findParam<region a>(params: borrow(a) ParamList, name: StringView) -> Slice<a, u8>? {
+    for (i in 0..params.entries.length) {
+        if (params.name(i).equalsIgnoreAsciiCase(name.bytes())) {
+            return params.value(i);
+        }
+    }
+    return null;
+}
+
+/// A parsed Content-Type or Content-Disposition: `kind` is the type (or the disposition), `subtype` empty for a
+/// disposition.
+@noncopy
+public struct MediaType {
+    public kind: Vector<u8>;
+    public subtype: Vector<u8>;
+    public params: ParamList;
+
+    public fn create() -> MediaType =>
+        MediaType { kind: Vector<u8>.create(), subtype: Vector<u8>.create(), params: ParamList.create() };
+
+    public fn clear(borrow mut this) {
+        this.kind.clear();
+        this.subtype.clear();
+        this.params.clear();
+    }
+
+    public fn isType(borrow this, kind: StringView) -> bool => this.kind.view().equalsIgnoreAsciiCase(kind.bytes());
+
+    public fn isSubtype(borrow this, subtype: StringView) -> bool =>
+        this.subtype.view().equalsIgnoreAsciiCase(subtype.bytes());
+}
+
+/// A cursor over a structured header value.
+struct Lexer<region r> {
+    text: Slice<r, u8>;
+    at: usize;
+
+    fn of(text: Slice<r, u8>) -> Lexer<r> => Lexer { text: text, at: 0 };
+
+    fn atEnd(borrow this) -> bool => this.at >= this.text.length;
+
+    fn peek(borrow this) -> u8 => this.text[this.at];
+
+    /// Skips whitespace and line breaks, not comments.
+    fn skipBlanks(borrow mut this) {
+        let text = this.text;
+        while (this.at < text.length) {
+            let c = text[this.at];
+            if (c != 0x20 && c != 0x09 && c != 0x0d && c != 0x0a) {
+                return;
+            }
+            this.at += 1;
+        }
+    }
+
+    /// Reads a comment, the cursor on its `(`: its text, without the outer parentheses and with quoted pairs
+    /// unescaped, is appended to `out`.
+    fn comment(borrow mut this, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+        let text = this.text;
+        var depth: usize = 0;
+        while (this.at < text.length) {
+            let d = text[this.at];
+            this.at += 1;
+            if (d == 0x5c && this.at < text.length) {
+                out.pushBE(text[this.at])?;
+                this.at += 1;
+                continue;
+            }
+            if (d == 0x28) {
+                depth += 1;
+                if (depth == 1) {
+                    continue;
+                }
+            } else if (d == 0x29) {
+                depth -= 1;
+                if (depth == 0) {
+                    return Ok();
+                }
+            }
+            if (d != 0x0d && d != 0x0a) {
+                out.pushBE(d)?;
+            }
+        }
+        return Ok();
+    }
+
+    /// Skips whitespace, line breaks and (nested) comments.
+    fn skipSpace(borrow mut this) {
+        let text = this.text;
+        while (this.at < text.length) {
+            let c = text[this.at];
+            if (c == 0x20 || c == 0x09 || c == 0x0d || c == 0x0a) {
+                this.at += 1;
+            } else if (c == 0x28) {
+                var depth: usize = 0;
+                while (this.at < text.length) {
+                    let d = text[this.at];
+                    this.at += 1;
+                    if (d == 0x5c) {
+                        this.at += 1;
+                    } else if (d == 0x28) {
+                        depth += 1;
+                    } else if (d == 0x29) {
+                        depth -= 1;
+                        if (depth == 0) {
+                            break;
+                        }
+                    }
+                }
+            } else {
+                return;
+            }
+        }
+    }
+
+    /// Skips an RFC 2045 token (8-bit bytes are allowed, as mail in the wild has them) and gives where it started:
+    /// the token is `text[start..at]`, empty if there is none.
+    fn token(borrow mut this) -> usize {
+        let text = this.text;
+        let start = this.at;
+        while (this.at < text.length && isTokenByte(text[this.at])) {
+            this.at += 1;
+        }
+        return start;
+    }
+
+    /// A quoted string's content, unescaped, appended to `out`. The cursor is on the opening quote. An unterminated
+    /// string runs to the end.
+    fn quoted(borrow mut this, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+        let text = this.text;
+        this.at += 1;
+        while (this.at < text.length) {
+            let c = text[this.at];
+            this.at += 1;
+            if (c == 0x22) {
+                return Ok();
+            }
+            if (c == 0x5c && this.at < text.length) {
+                out.pushBE(text[this.at])?;
+                this.at += 1;
+            } else if (c != 0x0d && c != 0x0a) {
+                out.pushBE(c)?;
+            }
+        }
+        return Ok();
+    }
+}
+
+fn isTokenByte(c: u8) -> bool {
+    if (c <= 0x20 || c == 0x7f) {
+        return false;
+    }
+    // tspecials: ( ) < > @ , ; : \ " / [ ] ? =
+    return !(c == 0x28 || c == 0x29 || c == 0x3c || c == 0x3e || c == 0x40 || c == 0x2c || c == 0x3b || c == 0x3a ||
+        c == 0x5c || c == 0x22 || c == 0x2f || c == 0x5b || c == 0x5d || c == 0x3f || c == 0x3d);
+}
+
+/// Parses a Content-Type value into `into`. False if it has no `type/subtype` (then `into` is cleared, and the
+/// caller uses the default type).
+public fn parseMediaType(value: Slice<u8>, into: borrow mut MediaType) -> Result<bool, AllocError> {
+    into.clear();
+    var lexer = Lexer.of(value);
+    lexer.skipSpace();
+    let kindStart = lexer.token();
+    let kindEnd = lexer.at;
+    lexer.skipSpace();
+    if (kindEnd == kindStart || lexer.atEnd() || lexer.peek() != 0x2f) {
+        return Ok(false);
+    }
+    lexer.at += 1;
+    lexer.skipSpace();
+    let subtypeStart = lexer.token();
+    if (lexer.at == subtypeStart) {
+        return Ok(false);
+    }
+    into.kind.extend(value[kindStart..kindEnd])?;
+    into.subtype.extend(value[subtypeStart..lexer.at])?;
+    parseParams(mut lexer, mut into.params)?;
+    return Ok(true);
+}
+
+/// Parses a Content-Disposition value into `into` (`subtype` stays empty). False if it has no disposition.
+public fn parseDisposition(value: Slice<u8>, into: borrow mut MediaType) -> Result<bool, AllocError> {
+    into.clear();
+    var lexer = Lexer.of(value);
+    lexer.skipSpace();
+    let start = lexer.token();
+    if (lexer.at == start) {
+        return Ok(false);
+    }
+    into.kind.extend(value[start..lexer.at])?;
+    parseParams(mut lexer, mut into.params)?;
+    return Ok(true);
+}
+
+/// `; name=value` pairs to the end. Malformed pairs are skipped up to the next `;`.
+fn parseParams<region r>(lexer: borrow mut Lexer<r>, into: borrow mut ParamList) -> Result<void, AllocError> {
+    var value = Vector<u8>.create();
+    loop {
+        lexer.skipSpace();
+        if (lexer.atEnd()) {
+            return Ok();
+        }
+        if (lexer.peek() != 0x3b) {
+            // Junk between parameters: skip to the next separator.
+            while (!lexer.atEnd() && lexer.peek() != 0x3b) {
+                if (lexer.peek() == 0x22) {
+                    value.clear();
+                    lexer.quoted(mut value)?;
+                } else {
+                    lexer.at += 1;
+                }
+            }
+            continue;
+        }
+        lexer.at += 1;
+        lexer.skipSpace();
+        let nameStart = lexer.token();
+        let nameEnd = lexer.at;
+        lexer.skipSpace();
+        if (nameEnd == nameStart || lexer.atEnd() || lexer.peek() != 0x3d) {
+            continue;
+        }
+        lexer.at += 1;
+        lexer.skipSpace();
+        value.clear();
+        if (!lexer.atEnd() && lexer.peek() == 0x22) {
+            lexer.quoted(mut value)?;
+        } else {
+            let start = lexer.token();
+            value.extend(lexer.text[start..lexer.at])?;
+        }
+        let text = lexer.text;
+        into.add(text[nameStart..nameEnd], value.view())?;
+    }
+}

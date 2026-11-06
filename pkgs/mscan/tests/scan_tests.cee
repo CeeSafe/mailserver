@@ -1,0 +1,155 @@
+// Against tools/fakescan.py (FAKE_CLAMD_PORT, FAKE_SPAMD_PORT) for the failure modes, and against real ClamAV and
+// SpamAssassin in Docker (CLAMD_PORT, SPAMD_PORT) when set. tests/run.sh starts what it can.
+
+fn port(name: StringView) -> u16? {
+    let text = Environment.variable(name)?;
+    return text.parseInt<u16>();
+}
+
+fn local(p: u16) -> SocketAddress => SocketAddress.V4([127u8, 0, 0, 1], p);
+
+/// The EICAR test file, put together here so that no file of this repository looks infected to a scanner.
+fn eicar(out: borrow mut Vector<u8>) {
+    out.extend("X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-".bytes())!;
+    out.extend("STANDARD-ANTIVIRUS-TEST-FILE!$H+H*".bytes())!;
+}
+
+/// SpamAssassin's GTUBE: any SpamAssassin scores it 1000.
+fn gtube(out: borrow mut Vector<u8>) {
+    out.extend("XJS*C4JDBQADN1.NSBN3*2IDNEN*GTUBE-".bytes())!;
+    out.extend("STANDARD-ANTI-UBE-TEST-EMAIL*C.34X".bytes())!;
+}
+
+async fn clamd(p: u16, message: borrow Vector<u8>, name: borrow mut String) -> Result<VirusVerdict, AsyncError> {
+    var scan = await ClamdScan.open(local(p))?;
+    // In uneven pieces, as a session sends what it holds.
+    var at: usize = 0;
+    var step: usize = 1;
+    while (at < message.length) {
+        let end = if (at + step > message.length) message.length else at + step;
+        await scan.send(message[at..end])?;
+        at = end;
+        step = step * 3 + 1;
+    }
+    let verdict = await scan.finish()?;
+    name.clear();
+    name.append(scan.signature.view())!;
+    return Ok(verdict);
+}
+
+async fn spamd(p: u16, message: borrow Vector<u8>) -> Result<SpamScore, AsyncError> {
+    var scan = await SpamdScan.open(local(p), message.length as u64, "alice@example.org")?;
+    await scan.send(message.view())?;
+    return await scan.finish();
+}
+
+fn verdictIs(v: Result<VirusVerdict, AsyncError>, want: u8) -> bool {
+    match (v) {
+        Ok(VirusVerdict.Clean) => { return want == 0; }
+        Ok(VirusVerdict.Infected) => { return want == 1; }
+        Ok(VirusVerdict.Unavailable) => { return want == 2; }
+        Err(_) => { return want == 3; }
+    }
+}
+
+fn message(body: StringView) -> Vector<u8> {
+    var m = Vector<u8>.create();
+    m.extend("From: x@remote.test\r\nSubject: test\r\n\r\n".bytes())!;
+    m.extend(body.bytes())!;
+    return m;
+}
+
+async fn timedClamd(p: u16, m: borrow Vector<u8>, name: borrow mut String) -> Result<VirusVerdict, AsyncError> {
+    let r: Result<VirusVerdict, AsyncError> = await Async.timeout(
+        1000,
+        AsyncError.TimedOut,
+        async () => await clamd(p, m, name),
+    );
+    return r;
+}
+
+@test
+fn handlesClamdReplies() -> Result<void, TestFailure> {
+    let p = match (port("FAKE_CLAMD_PORT")) {
+        Some(p) => p,
+        null => { return Ok(); }
+    };
+    var name = String.create();
+    let clean = message("hello\r\n");
+    Check.isTrue(verdictIs(Async.run(timedClamd(p, clean, mut name)), 0), "clean")?;
+    let infected = message("EICAR-FAKE\r\n");
+    Check.isTrue(
+        verdictIs(Async.run(timedClamd(p, infected, mut name)), 1) && name.view() == "Fake.Signature",
+        "infected",
+    )?;
+    Check.isTrue(verdictIs(Async.run(timedClamd(p, message("TOOBIG"), mut name)), 2), "an error reply")?;
+    Check.isTrue(verdictIs(Async.run(timedClamd(p, message("GARBAGE"), mut name)), 2), "a garbled reply")?;
+    Check.isTrue(verdictIs(Async.run(timedClamd(p, message("HANG"), mut name)), 3), "a hang times out")?;
+    // Nothing listening: an error, at once.
+    return Check.isTrue(verdictIs(Async.run(timedClamd(1, clean, mut name)), 3), "connection refused");
+}
+
+@test
+fn readsSpamdScores() -> Result<void, TestFailure> {
+    let p = match (port("FAKE_SPAMD_PORT")) {
+        Some(p) => p,
+        null => { return Ok(); }
+    };
+    let s = Async.run(spamd(p, message("X-Test-Score: 6.9\r\n")))!;
+    Check.isTrue(s.scored && s.spam && s.tenths == 69 && s.thresholdTenths == 50, "6.9 / 5.0")?;
+    let low = Async.run(spamd(p, message("X-Test-Score: -1.5\r\n")))!;
+    Check.isTrue(low.scored && !low.spam && low.tenths == -15, "a negative score")?;
+    let reply = "SPAMD/1.1 76 Bad header line\r\n\r\n";
+    Check.isTrue(!parseSpamdReply(reply.bytes()).scored, "an error status")?;
+    Check.isTrue(!parseSpamdReply("SPAMD/1.1 0 EX_OK\r\nSpam: True ; x / 5.0\r\n".bytes()).scored, "a bad score")?;
+    var text = Vector<u8>.create();
+    appendTenths(mut text, -15)!;
+    appendTenths(mut text, 1000)!;
+    return Check.isTrue(StringView.fromUtf8(text.view())! == "-1.5100.0", "tenths as text");
+}
+
+@test
+fn breaksAfterFailures() -> Result<void, TestFailure> {
+    let b = Breaker.create();
+    Check.isTrue(b.allows(1000), "closed")?;
+    b.failed(1000);
+    b.failed(1000);
+    Check.isTrue(b.allows(1000), "two failures: still closed")?;
+    b.failed(1000);
+    Check.isTrue(!b.allows(1001) && !b.allows(30999), "open for 30 s")?;
+    Check.isTrue(b.allows(31000), "closed again")?;
+    b.failed(31000);
+    b.succeeded();
+    b.failed(31000);
+    b.failed(31000);
+    return Check.isTrue(b.allows(31000), "a success resets the count");
+}
+
+@test
+fn realScanners() -> Result<void, TestFailure> {
+    match (port("CLAMD_PORT")) {
+        Some(p) => {
+            var name = String.create();
+            var bad = message("");
+            eicar(mut bad);
+            let found = Async.run(clamd(p, bad, mut name));
+            Check.isTrue(verdictIs(found, 1) && name.view().contains("Eicar"), "ClamAV finds EICAR")?;
+            let clean = message("Nothing to see here.\r\n");
+            Check.isTrue(verdictIs(Async.run(clamd(p, clean, mut name)), 0), "ClamAV passes a clean message")?;
+        }
+        null => {}
+    }
+    match (port("SPAMD_PORT")) {
+        Some(p) => {
+            var spam = message("");
+            gtube(mut spam);
+            let s = Async.run(spamd(p, spam))!;
+            Check.isTrue(s.scored && s.spam && s.tenths >= 10000, "SpamAssassin scores GTUBE 1000")?;
+            let ham = message("Lunch on Thursday?\r\n");
+            let h = Async.run(spamd(p, ham))!;
+            Check.isTrue(h.scored && !h.spam, "SpamAssassin passes a plain message")?;
+        }
+        null => {}
+    }
+    return Ok();
+}

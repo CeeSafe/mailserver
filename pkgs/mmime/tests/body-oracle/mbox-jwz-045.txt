@@ -1,0 +1,3 @@
+python 3.9.6
+parts 3
+text 2 30 8dd339d03b5e37e3ef7dc6ec01e01bf534e0dc4c811d0cea89f929dafb2189f6 8dd339d03b5e37e3ef7dc6ec01e01bf534e0dc4c811d0cea89f929dafb2189f6

@@ -1,0 +1,73 @@
+# The mail server's configuration for deploy/docker-compose.yml: copy it to /opt/mailserver/mailserver.toml, readable
+# by the container's user only (it holds the database password): chown 65532 mailserver.toml && chmod 600
+# mailserver.toml. Change every CHANGE_ME. Every key is described at the top of
+# src/config.cee. The container listens on unprivileged ports; compose publishes the public ones.
+
+hostname = "mail.example.com"
+database = "postgres://mailserver:CHANGE_ME@172.30.53.5:5432/mailserver?sslmode=disable"
+blobs = "/var/lib/mailserver/blobs"
+workers = 4
+
+[smtp]
+mx = "0.0.0.0:2525"             # host port 25
+submission = "0.0.0.0:2587"     # 587, STARTTLS
+submissions = "0.0.0.0:2465"    # 465, implicit TLS
+max_message_size = 52428800
+max_connections = 1000
+
+[imap]
+imap = "0.0.0.0:2143"           # 143, STARTTLS; empty to disable
+imaps = "0.0.0.0:2993"          # 993
+max_connections = 2000
+
+[http]
+http = "0.0.0.0:8080"           # host port 80: ACME challenges, autoconfig
+https = "0.0.0.0:8443"          # 443: MTA-STS policies, autoconfig, autodiscover
+admin = "0.0.0.0:9184"          # the admin API, for the admin UI container only: compose never publishes it
+proxied = "0.0.0.0:9185"        # plain HTTP for a TLS-terminating proxy (CosmoProxy): MTA-STS, autodiscover,
+                                #   ActiveSync, EWS, CalDAV/CardDAV; no admin API
+advertise_exchange = true       # autodiscover names EWS too; macOS Mail then sets up Exchange accounts (false: IMAP
+                                #   and SMTP only)
+imap_port = 993
+submission_port = 465
+
+[admin]
+# The admin UI's logins are signed with this; or set COSMOMAIL_JWT_SECRET in the environment (it wins).
+jwt_secret = ""
+
+[tls]
+certificate = "/var/lib/mailserver/tls/fullchain.pem"
+key = "/var/lib/mailserver/tls/key.pem"
+reload_interval = 60
+
+[acme]
+# Let's Encrypt, for hostname and mta-sts.<domain> of each domain publishing MTA-STS. With CosmoProxy (or another
+# proxy) holding ports 80 and 443 and the certificates, leave directory empty and point [tls] at its files.
+directory = "https://acme-v02.api.letsencrypt.org/directory"
+email = "postmaster@example.com"
+account_key = "/var/lib/mailserver/acme-account.pem"
+
+[dns]
+inbound_auth = true
+
+[scan]
+clamd = "172.30.53.10:3310"        # IP addresses: the server does not resolve host names here
+spamd = "172.30.53.11:783"
+
+[relay]
+workers = 8
+srs_secret = "CHANGE_ME: long random text"
+
+# With CosmoProxy in front (deploy/docker-compose.cosmoproxy.yml): it sends PROXY v2 headers from the Docker
+# bridge, and only from there are they taken.
+# [proxy]
+# from = "172.16.0.0/12"
+
+# The cutover (deploy/CUTOVER.md): the old CosmoMailServer database, and its content store.
+# [import]
+# source = "postgres://cosmomail:CHANGE_ME@old-postgres:5432/CosmoMail?sslmode=disable"
+# s3_endpoint = "http://mailserver-s3:8100"
+# s3_bucket = "default"
+# s3_region = "us-east-1"
+# s3_access_key = "default"
+# s3_secret_key = "default"

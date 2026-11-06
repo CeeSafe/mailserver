@@ -1,0 +1,1237 @@
+// SPF (RFC 7208): whether `ip` may send mail for a domain. Checked against the RFC's own test suite
+// (tests/spf/rfc7208-tests.yml, run by tests/spf/run.py).
+
+import mdns.DnsAnswer;
+import mdns.DnsError;
+import mdns.IpAddress;
+import mdns.RCODE_NOERROR;
+import mdns.RCODE_NXDOMAIN;
+import mdns.Resolver;
+import mdns.TYPE_A;
+import mdns.TYPE_AAAA;
+import mdns.TYPE_MX;
+import mdns.TYPE_PTR;
+import mdns.TYPE_TXT;
+import mdns.appendIp;
+import mdns.appendReverseName;
+import mdns.parseIp;
+
+/// An SPF result (RFC 7208 §2.6).
+public enum SpfResult {
+    None,
+    Neutral,
+    Pass,
+    Fail,
+    SoftFail,
+    TempError,
+    PermError,
+}
+
+/// The result's name, as Received-SPF and Authentication-Results write it.
+public fn spfName(r: SpfResult) -> StringView => match (r) {
+    SpfResult.None => "none",
+    SpfResult.Neutral => "neutral",
+    SpfResult.Pass => "pass",
+    SpfResult.Fail => "fail",
+    SpfResult.SoftFail => "softfail",
+    SpfResult.TempError => "temperror",
+    SpfResult.PermError => "permerror",
+};
+
+/// The most DNS-querying terms one check may evaluate (§4.6.4), and void lookups (no records, or NXDOMAIN).
+const LOOKUP_LIMIT: u32 = 10;
+const VOID_LIMIT: u32 = 2;
+/// The most names `mx` and `ptr` look at (§4.6.4).
+const NAME_LIMIT: usize = 10;
+
+/// The result of a check, with the explanation of a Fail (from `exp=`, macros expanded) when there is one.
+@noncopy
+public struct SpfOutcome {
+    public result: SpfResult;
+    public explanation: String;
+    /// The domain that was checked: the MAIL FROM's, or the HELO's for the null sender.
+    public domain: String;
+
+    public fn create() -> SpfOutcome => SpfOutcome {
+        result: SpfResult.None,
+        explanation: String.create(),
+        domain: String.create(),
+    };
+}
+
+/// What one check carries through its recursion.
+@noncopy
+struct SpfCheck {
+    ip: IpAddress;
+    /// The sender (`local@domain`); `postmaster@helo` for the null sender.
+    sender: Vector<u8>;
+    helo: Vector<u8>;
+    lookups: u32;
+    voids: u32;
+}
+
+/// A term of a record, parsed: positions into the record text.
+struct Term {
+    /// `+`, `-`, `~` or `?` as a result.
+    qualifier: SpfResult;
+    /// 0 all, 1 include, 2 a, 3 mx, 4 ptr, 5 ip4, 6 ip6, 7 exists; 10 redirect, 11 exp, 12 another modifier.
+    kind: u8;
+    /// The domain-spec or address: `[argAt, argEnd)`; empty when absent.
+    argAt: usize;
+    argEnd: usize;
+    cidr4: u32;
+    cidr6: u32;
+}
+
+const ALL: u8 = 0;
+const INCLUDE: u8 = 1;
+const A: u8 = 2;
+const MX: u8 = 3;
+const PTR: u8 = 4;
+const IP4: u8 = 5;
+const IP6: u8 = 6;
+const EXISTS: u8 = 7;
+const REDIRECT: u8 = 10;
+const EXP: u8 = 11;
+const OTHER: u8 = 12;
+
+/// Checks `ip` against the SPF policy of `mailFrom`'s domain (or, for the null sender, `helo`'s).
+public async fn checkSpf(
+    resolver: borrow Resolver,
+    ip: IpAddress,
+    mailFrom: StringView,
+    helo: StringView,
+    out: borrow mut SpfOutcome,
+) -> Result<void, AllocError> {
+    out.explanation.clear();
+    out.domain.clear();
+    var check = SpfCheck { ip: ip, sender: Vector<u8>.create(), helo: Vector<u8>.create(), lookups: 0, voids: 0 };
+    check.helo.extend(helo.bytes())?;
+    let from = mailFrom.bytes();
+    let at = match (from.lastIndexOf("@".bytes())) {
+        Some(a) => a,
+        null => from.length,
+    };
+    if (from.length == 0 || at == from.length) {
+        // The null sender, or no domain: the HELO identity, as postmaster (§2.4).
+        check.sender.extend("postmaster@".bytes())?;
+        check.sender.extend(helo.bytes())?;
+        out.domain.append(helo)?;
+    } else {
+        if (at == 0) {
+            check.sender.extend("postmaster".bytes())?;
+            check.sender.extend(from[at..])?;
+        } else {
+            check.sender.extend(from)?;
+        }
+        out.domain.append(mailFrom[at + 1..])?;
+    }
+    if (!validDomain(out.domain.view().bytes())) {
+        out.result = SpfResult.None; // §4.3: not a domain SPF can check
+        return Ok();
+    }
+    var domain = Vector<u8>.create();
+    domain.extend(out.domain.view().bytes())?;
+    out.result = await checkHost(resolver, mut check, domain.view(), true, out)?;
+    return Ok();
+}
+
+/// A domain worth checking: labels of 1 to 63 bytes, at least two of them.
+fn validDomain(d: Slice<u8>) -> bool {
+    var end = d.length;
+    if (end > 0 && d[end - 1] == 0x2e) {
+        end -= 1;
+    }
+    if (end == 0 || end > 253) {
+        return false;
+    }
+    var labels = 0u32;
+    var length: usize = 0;
+    for (i in 0..end) {
+        if (d[i] == 0x2e) {
+            if (length == 0 || length > 63) {
+                return false;
+            }
+            labels += 1;
+            length = 0;
+        } else {
+            length += 1;
+        }
+    }
+    return length > 0 && length <= 63 && labels >= 1;
+}
+
+/// The SPF record of `domain` into `record`: Ok(1) found, Ok(0) none, Err for the result to give.
+async fn fetchRecord(
+    resolver: borrow Resolver,
+    check: borrow mut SpfCheck,
+    domain: Slice<u8>,
+    record: borrow mut Vector<u8>,
+) -> Result<bool, SpfResult> {
+    let name = match (StringView.fromUtf8(domain)) {
+        Some(n) => n,
+        null => { return Ok(false); }
+    };
+    var answer = DnsAnswer.create();
+    match (await resolver.query(name, TYPE_TXT, mut answer)) {
+        Ok() => {}
+        Err(DnsError.BadName) => { return Ok(false); }
+        Err(_) => { return Err(SpfResult.TempError); }
+    }
+    if (answer.rcode != RCODE_NOERROR && answer.rcode != RCODE_NXDOMAIN) {
+        return Err(SpfResult.TempError);
+    }
+    var found = false;
+    for (i in 0..answer.count()) {
+        let text = answer.data(i);
+        let isSpf = text.length >= 6 && text[0..6].equalsIgnoreAsciiCase("v=spf1".bytes()) &&
+            (text.length == 6 || text[6] == 0x20);
+        if (isSpf) {
+            if (found) {
+                return Err(SpfResult.PermError); // two records (§4.5)
+            }
+            found = true;
+            record.clear();
+            match (record.extend(text)) {
+                Ok() => {}
+                Err(_) => { return Err(SpfResult.TempError); }
+            }
+        }
+    }
+    return Ok(found);
+}
+
+/// check_host() (§4): the result of `domain`'s record for the check.
+async fn checkHost(
+    resolver: borrow Resolver,
+    check: borrow mut SpfCheck,
+    domain: Slice<u8>,
+    top: bool,
+    out: borrow mut SpfOutcome,
+) -> Result<SpfResult, AllocError> {
+    var record = Vector<u8>.create();
+    match (await fetchRecord(resolver, check, domain, mut record)) {
+        Ok(true) => {}
+        Ok(false) => { return Ok(SpfResult.None); }
+        Err(r) => { return Ok(r); }
+    }
+    // Parse every term first: a syntax error anywhere is a PermError before anything is evaluated (§4.6).
+    var terms = Vector<Term>.create();
+    if (!parseRecord(record.view(), mut terms)?) {
+        return Ok(SpfResult.PermError);
+    }
+    var redirect: Term? = null;
+    var exp: Term? = null;
+    for (i in 0..terms.length) {
+        let t = terms[i];
+        if (t.kind == REDIRECT) {
+            if (redirect != null) {
+                return Ok(SpfResult.PermError);
+            }
+            redirect = t;
+        } else if (t.kind == EXP) {
+            if (exp != null) {
+                return Ok(SpfResult.PermError);
+            }
+            exp = t;
+        }
+    }
+    var target = Vector<u8>.create();
+    for (i in 0..terms.length) {
+        let t = terms[i];
+        if (t.kind >= REDIRECT) {
+            continue;
+        }
+        let matched = await evaluate(resolver, check, record.view(), domain, t, mut target)?;
+        match (matched) {
+            Matched.Yes => {
+                if (top) {
+                    match (t.qualifier) {
+                        SpfResult.Fail => {
+                            match (exp) {
+                                Some(e) => { await explain(resolver, check, record.view(), domain, e, out)?; }
+                                null => {}
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                return Ok(t.qualifier);
+            }
+            Matched.No => {}
+            Matched.Error(r) => { return Ok(r); }
+        }
+    }
+    match (redirect) {
+        Some(r) => {
+            // §6.1: the redirect counts as a lookup, and the target must have a record.
+            check.lookups += 1;
+            if (check.lookups > LOOKUP_LIMIT) {
+                return Ok(SpfResult.PermError);
+            }
+            target.clear();
+            if (!(await expandDomain(resolver, check, record.view(), r.argAt, r.argEnd, domain, false, mut target)?)) {
+                return Ok(SpfResult.PermError);
+            }
+            if (!validDomain(target.view())) {
+                return Ok(SpfResult.PermError);
+            }
+            let result = await checkHost(resolver, check, target.view(), top, out)?;
+            match (result) {
+                SpfResult.None => { return Ok(SpfResult.PermError); }
+                _ => { return Ok(result); }
+            }
+        }
+        null => {}
+    }
+    return Ok(SpfResult.Neutral);
+}
+
+enum Matched {
+    Yes,
+    No,
+    Error(SpfResult),
+}
+
+/// Counts a DNS-querying term; false when over the limit.
+fn countLookup(check: borrow mut SpfCheck) -> bool {
+    check.lookups += 1;
+    return check.lookups <= LOOKUP_LIMIT;
+}
+
+/// Counts a void lookup; false when over the limit.
+fn countVoid(check: borrow mut SpfCheck, answer: borrow DnsAnswer) -> bool {
+    if (answer.count() == 0) {
+        check.voids += 1;
+        return check.voids <= VOID_LIMIT;
+    }
+    return true;
+}
+
+/// Asks `name` for `kind`; `Err` with the term's result on a DNS failure.
+async fn lookup(
+    resolver: borrow Resolver,
+    name: Slice<u8>,
+    kind: u16,
+    answer: borrow mut DnsAnswer,
+) -> Result<void, SpfResult> {
+    let text = match (StringView.fromUtf8(name)) {
+        Some(t) => t,
+        null => { return Ok(); }
+    };
+    match (await resolver.query(text, kind, answer)) {
+        Ok() => {}
+        Err(DnsError.BadName) => {
+            // A name that cannot be asked for has no records.
+            return Ok();
+        }
+        Err(_) => { return Err(SpfResult.TempError); }
+    }
+    if (answer.rcode != RCODE_NOERROR && answer.rcode != RCODE_NXDOMAIN) {
+        return Err(SpfResult.TempError);
+    }
+    return Ok();
+}
+
+/// Whether `answer`'s addresses (A or AAAA) include `ip` within the CIDR lengths.
+fn addressMatch(answer: borrow DnsAnswer, ip: IpAddress, cidr4: u32, cidr6: u32) -> bool {
+    for (i in 0..answer.count()) {
+        let data = answer.data(i);
+        var bytes = [0u8; 16];
+        if (data.length == 4) {
+            bytes[10] = 0xff;
+            bytes[11] = 0xff;
+            bytes[12..16].copyFrom(data);
+        } else if (data.length == 16) {
+            bytes[..].copyFrom(data);
+        } else {
+            continue;
+        }
+        let address = IpAddress { bytes: bytes };
+        if (ip.inNetwork(address, if (address.isV4()) cidr4 else cidr6)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// The domain a term names: its domain-spec expanded, or the current domain.
+async fn termDomain(
+    resolver: borrow Resolver,
+    check: borrow mut SpfCheck,
+    record: Slice<u8>,
+    domain: Slice<u8>,
+    t: Term,
+    into: borrow mut Vector<u8>,
+) -> Result<bool, AllocError> {
+    into.clear();
+    if (t.argAt == t.argEnd) {
+        into.extend(domain)?;
+        return Ok(true);
+    }
+    return await expandDomain(resolver, check, record, t.argAt, t.argEnd, domain, false, into);
+}
+
+async fn evaluate(
+    resolver: borrow Resolver,
+    check: borrow mut SpfCheck,
+    record: Slice<u8>,
+    domain: Slice<u8>,
+    t: Term,
+    target: borrow mut Vector<u8>,
+) -> Result<Matched, AllocError> {
+    let ip = check.ip;
+    if (t.kind == ALL) {
+        return Ok(Matched.Yes);
+    }
+    if (t.kind == IP4 || t.kind == IP6) {
+        let network = match (parseIp(record[t.argAt..t.argEnd])) {
+            Some(n) => n,
+            null => { return Ok(Matched.Error(SpfResult.PermError)); }
+        };
+        let bits = if (t.kind == IP4) t.cidr4 else t.cidr6;
+        return Ok(if (ip.inNetwork(network, bits)) Matched.Yes else Matched.No);
+    }
+    // The rest query DNS.
+    if (!countLookup(check)) {
+        return Ok(Matched.Error(SpfResult.PermError));
+    }
+    if (!(await termDomain(resolver, check, record, domain, t, target)?)) {
+        return Ok(Matched.Error(SpfResult.PermError));
+    }
+    var answer = DnsAnswer.create();
+    let family = if (ip.isV4()) TYPE_A else TYPE_AAAA;
+    if (t.kind == INCLUDE) {
+        if (t.argAt == t.argEnd) {
+            return Ok(Matched.Error(SpfResult.PermError));
+        }
+        if (!validDomain(target.view())) {
+            return Ok(Matched.Error(SpfResult.PermError));
+        }
+        var nested = SpfOutcome.create();
+        var name = Vector<u8>.create();
+        name.extend(target.view())?;
+        let result = await checkHost(resolver, check, name.view(), false, mut nested)?;
+        match (result) {
+            SpfResult.Pass => { return Ok(Matched.Yes); }
+            SpfResult.Fail => { return Ok(Matched.No); }
+            SpfResult.SoftFail => { return Ok(Matched.No); }
+            SpfResult.Neutral => { return Ok(Matched.No); }
+            SpfResult.TempError => { return Ok(Matched.Error(SpfResult.TempError)); }
+            _ => { return Ok(Matched.Error(SpfResult.PermError)); } // none and permerror (§5.2)
+        }
+    }
+    if (!validDomain(target.view())) {
+        // A target that is not a domain has no records: a void lookup (§4.3 for the check's own domain).
+        check.voids += 1;
+        return Ok(if (check.voids > VOID_LIMIT) Matched.Error(SpfResult.PermError) else Matched.No);
+    }
+    if (t.kind == A) {
+        match (await lookup(resolver, target.view(), family, mut answer)) {
+            Ok() => {}
+            Err(r) => { return Ok(Matched.Error(r)); }
+        }
+        if (!countVoid(check, answer)) {
+            return Ok(Matched.Error(SpfResult.PermError));
+        }
+        return Ok(if (addressMatch(answer, ip, t.cidr4, t.cidr6)) Matched.Yes else Matched.No);
+    }
+    if (t.kind == EXISTS) {
+        // Always an A query, whatever the client's family (§5.7).
+        match (await lookup(resolver, target.view(), TYPE_A, mut answer)) {
+            Ok() => {}
+            Err(r) => { return Ok(Matched.Error(r)); }
+        }
+        if (!countVoid(check, answer)) {
+            return Ok(Matched.Error(SpfResult.PermError));
+        }
+        return Ok(if (answer.count() > 0) Matched.Yes else Matched.No);
+    }
+    if (t.kind == MX) {
+        match (await lookup(resolver, target.view(), TYPE_MX, mut answer)) {
+            Ok() => {}
+            Err(r) => { return Ok(Matched.Error(r)); }
+        }
+        if (!countVoid(check, answer)) {
+            return Ok(Matched.Error(SpfResult.PermError));
+        }
+        if (answer.count() > NAME_LIMIT) {
+            return Ok(Matched.Error(SpfResult.PermError));
+        }
+        var hosts = DnsAnswer.create();
+        for (i in 0..answer.count()) {
+            match (await lookup(resolver, answer.data(i), family, mut hosts)) {
+                Ok() => {}
+                Err(r) => { return Ok(Matched.Error(r)); }
+            }
+            if (addressMatch(hosts, ip, t.cidr4, t.cidr6)) {
+                return Ok(Matched.Yes);
+            }
+        }
+        return Ok(Matched.No);
+    }
+    // ptr (§5.5): a validated name of the client equal to or under the target.
+    var names = Vector<Vector<u8>>.create();
+    match (await validatedNames(resolver, ip, mut names)) {
+        Ok() => {}
+        Err(_) => { return Ok(Matched.No); } // a DNS error here is no match
+    }
+    for (i in 0..names.length) {
+        if (endsWithDomain(names[i].view(), target.view())) {
+            return Ok(Matched.Yes);
+        }
+    }
+    return Ok(Matched.No);
+}
+
+/// Whether `name` is `domain` or under it.
+fn endsWithDomain(name: Slice<u8>, domain: Slice<u8>) -> bool {
+    let n = trimDot(name);
+    let d = trimDot(domain);
+    if (n.length == d.length) {
+        return n.equalsIgnoreAsciiCase(d);
+    }
+    return n.length > d.length && n[n.length - d.length - 1] == 0x2e && n[n.length - d.length..].equalsIgnoreAsciiCase(
+        d,
+    );
+}
+
+fn trimDot(d: Slice<u8>) -> Slice<u8> {
+    if (d.length > 0 && d[d.length - 1] == 0x2e) {
+        return d[0..d.length - 1];
+    }
+    return d;
+}
+
+/// The client's names whose forward lookup gives its address back (at most 10 tried, §4.6.4).
+async fn validatedNames(
+    resolver: borrow Resolver,
+    ip: IpAddress,
+    into: borrow mut Vector<Vector<u8>>,
+) -> Result<void, SpfResult> {
+    var reverse = Vector<u8>.create();
+    match (appendReverseName(mut reverse, ip)) {
+        Ok() => {}
+        Err(_) => { return Err(SpfResult.TempError); }
+    }
+    var answer = DnsAnswer.create();
+    await lookup(resolver, reverse.view(), TYPE_PTR, mut answer)?;
+    var forward = DnsAnswer.create();
+    let family = if (ip.isV4()) TYPE_A else TYPE_AAAA;
+    let limit = if (answer.count() > NAME_LIMIT) NAME_LIMIT else answer.count();
+    for (i in 0..limit) {
+        match (await lookup(resolver, answer.data(i), family, mut forward)) {
+            Ok() => {}
+            Err(_) => { continue; }
+        }
+        if (addressMatch(forward, ip, 32, 128)) {
+            var name = Vector<u8>.create();
+            match (name.extend(answer.data(i))) {
+                Ok() => {}
+                Err(_) => { return Err(SpfResult.TempError); }
+            }
+            match (into.push(name)) {
+                Ok() => {}
+                Err(_) => { return Err(SpfResult.TempError); }
+            }
+        }
+    }
+    return Ok();
+}
+
+/// A Fail's explanation (§6.2): the TXT record at the expanded `exp=` domain, macros expanded. Failures are ignored:
+/// the result stays Fail, without an explanation.
+async fn explain(
+    resolver: borrow Resolver,
+    check: borrow mut SpfCheck,
+    record: Slice<u8>,
+    domain: Slice<u8>,
+    e: Term,
+    out: borrow mut SpfOutcome,
+) -> Result<void, AllocError> {
+    var target = Vector<u8>.create();
+    if (!(await expandDomain(resolver, check, record, e.argAt, e.argEnd, domain, false, mut target)?)) {
+        return Ok();
+    }
+    var answer = DnsAnswer.create();
+    match (await lookup(resolver, target.view(), TYPE_TXT, mut answer)) {
+        Ok() => {}
+        Err(_) => { return Ok(); }
+    }
+    if (answer.count() != 1) {
+        return Ok();
+    }
+    var text = Vector<u8>.create();
+    text.extend(answer.data(0))?;
+    var expanded = Vector<u8>.create();
+    if (!(await expandMacros(resolver, check, text.view(), 0, text.length, domain, true, mut expanded)?)) {
+        return Ok();
+    }
+    match (StringView.fromUtf8(expanded.view())) {
+        Some(t) => {
+            // Only printable ASCII is kept (§6.2).
+            for (c in t.bytes()) {
+                if (c < 0x20 || c > 0x7e) {
+                    return Ok();
+                }
+            }
+            out.explanation.append(t)?;
+        }
+        null => {}
+    }
+    return Ok();
+}
+
+// ---- Parsing (§4.6.1, §12) ----
+
+fn isAlpha(c: u8) -> bool => (c >= 0x41 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a);
+
+fn isDigit(c: u8) -> bool => c >= 0x30 && c <= 0x39;
+
+/// Splits the record into terms; false on a syntax error.
+fn parseRecord(record: Slice<u8>, terms: borrow mut Vector<Term>) -> Result<bool, AllocError> {
+    var at: usize = 6; // after "v=spf1"
+    while (at < record.length) {
+        if (record[at] == 0x20) {
+            at += 1;
+            continue;
+        }
+        var end = at;
+        while (end < record.length && record[end] != 0x20) {
+            end += 1;
+        }
+        match (parseTerm(record, at, end)) {
+            Some(t) => { terms.push(t)?; }
+            null => { return Ok(false); }
+        }
+        at = end;
+    }
+    return Ok(true);
+}
+
+fn parseTerm(record: Slice<u8>, start: usize, end: usize) -> Term? {
+    var at = start;
+    var qualifier = SpfResult.Pass;
+    var qualified = false;
+    let q = record[at];
+    if (q == 0x2b || q == 0x2d || q == 0x7e || q == 0x3f) {
+        qualifier =
+            if (q ==
+                0x2b) SpfResult.Pass else (if (q ==
+                0x2d) SpfResult.Fail else (if (q == 0x7e) SpfResult.SoftFail else SpfResult.Neutral));
+        qualified = true;
+        at += 1;
+    }
+    // The name: up to ':', '/', '=' or the end.
+    var nameEnd = at;
+    while (nameEnd < end && record[nameEnd] != 0x3a && record[nameEnd] != 0x2f && record[nameEnd] != 0x3d) {
+        nameEnd += 1;
+    }
+    let name = record[at..nameEnd];
+    if (name.length == 0) {
+        return null;
+    }
+    var term = Term { qualifier: qualifier, kind: OTHER, argAt: nameEnd, argEnd: nameEnd, cidr4: 32, cidr6: 128 };
+    if (nameEnd < end && record[nameEnd] == 0x3d) {
+        // A modifier: name "=" macro-string. No qualifier.
+        if (qualified || !isAlpha(name[0])) {
+            return null;
+        }
+        for (c in name) {
+            if (!(isAlpha(c) || isDigit(c) || c == 0x2d || c == 0x5f || c == 0x2e)) {
+                return null;
+            }
+        }
+        term.argAt = nameEnd + 1;
+        term.argEnd = end;
+        if (!validMacroString(record[term.argAt..end], true)) {
+            return null;
+        }
+        if (name.equalsIgnoreAsciiCase("redirect".bytes())) {
+            term.kind = REDIRECT;
+        } else if (name.equalsIgnoreAsciiCase("exp".bytes())) {
+            term.kind = EXP;
+        }
+        if ((term.kind == REDIRECT || term.kind == EXP) && !validDomainSpec(record[term.argAt..end])) {
+            return null;
+        }
+        return term;
+    }
+    let kind = mechanismKind(name)?;
+    term.kind = kind;
+    var argEnd = end;
+    if (kind == A || kind == MX || kind == IP6) {
+        // A trailing dual-cidr-length (§5.6): "/n", "//m" or "/n//m" at the very end; a domain-spec may hold
+        // other slashes. For ip6 only "/m".
+        let slash = cidrStart(record[nameEnd..end], kind == IP6);
+        if (slash < end - nameEnd) {
+            if (!parseCidrs(record[nameEnd + slash..end], kind, mut term)) {
+                return null;
+            }
+            argEnd = nameEnd + slash;
+        }
+    } else if (kind == IP4) {
+        match (record[nameEnd..end].indexOfByte(0x2f)) {
+            Some(s) => {
+                let bits = parseLength(record[nameEnd + s + 1..end], 32)?;
+                term.cidr4 = bits;
+                argEnd = nameEnd + s;
+            }
+            null => {}
+        }
+    } else if (nameEnd < end && record[nameEnd] == 0x2f) {
+        return null; // a CIDR length where none is allowed
+    }
+    if (nameEnd < argEnd) {
+        if (record[nameEnd] != 0x3a) {
+            return null;
+        }
+        term.argAt = nameEnd + 1;
+        term.argEnd = argEnd;
+        if (term.argAt == term.argEnd) {
+            return null; // "a:" with nothing after it
+        }
+    } else {
+        term.argAt = argEnd;
+        term.argEnd = argEnd;
+    }
+    let arg = record[term.argAt..term.argEnd];
+    if (kind == IP4) {
+        let ip = parseIp(arg)?;
+        if (!ip.isV4() || arg.indexOfByte(0x3a) != null) {
+            return null;
+        }
+    } else if (kind == IP6) {
+        if (arg.indexOfByte(0x3a) == null) {
+            return null;
+        }
+        parseIp(arg)?;
+    } else if (kind == ALL) {
+        if (term.argAt != term.argEnd) {
+            return null;
+        }
+    } else if ((kind == INCLUDE || kind == EXISTS) && term.argAt == term.argEnd) {
+        return null;
+    } else if (term.argAt != term.argEnd && !validDomainSpec(arg)) {
+        return null;
+    }
+    return term;
+}
+
+/// Where a trailing CIDR suffix starts in `text`, or `text.length` when there is none.
+fn cidrStart(text: Slice<u8>, single: bool) -> usize {
+    var at = text.length;
+    // Digits, then "/" or "//", from the end, up to twice.
+    for (round in 0..(if (single) 1 else 2)) {
+        var d = at;
+        while (d > 0 && isDigit(text[d - 1])) {
+            d -= 1;
+        }
+        if (d == at || d == 0 || text[d - 1] != 0x2f) {
+            break;
+        }
+        var slash = d - 1;
+        if (!single && slash > 0 && text[slash - 1] == 0x2f) {
+            if (round == 1) {
+                break; // "//m" must come last
+            }
+            slash -= 1;
+        } else if (round == 1 && at < text.length && text[at + 1] != 0x2f) {
+            break; // two single-slash lengths
+        }
+        at = slash;
+    }
+    return at;
+}
+
+fn mechanismKind(name: Slice<u8>) -> u8? {
+    let kinds = ["all", "include", "a", "mx", "ptr", "ip4", "ip6", "exists"];
+    for (i in 0..8) {
+        if (name.equalsIgnoreAsciiCase(kinds[i].bytes())) {
+            return truncate<u8>(i);
+        }
+    }
+    return null;
+}
+
+/// `/n` and `//m` after an a or mx mechanism, or `/m` after ip6.
+fn parseCidrs(text: Slice<u8>, kind: u8, term: borrow mut Term) -> bool {
+    if (kind == IP6) {
+        match (parseLength(text[1..], 128)) {
+            Some(b) => {
+                term.cidr6 = b;
+                return true;
+            }
+            null => { return false; }
+        }
+    }
+    if (text.length >= 2 && text[1] == 0x2f) {
+        match (parseLength(text[2..], 128)) {
+            Some(b) => {
+                term.cidr6 = b;
+                return true;
+            }
+            null => { return false; }
+        }
+    }
+    let rest = text[1..];
+    match (rest.indexOfByte(0x2f)) {
+        Some(s) => {
+            if (s + 1 >= rest.length || rest[s + 1] != 0x2f) {
+                return false;
+            }
+            match (parseLength(rest[0..s], 32)) {
+                Some(b) => { term.cidr4 = b; }
+                null => { return false; }
+            }
+            match (parseLength(rest[s + 2..], 128)) {
+                Some(b) => {
+                    term.cidr6 = b;
+                    return true;
+                }
+                null => { return false; }
+            }
+        }
+        null => {
+            match (parseLength(rest, 32)) {
+                Some(b) => {
+                    term.cidr4 = b;
+                    return true;
+                }
+                null => { return false; }
+            }
+        }
+    }
+}
+
+/// A CIDR length: digits without a leading zero (except "0"), at most `max`.
+fn parseLength(text: Slice<u8>, max: u32) -> u32? {
+    if (text.length == 0 || text.length > 3 || (text.length > 1 && text[0] == 0x30)) {
+        return null;
+    }
+    var n: u32 = 0;
+    for (c in text) {
+        if (!isDigit(c)) {
+            return null;
+        }
+        n = n * 10 + ((c - 0x30) as u32);
+    }
+    return if (n > max) null else n;
+}
+
+/// A macro-string: `%{…}`, `%%`, `%_`, `%-`, and visible ASCII (§7.1). Outside explanation text (`domainSpec`),
+/// the macros c, r and t are not allowed.
+fn validMacroString(text: Slice<u8>, domainSpec: bool) -> bool {
+    var i: usize = 0;
+    while (i < text.length) {
+        let c = text[i];
+        if (c == 0x25) {
+            if (i + 1 >= text.length) {
+                return false;
+            }
+            let n = text[i + 1];
+            if (n == 0x25 || n == 0x5f || n == 0x2d) {
+                i += 2;
+                continue;
+            }
+            if (n != 0x7b) {
+                return false;
+            }
+            let close = match (text[i + 2..].indexOfByte(0x7d)) {
+                Some(c2) => i + 2 + c2,
+                null => { return false; }
+            };
+            let inner = text[i + 2..close];
+            if (!validMacro(inner)) {
+                return false;
+            }
+            let letter = inner[0] | 0x20;
+            if (domainSpec && (letter == 0x63 || letter == 0x72 || letter == 0x74)) {
+                return false;
+            }
+            i = close + 1;
+            continue;
+        }
+        if (c < 0x21 || c > 0x7e) {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+/// The inside of `%{…}`: a letter, digits, an optional `r`, delimiters.
+fn validMacro(inner: Slice<u8>) -> bool {
+    if (inner.length == 0) {
+        return false;
+    }
+    let letter = inner[0] | 0x20;
+    if (!(letter == 0x73 || letter == 0x6c || letter == 0x6f || letter == 0x64 || letter == 0x69 || letter == 0x70 ||
+        letter == 0x68 || letter == 0x63 || letter == 0x72 || letter == 0x74 || letter == 0x76)) {
+        return false;
+    }
+    var i: usize = 1;
+    while (i < inner.length && isDigit(inner[i])) {
+        i += 1;
+    }
+    if (i < inner.length && (inner[i] | 0x20) == 0x72) {
+        i += 1;
+    }
+    while (i < inner.length) {
+        if (!isDelimiter(inner[i])) {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+fn isDelimiter(c: u8) -> bool =>
+    c == 0x2e || c == 0x2d || c == 0x2b || c == 0x2c || c == 0x2f || c == 0x5f || c == 0x3d;
+
+/// A domain-spec (§7.1): a macro-string that ends in a top label or a macro.
+fn validDomainSpec(text: Slice<u8>) -> bool {
+    if (text.length == 0 || !validMacroString(text, true)) {
+        return false;
+    }
+    if (text[text.length - 1] == 0x7d) {
+        return true; // ends with a macro-expand
+    }
+    // The last label (a final dot allowed) must be a toplabel: alphanumeric with a letter, hyphens inside.
+    var end = text.length;
+    if (text[end - 1] == 0x2e) {
+        end -= 1;
+    }
+    var start = end;
+    while (start > 0 && text[start - 1] != 0x2e) {
+        start -= 1;
+    }
+    let label = text[start..end];
+    // `"." toplabel`: the top label must follow a dot (a lone label is not a domain-spec).
+    if (start == 0 || label.length == 0 || label[0] == 0x2d || label[label.length - 1] == 0x2d) {
+        return false;
+    }
+    var letter = false;
+    for (c in label) {
+        if (isAlpha(c)) {
+            letter = true;
+        } else if (!(isDigit(c) || c == 0x2d)) {
+            return false;
+        }
+    }
+    return letter;
+}
+
+// ---- Macros (§7) ----
+
+/// Expands a domain-spec into `into`, keeping it at most 253 bytes by dropping leading labels (§7.3); false on a
+/// macro error.
+async fn expandDomain(
+    resolver: borrow Resolver,
+    check: borrow mut SpfCheck,
+    record: Slice<u8>,
+    start: usize,
+    end: usize,
+    domain: Slice<u8>,
+    explanation: bool,
+    into: borrow mut Vector<u8>,
+) -> Result<bool, AllocError> {
+    into.clear();
+    if (!(await expandMacros(resolver, check, record, start, end, domain, explanation, into)?)) {
+        return Ok(false);
+    }
+    while (into.length > 253) {
+        match (into.view().indexOfByte(0x2e)) {
+            Some(dot) => {
+                var rest = Vector<u8>.create();
+                rest.extend(into[dot + 1..])?;
+                into.clear();
+                into.extend(rest.view())?;
+            }
+            null => { return Ok(false); }
+        }
+    }
+    return Ok(true);
+}
+
+async fn expandMacros(
+    resolver: borrow Resolver,
+    check: borrow mut SpfCheck,
+    text: Slice<u8>,
+    start: usize,
+    end: usize,
+    domain: Slice<u8>,
+    explanation: bool,
+    into: borrow mut Vector<u8>,
+) -> Result<bool, AllocError> {
+    var i = start;
+    var value = Vector<u8>.create();
+    while (i < end) {
+        let c = text[i];
+        if (c != 0x25) {
+            into.push(c)?;
+            i += 1;
+            continue;
+        }
+        if (i + 1 >= end) {
+            return Ok(false);
+        }
+        let n = text[i + 1];
+        if (n == 0x25) {
+            into.push(0x25)?;
+            i += 2;
+            continue;
+        }
+        if (n == 0x5f) {
+            into.push(0x20)?;
+            i += 2;
+            continue;
+        }
+        if (n == 0x2d) {
+            into.extend("%20".bytes())?;
+            i += 2;
+            continue;
+        }
+        if (n != 0x7b) {
+            return Ok(false);
+        }
+        let close = match (text[i + 2..end].indexOfByte(0x7d)) {
+            Some(c2) => i + 2 + c2,
+            null => { return Ok(false); }
+        };
+        let inner = text[i + 2..close];
+        if (!validMacro(inner)) {
+            return Ok(false);
+        }
+        let letter = inner[0];
+        let lower = letter | 0x20;
+        if ((lower == 0x63 || lower == 0x72 || lower == 0x74) && !explanation) {
+            return Ok(false); // c, r and t are for explanations only
+        }
+        value.clear();
+        await macroValue(resolver, check, lower, domain, mut value)?;
+        // Transformers: digits keep that many rightmost parts, `r` reverses; delimiters split (default '.').
+        var j: usize = 1;
+        var keep: u32 = 0;
+        var hasKeep = false;
+        while (j < inner.length && isDigit(inner[j])) {
+            keep = keep * 10 + ((inner[j] - 0x30) as u32);
+            hasKeep = true;
+            j += 1;
+        }
+        if (hasKeep && keep == 0) {
+            return Ok(false);
+        }
+        var reverse = false;
+        if (j < inner.length && (inner[j] | 0x20) == 0x72) {
+            reverse = true;
+            j += 1;
+        }
+        let delimiters = inner[j..];
+        var parts = Vector<Vector<u8>>.create();
+        var current = Vector<u8>.create();
+        for (b in value.view()) {
+            var isDelim = false;
+            if (delimiters.length == 0) {
+                isDelim = b == 0x2e;
+            } else {
+                for (d in delimiters) {
+                    if (b == d) {
+                        isDelim = true;
+                    }
+                }
+            }
+            if (isDelim) {
+                parts.push(current)?;
+                current = Vector<u8>.create();
+            } else {
+                current.push(b)?;
+            }
+        }
+        parts.push(current)?;
+        if (reverse) {
+            var a: usize = 0;
+            var z = parts.length - 1;
+            while (a < z) {
+                parts.swap(a, z);
+                a += 1;
+                z -= 1;
+            }
+        }
+        var first: usize = 0;
+        if (hasKeep && (keep as usize) < parts.length) {
+            first = parts.length - (keep as usize);
+        }
+        var expanded = Vector<u8>.create();
+        for (k in first..parts.length) {
+            if (k > first) {
+                expanded.push(0x2e)?;
+            }
+            expanded.extend(parts[k].view())?;
+        }
+        // An upper-case macro letter URL-escapes the value (§7.3).
+        if (letter >= 0x41 && letter <= 0x5a) {
+            for (b in expanded.view()) {
+                let unreserved = isAlpha(b) || isDigit(b) || b == 0x2d || b == 0x2e || b == 0x5f || b == 0x7e;
+                if (unreserved) {
+                    into.push(b)?;
+                } else {
+                    into.push(0x25)?;
+                    let hex = "0123456789ABCDEF".bytes();
+                    into.push(hex[(b >> 4) as usize])?;
+                    into.push(hex[(b & 0x0f) as usize])?;
+                }
+            }
+        } else {
+            into.extend(expanded.view())?;
+        }
+        i = close + 1;
+    }
+    return Ok(true);
+}
+
+/// The value of macro letter `letter` (lowercase).
+async fn macroValue(
+    resolver: borrow Resolver,
+    check: borrow mut SpfCheck,
+    letter: u8,
+    domain: Slice<u8>,
+    out: borrow mut Vector<u8>,
+) -> Result<void, AllocError> {
+    let sender = check.sender.view();
+    let at = match (sender.lastIndexOf("@".bytes())) {
+        Some(a) => a,
+        null => 0,
+    };
+    if (letter == 0x73) {
+        return out.extend(sender);
+    }
+    if (letter == 0x6c) {
+        return out.extend(sender[0..at]);
+    }
+    if (letter == 0x6f) {
+        return out.extend(sender[at + 1..]);
+    }
+    if (letter == 0x64) {
+        return out.extend(domain);
+    }
+    if (letter == 0x69) {
+        // Dotted IPv4, or IPv6 as dot-separated nibbles (§7.3).
+        if (check.ip.isV4()) {
+            return appendIp(out, check.ip);
+        }
+        let hex = "0123456789abcdef".bytes();
+        for (k in 0..16) {
+            if (k > 0) {
+                out.push(0x2e)?;
+            }
+            out.push(hex[(check.ip.bytes[k] >> 4) as usize])?;
+            out.push(0x2e)?;
+            out.push(hex[(check.ip.bytes[k] & 0x0f) as usize])?;
+        }
+        return Ok();
+    }
+    if (letter == 0x70) {
+        // The client's validated name under the domain if there is one, else any validated name, else "unknown".
+        var names = Vector<Vector<u8>>.create();
+        match (await validatedNames(resolver, check.ip, mut names)) {
+            Ok() => {}
+            Err(_) => {}
+        }
+        for (i in 0..names.length) {
+            if (endsWithDomain(names[i].view(), domain)) {
+                return out.extend(trimDot(names[i].view()));
+            }
+        }
+        if (names.length > 0) {
+            return out.extend(trimDot(names[0].view()));
+        }
+        return out.extend("unknown".bytes());
+    }
+    if (letter == 0x76) {
+        return out.extend(if (check.ip.isV4()) "in-addr".bytes() else "ip6".bytes());
+    }
+    if (letter == 0x68) {
+        return out.extend(check.helo.view());
+    }
+    if (letter == 0x63) {
+        // The client's address in its usual text form.
+        if (check.ip.isV4()) {
+            return appendIp(out, check.ip);
+        }
+        return appendCompressed(out, check.ip);
+    }
+    if (letter == 0x72) {
+        return out.extend("unknown".bytes()); // the receiving host's name: set by the caller in a later version
+    }
+    // t: the current time in seconds.
+    var digits = Vector<u8>.create();
+    var n = Clock.unixMillis() / 1000;
+    loop {
+        digits.push(0x30 + truncate<u8>(n % 10))?;
+        n = n / 10;
+        if (n == 0) {
+            break;
+        }
+    }
+    var k = digits.length;
+    while (k > 0) {
+        k -= 1;
+        out.push(digits[k])?;
+    }
+    return Ok();
+}
+
+/// IPv6 in RFC 5952 form: lowercase, the longest run of zero groups as `::`.
+fn appendCompressed(out: borrow mut Vector<u8>, ip: IpAddress) -> Result<void, AllocError> {
+    var groups = [0u32; 8];
+    for (g in 0..8) {
+        groups[g] = ((ip.bytes[g * 2] as u32) << 8) | (ip.bytes[g * 2 + 1] as u32);
+    }
+    var bestStart: usize = 8;
+    var bestLength: usize = 1;
+    var g: usize = 0;
+    while (g < 8) {
+        if (groups[g] == 0) {
+            var e = g;
+            while (e < 8 && groups[e] == 0) {
+                e += 1;
+            }
+            if (e - g > bestLength) {
+                bestStart = g;
+                bestLength = e - g;
+            }
+            g = e;
+        } else {
+            g += 1;
+        }
+    }
+    let hex = "0123456789abcdef".bytes();
+    g = 0;
+    while (g < 8) {
+        if (g == bestStart) {
+            out.extend("::".bytes())?;
+            g += bestLength;
+            continue;
+        }
+        if (g > 0 && g != bestStart + bestLength) {
+            out.push(0x3a)?;
+        }
+        let v = groups[g];
+        var started = false;
+        var shift: u32 = 12;
+        loop {
+            let d = (v >> shift) & 0xf;
+            if (d != 0 || started || shift == 0) {
+                out.push(hex[d as usize])?;
+                started = true;
+            }
+            if (shift == 0) {
+                break;
+            }
+            shift -= 4;
+        }
+        g += 1;
+    }
+    return Ok();
+}

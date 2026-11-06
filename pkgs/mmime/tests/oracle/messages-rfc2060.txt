@@ -1,0 +1,40 @@
+size 1336
+envelope (NIL "Sample message structure for IMAP part specifiers" ((NIL NIL "me" "myself.com")) ((NIL NIL "me" "myself.com")) ((NIL NIL "me" "myself.com")) ((NIL NIL "me" "myself.com")) NIL NIL NIL NIL)
+bodystructure (("TEXT" "PLAIN" ("charset" "us-ascii") NIL NIL "7bit" 34 1 NIL NIL NIL NIL) ("APPLICATION" "OCTET-STREAM" NIL NIL NIL "7bit" 34 NIL NIL NIL NIL) ("message" "rfc822" NIL NIL NIL "7bit" 320 (NIL "This part specifier should be: 3" ((NIL NIL "me" "myself.com")) ((NIL NIL "me" "myself.com")) ((NIL NIL "me" "myself.com")) ((NIL NIL "me" "myself.com")) NIL NIL NIL NIL) (("TEXT" "PLAIN" ("charset" "us-ascii") NIL NIL "7bit" 36 1 NIL NIL NIL NIL) ("APPLICATION" "OCTET-STREAM" NIL NIL NIL "7bit" 36 NIL NIL NIL NIL) "MIXED" ("boundary" "3.x") NIL NIL NIL) 17 NIL NIL NIL NIL) (("IMAGE" "GIF" NIL NIL NIL "7bit" 36 NIL NIL NIL NIL) ("message" "rfc822" NIL NIL NIL "7bit" 489 (NIL "This part specifier should be: 4.2" ((NIL NIL "me" "myself.com")) ((NIL NIL "me" "myself.com")) ((NIL NIL "me" "myself.com")) ((NIL NIL "me" "myself.com")) NIL NIL NIL NIL) (("TEXT" "PLAIN" ("charset" "us-ascii") NIL NIL "7bit" 38 1 NIL NIL NIL NIL) (("TEXT" "PLAIN" ("charset" "us-ascii") NIL NIL "7bit" 40 1 NIL NIL NIL NIL) ("TEXT" "RICHTEXT" ("charset" "us-ascii") NIL NIL "7bit" 40 1 NIL NIL NIL NIL) "ALTERNATIVE" ("boundary" "4.2.2.x") NIL NIL NIL) "MIXED" ("boundary" "4.2.x") NIL NIL NIL) 26 NIL NIL NIL NIL) "MIXED" ("boundary" "4.x") NIL NIL NIL) "MIXED" ("boundary" "x") NIL NIL NIL)
+body (("TEXT" "PLAIN" ("charset" "us-ascii") NIL NIL "7bit" 34 1) ("APPLICATION" "OCTET-STREAM" NIL NIL NIL "7bit" 34) ("message" "rfc822" NIL NIL NIL "7bit" 320 (NIL "This part specifier should be: 3" ((NIL NIL "me" "myself.com")) ((NIL NIL "me" "myself.com")) ((NIL NIL "me" "myself.com")) ((NIL NIL "me" "myself.com")) NIL NIL NIL NIL) (("TEXT" "PLAIN" ("charset" "us-ascii") NIL NIL "7bit" 36 1) ("APPLICATION" "OCTET-STREAM" NIL NIL NIL "7bit" 36) "MIXED") 17) (("IMAGE" "GIF" NIL NIL NIL "7bit" 36) ("message" "rfc822" NIL NIL NIL "7bit" 489 (NIL "This part specifier should be: 4.2" ((NIL NIL "me" "myself.com")) ((NIL NIL "me" "myself.com")) ((NIL NIL "me" "myself.com")) ((NIL NIL "me" "myself.com")) NIL NIL NIL NIL) (("TEXT" "PLAIN" ("charset" "us-ascii") NIL NIL "7bit" 38 1) (("TEXT" "PLAIN" ("charset" "us-ascii") NIL NIL "7bit" 40 1) ("TEXT" "RICHTEXT" ("charset" "us-ascii") NIL NIL "7bit" 40 1) "ALTERNATIVE") "MIXED") 26) "MIXED") "MIXED")
+section HEADER 166 a5d4052197ed62e7c1c22c7b0d7797e6f7932f2cbeed96115cf3ba422ecdcb20
+section TEXT 1170 6f967f4a0d7cf0cd5ca2eae8be6031c3d816b0e3f7506b4b062108d76b660cd5
+section HEADER.FIELDS 147 6b6098792d29ab762217f7dda862be914dcc23b5705f665abb78bb2087b17281
+section HEADER.FIELDS.NOT 21 07a26ab8981ff3b1de28da29cf47f47e315b9c25685121dc5ebb60391005b2de
+section 1 34 a31c50e39f954d3f5a6b579222805d104cb39ec9a397d7f7e83f1ae8c8b4afe6
+section 1.MIME 28 e213da5ffc3f6327718c2259e9c86884737b911f88ea10d843c2ba294fae6b9a
+section 2 34 341cbd252030332906bfbd1a89e5913375ac49eaa1c47a5e7753e64e9f4ac30e
+section 2.MIME 42 210ba1654995493705abd156d03621bc5ee4c78c9c7e2d97f21ed190c1898e3c
+section 3 320 cc3fb177202f0394e81595f367693c34fe682a70b1ef4a6c21baa06e66cc7d74
+section 3.MIME 32 d54d74bead1c2af9ee34844c5ffb7a48f0f3cc930ab6c005037e45843e474fbe
+section 3.HEADER 151 c109e7fc09b5a50f91cbbf94ee22bbd6b3eaffe7bbd2542d5b32f220d21c5055
+section 3.TEXT 169 ad0c0c4ae60ed35bf5c6486394e755fd42ec15a3d05aa4a57e15b52b868b015e
+section 3.HEADER.FIELDS 132 095e49e050bd0175be24bdbe2d69cfa18dc9d2625513aac4ccd2b681ddfb5469
+section 3.HEADER.FIELDS.NOT 21 07a26ab8981ff3b1de28da29cf47f47e315b9c25685121dc5ebb60391005b2de
+section 3.1 36 66cb0e6f423975c41b1c2892b0217b6f4627e7aea374192d39adffdd543935e7
+section 3.1.MIME 28 e213da5ffc3f6327718c2259e9c86884737b911f88ea10d843c2ba294fae6b9a
+section 3.2 36 8619404ecf49db5cc8fdc9ee833d3aa5ede4e4d2478114e8bb09737ecb5f1b44
+section 3.2.MIME 42 210ba1654995493705abd156d03621bc5ee4c78c9c7e2d97f21ed190c1898e3c
+section 4 600 7fe427eb9569ef51f13d1cbe6b9f0ce18de4b7e1d36ef340cbd6d0852efb2a79
+section 4.MIME 49 5f8ed094d2ce4f17a451406916995abdea6f47d87c910a8ed628fa4b7daeb1e9
+section 4.1 36 d8e744d25473b93fea472defa6f524ec0195f4dd07d21a5faf1231dc422abd57
+section 4.1.MIME 27 0c3a5ee1dc91552534b272eb9cf526c3ceddadf40811e676874194f76cba72ef
+section 4.2 489 c69e418bb7aec9e0bce040e4fde820b798c4ea4e68f1600df41c7eb2ba91def1
+section 4.2.MIME 32 d54d74bead1c2af9ee34844c5ffb7a48f0f3cc930ab6c005037e45843e474fbe
+section 4.2.HEADER 155 6988bf7b0f56514040f2b8fb322f07ae969ca44627990daf038c3967bc0965d8
+section 4.2.TEXT 334 eb0a82737ec2014bac3dba37cc55b52c3d7618ea3c5cd229c5bf5be7358eb220
+section 4.2.HEADER.FIELDS 136 3ae365f3333a316a87752f4a0c2fbccf2504f0988621b6cb0afddf2bd462700e
+section 4.2.HEADER.FIELDS.NOT 21 07a26ab8981ff3b1de28da29cf47f47e315b9c25685121dc5ebb60391005b2de
+section 4.2.1 38 613cf61a735e8d2c8b4828c22016ce2fd90428debf7519d6da30120810ce991a
+section 4.2.1.MIME 28 e213da5ffc3f6327718c2259e9c86884737b911f88ea10d843c2ba294fae6b9a
+section 4.2.2 178 b47aef28ff7275548e617f8eaa4455fcb8772514c7558ef322de2cf0380bc124
+section 4.2.2.MIME 59 a946f405c5ffe178157f0bc8e040db0d0f9a99fe7e09dac4ccf3562b1d76f687
+section 4.2.2.1 40 375163fb72690e2afd61d8913f57f2c5b776c49f7b7e586010ee0531992f7373
+section 4.2.2.1.MIME 28 e213da5ffc3f6327718c2259e9c86884737b911f88ea10d843c2ba294fae6b9a
+section 4.2.2.2 40 edd717372b5c5294b7b7b13fb2bda0fd30809f872c009551dabf6d757a78659f
+section 4.2.2.2.MIME 31 d838ab29d839c3654a9b762aea0be9661ec434848418aaf47e9657b157f093d9
