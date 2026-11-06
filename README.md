@@ -611,3 +611,8 @@ The server runs in production for ceesafe.com. What is not done yet:
 - **Not yet tested:** against a real CosmoMailServer database; so far only against its schema.
 
 [PORTING_PLAN.md](PORTING_PLAN.md) has the full history and the open decisions.
+
+## License
+
+The mail server is licensed under the GNU General Public License, version 2 only ([COPYING](COPYING)).
+Data from other projects keeps its own license; see [THIRD_PARTY.md](THIRD_PARTY.md).
