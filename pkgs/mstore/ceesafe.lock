@@ -9,6 +9,10 @@ name = "encoding"
 source = "path+../../../../CeeSafeLibs/encoding"
 
 [[package]]
+name = "pkey"
+source = "path+../../../../CeeSafeLibs/pkey"
+
+[[package]]
 name = "postgres"
 source = "path+../../../PostgresClient"
 
