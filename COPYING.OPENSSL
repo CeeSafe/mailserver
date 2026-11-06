@@ -1,0 +1,17 @@
+OpenSSL linking exception
+
+Copyright (C) 2026 Veeran Puthumkara.
+
+mailserver is licensed under the GNU General Public License, version 2 only (COPYING), with the exception below.
+Some of it links OpenSSL (version 3 and later are under the Apache License 2.0, which the GNU GPL version 2 is
+not compatible with), so that a program built from it, and the images that ship such a program together with
+OpenSSL's libraries, may be distributed, it carries this exception.
+
+-----------------------------------------------------------------------------------------------------------
+
+In addition, as a special exception, the copyright holders give permission to link the code of this program with
+the OpenSSL library (or with modified versions of OpenSSL that use the same license as OpenSSL), and to distribute
+linked combinations including the two. You must obey the GNU General Public License in all respects for all of
+the code used other than OpenSSL. If you modify this program, you may extend this exception to your version of
+it, but you are not obligated to do so. If you do not wish to do so, delete this exception statement from your
+version.

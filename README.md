@@ -614,5 +614,6 @@ The server runs in production for ceesafe.com. What is not done yet:
 
 ## License
 
-The mail server is licensed under the GNU General Public License, version 2 only ([COPYING](COPYING)).
+The mail server is licensed under the GNU General Public License, version 2 only ([COPYING](COPYING)),
+with an exception that permits linking with OpenSSL ([COPYING.OPENSSL](COPYING.OPENSSL)).
 Data from other projects keeps its own license; see [THIRD_PARTY.md](THIRD_PARTY.md).
