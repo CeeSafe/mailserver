@@ -147,10 +147,10 @@ The build uses two sibling repositories through relative paths, so clone all thr
 
 ```sh
 mkdir dev && cd dev
-git clone https://github.com/pooviputh/CeeSafeLibs.git                  # dev/CeeSafeLibs
+git clone https://github.com/CeeSafe/CeeSafeLibs.git                    # dev/CeeSafeLibs
 mkdir CeeSafeApps && cd CeeSafeApps
-git clone https://github.com/pooviputh/PostgresClient.git               # dev/CeeSafeApps/PostgresClient
-git clone https://github.com/pooviputh/mailserver.git                   # dev/CeeSafeApps/mailserver
+git clone https://github.com/CeeSafe/PostgresClient.git                 # dev/CeeSafeApps/PostgresClient
+git clone https://github.com/CeeSafe/mailserver.git                     # dev/CeeSafeApps/mailserver
 cd mailserver
 ```
 
