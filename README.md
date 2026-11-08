@@ -327,12 +327,16 @@ MAILSERVER_IMAGE=mailserver:1.0.0
 ADMIN_UI_IMAGE=mailserver-admin-ui:1.0.0
 POSTGRES_PASSWORD=$(openssl rand -hex 24)
 COSMOMAIL_JWT_SECRET=$(openssl rand -hex 32)
+COSMOMAIL_POSTMARK_TOKEN=$(openssl rand -hex 32)
 NUXT_SESSION_PASSWORD=$(openssl rand -hex 32)
 PUBLIC_IP=203.0.113.10
 EOF
 ```
 
 `PUBLIC_IP` is for layout B when a local MTA holds 127.0.0.1:25; leave it out otherwise.
+`COSMOMAIL_POSTMARK_TOKEN` is the token applications send to the transactional API. Leave it empty to turn the API
+off (it then answers 503). When moving from CosmoMailServer, use its `ApiAccess.PostmarkToken` here, so applications
+keep working.
 
 Edit **`mailserver.toml`**:
 - `hostname = "mail.example.com"`;
@@ -506,6 +510,7 @@ openssl s_client -starttls smtp -connect mail.example.com:25 </dev/null | grep '
 curl -s https://mta-sts.example.com/.well-known/mta-sts.txt                              # mode, mx
 curl -s "https://autoconfig.example.com/mail/config-v1.1.xml?emailaddress=you@example.com" | head
 curl -s -o /dev/null -w '%{http_code}\n' -X OPTIONS https://mail.example.com/Microsoft-Server-ActiveSync  # 200
+curl -s -H "X-Postmark-Server-Token: $TOKEN" "https://mail.example.com/postmark/templates?domain=example.com"  # []
 ```
 
 Then add the account to a mail client. Thunderbird, Outlook, iOS and macOS Mail find the settings from the address
@@ -530,10 +535,28 @@ Exchange, which gives mail, push and folders. Set it to `false` if you want IMAP
 **Upgrading:**
 
 ```sh
-# Build and load the new image (step 3), then:
-sed -i 's/^MAILSERVER_IMAGE=.*/MAILSERVER_IMAGE=mailserver:1.0.1/' .env
+# Build and load the new image (step 3). A new schema version cannot be undone, so back up first (below). Then:
+sed -i 's/^MAILSERVER_IMAGE=.*/MAILSERVER_IMAGE=mailserver:1.0.4/' .env
 docker compose up -d mailserver              # schema migrations run on start; connections reconnect
 ```
+
+An install from before 1.0.4 has no transactional API token. Add `COSMOMAIL_POSTMARK_TOKEN=…` to `.env`, and
+`COSMOMAIL_POSTMARK_TOKEN: ${COSMOMAIL_POSTMARK_TOKEN:-}` to the mailserver service's `environment` in
+`docker-compose.yml`, as in `deploy/`.
+
+**Transactional email:** applications send through `https://mail.example.com/postmark/…` with the token. The From
+address must be in one of the server's domains; the message is DKIM-signed with that domain's key.
+
+```sh
+curl -s -H "X-Postmark-Server-Token: $TOKEN" -H 'Content-Type: application/json' \
+    -d '{"From": "noreply@example.com", "To": "someone@example.net", "Subject": "Hi", "TextBody": "Hello"}' \
+    https://mail.example.com/postmark/email                     # {"messageID": "…", "errorCode": 0, …}
+curl -s -H "X-Postmark-Server-Token: $TOKEN" https://mail.example.com/postmark/messages/MESSAGE_ID/status
+```
+
+Templates, batch sends and suppression lists are under `/postmark/templates` and `/postmark/suppressions`. Their
+routes and JSON are those of CosmoMailServer's Postmark-compatible API. Behind CosmoProxy, send a browser
+User-Agent, because its bot filter refuses `curl`'s.
 
 **Backups:** back up the database and the content files together. A message's row and its file are both needed.
 

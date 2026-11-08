@@ -30,6 +30,7 @@ services:
       - mailserver-data:/var/lib/mailserver
     environment:
       COSMOMAIL_JWT_SECRET: ${COSMOMAIL_JWT_SECRET}
+      COSMOMAIL_POSTMARK_TOKEN: ${COSMOMAIL_POSTMARK_TOKEN:-}
     networks:
       default: { ipv4_address: 172.30.53.2 }
     depends_on:
