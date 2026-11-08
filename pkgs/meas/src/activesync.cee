@@ -259,7 +259,11 @@ fn options() -> Result<Response, AllocError> {
 /// Answers a request to `/Microsoft-Server-ActiveSync`.
 public async fn serveActiveSync(mail: borrow SmtpContext, request: borrow Request) -> Result<Response, AllocError> {
     let isOptions = request.isMethod("OPTIONS");
-    if (!isOptions && !request.isMethod("POST")) {
+    // iOS's account setup checks the URL with a GET carrying the password: as Exchange, a GET is logged in first
+    // (401 for a wrong password) and then answered 501, which tells the setup the server and the password are good.
+    // A 405 here made iOS give up and ask for the server by hand.
+    let isGet = request.isMethod("GET") || request.isMethod("HEAD");
+    if (!isOptions && !isGet && !request.isMethod("POST")) {
         var r = Response.text(405, "Use POST.")?;
         r.header("Allow", "OPTIONS,POST")?;
         return Ok(r);
@@ -276,6 +280,11 @@ public async fn serveActiveSync(mail: borrow SmtpContext, request: borrow Reques
     }
     if (isOptions) {
         return options();
+    }
+    if (isGet) {
+        var r = Response.text(501, "This is an Exchange ActiveSync server: use an ActiveSync client.")?;
+        r.header("Allow", "OPTIONS,POST")?;
+        return Ok(r);
     }
     var s = Session.create();
     s.userId = account.userId;

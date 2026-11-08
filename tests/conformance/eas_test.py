@@ -318,6 +318,24 @@ class Discovery(unittest.TestCase):
         self.assertEqual(r.status, 401)
         self.assertIn("Basic", r.getheader("WWW-Authenticate"))
 
+    def test_ios_setup_get(self):
+        """iOS's account setup (Settings, CFNetwork) checks the URL with a GET carrying the password, as Exchange
+        answers it: 401 for no or a wrong password, else 501. A 405 made iOS ask for the server by hand."""
+        def get(auth=None):
+            c = http.client.HTTPSConnection(HOST, HTTPS, context=tls())
+            headers = {"User-Agent": "Preferences/2027.0.10.401 CFNetwork/3896.100.1.2.1 Darwin/27.0.0"}
+            if auth:
+                headers["Authorization"] = "Basic " + base64.b64encode(auth.encode()).decode()
+            c.request("GET", "/Microsoft-Server-ActiveSync", headers=headers)
+            r = c.getresponse()
+            r.read()
+            return r
+        r = get()
+        self.assertEqual(r.status, 401)
+        self.assertIn("Basic", r.getheader("WWW-Authenticate"))
+        self.assertEqual(get(f"{USER}:wrong").status, 401)
+        self.assertEqual(get(f"{USER}:{PASSWORD}").status, 501)
+
     def test_wrong_password(self):
         status, _, _ = post("FolderSync", ("FolderHierarchy:FolderSync", [("FolderHierarchy:SyncKey", "0")]),
                             password="nope")
