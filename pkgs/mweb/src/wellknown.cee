@@ -528,17 +528,10 @@ async fn autodiscoverJson(
         w.endObject();
         return Response.json(200, w.finish()?);
     }
-    if (p.view() == "activesync") {
-        var url = String.create();
-        url.append("https://")?;
-        url.append(server.view())?;
-        url.append("/Microsoft-Server-ActiveSync")?;
-        w.beginObject();
-        w.stringField("Protocol", "ActiveSync");
-        w.stringField("Url", url.view());
-        w.endObject();
-        return Response.json(200, w.finish()?);
-    }
+    // ActiveSync is not answered here, on purpose: given its URL by v2, iOS 27's account setup took the server for
+    // Exchange Online, sent a modern-auth probe (an empty Bearer), and after our Basic-only answer gave up and asked
+    // for the server by hand. Without it, iOS takes the classic path (the mobilesync XML autodiscover, then the
+    // password over Basic), as with servers such as Z-Push. Outlook mobile also falls back to the XML.
     if (p.view() == "ews") {
         var url = String.create();
         ewsUrl(server.view(), mut url)?;

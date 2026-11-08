@@ -227,10 +227,10 @@ class Autodiscover(unittest.TestCase):
                           host="autodiscover.example.org")
         self.assertEqual(json.loads(data), {"Protocol": "AutodiscoverV1",
                                             "Url": "https://mail.example.org/Autodiscover/Autodiscover.xml"})
+        # Not ActiveSync: answering it sent iOS down the Exchange Online path, which it gives up on (see wellknown.cee).
         r, data = request(HTTPS, "GET", "/autodiscover/autodiscover.json?Email=alice@example.org&Protocol=ActiveSync")
-        self.assertEqual(r.status, 200)
-        self.assertEqual(json.loads(data), {"Protocol": "ActiveSync",
-                                            "Url": "https://mail.example.org/Microsoft-Server-ActiveSync"})
+        self.assertEqual(r.status, 404)
+        self.assertEqual(json.loads(data)["ErrorCode"], "ProtocolNotSupported")
         r, data = request(HTTPS, "GET", "/autodiscover/autodiscover.json?Email=alice@example.org&Protocol=Pop3")
         self.assertEqual(r.status, 404)
         self.assertEqual(json.loads(data)["ErrorCode"], "ProtocolNotSupported")
