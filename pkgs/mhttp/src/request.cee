@@ -51,7 +51,8 @@ public struct RequestLimits {
     /// The largest body.
     public maxBody: usize;
     /// The largest body for the groupware protocols, which upload messages and attachments (ActiveSync's SendMail,
-    /// EWS's CreateItem, a DAV PUT): paths under `/Microsoft-Server-ActiveSync`, `/EWS/` and `/dav/`.
+    /// EWS's CreateItem, a DAV PUT), and for the transactional API's sends: paths under
+    /// `/Microsoft-Server-ActiveSync`, `/EWS/`, `/dav/` and `/postmark/`.
     public uploadBody: usize;
     /// How long a connection may idle before its next request, and how long each read within a request may wait.
     public idleMs: u64;
@@ -69,7 +70,7 @@ public struct RequestLimits {
 public fn isUploadPath(path: StringView) -> bool {
     let p = path.bytes();
     return startsIgnoringCase(p, "/microsoft-server-activesync") || startsIgnoringCase(p, "/ews/") ||
-        startsIgnoringCase(p, "/dav/");
+        startsIgnoringCase(p, "/dav/") || startsIgnoringCase(p, "/postmark/");
 }
 
 fn startsIgnoringCase(text: Slice<u8>, prefix: StringView) -> bool {

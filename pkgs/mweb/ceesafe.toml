@@ -12,6 +12,7 @@ diskio = { path = "../../../../CeeSafeLibs/diskio" }
 sha256 = { path = "../../../../CeeSafeLibs/sha256" }
 encoding = { path = "../../../../CeeSafeLibs/encoding" }
 msmtp = { path = "../msmtp" }
+mmime = { path = "../mmime" }
 msieve = { path = "../msieve" }
 mstore = { path = "../mstore" }
 postgres = { path = "../../../PostgresClient" }

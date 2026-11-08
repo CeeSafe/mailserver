@@ -64,6 +64,14 @@ async fn route(ctx: borrow WebContext, mode: WebMode, request: borrow Request) -
         }
         return health();
     }
+    if (lowered.view() == "/postmark" || lowered.view().startsWith("/postmark/")) {
+        // The transactional API: its token travels in every request, so never over plain HTTP from the network.
+        match (mode) {
+            WebMode.Plain => { return pmError(403, 403, "Use HTTPS."); }
+            _ => {}
+        }
+        return await postmarkApi(ctx, request);
+    }
     match (mode) {
         WebMode.Admin => {
             if (path.startsWith("/api/")) {

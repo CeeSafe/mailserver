@@ -3,9 +3,9 @@
 //
 // - Accounts: domains (their settings kept for the admin UI), domain aliases, users (with their bcrypt hashes, so
 //   passwords keep working), admin logins, aliases, DKIM keys (signing stays as it was: the keys are in DNS
-//   already), Sieve scripts and mailboxes. Each table is read from the source as one JSON document and written
-//   with one statement; rows that exist already (by name or address) are left alone, so a second run adds only
-//   what is new.
+//   already), Sieve scripts, mailboxes, and transactional email's templates and suppression lists. Each table is
+//   read from the source as one JSON document and written with one statement; rows that exist already (by name or
+//   address) are left alone, so a second run adds only what is new.
 // - Messages keep their mailbox's UIDVALIDITY and their uids, so IMAP clients see the same mailboxes and do not
 //   fetch everything again. A run copies the messages above the highest uid copied before, then brings every
 //   copied message's flags up to date and drops those the source expunged: run it once ahead of the cutover
@@ -142,6 +142,8 @@ async fn importCosmoMail(config: borrow Config, store: borrow MailStore) -> Resu
     await copyTable(mut source, store, "users", SRC_USERS, TGT_USERS)?;
     await copyTable(mut source, store, "admin logins", SRC_ADMINS, TGT_ADMINS)?;
     await copyTable(mut source, store, "aliases", SRC_ALIASES, TGT_ALIASES)?;
+    await copyTable(mut source, store, "email templates", SRC_TEMPLATES, TGT_TEMPLATES)?;
+    await copyTable(mut source, store, "suppression lists", SRC_SUPPRESSIONS, TGT_SUPPRESSIONS)?;
     await copyTable(mut source, store, "mailboxes", SRC_MAILBOXES, TGT_MAILBOXES)?;
     await targetBatch(store, TGT_UID_VALIDITY_SEQUENCE)?;
     await copyDkim(mut source, store)?;

@@ -757,6 +757,11 @@ async fn run(
         Ok() => {}
         Err(_) => { return Err(StoreError.OutOfMemory); }
     }
+    let postmark = Environment.variable("COSMOMAIL_POSTMARK_TOKEN") ?? config.postmarkToken.view();
+    match (adminSettings.postmarkToken.append(postmark.trim())) {
+        Ok() => {}
+        Err(_) => { return Err(StoreError.OutOfMemory); }
+    }
     adminSettings.tokenHours = if (config.tokenHours < 1) 1 else config.tokenHours;
     let web = match (WebContext.create(shared.clone(), webSettings, adminSettings)) {
         Ok(w) => w,
@@ -995,6 +1000,11 @@ async fn housekeeping(shared: borrow Arc<SmtpContext>) -> Result<void, StoreErro
             Err(_) => {}
         }
         match (await shared.get().store.forgetSuppressions()) {
+            Ok(_) => {}
+            Err(_) => {}
+        }
+        // Transactional message events are kept 45 days, as Postmark keeps its message history.
+        match (await shared.get().store.forgetMessageEvents(45)) {
             Ok(_) => {}
             Err(_) => {}
         }

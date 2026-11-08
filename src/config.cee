@@ -31,6 +31,8 @@
 //     jwt_secret = "at least 32 random characters"   # signs the admin UI's logins; env COSMOMAIL_JWT_SECRET wins
 //     token = ""                      # a static token for scripts (X-CosmoMail-Admin-Token); env COSMOMAIL_ADMIN_TOKEN
 //     token_hours = 24
+//     postmark_token = ""             # the transactional API's X-Postmark-Server-Token, under /postmark on https
+//                                     #   and proxied; empty: the API answers 503. Env COSMOMAIL_POSTMARK_TOKEN wins
 //     [tls]
 //     certificate = "/etc/mailserver/fullchain.pem"
 //     key = "/etc/mailserver/key.pem"
@@ -123,6 +125,7 @@ struct Config {
     tlsReloadInterval: u64;
     jwtSecret: String;
     adminToken: String;
+    postmarkToken: String;
     tokenHours: i64;
     acmeDirectory: String;
     acmeEmail: String;
@@ -202,6 +205,7 @@ fn defaults() -> Config => Config {
     tlsReloadInterval: 60,
     jwtSecret: String.create(),
     adminToken: String.create(),
+    postmarkToken: String.create(),
     tokenHours: 24,
     acmeDirectory: String.create(),
     acmeEmail: String.create(),
@@ -454,6 +458,9 @@ fn set(
         }
         if (key == "token") {
             return text(mut config.adminToken, value, line);
+        }
+        if (key == "postmark_token") {
+            return text(mut config.postmarkToken, value, line);
         }
         if (key == "token_hours") {
             config.tokenHours = truncate<i64>(integer(value, line)?);

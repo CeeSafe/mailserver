@@ -7,6 +7,7 @@
 #   IMAP_PLAINTEXT_AUTH=true tests/conformance/run.sh --imap   # also IDLE over plaintext
 #   tests/conformance/run.sh --web [Class.test ...]    # only the HTTP tests
 #   tests/conformance/run.sh --admin [Class.test ...]  # the admin JSON API
+#   tests/conformance/run.sh --postmark [Class.test ...]   # the transactional email API (/postmark)
 #   tests/conformance/run.sh --acme                     # certificate issuance and renewal against a fake CA
 #   tests/conformance/run.sh --import                   # import-cosmomail from a CosmoMail database and fake S3
 #   tests/conformance/run.sh --proxy                    # PROXY protocol headers, required from 127.0.0.1
@@ -173,6 +174,7 @@ admin = "127.0.0.1:2918"
 [admin]
 jwt_secret = "conformance-jwt-secret-0123456789abcdef"
 token = "conformance-static-token"
+postmark_token = "conformance-postmark-token"
 [tls]
 certificate = "$work/server.pem"
 key = "$work/server.key"
@@ -247,6 +249,10 @@ elif [ "${1:-}" = "--eas" ]; then
 elif [ "${1:-}" = "--ews" ]; then
     shift
     SERVER_LOG="$work/server.log" FAKEMX_LOG="$work/mx" CA="$fixtures/ca.pem" python3 "$here/ews_test.py" "$@" || status=$?
+elif [ "${1:-}" = "--postmark" ]; then
+    shift
+    SERVER_LOG="$work/server.log" MAILSERVER_BLOBS="$work/blobs" FAKEMX_LOG="$work/mx" CA="$fixtures/ca.pem" \
+        python3 "$here/postmark_test.py" "$@" || status=$?
 elif [ "${1:-}" = "--admin" ]; then
     shift
     SERVER_LOG="$work/server.log" MAILSERVER_BIN="$bin" MAILSERVER_CONFIG="$work/mailserver.toml" CA="$fixtures/ca.pem" \

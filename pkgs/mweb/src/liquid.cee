@@ -1,0 +1,1463 @@
+// Liquid templates for transactional email, as the C# server rendered them with Fluid: `{{ expression | filter }}`
+// outputs, and the tags if/elsif/else, unless, for (with forloop), assign, comment and raw, with whitespace control
+// (`{{-`, `-%}`). The model is a JSON object (a send's TemplateModel): its strings, numbers, booleans, arrays and
+// objects, reached by dotted paths (`order.items[0].name`). Unknown variables render empty; values are not escaped
+// (use `| escape`). A template that does not parse is rendered the C# server's fallback way: each `{{name}}` with a
+// model string is replaced, and everything else is left as written.
+
+import mhttp.JsonDocument;
+import mhttp.JsonKind;
+
+const LT_TEXT: u8 = 1;
+const LT_OUTPUT: u8 = 2;
+const LT_IF: u8 = 3;
+const LT_ELSIF: u8 = 4;
+const LT_ELSE: u8 = 5;
+const LT_ENDIF: u8 = 6;
+const LT_UNLESS: u8 = 7;
+const LT_ENDUNLESS: u8 = 8;
+const LT_FOR: u8 = 9;
+const LT_ENDFOR: u8 = 10;
+const LT_ASSIGN: u8 = 11;
+const LT_CASE: u8 = 12;
+const LT_WHEN: u8 = 13;
+const LT_ENDCASE: u8 = 14;
+
+/// The most nested blocks, and the deepest recursion of a render.
+const LIQUID_MAX_DEPTH: usize = 64;
+/// The most output a render may make, so a loop over a large model cannot grow without end.
+const LIQUID_MAX_OUTPUT: usize = 16777216;
+
+/// A piece of a parsed template. For text, `start..end` is the text; for an output or a tag, its expression or
+/// arguments. A block's opening tag and each branch (elsif, else, when) has in `jump` the next branch or the end tag,
+/// and the opening tag has its end tag in `close`.
+struct LiquidToken {
+    kind: u8;
+    start: usize;
+    end: usize;
+    jump: usize;
+    close: usize;
+}
+
+const LV_NIL: u8 = 0;
+const LV_BOOL: u8 = 1;
+const LV_NUMBER: u8 = 2;
+const LV_STRING: u8 = 3;
+/// An array or object of the model, by node.
+const LV_NODE: u8 = 4;
+/// The literals `empty` and `blank`.
+const LV_EMPTY: u8 = 5;
+const LV_BLANK: u8 = 6;
+
+/// A value: a number keeps its text as written.
+@noncopy
+struct LiquidValue {
+    kind: u8;
+    flag: bool;
+    node: usize;
+    text: Vector<u8>;
+}
+
+fn liquidNil() -> LiquidValue => LiquidValue { kind: LV_NIL, flag: false, node: 0, text: Vector<u8>.create() };
+
+fn liquidBool(b: bool) -> LiquidValue => LiquidValue { kind: LV_BOOL, flag: b, node: 0, text: Vector<u8>.create() };
+
+fn liquidText(kind: u8, bytes: Slice<u8>) -> Result<LiquidValue, AllocError> {
+    var v = LiquidValue { kind: kind, flag: false, node: 0, text: Vector<u8>.create() };
+    v.text.extend(bytes)?;
+    return Ok(v);
+}
+
+fn liquidCopy(v: borrow LiquidValue) -> Result<LiquidValue, AllocError> {
+    var c = LiquidValue { kind: v.kind, flag: v.flag, node: v.node, text: Vector<u8>.create() };
+    c.text.extend(v.text.view())?;
+    return Ok(c);
+}
+
+@noncopy
+struct LiquidBinding {
+    name: Vector<u8>;
+    value: LiquidValue;
+}
+
+/// A for loop being rendered, for `forloop`.
+struct LiquidLoop {
+    index: usize;
+    length: usize;
+}
+
+/// What a render has: the model, the bindings made by for and assign, and the loops.
+@noncopy
+struct LiquidScope {
+    bindings: Vector<LiquidBinding>;
+    loops: Vector<LiquidLoop>;
+    depth: usize;
+}
+
+/// Renders `template` with the model `root` of `doc` (an object; any other value is an empty model), appending to
+/// `out`.
+public fn renderLiquid(
+    template: StringView,
+    doc: borrow JsonDocument,
+    root: usize,
+    out: borrow mut Vector<u8>,
+) -> Result<void, AllocError> {
+    let text = template.bytes();
+    var tokens = Vector<LiquidToken>.create();
+    if (!(liquidParse(text, mut tokens)?)) {
+        return liquidFallback(text, doc, root, out);
+    }
+    var scope = LiquidScope {
+        bindings: Vector<LiquidBinding>.create(),
+        loops: Vector<LiquidLoop>.create(),
+        depth: 0,
+    };
+    return liquidRange(text, tokens, doc, root, mut scope, 0, tokens.length, out);
+}
+
+// ---- Parsing ----
+
+fn isLiquidSpace(c: u8) -> bool => c == 0x20 || c == 0x09 || c == 0x0a || c == 0x0d;
+
+/// `text[from..]`'s first `a` followed by `b`, from `from`.
+fn findPair(text: Slice<u8>, from: usize, a: u8, b: u8) -> usize? {
+    var i = from;
+    while (i + 1 < text.length) {
+        if (text[i] == a && text[i + 1] == b) {
+            return i;
+        }
+        i += 1;
+    }
+    return null;
+}
+
+/// The next `{{` or `{%` at or after `from`.
+fn nextMarkup(text: Slice<u8>, from: usize) -> usize? {
+    var i = from;
+    while (i + 1 < text.length) {
+        if (text[i] == 0x7b && (text[i + 1] == 0x7b || text[i + 1] == 0x25)) {
+            return i;
+        }
+        i += 1;
+    }
+    return null;
+}
+
+/// `start..end` without white space at either end.
+fn trimRange(text: Slice<u8>, start: usize, end: usize) -> [usize; 2] {
+    var s = start;
+    var e = end;
+    while (s < e && isLiquidSpace(text[s])) {
+        s += 1;
+    }
+    while (e > s && isLiquidSpace(text[e - 1])) {
+        e -= 1;
+    }
+    return [s, e];
+}
+
+/// The end of the word (a tag name) starting at `from`.
+fn wordEnd(text: Slice<u8>, from: usize, end: usize) -> usize {
+    var i = from;
+    while (i < end && !isLiquidSpace(text[i])) {
+        i += 1;
+    }
+    return i;
+}
+
+fn tagKind(name: Slice<u8>) -> u8 {
+    if (name == "if".bytes()) {
+        return LT_IF;
+    }
+    if (name == "elsif".bytes()) {
+        return LT_ELSIF;
+    }
+    if (name == "else".bytes()) {
+        return LT_ELSE;
+    }
+    if (name == "endif".bytes()) {
+        return LT_ENDIF;
+    }
+    if (name == "unless".bytes()) {
+        return LT_UNLESS;
+    }
+    if (name == "endunless".bytes()) {
+        return LT_ENDUNLESS;
+    }
+    if (name == "for".bytes()) {
+        return LT_FOR;
+    }
+    if (name == "endfor".bytes()) {
+        return LT_ENDFOR;
+    }
+    if (name == "assign".bytes()) {
+        return LT_ASSIGN;
+    }
+    if (name == "case".bytes()) {
+        return LT_CASE;
+    }
+    if (name == "when".bytes()) {
+        return LT_WHEN;
+    }
+    if (name == "endcase".bytes()) {
+        return LT_ENDCASE;
+    }
+    return 0;
+}
+
+/// A tag `{% … %}` at `at`: its name's range, its arguments' range, where it ends (after `%}`), and whether it trims
+/// white space before and after it. Null when it is not closed.
+fn readTag(text: Slice<u8>, at: usize) -> [usize; 7]? {
+    let close = findPair(text, at + 2, 0x25, 0x7d)?;
+    var start = at + 2;
+    var end = close;
+    var left: usize = 0;
+    var right: usize = 0;
+    if (start < end && text[start] == 0x2d) {
+        start += 1;
+        left = 1;
+    }
+    if (end > start && text[end - 1] == 0x2d) {
+        end -= 1;
+        right = 1;
+    }
+    let inner = trimRange(text, start, end);
+    let nameEnd = wordEnd(text, inner[0], inner[1]);
+    let args = trimRange(text, nameEnd, inner[1]);
+    return [inner[0], nameEnd, args[0], args[1], close + 2, left, right];
+}
+
+/// Pushes the text `start..end` (trimmed at the start when `trimLeft`, at the end when `trimRight`), unless empty.
+fn pushText(
+    text: Slice<u8>,
+    start: usize,
+    end: usize,
+    trimLeft: bool,
+    trimRight: bool,
+    tokens: borrow mut Vector<LiquidToken>,
+) -> Result<void, AllocError> {
+    var s = start;
+    var e = end;
+    if (trimLeft) {
+        while (s < e && isLiquidSpace(text[s])) {
+            s += 1;
+        }
+    }
+    if (trimRight) {
+        while (e > s && isLiquidSpace(text[e - 1])) {
+            e -= 1;
+        }
+    }
+    if (e > s) {
+        tokens.push(LiquidToken { kind: LT_TEXT, start: s, end: e, jump: 0, close: 0 })?;
+    }
+    return Ok();
+}
+
+/// Finds the tag named `name` after `from` (for endcomment and endraw): its start and its end (after `%}`).
+fn findEndTag(text: Slice<u8>, from: usize, name: StringView) -> [usize; 2]? {
+    var at = from;
+    while (true) {
+        let open = findPair(text, at, 0x7b, 0x25)?;
+        let tag = readTag(text, open)?;
+        if (text[tag[0]..tag[1]] == name.bytes()) {
+            return [open, tag[4]];
+        }
+        at = open + 2;
+    }
+    return null;
+}
+
+/// Splits `text` into tokens and matches its blocks. False when it is not a template this renderer understands: a
+/// markup left open, an unknown tag, or blocks that do not match.
+fn liquidParse(text: Slice<u8>, tokens: borrow mut Vector<LiquidToken>) -> Result<bool, AllocError> {
+    var at: usize = 0;
+    var trimNext = false;
+    while (at < text.length) {
+        let next = match (nextMarkup(text, at)) {
+            Some(n) => n,
+            null => {
+                pushText(text, at, text.length, trimNext, false, tokens)?;
+                break;
+            }
+        };
+        let trimBefore = next + 2 < text.length && text[next + 2] == 0x2d;
+        pushText(text, at, next, trimNext, trimBefore, tokens)?;
+        trimNext = false;
+        if (text[next + 1] == 0x7b) {
+            let close = match (findPair(text, next + 2, 0x7d, 0x7d)) {
+                Some(c) => c,
+                null => { return Ok(false); }
+            };
+            var start = next + 2;
+            var end = close;
+            if (start < end && text[start] == 0x2d) {
+                start += 1;
+            }
+            if (end > start && text[end - 1] == 0x2d) {
+                end -= 1;
+                trimNext = true;
+            }
+            let inner = trimRange(text, start, end);
+            tokens.push(LiquidToken { kind: LT_OUTPUT, start: inner[0], end: inner[1], jump: 0, close: 0 })?;
+            at = close + 2;
+            continue;
+        }
+        let tag = match (readTag(text, next)) {
+            Some(t) => t,
+            null => { return Ok(false); }
+        };
+        let name = text[tag[0]..tag[1]];
+        trimNext = tag[6] == 1;
+        if (name == "comment".bytes()) {
+            let end = match (findEndTag(text, tag[4], "endcomment")) {
+                Some(e) => e,
+                null => { return Ok(false); }
+            };
+            at = end[1];
+            continue;
+        }
+        if (name == "raw".bytes()) {
+            let end = match (findEndTag(text, tag[4], "endraw")) {
+                Some(e) => e,
+                null => { return Ok(false); }
+            };
+            pushText(text, tag[4], end[0], false, false, tokens)?;
+            at = end[1];
+            continue;
+        }
+        let kind = tagKind(name);
+        if (kind == 0) {
+            return Ok(false);
+        }
+        tokens.push(LiquidToken { kind: kind, start: tag[2], end: tag[3], jump: 0, close: 0 })?;
+        at = tag[4];
+    }
+    return liquidMatch(tokens);
+}
+
+/// Links each block's branches and end. False when they do not match.
+fn liquidMatch(tokens: borrow mut Vector<LiquidToken>) -> Result<bool, AllocError> {
+    var openers = Vector<usize>.create();
+    var branches = Vector<usize>.create();
+    for (i in 0..tokens.length) {
+        let kind = tokens[i].kind;
+        if (kind == LT_IF || kind == LT_UNLESS || kind == LT_FOR || kind == LT_CASE) {
+            if (openers.length >= LIQUID_MAX_DEPTH) {
+                return Ok(false);
+            }
+            openers.push(i)?;
+            branches.push(i)?;
+            continue;
+        }
+        if (kind == LT_ELSIF || kind == LT_ELSE || kind == LT_WHEN) {
+            if (openers.length == 0) {
+                return Ok(false);
+            }
+            let opener = tokens[openers[openers.length - 1]].kind;
+            let fits = if (kind == LT_ELSIF) opener == LT_IF || opener == LT_UNLESS else if (kind == LT_WHEN) opener ==
+                LT_CASE else true;
+            if (!fits) {
+                return Ok(false);
+            }
+            let last = branches.length - 1;
+            tokens[branches[last]].jump = i;
+            branches[last] = i;
+            continue;
+        }
+        if (kind == LT_ENDIF || kind == LT_ENDUNLESS || kind == LT_ENDFOR || kind == LT_ENDCASE) {
+            if (openers.length == 0) {
+                return Ok(false);
+            }
+            let opener = openers[openers.length - 1];
+            let wanted =
+                if (kind ==
+                    LT_ENDIF) LT_IF else if (kind ==
+                    LT_ENDUNLESS) LT_UNLESS else if (kind == LT_ENDFOR) LT_FOR else LT_CASE;
+            if (tokens[opener].kind != wanted) {
+                return Ok(false);
+            }
+            tokens[branches[branches.length - 1]].jump = i;
+            tokens[opener].close = i;
+            let a = openers.pop();
+            let b = branches.pop();
+        }
+    }
+    return Ok(openers.length == 0);
+}
+
+// ---- Rendering ----
+
+fn liquidRange(
+    text: Slice<u8>,
+    tokens: borrow Vector<LiquidToken>,
+    doc: borrow JsonDocument,
+    root: usize,
+    scope: borrow mut LiquidScope,
+    from: usize,
+    to: usize,
+    out: borrow mut Vector<u8>,
+) -> Result<void, AllocError> {
+    if (scope.depth >= LIQUID_MAX_DEPTH) {
+        return Ok();
+    }
+    scope.depth += 1;
+    var i = from;
+    while (i < to && out.length < LIQUID_MAX_OUTPUT) {
+        let t = tokens[i];
+        if (t.kind == LT_TEXT) {
+            out.extend(text[t.start..t.end])?;
+            i += 1;
+            continue;
+        }
+        if (t.kind == LT_OUTPUT) {
+            let v = evalOutput(text[t.start..t.end], doc, root, scope)?;
+            appendValue(doc, v, out)?;
+            i += 1;
+            continue;
+        }
+        if (t.kind == LT_ASSIGN) {
+            assign(text[t.start..t.end], doc, root, scope)?;
+            i += 1;
+            continue;
+        }
+        if (t.kind == LT_IF || t.kind == LT_UNLESS) {
+            var b = i;
+            while (b != t.close) {
+                let branch = tokens[b];
+                let taken = if (branch.kind == LT_ELSE) true else if (branch.kind == LT_UNLESS) !evalCondition(
+                    text[branch.start..branch.end],
+                    doc,
+                    root,
+                    scope,
+                )? else evalCondition(text[branch.start..branch.end], doc, root, scope)?;
+                if (taken) {
+                    liquidRange(text, tokens, doc, root, scope, b + 1, branch.jump, out)?;
+                    break;
+                }
+                b = branch.jump;
+            }
+            i = t.close + 1;
+            continue;
+        }
+        if (t.kind == LT_CASE) {
+            let subject = evalOutput(text[t.start..t.end], doc, root, scope)?;
+            var b = t.jump;
+            var matched = false;
+            while (b != t.close) {
+                let branch = tokens[b];
+                if (branch.kind == LT_ELSE) {
+                    if (!matched) {
+                        liquidRange(text, tokens, doc, root, scope, b + 1, branch.jump, out)?;
+                    }
+                    break;
+                }
+                if (!matched && whenMatches(text[branch.start..branch.end], subject, doc, root, scope)?) {
+                    matched = true;
+                    liquidRange(text, tokens, doc, root, scope, b + 1, branch.jump, out)?;
+                }
+                b = branch.jump;
+            }
+            i = t.close + 1;
+            continue;
+        }
+        if (t.kind == LT_FOR) {
+            renderFor(text, tokens, doc, root, scope, i, out)?;
+            i = t.close + 1;
+            continue;
+        }
+        // A stray branch or end tag cannot be reached: the blocks were matched.
+        i += 1;
+    }
+    scope.depth -= 1;
+    return Ok();
+}
+
+/// `{% for item in collection [reversed] [limit: n] [offset: n] %}`: the body once per element, or the else branch
+/// when there is none.
+fn renderFor(
+    text: Slice<u8>,
+    tokens: borrow Vector<LiquidToken>,
+    doc: borrow JsonDocument,
+    root: usize,
+    scope: borrow mut LiquidScope,
+    at: usize,
+    out: borrow mut Vector<u8>,
+) -> Result<void, AllocError> {
+    let t = tokens[at];
+    let args = text[t.start..t.end];
+    let nameEnd = wordEnd(args, 0, args.length);
+    let name = args[0..nameEnd];
+    let rest = trimRange(args, nameEnd, args.length);
+    let afterIn = args[rest[0]..rest[1]];
+    if (afterIn.length < 3 || afterIn[0..3] != "in ".bytes()) {
+        return Ok();
+    }
+    let source = trimRange(afterIn, 3, afterIn.length);
+    let spec = afterIn[source[0]..source[1]];
+    let exprEnd = wordEnd(spec, 0, spec.length);
+    let collection = evalExpression(spec[0..exprEnd], doc, root, scope)?;
+    let options = spec[exprEnd..];
+    let reversed = options.contains("reversed".bytes());
+    var items = Vector<usize>.create();
+    if (collection.kind == LV_NODE) {
+        doc.items(collection.node, mut items)?;
+    }
+    var first = optionNumber(options, "offset:");
+    var count = items.length;
+    if (first > count) {
+        first = count;
+    }
+    count -= first;
+    match (optionPresent(options, "limit:")) {
+        true => {
+            let limit = optionNumber(options, "limit:");
+            if (limit < count) {
+                count = limit;
+            }
+        }
+        false => {}
+    }
+    let body = t.jump;
+    if (count == 0) {
+        if (tokens[body].kind == LT_ELSE) {
+            liquidRange(text, tokens, doc, root, scope, body + 1, tokens[body].jump, out)?;
+        }
+        return Ok();
+    }
+    scope.loops.push(LiquidLoop { index: 0, length: count })?;
+    var name8 = Vector<u8>.create();
+    name8.extend(name)?;
+    scope.bindings.push(LiquidBinding { name: name8, value: liquidNil() })?;
+    let slot = scope.bindings.length - 1;
+    let current = scope.loops.length - 1;
+    for (k in 0..count) {
+        let element = if (reversed) items[first + count - 1 - k] else items[first + k];
+        scope.bindings[slot].value = nodeValue(doc, element)?;
+        scope.loops[current].index = k;
+        // A body's assign binds after the loop variable; forget those each turn.
+        liquidRange(text, tokens, doc, root, scope, at + 1, body, out)?;
+        scope.bindings.truncate(slot + 1);
+        if (out.length >= LIQUID_MAX_OUTPUT) {
+            break;
+        }
+    }
+    scope.bindings.truncate(slot);
+    scope.loops.truncate(current);
+    return Ok();
+}
+
+fn optionPresent(options: Slice<u8>, name: StringView) -> bool => options.contains(name.bytes());
+
+/// The number after `name` in a for tag's options, or 0.
+fn optionNumber(options: Slice<u8>, name: StringView) -> usize {
+    let at = match (indexOfBytes(options, name.bytes())) {
+        Some(a) => a + name.length,
+        null => { return 0; }
+    };
+    var i = at;
+    while (i < options.length && isLiquidSpace(options[i])) {
+        i += 1;
+    }
+    var n: usize = 0;
+    while (i < options.length && options[i] >= 0x30 && options[i] <= 0x39) {
+        if (n < 1000000) {
+            n = n * 10 + (options[i] - 0x30) as usize;
+        }
+        i += 1;
+    }
+    return n;
+}
+
+fn indexOfBytes(text: Slice<u8>, needle: Slice<u8>) -> usize? {
+    if (needle.length == 0 || needle.length > text.length) {
+        return null;
+    }
+    var i: usize = 0;
+    while (i + needle.length <= text.length) {
+        if (text[i..i + needle.length] == needle) {
+            return i;
+        }
+        i += 1;
+    }
+    return null;
+}
+
+/// `{% assign name = expression | filters %}`.
+fn assign(
+    args: Slice<u8>,
+    doc: borrow JsonDocument,
+    root: usize,
+    scope: borrow mut LiquidScope,
+) -> Result<void, AllocError> {
+    let eq = match (args.indexOfByte(0x3d)) {
+        Some(e) => e,
+        null => { return Ok(); }
+    };
+    let name = trimRange(args, 0, eq);
+    if (name[1] == name[0]) {
+        return Ok();
+    }
+    let value = evalOutput(args[eq + 1..], doc, root, scope)?;
+    var key = Vector<u8>.create();
+    key.extend(args[name[0]..name[1]])?;
+    scope.bindings.push(LiquidBinding { name: key, value: value })?;
+    return Ok();
+}
+
+/// Whether one of a when tag's values (`a, b` or `a or b`) equals `subject`.
+fn whenMatches(
+    args: Slice<u8>,
+    subject: borrow LiquidValue,
+    doc: borrow JsonDocument,
+    root: usize,
+    scope: borrow LiquidScope,
+) -> Result<bool, AllocError> {
+    var start: usize = 0;
+    var i: usize = 0;
+    var quote: u8 = 0;
+    while (i <= args.length) {
+        let atEnd = i == args.length;
+        let c: u8 = if (atEnd) 0x2c else args[i];
+        if (quote != 0) {
+            if (c == quote) {
+                quote = 0;
+            }
+            i += 1;
+            continue;
+        }
+        if (!atEnd && (c == 0x22 || c == 0x27)) {
+            quote = c;
+            i += 1;
+            continue;
+        }
+        var cut: usize = 0;
+        if (c == 0x2c) {
+            cut = 1;
+        } else if (i + 4 <= args.length && args[i..i + 4] == " or ".bytes()) {
+            cut = 4;
+        }
+        if (cut > 0) {
+            let part = trimRange(args, start, i);
+            if (part[1] > part[0]) {
+                let v = evalExpression(args[part[0]..part[1]], doc, root, scope)?;
+                if (equalValues(doc, subject, v)?) {
+                    return Ok(true);
+                }
+            }
+            i += cut;
+            start = i;
+            continue;
+        }
+        i += 1;
+    }
+    return Ok(false);
+}
+
+// ---- Expressions ----
+
+/// The index of the first `byte` outside quotes in `text`, from `from`.
+fn findOutside(text: Slice<u8>, from: usize, needle: Slice<u8>) -> usize? {
+    var quote: u8 = 0;
+    var i = from;
+    while (i < text.length) {
+        let c = text[i];
+        if (quote != 0) {
+            if (c == quote) {
+                quote = 0;
+            }
+        } else if (c == 0x22 || c == 0x27) {
+            quote = c;
+        } else if (i + needle.length <= text.length && text[i..i + needle.length] == needle) {
+            return i;
+        }
+        i += 1;
+    }
+    return null;
+}
+
+/// An output: an expression and its filters.
+fn evalOutput(
+    text: Slice<u8>,
+    doc: borrow JsonDocument,
+    root: usize,
+    scope: borrow LiquidScope,
+) -> Result<LiquidValue, AllocError> {
+    let pipe = findOutside(text, 0, "|".bytes()) ?? text.length;
+    let head = trimRange(text, 0, pipe);
+    var value = evalExpression(text[head[0]..head[1]], doc, root, scope)?;
+    var at = pipe;
+    while (at < text.length) {
+        let next = findOutside(text, at + 1, "|".bytes()) ?? text.length;
+        value = applyFilter(text[at + 1..next], value, doc, root, scope)?;
+        at = next;
+    }
+    return Ok(value);
+}
+
+/// A condition: comparisons joined by `and` and `or`, evaluated right to left as Liquid does.
+fn evalCondition(
+    text: Slice<u8>,
+    doc: borrow JsonDocument,
+    root: usize,
+    scope: borrow LiquidScope,
+) -> Result<bool, AllocError> {
+    let and = findOutside(text, 0, " and ".bytes());
+    let or = findOutside(text, 0, " or ".bytes());
+    let useAnd = match (and) {
+        Some(a) => match (or) {
+            Some(o) => a < o,
+            null => true,
+        },
+        null => false,
+    };
+    if (useAnd) {
+        let a = and!;
+        let left = evalComparison(text[0..a], doc, root, scope)?;
+        let right = evalCondition(text[a + 5..], doc, root, scope)?;
+        return Ok(left && right);
+    }
+    match (or) {
+        Some(o) => {
+            let left = evalComparison(text[0..o], doc, root, scope)?;
+            let right = evalCondition(text[o + 4..], doc, root, scope)?;
+            return Ok(left || right);
+        }
+        null => {}
+    }
+    return evalComparison(text, doc, root, scope);
+}
+
+const CMP_EQ: u8 = 1;
+const CMP_NE: u8 = 2;
+const CMP_LT: u8 = 3;
+const CMP_GT: u8 = 4;
+const CMP_LE: u8 = 5;
+const CMP_GE: u8 = 6;
+const CMP_CONTAINS: u8 = 7;
+
+/// One comparison, or one value's truthiness.
+fn evalComparison(
+    text: Slice<u8>,
+    doc: borrow JsonDocument,
+    root: usize,
+    scope: borrow LiquidScope,
+) -> Result<bool, AllocError> {
+    var op: u8 = 0;
+    var at: usize = 0;
+    var width: usize = 0;
+    var quote: u8 = 0;
+    var i: usize = 0;
+    while (i < text.length && op == 0) {
+        let c = text[i];
+        if (quote != 0) {
+            if (c == quote) {
+                quote = 0;
+            }
+            i += 1;
+            continue;
+        }
+        if (c == 0x22 || c == 0x27) {
+            quote = c;
+            i += 1;
+            continue;
+        }
+        let two = if (i + 1 < text.length) text[i..i + 2] else text[i..i + 1];
+        if (two == "==".bytes()) {
+            op = CMP_EQ;
+            width = 2;
+        } else if (two == "!=".bytes() || two == "<>".bytes()) {
+            op = CMP_NE;
+            width = 2;
+        } else if (two == "<=".bytes()) {
+            op = CMP_LE;
+            width = 2;
+        } else if (two == ">=".bytes()) {
+            op = CMP_GE;
+            width = 2;
+        } else if (c == 0x3c) {
+            op = CMP_LT;
+            width = 1;
+        } else if (c == 0x3e) {
+            op = CMP_GT;
+            width = 1;
+        } else if (i + 10 <= text.length && text[i..i + 10] == " contains ".bytes()) {
+            op = CMP_CONTAINS;
+            width = 10;
+        }
+        if (op != 0) {
+            at = i;
+        }
+        i += 1;
+    }
+    if (op == 0) {
+        let whole = trimRange(text, 0, text.length);
+        let v = evalExpression(text[whole[0]..whole[1]], doc, root, scope)?;
+        return Ok(truthy(v));
+    }
+    let l = trimRange(text, 0, at);
+    let r = trimRange(text, at + width, text.length);
+    let left = evalExpression(text[l[0]..l[1]], doc, root, scope)?;
+    let right = evalExpression(text[r[0]..r[1]], doc, root, scope)?;
+    if (op == CMP_EQ) {
+        return equalValues(doc, left, right);
+    }
+    if (op == CMP_NE) {
+        return Ok(!(equalValues(doc, left, right)?));
+    }
+    if (op == CMP_CONTAINS) {
+        return containsValue(doc, left, right);
+    }
+    let order = match (compareValues(left, right)) {
+        Some(o) => o,
+        null => { return Ok(false); }
+    };
+    return Ok(
+        if (op == CMP_LT) order < 0 else if (op == CMP_GT) order > 0 else if (op == CMP_LE) order <= 0 else order >= 0,
+    );
+}
+
+fn truthy(v: borrow LiquidValue) -> bool => if (v.kind == LV_NIL) false else if (v.kind == LV_BOOL) v.flag else true;
+
+/// Whether `v` is empty: an empty string, array or object.
+fn isEmpty(doc: borrow JsonDocument, v: borrow LiquidValue) -> Result<bool, AllocError> {
+    if (v.kind == LV_STRING) {
+        return Ok(v.text.length == 0);
+    }
+    if (v.kind == LV_NODE) {
+        var items = Vector<usize>.create();
+        match (doc.kind(v.node)) {
+            JsonKind.Array => { doc.items(v.node, mut items)?; }
+            _ => { doc.keys(v.node, mut items)?; }
+        }
+        return Ok(items.length == 0);
+    }
+    return Ok(v.kind == LV_EMPTY);
+}
+
+/// Whether `v` is blank: nil, false, empty, or a string of white space.
+fn isBlank(doc: borrow JsonDocument, v: borrow LiquidValue) -> Result<bool, AllocError> {
+    if (v.kind == LV_NIL || (v.kind == LV_BOOL && !v.flag) || v.kind == LV_BLANK) {
+        return Ok(true);
+    }
+    if (v.kind == LV_STRING) {
+        for (c in v.text.view()) {
+            if (!isLiquidSpace(c)) {
+                return Ok(false);
+            }
+        }
+        return Ok(true);
+    }
+    return isEmpty(doc, v);
+}
+
+fn equalValues(doc: borrow JsonDocument, a: borrow LiquidValue, b: borrow LiquidValue) -> Result<bool, AllocError> {
+    if (b.kind == LV_EMPTY) {
+        return isEmpty(doc, a);
+    }
+    if (a.kind == LV_EMPTY) {
+        return isEmpty(doc, b);
+    }
+    if (b.kind == LV_BLANK) {
+        return isBlank(doc, a);
+    }
+    if (a.kind == LV_BLANK) {
+        return isBlank(doc, b);
+    }
+    if (a.kind != b.kind) {
+        return Ok(false);
+    }
+    if (a.kind == LV_NIL) {
+        return Ok(true);
+    }
+    if (a.kind == LV_BOOL) {
+        return Ok(a.flag == b.flag);
+    }
+    if (a.kind == LV_NUMBER) {
+        match (compareValues(a, b)) {
+            Some(o) => { return Ok(o == 0); }
+            null => { return Ok(a.text.view() == b.text.view()); }
+        }
+    }
+    if (a.kind == LV_NODE) {
+        return Ok(a.node == b.node);
+    }
+    return Ok(a.text.view() == b.text.view());
+}
+
+/// A string's substring, or an array's string element.
+fn containsValue(
+    doc: borrow JsonDocument,
+    hay: borrow LiquidValue,
+    needle: borrow LiquidValue,
+) -> Result<bool, AllocError> {
+    var want = Vector<u8>.create();
+    appendValue(doc, liquidCopy(needle)?, mut want)?;
+    if (hay.kind == LV_STRING) {
+        return Ok(want.length == 0 || hay.text.view().contains(want.view()));
+    }
+    if (hay.kind == LV_NODE) {
+        var items = Vector<usize>.create();
+        doc.items(hay.node, mut items)?;
+        var s = String.create();
+        for (item in items.view()) {
+            if (doc.string(item, mut s)?) {
+                if (s.view().bytes() == want.view()) {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    return Ok(false);
+}
+
+/// The order of two numbers (whole ones), or of two strings; null for other pairs.
+fn compareValues(a: borrow LiquidValue, b: borrow LiquidValue) -> i32? {
+    if (a.kind == LV_NUMBER && b.kind == LV_NUMBER) {
+        let x = (StringView.fromUtf8(a.text.view()) ?? "").parseInt<i64>()?;
+        let y = (StringView.fromUtf8(b.text.view()) ?? "").parseInt<i64>()?;
+        return if (x < y) -1 else if (x > y) 1 else 0;
+    }
+    if (a.kind == LV_STRING && b.kind == LV_STRING) {
+        let x = a.text.view();
+        let y = b.text.view();
+        var i: usize = 0;
+        while (i < x.length && i < y.length) {
+            if (x[i] != y[i]) {
+                return if (x[i] < y[i]) -1 else 1;
+            }
+            i += 1;
+        }
+        return if (x.length < y.length) -1 else if (x.length > y.length) 1 else 0;
+    }
+    return null;
+}
+
+/// A model value by node.
+fn nodeValue(doc: borrow JsonDocument, node: usize) -> Result<LiquidValue, AllocError> {
+    match (doc.kind(node)) {
+        JsonKind.Null => { return Ok(liquidNil()); }
+        JsonKind.True => { return Ok(liquidBool(true)); }
+        JsonKind.False => { return Ok(liquidBool(false)); }
+        JsonKind.Number => { return liquidText(LV_NUMBER, doc.source(node)); }
+        JsonKind.String => {
+            var s = String.create();
+            doc.string(node, mut s)?;
+            return liquidText(LV_STRING, s.view().bytes());
+        }
+        _ => { return Ok(LiquidValue { kind: LV_NODE, flag: false, node: node, text: Vector<u8>.create() }); }
+    }
+}
+
+fn isDigit(c: u8) -> bool => c >= 0x30 && c <= 0x39;
+
+fn isNameByte(c: u8) -> bool =>
+    (c >= 0x61 && c <= 0x7a) || (c >= 0x41 && c <= 0x5a) || isDigit(c) || c == 0x5f || c == 0x2d || c == 0x3f ||
+        c >= 0x80;
+
+/// A literal or a variable path.
+fn evalExpression(
+    text: Slice<u8>,
+    doc: borrow JsonDocument,
+    root: usize,
+    scope: borrow LiquidScope,
+) -> Result<LiquidValue, AllocError> {
+    if (text.length == 0) {
+        return Ok(liquidNil());
+    }
+    let c = text[0];
+    if (c == 0x22 || c == 0x27) {
+        let end = if (text.length >= 2 && text[text.length - 1] == c) text.length - 1 else text.length;
+        return liquidText(LV_STRING, text[1..end]);
+    }
+    if (isDigit(c) || (c == 0x2d && text.length > 1 && isDigit(text[1]))) {
+        return liquidText(LV_NUMBER, text);
+    }
+    if (text == "true".bytes()) {
+        return Ok(liquidBool(true));
+    }
+    if (text == "false".bytes()) {
+        return Ok(liquidBool(false));
+    }
+    if (text == "nil".bytes() || text == "null".bytes()) {
+        return Ok(liquidNil());
+    }
+    if (text == "empty".bytes()) {
+        return Ok(LiquidValue { kind: LV_EMPTY, flag: false, node: 0, text: Vector<u8>.create() });
+    }
+    if (text == "blank".bytes()) {
+        return Ok(LiquidValue { kind: LV_BLANK, flag: false, node: 0, text: Vector<u8>.create() });
+    }
+    // The first name, then `.name`, `[n]` or `["name"]` steps.
+    var at: usize = 0;
+    while (at < text.length && isNameByte(text[at])) {
+        at += 1;
+    }
+    let first = text[0..at];
+    var value = liquidNil();
+    if (first == "forloop".bytes() && scope.loops.length > 0) {
+        let current = scope.loops[scope.loops.length - 1];
+        let field = if (at < text.length && text[at] == 0x2e) text[at + 1..] else "".bytes();
+        return forloopField(current, field);
+    }
+    var found = false;
+    var b = scope.bindings.length;
+    while (b > 0) {
+        b -= 1;
+        if (scope.bindings[b].name.view() == first) {
+            value = liquidCopy(scope.bindings[b].value)?;
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        match (doc.member(root, StringView.fromUtf8(first) ?? "")) {
+            Some(n) => { value = nodeValue(doc, n)?; }
+            null => { return Ok(liquidNil()); }
+        }
+    }
+    while (at < text.length) {
+        var key = Vector<u8>.create();
+        var index: i64 = -1;
+        if (text[at] == 0x2e) {
+            let start = at + 1;
+            at = start;
+            while (at < text.length && isNameByte(text[at])) {
+                at += 1;
+            }
+            key.extend(text[start..at])?;
+        } else if (text[at] == 0x5b) {
+            let close = match (findOutside(text, at + 1, "]".bytes())) {
+                Some(cl) => cl,
+                null => { return Ok(liquidNil()); }
+            };
+            let inner = trimRange(text, at + 1, close);
+            let step = evalExpression(text[inner[0]..inner[1]], doc, root, scope)?;
+            if (step.kind == LV_NUMBER) {
+                index = (StringView.fromUtf8(step.text.view()) ?? "").parseInt<i64>() ?? -1;
+            } else {
+                key.extend(step.text.view())?;
+            }
+            at = close + 1;
+        } else {
+            return Ok(liquidNil());
+        }
+        value = stepInto(doc, value, key.view(), index)?;
+        if (value.kind == LV_NIL) {
+            return Ok(value);
+        }
+    }
+    return Ok(value);
+}
+
+/// `forloop.index` (from 1), `index0`, `rindex`, `rindex0`, `first`, `last`, `length`.
+fn forloopField(current: LiquidLoop, field: Slice<u8>) -> Result<LiquidValue, AllocError> {
+    var n: usize = 0;
+    if (field == "first".bytes()) {
+        return Ok(liquidBool(current.index == 0));
+    }
+    if (field == "last".bytes()) {
+        return Ok(liquidBool(current.index + 1 == current.length));
+    }
+    if (field == "index".bytes()) {
+        n = current.index + 1;
+    } else if (field == "index0".bytes()) {
+        n = current.index;
+    } else if (field == "rindex".bytes()) {
+        n = current.length - current.index;
+    } else if (field == "rindex0".bytes()) {
+        n = current.length - current.index - 1;
+    } else if (field == "length".bytes()) {
+        n = current.length;
+    } else {
+        return Ok(liquidNil());
+    }
+    var v = LiquidValue { kind: LV_NUMBER, flag: false, node: 0, text: Vector<u8>.create() };
+    var s = String.create();
+    s.appendNumber(truncate<i64>(n))?;
+    v.text.extend(s.view().bytes())?;
+    return Ok(v);
+}
+
+/// One step of a path: an object's member `key`, an array's element `index`, or `size`, `first`, `last`.
+fn stepInto(
+    doc: borrow JsonDocument,
+    value: LiquidValue,
+    key: Slice<u8>,
+    index: i64,
+) -> Result<LiquidValue, AllocError> {
+    if (key == "size".bytes()) {
+        return sizeOf(doc, value);
+    }
+    if (value.kind != LV_NODE) {
+        return Ok(liquidNil());
+    }
+    match (doc.kind(value.node)) {
+        JsonKind.Array => {
+            var items = Vector<usize>.create();
+            doc.items(value.node, mut items)?;
+            if (items.length == 0) {
+                return Ok(liquidNil());
+            }
+            if (key == "first".bytes()) {
+                return nodeValue(doc, items[0]);
+            }
+            if (key == "last".bytes()) {
+                return nodeValue(doc, items[items.length - 1]);
+            }
+            if (index >= 0 && truncate<usize>(index) < items.length) {
+                return nodeValue(doc, items[truncate<usize>(index)]);
+            }
+            if (index < 0 && key.length == 0 && truncate<usize>(0 - index) <= items.length) {
+                return nodeValue(doc, items[items.length - truncate<usize>(0 - index)]);
+            }
+            return Ok(liquidNil());
+        }
+        JsonKind.Object => {
+            match (doc.member(value.node, StringView.fromUtf8(key) ?? "")) {
+                Some(n) => { return nodeValue(doc, n); }
+                null => { return Ok(liquidNil()); }
+            }
+        }
+        _ => { return Ok(liquidNil()); }
+    }
+}
+
+fn sizeOf(doc: borrow JsonDocument, value: LiquidValue) -> Result<LiquidValue, AllocError> {
+    var n: usize = 0;
+    if (value.kind == LV_STRING) {
+        n = charCount(value.text.view());
+    } else if (value.kind == LV_NODE) {
+        var items = Vector<usize>.create();
+        match (doc.kind(value.node)) {
+            JsonKind.Array => { doc.items(value.node, mut items)?; }
+            _ => { doc.keys(value.node, mut items)?; }
+        }
+        n = items.length;
+    }
+    var s = String.create();
+    s.appendNumber(truncate<i64>(n))?;
+    return liquidText(LV_NUMBER, s.view().bytes());
+}
+
+/// UTF-8 characters in `text`.
+fn charCount(text: Slice<u8>) -> usize {
+    var n: usize = 0;
+    for (c in text) {
+        if ((c & 0xc0) != 0x80) {
+            n += 1;
+        }
+    }
+    return n;
+}
+
+/// Appends a value as an output shows it: an array's elements one after another, an object as nothing.
+fn appendValue(doc: borrow JsonDocument, v: LiquidValue, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    if (v.kind == LV_BOOL) {
+        return out.extend(if (v.flag) "true".bytes() else "false".bytes());
+    }
+    if (v.kind == LV_NUMBER || v.kind == LV_STRING) {
+        return out.extend(v.text.view());
+    }
+    if (v.kind == LV_NODE) {
+        match (doc.kind(v.node)) {
+            JsonKind.Array => {
+                var items = Vector<usize>.create();
+                doc.items(v.node, mut items)?;
+                for (item in items.view()) {
+                    appendValue(doc, nodeValue(doc, item)?, out)?;
+                }
+            }
+            _ => {}
+        }
+    }
+    return Ok();
+}
+
+// ---- Filters ----
+
+/// The filter `name: arg, arg` applied to `value`. An unknown filter gives the value unchanged, as Fluid does.
+fn applyFilter(
+    spec: Slice<u8>,
+    value: LiquidValue,
+    doc: borrow JsonDocument,
+    root: usize,
+    scope: borrow LiquidScope,
+) -> Result<LiquidValue, AllocError> {
+    let whole = trimRange(spec, 0, spec.length);
+    let s = spec[whole[0]..whole[1]];
+    let colon = findOutside(s, 0, ":".bytes()) ?? s.length;
+    let nameRange = trimRange(s, 0, colon);
+    let name = s[nameRange[0]..nameRange[1]];
+    var args = Vector<LiquidValue>.create();
+    if (colon < s.length) {
+        var at = colon + 1;
+        while (at <= s.length) {
+            let comma = findOutside(s, at, ",".bytes()) ?? s.length;
+            let a = trimRange(s, at, comma);
+            args.push(evalExpression(s[a[0]..a[1]], doc, root, scope)?)?;
+            at = comma + 1;
+        }
+    }
+    if (name == "default".bytes()) {
+        let fallback = (isBlank(doc, value)? && !(value.kind == LV_BOOL && !value.flag)) || value.kind == LV_NIL ||
+            (value.kind == LV_BOOL && !value.flag) || (value.kind == LV_STRING && value.text.length == 0);
+        if (fallback && args.length > 0) {
+            return liquidCopy(args[0]);
+        }
+        return Ok(value);
+    }
+    if (name == "size".bytes()) {
+        return sizeOf(doc, value);
+    }
+    if (name == "first".bytes() || name == "last".bytes()) {
+        return stepInto(doc, value, name, -1);
+    }
+    if (name == "join".bytes()) {
+        if (value.kind != LV_NODE) {
+            return Ok(value);
+        }
+        var glue = Vector<u8>.create();
+        if (args.length > 0) {
+            appendValue(doc, liquidCopy(args[0])?, mut glue)?;
+        } else {
+            glue.push(0x20)?;
+        }
+        var items = Vector<usize>.create();
+        doc.items(value.node, mut items)?;
+        var joined = Vector<u8>.create();
+        for (k in 0..items.length) {
+            if (k > 0) {
+                joined.extend(glue.view())?;
+            }
+            appendValue(doc, nodeValue(doc, items[k])?, mut joined)?;
+        }
+        return liquidText(LV_STRING, joined.view());
+    }
+    // The rest work on the value's text.
+    let kind = value.kind;
+    var text = Vector<u8>.create();
+    appendValue(doc, value, mut text)?;
+    var arg0 = Vector<u8>.create();
+    var arg1 = Vector<u8>.create();
+    if (args.length > 0) {
+        appendValue(doc, liquidCopy(args[0])?, mut arg0)?;
+    }
+    if (args.length > 1) {
+        appendValue(doc, liquidCopy(args[1])?, mut arg1)?;
+    }
+    var result = Vector<u8>.create();
+    let t = text.view();
+    if (name == "upcase".bytes() || name == "downcase".bytes()) {
+        let up = name == "upcase".bytes();
+        for (c in t) {
+            result.push(
+                if (up && c >= 0x61 && c <= 0x7a) c - 0x20 else if (!up && c >= 0x41 && c <= 0x5a) c + 0x20 else c,
+            )?;
+        }
+    } else if (name == "capitalize".bytes()) {
+        for (k in 0..t.length) {
+            let c = t[k];
+            result.push(
+                if (k == 0 &&
+                    c >= 0x61 && c <= 0x7a) c - 0x20 else if (k > 0 && c >= 0x41 && c <= 0x5a) c + 0x20 else c,
+            )?;
+        }
+    } else if (name == "strip".bytes() || name == "lstrip".bytes() || name == "rstrip".bytes()) {
+        var s0: usize = 0;
+        var e0 = t.length;
+        if (name != "rstrip".bytes()) {
+            while (s0 < e0 && isLiquidSpace(t[s0])) {
+                s0 += 1;
+            }
+        }
+        if (name != "lstrip".bytes()) {
+            while (e0 > s0 && isLiquidSpace(t[e0 - 1])) {
+                e0 -= 1;
+            }
+        }
+        result.extend(t[s0..e0])?;
+    } else if (name == "escape".bytes() || name == "h".bytes()) {
+        appendEscaped(t, false, mut result)?;
+    } else if (name == "escape_once".bytes()) {
+        appendEscaped(t, true, mut result)?;
+    } else if (name == "newline_to_br".bytes()) {
+        for (c in t) {
+            if (c == 0x0a) {
+                result.extend("<br />\n".bytes())?;
+            } else {
+                result.push(c)?;
+            }
+        }
+    } else if (name == "strip_newlines".bytes()) {
+        for (c in t) {
+            if (c != 0x0a && c != 0x0d) {
+                result.push(c)?;
+            }
+        }
+    } else if (name == "url_encode".bytes()) {
+        let hex = "0123456789ABCDEF".bytes();
+        for (c in t) {
+            if ((c >= 0x30 && c <= 0x39) || (c >= 0x41 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a) || c == 0x2d ||
+                c == 0x2e || c == 0x5f || c == 0x7e) {
+                result.push(c)?;
+            } else if (c == 0x20) {
+                result.push(0x2b)?;
+            } else {
+                result.push(0x25)?;
+                result.push(hex[(c >> 4) as usize])?;
+                result.push(hex[(c & 0x0f) as usize])?;
+            }
+        }
+    } else if (name == "append".bytes()) {
+        result.extend(t)?;
+        result.extend(arg0.view())?;
+    } else if (name == "prepend".bytes()) {
+        result.extend(arg0.view())?;
+        result.extend(t)?;
+    } else if (name == "replace".bytes() || name == "remove".bytes() || name == "replace_first".bytes() ||
+        name == "remove_first".bytes()) {
+        let once = name == "replace_first".bytes() || name == "remove_first".bytes();
+        let with = if (name == "replace".bytes() || name == "replace_first".bytes()) arg1.view() else "".bytes();
+        replaceAll(t, arg0.view(), with, once, mut result)?;
+    } else if (name == "truncate".bytes()) {
+        let limit = (StringView.fromUtf8(arg0.view()) ?? "").parseInt<i64>() ?? 50;
+        let ellipsis = if (args.length > 1) arg1.view() else "...".bytes();
+        truncateChars(t, if (limit < 0) 0 else truncate<usize>(limit), ellipsis, mut result)?;
+    } else {
+        return liquidText(kind, t);
+    }
+    return liquidText(LV_STRING, result.view());
+}
+
+/// HTML-escapes `text`; with `once`, an entity already there (`&amp;`, `&#39;`) is kept.
+fn appendEscaped(text: Slice<u8>, once: bool, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    for (k in 0..text.length) {
+        let c = text[k];
+        if (c == 0x26) {
+            if (once && isEntity(text, k)) {
+                out.push(c)?;
+            } else {
+                out.extend("&amp;".bytes())?;
+            }
+        } else if (c == 0x3c) {
+            out.extend("&lt;".bytes())?;
+        } else if (c == 0x3e) {
+            out.extend("&gt;".bytes())?;
+        } else if (c == 0x22) {
+            out.extend("&quot;".bytes())?;
+        } else if (c == 0x27) {
+            out.extend("&#39;".bytes())?;
+        } else {
+            out.push(c)?;
+        }
+    }
+    return Ok();
+}
+
+/// Whether an entity (`&name;` or `&#n;`) starts at `at`.
+fn isEntity(text: Slice<u8>, at: usize) -> bool {
+    var i = at + 1;
+    while (i < text.length && i < at + 12) {
+        let c = text[i];
+        if (c == 0x3b) {
+            return i > at + 1;
+        }
+        let ok = (c >= 0x30 && c <= 0x39) || (c >= 0x41 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a) || (c == 0x23 &&
+            i == at + 1);
+        if (!ok) {
+            return false;
+        }
+        i += 1;
+    }
+    return false;
+}
+
+fn replaceAll(
+    text: Slice<u8>,
+    find: Slice<u8>,
+    with: Slice<u8>,
+    once: bool,
+    out: borrow mut Vector<u8>,
+) -> Result<void, AllocError> {
+    if (find.length == 0) {
+        return out.extend(text);
+    }
+    var i: usize = 0;
+    var done = false;
+    while (i < text.length) {
+        if (!done && i + find.length <= text.length && text[i..i + find.length] == find) {
+            out.extend(with)?;
+            i += find.length;
+            done = once;
+            continue;
+        }
+        out.push(text[i])?;
+        i += 1;
+    }
+    return Ok();
+}
+
+/// `text` cut to `limit` characters, the ellipsis included, as Liquid's truncate does.
+fn truncateChars(
+    text: Slice<u8>,
+    limit: usize,
+    ellipsis: Slice<u8>,
+    out: borrow mut Vector<u8>,
+) -> Result<void, AllocError> {
+    if (charCount(text) <= limit) {
+        return out.extend(text);
+    }
+    let keep = if (limit > charCount(ellipsis)) limit - charCount(ellipsis) else 0;
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < text.length) {
+        if ((text[i] & 0xc0) != 0x80) {
+            if (n == keep) {
+                break;
+            }
+            n += 1;
+        }
+        i += 1;
+    }
+    out.extend(text[0..i])?;
+    return out.extend(ellipsis);
+}
+
+// ---- The fallback ----
+
+/// The C# server's fallback for a template Fluid could not parse: `{{name}}` (a word, no spaces) becomes the model's
+/// string `name`; everything else stays.
+fn liquidFallback(
+    text: Slice<u8>,
+    doc: borrow JsonDocument,
+    root: usize,
+    out: borrow mut Vector<u8>,
+) -> Result<void, AllocError> {
+    var i: usize = 0;
+    while (i < text.length) {
+        if (i + 1 < text.length && text[i] == 0x7b && text[i + 1] == 0x7b) {
+            var j = i + 2;
+            while (j < text.length && ((text[j] >= 0x30 && text[j] <= 0x39) || (text[j] >= 0x41 && text[j] <= 0x5a) ||
+                (text[j] >= 0x61 && text[j] <= 0x7a) || text[j] == 0x5f)) {
+                j += 1;
+            }
+            if (j > i + 2 && j + 1 < text.length && text[j] == 0x7d && text[j + 1] == 0x7d) {
+                match (doc.member(root, StringView.fromUtf8(text[i + 2..j]) ?? "")) {
+                    Some(n) => {
+                        var s = String.create();
+                        if (doc.string(n, mut s)?) {
+                            out.extend(s.view().bytes())?;
+                            i = j + 2;
+                            continue;
+                        }
+                    }
+                    null => {}
+                }
+            }
+        }
+        out.push(text[i])?;
+        i += 1;
+    }
+    return Ok();
+}

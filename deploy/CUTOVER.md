@@ -72,7 +72,9 @@ cutover: do not deliver real mail to it.
 4. Move the new server onto the ports CosmoProxy proxies to: restore `docker-compose.cosmoproxy.yml`'s
    25025/25587/25465/25993/25143 and `docker compose ... up -d`. The CosmoProxyfile does not change for the mail
    ports. Point what the C# api took (autodiscover/autoconfig, `mta-sts.<domain>`, `/Microsoft-Server-ActiveSync`,
-   `/EWS/*`, `/dav/*`, `/.well-known/caldav`, `/.well-known/carddav`) at 127.0.0.1:9185 (`[http] proxied`); Autodiscover names EWS
+   `/EWS/*`, `/dav/*`, `/.well-known/caldav`, `/.well-known/carddav`, and the transactional API's `/postmark/*`) at
+   127.0.0.1:9185 (`[http] proxied`). Applications keep their `X-Postmark-Server-Token`: copy the C# server's
+   `ApiAccess.PostmarkToken` (or `COSMOMAIL_POSTMARK_TOKEN`) to `[admin] postmark_token`. Autodiscover names EWS
    (`[http] advertise_exchange`, on by default). Point the admin UI's
    host at 127.0.0.1:9183.
 5. Watch `docker compose logs -f mailserver`: `smtp [<client>] accepted` lines with real client addresses (not

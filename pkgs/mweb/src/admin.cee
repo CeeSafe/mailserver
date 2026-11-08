@@ -31,9 +31,16 @@ public struct AdminSettings {
     /// A static token for scripts (X-CosmoMail-Admin-Token), acting as a server admin; empty for none.
     public staticToken: String;
     public tokenHours: i64;
+    /// The transactional API's token (X-Postmark-Server-Token); empty: the API answers 503.
+    public postmarkToken: String;
 
     public fn create() -> AdminSettings =>
-        AdminSettings { jwtSecret: String.create(), staticToken: String.create(), tokenHours: 24 };
+        AdminSettings {
+            jwtSecret: String.create(),
+            staticToken: String.create(),
+            tokenHours: 24,
+            postmarkToken: String.create(),
+        };
 }
 
 const ROLE_SERVER: u8 = 1;

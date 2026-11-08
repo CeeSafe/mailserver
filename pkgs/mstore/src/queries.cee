@@ -194,16 +194,24 @@ fn sqlSpecialMailbox() -> StringView =>
     SELECT id FROM mailboxes WHERE user_id = $1 AND special_use = $2 ORDER BY id LIMIT 1
     """;
 
-/// $1 blob, $2 size, $3 sender, $4 recipients (newline-separated), $5 submitting user or NULL.
+/// $1 blob, $2 size, $3 sender, $4 recipients (newline-separated), $5 submitting user or NULL, $6 the transactional
+/// API's message id or ''. A message with an id gets its "queued" event in the same statement.
 fn sqlEnqueue() -> StringView =>
     """
-    INSERT INTO queue (blob, size, sender, recipients, user_id)
-    VALUES ($1, $2, $3, string_to_array($4, E'\n'), $5::int8)
-    RETURNING id
+    WITH q AS (
+        INSERT INTO queue (blob, size, sender, recipients, user_id, message_id)
+        VALUES ($1, $2, $3, string_to_array($4, E'\n'), $5::int8, nullif($6, ''))
+        RETURNING id, message_id
+    ), e AS (
+        INSERT INTO message_events (message_id, event_type)
+        SELECT message_id, 'queued' FROM q WHERE message_id IS NOT NULL
+    )
+    SELECT id FROM q
     """;
 
 /// $1 most rows, $2 claim token, $3 seconds the claim lasts. Claims the rows due, oldest due first, skipping rows
-/// another worker holds. Each: id, blob, size, sender, recipients (newline-separated), attempts, age in seconds.
+/// another worker holds. Each: id, blob, size, sender, recipients (newline-separated), attempts, age in seconds,
+/// whether a delay notice went, the transactional message id ('' for none).
 /// The due rows are chosen once, in a materialized CTE: as a subquery joined to queue, the planner rescanned it in a
 /// nested loop, and each rescan could skip-lock a different row, so one claim of LIMIT 1 took several rows.
 fn sqlClaimQueue() -> StringView =>
@@ -218,7 +226,7 @@ fn sqlClaimQueue() -> StringView =>
     FROM due
     WHERE q.id = due.id
     RETURNING q.id, q.blob, q.size, q.sender, array_to_string(q.recipients, E'\n'), q.attempts,
-        extract(epoch FROM now() - q.created_at)::int8, q.delay_notified
+        extract(epoch FROM now() - q.created_at)::int8, q.delay_notified, coalesce(q.message_id, '')
     """;
 
 /// $1 id, $2 claim, $3 the recipients left (newline-separated), $4 seconds until the next attempt, $5 the last error,
@@ -563,4 +571,16 @@ fn sqlSaveStsPolicy() -> StringView =>
 fn sqlForgetStsPolicies() -> StringView =>
     """
     DELETE FROM mta_sts_policies WHERE expires_at <= now()
+    """;
+
+/// $1 message id, $2 event type, $3 details or ''.
+fn sqlMessageEvent() -> StringView =>
+    """
+    INSERT INTO message_events (message_id, event_type, details) VALUES ($1, $2, nullif($3, ''))
+    """;
+
+/// $1 days. Forgets message events older than that.
+fn sqlForgetMessageEvents() -> StringView =>
+    """
+    DELETE FROM message_events WHERE created_at < now() - make_interval(days => $1::int)
     """;

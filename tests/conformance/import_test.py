@@ -115,6 +115,12 @@ def seed():
         INSERT INTO sieve_scripts (user_id, name, content, active)
         VALUES (1, 'filters', 'require "fileinto";\nif header :contains "Subject" "offer" {{ fileinto "Spam"; }}', true),
                (1, 'second', 'keep;', true);
+        INSERT INTO email_templates (id, domain_id, name, subject, html_body, text_body, active)
+        VALUES (1, 1, 'welcome', 'Old {{{{ name }}}}', NULL, 'old', true),
+               (2, 1, 'welcome', 'Hi {{{{ name }}}}', '<p>Hi</p>', NULL, true),
+               (3, 1, 'receipt', 'Receipt', NULL, 'Total', false);
+        INSERT INTO suppression_list (domain_id, email, reason)
+        VALUES (1, 'Gone@Remote.test', 'bounce'), (2, 'x@remote.test', 'manual');
     """)
     put("mailstore/1/1/0000000002.eml", S3_MESSAGE)
     put("mailstore/1/1/0000000005.eml", KV_MESSAGE)  # CosmoKvD's locator has no bucket: the configured one
@@ -256,6 +262,19 @@ class Import(unittest.TestCase):
         self.assertIn(b"UNSEEN 3", data[0])
         self.assertGreater(int(sql(modseq)), before)
         c.logout()
+
+    def test_9_transactional(self):
+        """Templates (the newest of a name wins, as the C# server took the latest) and suppression lists."""
+        self.assertIn("email templates: 2 added of 2", self.first)
+        self.assertIn("suppression lists: 2 added of 2", self.first)
+        self.assertEqual(sql("SELECT t.name, t.subject, coalesce(t.html_body, '-'), coalesce(t.text_body, '-'), t.active "
+                             "FROM email_templates t JOIN domains d ON d.id = t.domain_id "
+                             "WHERE d.name = 'legacy.example' ORDER BY t.name"),
+                         "receipt|Receipt|-|Total|f\nwelcome|Hi {{ name }}|<p>Hi</p>|-|t")
+        self.assertEqual(sql("SELECT d.name, s.email, s.reason FROM suppression_list s JOIN domains d ON d.id = s.domain_id "
+                             "ORDER BY d.name"),
+                         "legacy.example|gone@remote.test|bounce\nquiet.example|x@remote.test|manual")
+        self.assertIn("email templates: 0 added of 2", run_import(), "a second run adds nothing")
 
     def test_7_compare_tool(self):
         # deploy/compare-imap.py, our server against itself: it reads every mailbox and finds nothing different.

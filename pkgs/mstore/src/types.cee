@@ -261,14 +261,22 @@ public struct Outbound {
     public recipients: Vector<String>;
     /// The submitting user, or 0.
     public userId: i64;
+    /// The message id the transactional API gave it, whose events the relay records; empty for other mail.
+    public messageId: String;
 
     public fn create() -> Outbound =>
-        Outbound { sender: String.create(), recipients: Vector<String>.create(), userId: 0 };
+        Outbound {
+            sender: String.create(),
+            recipients: Vector<String>.create(),
+            userId: 0,
+            messageId: String.create(),
+        };
 
     public fn clear(borrow mut this) {
         this.sender.clear();
         this.recipients.clear();
         this.userId = 0;
+        this.messageId.clear();
     }
 }
 
@@ -291,6 +299,8 @@ public struct QueueItem {
     public claim: i64;
     /// Whether the sender has been told it is delayed; set it before settling to note that a notice went.
     public delayNotified: bool;
+    /// The transactional API's message id (`Outbound.messageId`); empty for other mail.
+    public messageId: String;
 }
 
 /// What `MailStore.copy` did: `source[i]` became `target[i]` in a mailbox of `uidValidity`.

@@ -23,9 +23,18 @@ The server's HTTP side: the listeners, the public endpoints, certificates, and t
   - Postgres builds the JSON, and request bodies go to SQL as one jsonb parameter.
   - Every change is written to `audit_logs`.
 
+- `postmark.cee`: the transactional email API under `/postmark`, the C# server's Postmark-compatible routes and
+  shapes. It is on HTTPS, admin and proxied, and refused over plain HTTP. Its token (`X-Postmark-Server-Token`) is
+  compared in constant time, and wrong tokens count against the failed-login guard. Messages go through
+  `MailStore.accept`, like submitted mail. A queue row carries its message id (`queue.message_id`), so the relay
+  records its `message_events`.
+- `liquid.cee`: Liquid for the templates. A model is a JSON object; output is capped at 16 MiB and nesting at 64.
+  `mailcompose.cee` writes the MIME message: encoded words, quoted-printable, base64 attachments, and RFC 2231
+  file names.
+
 Running the admin UI: build the frontend and run its Nitro server with `COSMOMAIL_ADMIN_API_BASE` set to the
 admin listener (for example `http://127.0.0.1:9184`), and set `[admin] jwt_secret`. Make a login with
 `mailserver add-admin admin PASSWORD`. The admin listener must stay on loopback, or behind the UI's server.
 
-Tests: `ceesafec test` (JWT with RFC 7515's example, MTA-STS text, XML), and `tests/conformance/run.sh --web`,
-`--admin` and `--acme`.
+Tests: `ceesafec test` (JWT with RFC 7515's example, MTA-STS text, XML, Liquid), and `tests/conformance/run.sh
+--web`, `--admin`, `--postmark` and `--acme`.

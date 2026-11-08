@@ -407,7 +407,12 @@ Each phase ends with something that runs, plus its tests.
 ### Phase 10: Deferred feature tracks
 These are optional and should be prioritised by actual usage:
 - OAuth2/OIDC server and XOAUTH2 validation (JWT through mcrypto).
-- Webhooks (HMAC), the transactional/Postmark API and Liquid-lite templates.
+- Webhooks (HMAC).
+- ~~The transactional/Postmark API and Liquid-lite templates.~~ Done (2026-11-08): `pkgs/mweb/src/postmark.cee`,
+  `liquid.cee` and `mailcompose.cee`, and schema version 12. Tests: 6 Liquid unit tests, `run.sh --postmark` 13.
+  - Changed from C#: Cc, Bcc and ReplyTo are sent, where the C# server dropped them; a template is looked up in the
+    sender's domain only; `active` can be changed with PUT; template names are unique per domain; an unknown local
+    recipient gets a `failed` event.
 - S3 blob backend (SigV4), Postgres backend, OpenTelemetry.
 
 ---

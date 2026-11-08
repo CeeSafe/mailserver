@@ -87,10 +87,18 @@ admin UI uses.
   on time and reloaded without a restart. You can instead give it certificate files that another proxy renews.
 - **Admin API:** `/api/*`, with the same routes and JSON shapes as the C# server, for the CosmoMailAdmin Nuxt UI.
   It covers domains, users, aliases, mailboxes, Sieve, DKIM keys, the queue, statistics and the audit log.
+- **Transactional email:** `/postmark/*` on HTTPS and the proxied listener, as the C# server's Postmark-compatible
+  API, for applications. It takes `X-Postmark-Server-Token` (`[admin] postmark_token`). It covers:
+  - `POST /postmark/email`: one message with To, Cc, Bcc, Reply-To, a tag, text and HTML bodies, and attachments up to
+    25 MB;
+  - templates per domain, written in Liquid (if, unless, case, for, assign, filters), with create, read, update,
+    list, delete, send by id or name, and batch send to up to 500 recipients;
+  - each message's events (`queued`, `sent`, `deferred`, `failed`, `delivered`) and status, kept 45 days;
+  - each domain's suppression list, which these sends check.
 - **Hardened HTTP/1.1 parser:** request-smuggling shapes are refused, and body sizes are limited per path.
 
 ### Storage (`pkgs/mstore`)
-- **Postgres:** the schema is migrated on start, 11 versions so far. Mailbox counters and UIDs are allocated in the
+- **Postgres:** the schema is migrated on start, 12 versions so far. Mailbox counters and UIDs are allocated in the
   mailbox row, so a delivery takes one row lock.
 - **Message files:** content is stored once per distinct message, by SHA-256, and reference-counted and collected
   automatically.
@@ -102,7 +110,8 @@ admin UI uses.
   - aliases, DKIM keys and Sieve scripts;
   - mailboxes with their UIDVALIDITY;
   - every message with its uid and flags, from the database, S3 (SigV4) or CosmoKvD;
-  - calendars and contacts, with their URLs and etags.
+  - calendars and contacts, with their URLs and etags;
+  - transactional email templates and suppression lists.
 - **`deploy/compare-imap.py`** compares an account on the old and new servers, read-only.
 - **[`deploy/CUTOVER.md`](deploy/CUTOVER.md)** is the runbook for the switch.
 
@@ -204,7 +213,7 @@ The configuration is a TOML subset: `[section]`, `key = "string"`, `key = 123`, 
 | `[imap]` | `imap` (STARTTLS), `imaps`, `max_append_size`, `max_connections` |
 | `[http]` | `http`, `https`, `admin` (the admin API; never expose it), and `proxied` (plain HTTP for a TLS-terminating proxy, without the admin API) |
 | `[http]` (advertising) | `imap_port` and `submission_port` (advertised to clients), and `advertise_exchange` (autodiscover names EWS) |
-| `[admin]` | `jwt_secret` (or `COSMOMAIL_JWT_SECRET`), `token` for scripts, `token_hours` |
+| `[admin]` | `jwt_secret` (or `COSMOMAIL_JWT_SECRET`), `token` for scripts, `token_hours`, `postmark_token` for the transactional API (or `COSMOMAIL_POSTMARK_TOKEN`) |
 | `[tls]` | `certificate`, `key` (PEM files, polled for changes), `reload_interval` |
 | `[acme]` | `directory` (empty: no ACME), `email`, `account_key`, `names`, `mta_sts_names`, renewal timing |
 | `[proxy]` | `from`: networks whose SMTP and IMAP connections start with a PROXY header |
@@ -579,7 +588,8 @@ tests/conformance/run.sh            # SMTP (55), IMAP (56), HTTP (20) and admin 
 tests/conformance/run.sh --dav      # CalDAV/CardDAV (11)
 tests/conformance/run.sh --eas      # ActiveSync, with its own WBXML codec (21)
 tests/conformance/run.sh --ews      # EWS, including Apple Mail's folder sequence (19)
-tests/conformance/run.sh --import   # import-cosmomail from the C# schema and a strict fake S3 (8)
+tests/conformance/run.sh --import   # import-cosmomail from the C# schema and a strict fake S3 (9)
+tests/conformance/run.sh --postmark # the transactional email API (13)
 tests/conformance/run.sh --proxy    # PROXY protocol (6)
 tests/conformance/run.sh --acme     # certificate issuance and renewal against a fake CA (4)
 ```
@@ -606,7 +616,11 @@ The server runs in production for ceesafe.com. What is not done yet:
     ResolveNames answers empty.
 - **Account settings:** `forward_to`, quotas and retention are stored and shown, but not enforced. Auto-replies go
   through Sieve (`set-vacation`).
-- **Not ported from CosmoMailServer:** the OAuth2/OIDC server, webhooks, the transactional/Postmark API and TOTP.
+- **Not ported from CosmoMailServer:** the OAuth2/OIDC server, webhooks (so delivery events are not pushed; poll
+  `/postmark/messages/{id}/status`) and TOTP.
+- **Transactional email:** message events are not imported from CosmoMailServer, so a message sent before the
+  cutover has no status here. Liquid is a subset of Fluid's: no `capture`, `cycle`, `include`, math or date filters.
+  A template that uses them falls back to the C# server's `{{name}}`-only rendering.
 - **Storage:** the S3 content backend; content is on local disk only.
 - **Not yet tested:** against a real CosmoMailServer database; so far only against its schema.
 

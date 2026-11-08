@@ -124,6 +124,57 @@ const TGT_ADMINS: StringView =
     SELECT (SELECT count(*) FROM added), (SELECT count(*) FROM r)
     """;
 
+// Transactional email: templates (of those with the same name in a domain, the newest, as the C# server took the
+// latest) and each domain's suppression list. Message events are history and are not copied.
+const SRC_TEMPLATES: StringView =
+    """
+    SELECT coalesce(json_agg(json_build_object(
+        'domain', t.domain, 'name', t.name, 'subject', t.subject, 'html_body', t.html_body,
+        'text_body', t.text_body, 'active', t.active, 'created_at', t.created_at, 'updated_at', t.updated_at
+    ) ORDER BY t.id), '[]')::text
+    FROM (SELECT DISTINCT ON (t.domain_id, t.name) t.*, lower(d.name) AS domain
+          FROM email_templates t JOIN domains d ON d.id = t.domain_id
+          ORDER BY t.domain_id, t.name, t.id DESC) t
+    """;
+
+const TGT_TEMPLATES: StringView =
+    """
+    WITH r AS (
+        SELECT * FROM jsonb_to_recordset($1::jsonb) AS r(domain text, name text, subject text, html_body text,
+            text_body text, active bool, created_at timestamptz, updated_at timestamptz)
+    ),
+    added AS (
+        INSERT INTO email_templates (domain_id, name, subject, html_body, text_body, active, created_at, updated_at)
+        SELECT d.id, r.name, r.subject, r.html_body, r.text_body, r.active, r.created_at, r.updated_at
+        FROM r JOIN domains d ON d.name = r.domain
+        ON CONFLICT (domain_id, name) DO NOTHING
+        RETURNING 1
+    )
+    SELECT (SELECT count(*) FROM added), (SELECT count(*) FROM r)
+    """;
+
+const SRC_SUPPRESSIONS: StringView =
+    """
+    SELECT coalesce(json_agg(json_build_object(
+        'domain', lower(d.name), 'email', lower(btrim(s.email)), 'reason', s.reason, 'created_at', s.created_at
+    ) ORDER BY s.id), '[]')::text
+    FROM suppression_list s JOIN domains d ON d.id = s.domain_id
+    """;
+
+const TGT_SUPPRESSIONS: StringView =
+    """
+    WITH r AS (
+        SELECT * FROM jsonb_to_recordset($1::jsonb) AS r(domain text, email text, reason text, created_at timestamptz)
+    ),
+    added AS (
+        INSERT INTO suppression_list (domain_id, email, reason, created_at)
+        SELECT d.id, r.email, r.reason, r.created_at FROM r JOIN domains d ON d.name = r.domain
+        ON CONFLICT (domain_id, email) DO NOTHING
+        RETURNING 1
+    )
+    SELECT (SELECT count(*) FROM added), (SELECT count(*) FROM r)
+    """;
+
 const SRC_ALIASES: StringView =
     """
     SELECT coalesce(json_agg(json_build_object(

@@ -324,7 +324,9 @@ public struct MailStore {
                 age: orElse(rows.int64(i, 6), 0),
                 claim: claim,
                 delayNotified: orElse(rows.bool(i, 7), false),
+                messageId: String.create(),
             };
+            grown(item.messageId.append(textOr(rows.text(i, 8))))?;
             match (rows.bytea(i, 1, mut item.blob)) {
                 Ok(_) => {}
                 Err(e) => { return Err(StoreError.Db(e)); }
@@ -436,6 +438,30 @@ public struct MailStore {
         var params = PgParams.create();
         bound(params.text(lowered.view()))?;
         return Ok(await this.execute(sqlUnsuppress(), params)? > 0);
+    }
+
+    // ---- Transactional message events ----
+
+    /// Records that `eventType` happened to the transactional message `messageId`, with `details` ("" for none).
+    public async fn messageEvent(
+        borrow this,
+        messageId: StringView,
+        eventType: StringView,
+        details: StringView,
+    ) -> Result<void, StoreError> {
+        var params = PgParams.create();
+        bound(params.text(messageId))?;
+        bound(params.text(eventType))?;
+        bound(params.text(details))?;
+        await this.execute(sqlMessageEvent(), params)?;
+        return Ok();
+    }
+
+    /// Forgets message events older than `days`; how many went.
+    public async fn forgetMessageEvents(borrow this, days: i64) -> Result<u64, StoreError> {
+        var params = PgParams.create();
+        bound(params.int64(days))?;
+        return await this.execute(sqlForgetMessageEvents(), params);
     }
 
     /// Forgets suppressions that have run out.
@@ -868,6 +894,7 @@ public struct MailStore {
             } else {
                 bound(params.int64(outbound.userId))?;
             }
+            bound(params.text(outbound.messageId.view()))?;
             await queryOn(connection, sqlEnqueue(), params, mut rows)?;
             queued = orElse(rows.int64(0, 0), 0);
         }

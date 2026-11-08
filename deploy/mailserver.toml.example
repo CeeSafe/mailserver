@@ -34,6 +34,9 @@ submission_port = 465
 [admin]
 # The admin UI's logins are signed with this; or set COSMOMAIL_JWT_SECRET in the environment (it wins).
 jwt_secret = ""
+# The transactional email API (/postmark/*): applications send X-Postmark-Server-Token with this; or set
+# COSMOMAIL_POSTMARK_TOKEN. Empty: the API answers 503.
+postmark_token = ""
 
 [tls]
 certificate = "/var/lib/mailserver/tls/fullchain.pem"

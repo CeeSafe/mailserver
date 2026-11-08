@@ -1,0 +1,455 @@
+// Composing a transactional message (RFC 5322 with MIME, RFC 2045–2047 and 2231): the header, a text and/or HTML body
+// (multipart/alternative when both), and attachments (multipart/mixed). Text parts are 7bit when they can be, else
+// quoted-printable; attachments are base64. Header text that is not plain ASCII becomes encoded words.
+
+import mmime.AddressList;
+import mmime.parseAddressList;
+import msmtp.appendDate;
+import msmtp.isMailbox;
+
+/// One attachment: decoded content.
+@noncopy
+public struct MailAttachment {
+    public name: Vector<u8>;
+    public contentType: Vector<u8>;
+    public data: Vector<u8>;
+}
+
+/// A message to compose. Address fields are lists as a client gives them (`"Ann" <ann@example.org>, bob@example.net`),
+/// already checked by `addressesOf`.
+@noncopy
+public struct OutgoingMail {
+    public from: Vector<u8>;
+    public to: Vector<u8>;
+    public cc: Vector<u8>;
+    public replyTo: Vector<u8>;
+    public subject: Vector<u8>;
+    public tag: Vector<u8>;
+    public html: Vector<u8>;
+    public hasHtml: bool;
+    public text: Vector<u8>;
+    public hasText: bool;
+    public attachments: Vector<MailAttachment>;
+    /// With its brackets.
+    public messageId: Vector<u8>;
+    public date: i64;
+
+    public fn create() -> OutgoingMail =>
+        OutgoingMail {
+            from: Vector<u8>.create(),
+            to: Vector<u8>.create(),
+            cc: Vector<u8>.create(),
+            replyTo: Vector<u8>.create(),
+            subject: Vector<u8>.create(),
+            tag: Vector<u8>.create(),
+            html: Vector<u8>.create(),
+            hasHtml: false,
+            text: Vector<u8>.create(),
+            hasText: false,
+            attachments: Vector<MailAttachment>.create(),
+            messageId: Vector<u8>.create(),
+            date: 0,
+        };
+}
+
+/// The addresses of the list `value` (lowercased domains), appended to `into`. False when one is not a mailbox
+/// (`local@domain`), or the list has a group.
+public fn addressesOf(value: Slice<u8>, into: borrow mut Vector<String>) -> Result<bool, AllocError> {
+    var list = AddressList.create();
+    parseAddressList(value, mut list)?;
+    for (i in 0..list.count()) {
+        let mailbox = match (list.mailbox(i)) {
+            Some(m) => m,
+            null => { return Ok(false); }
+        };
+        let host = match (list.host(i)) {
+            Some(h) => h,
+            null => { return Ok(false); }
+        };
+        var bytes = Vector<u8>.create();
+        bytes.extend(mailbox)?;
+        bytes.push(0x40)?;
+        for (b in host) {
+            bytes.push(if (b >= 0x41 && b <= 0x5a) b + 0x20 else b)?;
+        }
+        if (!isMailbox(bytes.view())) {
+            return Ok(false);
+        }
+        var a = String.create();
+        a.append(StringView.fromUtf8(bytes.view()) ?? "")?;
+        var seen = false;
+        for (x in into.view()) {
+            if (x.view().equalsIgnoreAsciiCase(a.view())) {
+                seen = true;
+            }
+        }
+        if (!seen) {
+            into.push(a)?;
+        }
+    }
+    return Ok(list.count() > 0);
+}
+
+/// Writes `mail` as a message, CRLF line ends, into `out` (replacing it). `boundary` is unique text for the multipart
+/// boundaries (random hex).
+public fn composeMail(
+    mail: borrow OutgoingMail,
+    boundary: Slice<u8>,
+    out: borrow mut Vector<u8>,
+) -> Result<void, AllocError> {
+    out.clear();
+    appendAddressField("From", mail.from.view(), out)?;
+    appendAddressField("To", mail.to.view(), out)?;
+    appendAddressField("Cc", mail.cc.view(), out)?;
+    appendAddressField("Reply-To", mail.replyTo.view(), out)?;
+    out.extend("Subject: ".bytes())?;
+    appendUnstructured(mail.subject.view(), 9, out)?;
+    out.extend("\r\nDate: ".bytes())?;
+    appendDate(out, mail.date)?;
+    out.extend("\r\nMessage-ID: ".bytes())?;
+    out.extend(mail.messageId.view())?;
+    out.extend("\r\n".bytes())?;
+    if (mail.tag.length > 0) {
+        out.extend("X-PM-Tag: ".bytes())?;
+        appendUnstructured(mail.tag.view(), 10, out)?;
+        out.extend("\r\n".bytes())?;
+    }
+    out.extend("MIME-Version: 1.0\r\n".bytes())?;
+    let mixed = mail.attachments.length > 0;
+    if (mixed) {
+        out.extend("Content-Type: multipart/mixed; boundary=\"=_m".bytes())?;
+        out.extend(boundary)?;
+        out.extend("\"\r\n\r\nThis is a multi-part message in MIME format.\r\n".bytes())?;
+        appendBoundary("m", boundary, false, out)?;
+    }
+    if (mail.hasText && mail.hasHtml) {
+        out.extend("Content-Type: multipart/alternative; boundary=\"=_a".bytes())?;
+        out.extend(boundary)?;
+        out.extend("\"\r\n\r\n".bytes())?;
+        appendBoundary("a", boundary, false, out)?;
+        appendTextPart("plain", mail.text.view(), out)?;
+        appendBoundary("a", boundary, false, out)?;
+        appendTextPart("html", mail.html.view(), out)?;
+        appendBoundary("a", boundary, true, out)?;
+    } else if (mail.hasHtml) {
+        appendTextPart("html", mail.html.view(), out)?;
+    } else {
+        appendTextPart("plain", mail.text.view(), out)?;
+    }
+    if (mixed) {
+        for (a in mail.attachments.view()) {
+            appendBoundary("m", boundary, false, out)?;
+            appendAttachment(a, out)?;
+        }
+        appendBoundary("m", boundary, true, out)?;
+    }
+    return Ok();
+}
+
+fn appendBoundary(
+    kind: StringView,
+    boundary: Slice<u8>,
+    last: bool,
+    out: borrow mut Vector<u8>,
+) -> Result<void, AllocError> {
+    out.extend("\r\n--=_".bytes())?;
+    out.extend(kind.bytes())?;
+    out.extend(boundary)?;
+    if (last) {
+        out.extend("--".bytes())?;
+    }
+    return out.extend("\r\n".bytes());
+}
+
+/// `Name: ` and the list `value` rewritten one address a line; nothing when it is empty.
+fn appendAddressField(name: StringView, value: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    var list = AddressList.create();
+    parseAddressList(value, mut list)?;
+    var written: usize = 0;
+    for (i in 0..list.count()) {
+        let mailbox = match (list.mailbox(i)) {
+            Some(m) => m,
+            null => { continue; }
+        };
+        let host = match (list.host(i)) {
+            Some(h) => h,
+            null => { continue; }
+        };
+        if (written == 0) {
+            out.extend(name.bytes())?;
+            out.extend(": ".bytes())?;
+        } else {
+            out.extend(",\r\n ".bytes())?;
+        }
+        let display = list.name(i) ?? "".bytes();
+        if (display.length > 0) {
+            appendPhrase(display, out)?;
+            out.extend(" <".bytes())?;
+        }
+        out.extend(mailbox)?;
+        out.push(0x40)?;
+        out.extend(host)?;
+        if (display.length > 0) {
+            out.push(0x3e)?;
+        }
+        written += 1;
+    }
+    if (written > 0) {
+        out.extend("\r\n".bytes())?;
+    }
+    return Ok();
+}
+
+fn isAtext(c: u8) -> bool =>
+    (c >= 0x30 && c <= 0x39) || (c >= 0x41 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a) || c == 0x21 || c == 0x23 ||
+        c == 0x24 || c == 0x25 || c == 0x26 || c == 0x27 || c == 0x2a || c == 0x2b || c == 0x2d || c == 0x2f ||
+        c == 0x3d || c == 0x3f || c == 0x5e || c == 0x5f || c == 0x60 || c == 0x7b || c == 0x7c || c == 0x7d ||
+        c == 0x7e;
+
+/// A display name: as it is when it is atoms, quoted when it is other ASCII, encoded words otherwise (or when it
+/// already holds one, as the parser keeps them).
+fn appendPhrase(name: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    var atoms = true;
+    var ascii = true;
+    for (c in name) {
+        if (c >= 0x80 || c < 0x20 || c == 0x7f) {
+            ascii = false;
+        } else if (!isAtext(c) && c != 0x20) {
+            atoms = false;
+        }
+    }
+    if (ascii && name.contains("=?".bytes())) {
+        // Already encoded words: keep them.
+        return out.extend(name);
+    }
+    if (!ascii) {
+        return appendEncodedWords(name, 0, out);
+    }
+    if (atoms) {
+        return out.extend(name);
+    }
+    out.push(0x22)?;
+    for (c in name) {
+        if (c == 0x22 || c == 0x5c) {
+            out.push(0x5c)?;
+        }
+        out.push(c)?;
+    }
+    return out.push(0x22);
+}
+
+/// Unstructured header text (Subject, a tag): one line; encoded words when it is not plain ASCII or is long.
+/// `used` is how much of the line the field's name took.
+fn appendUnstructured(text: Slice<u8>, used: usize, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    var plain = text.length + used <= 78;
+    for (c in text) {
+        if (c >= 0x80 || c < 0x20 || c == 0x7f) {
+            plain = false;
+        }
+    }
+    if (plain && !text.contains("=?".bytes())) {
+        return out.extend(text);
+    }
+    var flat = Vector<u8>.create();
+    for (c in text) {
+        flat.push(if (c == 0x0d || c == 0x0a || c == 0x09) 0x20 else c)?;
+    }
+    return appendEncodedWords(flat.view(), used, out);
+}
+
+/// `text` as `=?utf-8?B?…?=` words of at most 75 characters, folded onto lines of their own, cut between
+/// characters (RFC 2047 §5).
+fn appendEncodedWords(text: Slice<u8>, used: usize, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    var at: usize = 0;
+    var first = true;
+    while (at < text.length || first) {
+        // 45 bytes are 60 base64 characters: with =?utf-8?B? and ?= the word is 72.
+        var end = if (at + 45 < text.length) at + 45 else text.length;
+        while (end > at && end < text.length && (text[end] & 0xc0) == 0x80) {
+            end -= 1;
+        }
+        if (end == at && at < text.length) {
+            end = at + 1;
+        }
+        if (!first) {
+            out.extend("\r\n ".bytes())?;
+        }
+        out.extend("=?utf-8?B?".bytes())?;
+        encoding.Base64.encode(text[at..end], out)?;
+        out.extend("?=".bytes())?;
+        first = false;
+        at = end;
+        if (used > 0 && at >= text.length) {
+            break;
+        }
+    }
+    return Ok();
+}
+
+/// A text/plain or text/html part: 7bit when it is ASCII with short lines, else quoted-printable.
+fn appendTextPart(subtype: StringView, body: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    var seven = true;
+    var line: usize = 0;
+    for (c in body) {
+        if (c == 0x0a) {
+            line = 0;
+            continue;
+        }
+        line += 1;
+        if (c >= 0x80 || c == 0 || line > 900) {
+            seven = false;
+        }
+    }
+    out.extend("Content-Type: text/".bytes())?;
+    out.extend(subtype.bytes())?;
+    out.extend("; charset=utf-8\r\nContent-Transfer-Encoding: ".bytes())?;
+    out.extend(if (seven) "7bit\r\n\r\n".bytes() else "quoted-printable\r\n\r\n".bytes())?;
+    if (seven) {
+        return appendCrlfLines(body, out);
+    }
+    return appendQuotedPrintable(body, out);
+}
+
+/// `text` with every line end made CRLF, ending with one.
+fn appendCrlfLines(text: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    var i: usize = 0;
+    while (i < text.length) {
+        let c = text[i];
+        if (c == 0x0d) {
+            out.extend("\r\n".bytes())?;
+            if (i + 1 < text.length && text[i + 1] == 0x0a) {
+                i += 1;
+            }
+        } else if (c == 0x0a) {
+            out.extend("\r\n".bytes())?;
+        } else {
+            out.push(c)?;
+        }
+        i += 1;
+    }
+    if (out.length < 2 || out[out.length - 1] != 0x0a) {
+        out.extend("\r\n".bytes())?;
+    }
+    return Ok();
+}
+
+/// Quoted-printable (RFC 2045 §6.7): line ends stay line ends, lines are cut at 76 with soft breaks, and white space
+/// before a line end is encoded.
+public fn appendQuotedPrintable(text: Slice<u8>, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    let hex = "0123456789ABCDEF".bytes();
+    var column: usize = 0;
+    var i: usize = 0;
+    while (i < text.length) {
+        let c = text[i];
+        if (c == 0x0d || c == 0x0a) {
+            out.extend("\r\n".bytes())?;
+            column = 0;
+            if (c == 0x0d && i + 1 < text.length && text[i + 1] == 0x0a) {
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        let atLineEnd = i + 1 >= text.length || text[i + 1] == 0x0d || text[i + 1] == 0x0a;
+        let literal = (c >= 0x21 && c <= 0x7e && c != 0x3d) || ((c == 0x20 || c == 0x09) && !atLineEnd);
+        let width: usize = if (literal) 1 else 3;
+        if (column + width > 75) {
+            out.extend("=\r\n".bytes())?;
+            column = 0;
+        }
+        if (literal) {
+            out.push(c)?;
+        } else {
+            out.push(0x3d)?;
+            out.push(hex[(c >> 4) as usize])?;
+            out.push(hex[(c & 0x0f) as usize])?;
+        }
+        column += width;
+        i += 1;
+    }
+    if (out.length < 2 || out[out.length - 1] != 0x0a) {
+        out.extend("\r\n".bytes())?;
+    }
+    return Ok();
+}
+
+/// Whether `value` is a media type, `type/subtype`, of token characters.
+public fn isMediaType(value: Slice<u8>) -> bool {
+    var slash: usize? = null;
+    for (k in 0..value.length) {
+        let c = value[k];
+        if (c == 0x2f) {
+            if (slash != null || k == 0) {
+                return false;
+            }
+            slash = k;
+            continue;
+        }
+        let token = (c >= 0x30 && c <= 0x39) || (c >= 0x41 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a) || c == 0x21 ||
+            c == 0x23 || c == 0x24 || c == 0x26 || c == 0x5e || c == 0x5f || c == 0x2e || c == 0x2b || c == 0x2d;
+        if (!token) {
+            return false;
+        }
+    }
+    return match (slash) {
+        Some(s) => s + 1 < value.length && value.length <= 127,
+        null => false,
+    };
+}
+
+/// An attachment: its type and name, and its content in base64 lines of 76.
+fn appendAttachment(a: borrow MailAttachment, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+    var name = Vector<u8>.create();
+    var ascii = true;
+    for (c in a.name.view()) {
+        if (c < 0x20 || c == 0x7f || c == 0x22 || c == 0x5c) {
+            continue;
+        }
+        if (c >= 0x80) {
+            ascii = false;
+        }
+        name.push(c)?;
+    }
+    if (name.length == 0) {
+        name.extend("attachment".bytes())?;
+    }
+    out.extend("Content-Type: ".bytes())?;
+    out.extend(a.contentType.view())?;
+    out.extend(";\r\n name=\"".bytes())?;
+    if (ascii) {
+        out.extend(name.view())?;
+    } else {
+        appendEncodedWords(name.view(), 0, out)?;
+    }
+    out.extend("\"\r\nContent-Disposition: attachment;\r\n filename".bytes())?;
+    if (ascii) {
+        out.extend("=\"".bytes())?;
+        out.extend(name.view())?;
+        out.push(0x22)?;
+    } else {
+        // RFC 2231: filename*=utf-8''percent-encoded.
+        out.extend("*=utf-8''".bytes())?;
+        let hex = "0123456789ABCDEF".bytes();
+        for (c in name.view()) {
+            let plain = (c >= 0x30 && c <= 0x39) || (c >= 0x41 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a) || c == 0x2d ||
+                c == 0x2e || c == 0x5f;
+            if (plain) {
+                out.push(c)?;
+            } else {
+                out.push(0x25)?;
+                out.push(hex[(c >> 4) as usize])?;
+                out.push(hex[(c & 0x0f) as usize])?;
+            }
+        }
+    }
+    out.extend("\r\nContent-Transfer-Encoding: base64\r\n\r\n".bytes())?;
+    let data = a.data.view();
+    var at: usize = 0;
+    while (at < data.length) {
+        let end = if (at + 57 < data.length) at + 57 else data.length;
+        encoding.Base64.encode(data[at..end], out)?;
+        out.extend("\r\n".bytes())?;
+        at = end;
+    }
+    return Ok();
+}

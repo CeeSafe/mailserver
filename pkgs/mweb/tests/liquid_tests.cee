@@ -1,0 +1,130 @@
+// The Liquid renderer: the C# server's TemplateRenderTests, then the tags and filters its samples use.
+
+import mhttp.JsonDocument;
+
+fn render(template: StringView, model: StringView) -> Vector<u8> {
+    let doc = JsonDocument.parse(model.bytes())!;
+    var out = Vector<u8>.create();
+    renderLiquid(template, doc, doc.root(), mut out)!;
+    return out;
+}
+
+fn renders(template: StringView, model: StringView, want: StringView) -> bool => render(template, model).view() ==
+    want.bytes();
+
+@test
+fn rendersAsTheCSharpServer() -> Result<void, TestFailure> {
+    Check.isTrue(renders("Hello {{name}}", "{\"name\":\"World\"}", "Hello World"), "a variable")?;
+    Check.isTrue(renders("{{first}} {{last}}", "{\"first\":\"John\",\"last\":\"Doe\"}", "John Doe"), "two")?;
+    Check.isTrue(renders("Hello {{unknown}}", "{\"name\":\"World\"}", "Hello "), "a missing one is empty")?;
+    Check.isTrue(renders("", "{\"x\":\"y\"}", ""), "an empty template")?;
+    Check.isTrue(
+        renders(
+            "<p>Hello {{name}}</p>",
+            "{\"name\":\"<script>alert(1)</script>\"}",
+            "<p>Hello <script>alert(1)</script></p>",
+        ),
+        "values are not escaped",
+    )?;
+    Check.isTrue(renders("{{x}}-{{x}}-{{x}}", "{\"x\":\"A\"}", "A-A-A"), "used again")?;
+    Check.isTrue(renders("Plain text no vars", "{\"a\":\"b\"}", "Plain text no vars"), "no variables")?;
+    Check.isTrue(renders("Hello {{name}}", "{}", "Hello "), "an empty model")?;
+    Check.isTrue(renders("Hello {{ name }}", "{\"name\":\"World\"}", "Hello World"), "spaces in the braces")?;
+    Check.isTrue(renders("{% if show %}visible{% endif %}", "{\"show\":\"true\"}", "visible"), "a truthy if")?;
+    Check.isTrue(renders("{% if show %}visible{% endif %}", "{}", ""), "a missing variable is falsy")?;
+    return Ok();
+}
+
+@test
+fn conditions() -> Result<void, TestFailure> {
+    let t = "{% if plan == \"Premium\" %}P{% elsif plan == 'Basic' %}B{% else %}?{% endif %}";
+    Check.isTrue(renders(t, "{\"plan\":\"Premium\"}", "P"), "if")?;
+    Check.isTrue(renders(t, "{\"plan\":\"Basic\"}", "B"), "elsif")?;
+    Check.isTrue(renders(t, "{\"plan\":\"Free\"}", "?"), "else")?;
+    Check.isTrue(renders("{% if n > 2 and n <= 5 %}y{% endif %}", "{\"n\":4}", "y"), "and, numbers")?;
+    Check.isTrue(renders("{% if n > 2 and n <= 5 %}y{% endif %}", "{\"n\":6}", ""), "and, false")?;
+    Check.isTrue(renders("{% if a or b %}y{% endif %}", "{\"b\":true}", "y"), "or")?;
+    Check.isTrue(renders("{% if false %}y{% endif %}", "{}", ""), "false")?;
+    Check.isTrue(renders("{% if s contains \"ell\" %}y{% endif %}", "{\"s\":\"hello\"}", "y"), "contains")?;
+    Check.isTrue(renders("{% if tags contains 'b' %}y{% endif %}", "{\"tags\":[\"a\",\"b\"]}", "y"), "in an array")?;
+    Check.isTrue(renders("{% unless done %}todo{% endunless %}", "{\"done\":false}", "todo"), "unless")?;
+    Check.isTrue(renders("{% if list == empty %}none{% endif %}", "{\"list\":[]}", "none"), "empty")?;
+    Check.isTrue(renders("{% if s != blank %}y{% else %}n{% endif %}", "{\"s\":\"  \"}", "n"), "blank")?;
+    Check.isTrue(
+        renders("{% case c %}{% when 'r', 'red' %}R{% when 'g' %}G{% else %}X{% endcase %}", "{\"c\":\"red\"}", "R"),
+        "case",
+    )?;
+    return Ok();
+}
+
+@test
+fn loopsAndPaths() -> Result<void, TestFailure> {
+    let model = "{\"items\":[{\"name\":\"Pen\",\"qty\":2},{\"name\":\"Ink\",\"qty\":1}],\"order\":{\"id\":\"A7\"}}";
+    Check.isTrue(
+        renders("{% for item in items %}{{ item.name }} x{{ item.qty }};{% endfor %}", model, "Pen x2;Ink x1;"),
+        "for",
+    )?;
+    Check.isTrue(
+        renders(
+            "{% for i in items %}{{ forloop.index }}{% unless forloop.last %},{% endunless %}{% endfor %}",
+            model,
+            "1,2",
+        ),
+        "forloop",
+    )?;
+    Check.isTrue(renders("{% for i in items reversed %}{{ i.name }}{% endfor %}", model, "InkPen"), "reversed")?;
+    Check.isTrue(renders("{% for i in items limit: 1 %}{{ i.name }}{% endfor %}", model, "Pen"), "limit")?;
+    Check.isTrue(renders("{% for i in none %}x{% else %}empty{% endfor %}", model, "empty"), "for else")?;
+    Check.isTrue(renders("{{ order.id }} {{ items[1].name }} {{ items.size }}", model, "A7 Ink 2"), "paths")?;
+    Check.isTrue(renders("{{ items.first.name }}/{{ items.last.name }}", model, "Pen/Ink"), "first and last")?;
+    Check.isTrue(renders("{% assign who = order.id | downcase %}{{ who }}", model, "a7"), "assign")?;
+    return Ok();
+}
+
+@test
+fn filters() -> Result<void, TestFailure> {
+    Check.isTrue(renders("{{ n | upcase }}", "{\"n\":\"abc\"}", "ABC"), "upcase")?;
+    Check.isTrue(renders("{{ n | capitalize }}", "{\"n\":\"aBC\"}", "Abc"), "capitalize")?;
+    Check.isTrue(renders("{{ n | default: 'friend' }}", "{}", "friend"), "default")?;
+    Check.isTrue(renders("{{ n | default: 'friend' }}", "{\"n\":\"\"}", "friend"), "default for empty")?;
+    Check.isTrue(renders("{{ n | default: 'x' }}", "{\"n\":\"Al\"}", "Al"), "default unused")?;
+    Check.isTrue(
+        renders("{{ n | escape }}", "{\"n\":\"<a href='x'>&</a>\"}", "&lt;a href=&#39;x&#39;&gt;&amp;&lt;/a&gt;"),
+        "escape",
+    )?;
+    Check.isTrue(renders("{{ n | escape_once }}", "{\"n\":\"&amp; <\"}", "&amp; &lt;"), "escape_once")?;
+    Check.isTrue(renders("{{ n | append: '!' | prepend: '>' }}", "{\"n\":\"hi\"}", ">hi!"), "a chain")?;
+    Check.isTrue(renders("{{ n | replace: 'a', 'o' }}", "{\"n\":\"banana\"}", "bonono"), "replace")?;
+    Check.isTrue(renders("{{ n | truncate: 8 }}", "{\"n\":\"abcdefghijkl\"}", "abcde..."), "truncate")?;
+    Check.isTrue(renders("{{ n | url_encode }}", "{\"n\":\"a b&c\"}", "a+b%26c"), "url_encode")?;
+    Check.isTrue(renders("{{ t | join: ', ' }}", "{\"t\":[\"a\",\"b\"]}", "a, b"), "join")?;
+    Check.isTrue(renders("{{ n | size }}", "{\"n\":\"héllo\"}", "5"), "size counts characters")?;
+    Check.isTrue(renders("{{ n | nosuchfilter }}", "{\"n\":\"same\"}", "same"), "an unknown filter")?;
+    Check.isTrue(renders("{{ 'a|b' | upcase }}", "{}", "A|B"), "a pipe in a string")?;
+    return Ok();
+}
+
+@test
+fn whitespaceCommentsAndRaw() -> Result<void, TestFailure> {
+    Check.isTrue(renders("a  {{- n -}}  b", "{\"n\":\"X\"}", "aXb"), "output trimming")?;
+    Check.isTrue(
+        renders("<ul>\n  {%- if t -%}\n  <li>\n  {%- endif %}</ul>", "{\"t\":1}", "<ul><li></ul>"),
+        "tag trimming",
+    )?;
+    Check.isTrue(renders("a{% comment %} {{ n }} {% endcomment %}b", "{}", "ab"), "comment")?;
+    Check.isTrue(renders("{% raw %}{{ n }}{% endraw %}", "{\"n\":\"X\"}", "{{ n }}"), "raw")?;
+    return Ok();
+}
+
+@test
+fn fallsBackOnWhatItCannotParse() -> Result<void, TestFailure> {
+    // Fluid could not parse these, and the C# server replaced only {{name}}.
+    Check.isTrue(renders("Hi {{name}} {% bogus %}", "{\"name\":\"Al\"}", "Hi Al {% bogus %}"), "an unknown tag")?;
+    Check.isTrue(renders("{% if a %}open {{name}}", "{\"name\":\"Al\"}", "{% if a %}open Al"), "an unclosed block")?;
+    Check.isTrue(renders("Hi {{name}} {{ open", "{\"name\":\"Al\"}", "Hi Al {{ open"), "an unclosed output")?;
+    Check.isTrue(
+        renders("{{missing}} {% bogus %}", "{}", "{{missing}} {% bogus %}"),
+        "kept when there is no such value",
+    )?;
+    return Ok();
+}

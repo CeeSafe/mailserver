@@ -2,7 +2,7 @@
 // version by raising SCHEMA_VERSION and adding its statements, never by changing an applied one.
 
 /// The number of schema versions.
-const SCHEMA_VERSION: i32 = 11;
+const SCHEMA_VERSION: i32 = 12;
 
 /// Statement `part` of the script that brings the schema from `version - 1` to `version`, or empty after
 /// the last.
@@ -510,6 +510,54 @@ fn migrationPart(version: i32, part: usize) -> StringView {
             );
             """;
     }
+    if (version == 12 && part == 0) {
+        // mstore schema, version 12: transactional email (the Postmark-compatible API, pkgs/mweb's postmark.cee).
+        // Templates are per domain and named uniquely there; Liquid in their subject and bodies is rendered at send.
+        return """
+            CREATE TABLE email_templates (
+                id         BIGSERIAL   PRIMARY KEY,
+                domain_id  BIGINT      NOT NULL REFERENCES domains(id) ON DELETE CASCADE,
+                name       TEXT        NOT NULL,
+                subject    TEXT        NULL,
+                html_body  TEXT        NULL,
+                text_body  TEXT        NULL,
+                active     BOOLEAN     NOT NULL DEFAULT TRUE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                UNIQUE (domain_id, name)
+            );
+            """;
+    }
+    if (version == 12 && part == 1) {
+        // A domain's own list of addresses the API will not send to, kept by hand (unlike `suppression`, which the
+        // relay fills from bounces and which expires).
+        return """
+            CREATE TABLE suppression_list (
+                id         BIGSERIAL   PRIMARY KEY,
+                domain_id  BIGINT      NOT NULL REFERENCES domains(id) ON DELETE CASCADE,
+                email      TEXT        NOT NULL,          -- lowercase
+                reason     TEXT        NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                UNIQUE (domain_id, email)
+            );
+            """;
+    }
+    if (version == 12 && part == 2) {
+        // What happened to a message the API sent: queued, sent or deferred or failed per recipient, delivered.
+        // A queue row the API made carries its message id, so the relay can record its events.
+        return """
+            CREATE TABLE message_events (
+                id         BIGSERIAL   PRIMARY KEY,
+                message_id TEXT        NOT NULL,
+                event_type TEXT        NOT NULL,
+                details    TEXT        NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+            CREATE INDEX message_events_message ON message_events(message_id, id);
+            CREATE INDEX message_events_created ON message_events(created_at);
+            ALTER TABLE queue ADD COLUMN message_id TEXT NULL;
+            """;
+    }
     return "";
 }
 
@@ -547,6 +595,9 @@ fn migrationName(version: i32) -> StringView {
     }
     if (version == 11) {
         return "011_groupware";
+    }
+    if (version == 12) {
+        return "012_transactional";
     }
     return "";
 }

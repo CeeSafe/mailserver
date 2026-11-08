@@ -309,6 +309,12 @@ async fn process(relay: borrow Relay, store: borrow MailStore, queued: QueueItem
             failures.push(f)?;
         }
         await logResult(item.id, p)?;
+        if (item.messageId.length > 0) {
+            let kind =
+                if (p.outcome == OUTCOME_DELIVERED) "sent" else if (p.outcome == OUTCOME_TRANSIENT &&
+                    !expired) "deferred" else "failed";
+            await messageEvent(store, item.messageId.view(), kind, p)?;
+        }
     }
     if (failures.length > 0 && item.sender.length > 0) {
         match (await bounce(relay, store, item, failures, "".bytes())) {
@@ -328,7 +334,14 @@ async fn process(relay: borrow Relay, store: borrow MailStore, queued: QueueItem
     }
     var done = Vector<Delivered>.create();
     match (await store.settle(item, locals, remaining, delay, lastError.view(), mut done)) {
-        Ok(true) => {}
+        Ok(true) => {
+            if (item.messageId.length > 0 && remaining.length == 0 && failures.length == 0) {
+                match (await store.messageEvent(item.messageId.view(), "delivered", "")) {
+                    Ok() => {}
+                    Err(_) => {}
+                }
+            }
+        }
         Ok(false) => { await logLine("relay: claim lost, another worker has", item.sender.view()); }
         Err(StoreError.OutOfMemory) => { return Err(AllocError.OutOfMemory); }
         Err(_) => {
@@ -337,6 +350,27 @@ async fn process(relay: borrow Relay, store: borrow MailStore, queued: QueueItem
                 item.sender.view(),
             );
         }
+    }
+    return Ok();
+}
+
+/// Records a transactional message's event for one recipient: its address, and the reply unless it was delivered.
+/// A failure to record is logged and otherwise ignored: the delivery outcome stands.
+async fn messageEvent(
+    store: borrow MailStore,
+    messageId: StringView,
+    kind: StringView,
+    p: borrow Pending,
+) -> Result<void, AllocError> {
+    var details = String.create();
+    details.append(p.address.view())?;
+    if (p.outcome != OUTCOME_DELIVERED) {
+        details.append(": ")?;
+        details.append(p.reply.view())?;
+    }
+    match (await store.messageEvent(messageId, kind, details.view())) {
+        Ok() => {}
+        Err(_) => { await logLine("relay: a message event could not be recorded for", messageId); }
     }
     return Ok();
 }
