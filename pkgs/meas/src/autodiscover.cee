@@ -20,10 +20,14 @@ fn appendEscaped(out: borrow mut Vector<u8>, text: StringView) -> Result<void, A
 }
 
 /// The answer to an autodiscover request for the mobilesync schema: the ActiveSync URL on `host`.
+///
+/// The root declares only the default namespace. With `xmlns:xsi` and `xmlns:xsd` before it, as in MS-ASCMD's
+/// example, iOS 27's account setup logged "Response schema is not the appropriate schema" and asked for the server by
+/// hand (2026-11-08); the C# server, which never sent them, is the shape here.
 public fn mobileSyncAutodiscover(email: StringView, host: StringView) -> Result<Response, AllocError> {
     var out = Vector<u8>.create();
     out.extend(
-        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<Autodiscover xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\" xmlns=\"http://schemas.microsoft.com/exchange/autodiscover/responseschema/2006\">\n  <Response xmlns=\"http://schemas.microsoft.com/exchange/autodiscover/mobilesync/responseschema/2006\">\n    <Culture>en:en</Culture>\n    <User>\n      <DisplayName>".bytes(),
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<Autodiscover xmlns=\"http://schemas.microsoft.com/exchange/autodiscover/responseschema/2006\">\n  <Response xmlns=\"http://schemas.microsoft.com/exchange/autodiscover/mobilesync/responseschema/2006\">\n    <Culture>en:en</Culture>\n    <User>\n      <DisplayName>".bytes(),
     )?;
     appendEscaped(mut out, email)?;
     out.extend("</DisplayName>\n      <EMailAddress>".bytes())?;
