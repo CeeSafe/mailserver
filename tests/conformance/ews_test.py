@@ -522,8 +522,10 @@ class Autodiscover(unittest.TestCase):
                 '<AcceptableResponseSchema>http://schemas.microsoft.com/exchange/autodiscover/outlook/'
                 'responseschema/2006a</AcceptableResponseSchema></Request></Autodiscover>')
         c = http.client.HTTPSConnection(HOST, HTTPS, context=tls_context(), timeout=10)
+        import base64
+        auth = "Basic " + base64.b64encode(b"ews@example.org:ews-pw-1234").decode()
         c.request("POST", "/autodiscover/autodiscover.xml", body=body,
-                  headers={"Host": "autodiscover.example.org", "Content-Type": "text/xml"})
+                  headers={"Host": "autodiscover.example.org", "Content-Type": "text/xml", "Authorization": auth})
         data = c.getresponse().read().decode()
         # run.sh --ews turns advertise_exchange on.
         self.assertIn("<Type>EXPR</Type>", data)

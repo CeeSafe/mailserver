@@ -20,3 +20,4 @@ tls = { path = "../../../../CeeSafeLibs/tls" }
 mdav = { path = "../mdav" }
 meas = { path = "../meas" }
 mews = { path = "../mews" }
+mpim = { path = "../mpim" }

@@ -6,6 +6,8 @@ import mhttp.Request;
 import mhttp.Response;
 import mhttp.appendIsoTime;
 import mdav.serveDav;
+import mpim.Account;
+import mpim.basicLogin;
 import meas.mobileSyncAutodiscover;
 import meas.serveActiveSync;
 import mews.appendExchangeProtocol;
@@ -439,6 +441,14 @@ async fn autodiscoverXml(
     mode: WebMode,
     request: borrow Request,
 ) -> Result<Response, AllocError> {
+    // Logged in, as Exchange and Z-Push answer it: 401 with a Basic challenge for no credentials or ones that do not
+    // log in. iOS 27 sends its variants of the user name at once (`kutty`, `kutty@ceesafe.com`) and takes the one
+    // that logs in; when every variant had an answer, it could not tell and asked for the server by hand.
+    var account = Account.create();
+    match (await basicLogin(ctx.mail.get(), request, mut account)) {
+        Ok() => {}
+        Err(f) => { return mpim.loginAnswer(f, "Autodiscover"); }
+    }
     let body = StringView.fromUtf8(request.body.view()) ?? "";
     let given = elementText(body, "EMailAddress");
     let schema = elementText(body, "AcceptableResponseSchema");

@@ -181,13 +181,19 @@ POX = """<?xml version="1.0" encoding="utf-8"?>
   </a:Request>
 </a:Autodiscover>"""
 OUTLOOK = "http://schemas.microsoft.com/exchange/autodiscover/outlook/responseschema/2006a"
+MOBILE = "http://schemas.microsoft.com/exchange/autodiscover/mobilesync/responseschema/2006"
+
+
+def basic(user, password):
+    import base64
+    return {"Authorization": "Basic " + base64.b64encode(f"{user}:{password}".encode()).decode()}
 
 
 class Autodiscover(unittest.TestCase):
     def test_pox(self):
         body = POX.format(email="alice@example.org", schema=OUTLOOK).encode()
         r, data = request(HTTPS, "POST", "/Autodiscover/Autodiscover.xml", host="autodiscover.example.org", body=body,
-                          headers={"Content-Type": "text/xml"})
+                          headers={"Content-Type": "text/xml", **basic("alice@example.org", "alice-pw")})
         self.assertEqual(r.status, 200)
         text = data.decode()
         self.assertIn("<AutoDiscoverSMTPAddress>alice@example.org</AutoDiscoverSMTPAddress>", text)
@@ -203,17 +209,31 @@ class Autodiscover(unittest.TestCase):
     def test_unprefixed_and_mobilesync(self):
         plain = POX.replace("a:", "").replace(":a=", "=")
         r, data = request(HTTPS, "POST", "/autodiscover/autodiscover.xml", host="localhost",
-                          body=plain.format(email="bob@example.org", schema=OUTLOOK).encode())
+                          body=plain.format(email="bob@example.org", schema=OUTLOOK).encode(),
+                          headers=basic("bob@example.org", "bob-pw"))
         self.assertEqual(r.status, 200)
         self.assertIn(b"<Server>mail.example.org</Server>", data)
-        mobile = "http://schemas.microsoft.com/exchange/autodiscover/mobilesync/responseschema/2006"
         r, data = request(HTTPS, "POST", "/autodiscover/autodiscover.xml", host="localhost",
-                          body=POX.format(email="bob@example.org", schema=mobile).encode())
+                          body=POX.format(email="bob@example.org", schema=MOBILE).encode(),
+                          headers=basic("bob@example.org", "bob-pw"))
         self.assertEqual(r.status, 200, "ActiveSync")
         self.assertIn(b"<Type>MobileSync</Type>", data)
         self.assertIn(b"<Url>https://mail.example.org/Microsoft-Server-ActiveSync</Url>", data)
         r, _ = request(HTTPS, "GET", "/autodiscover/autodiscover.xml")
         self.assertEqual(r.status, 405)
+
+    def test_login_required(self):
+        """As Exchange and Z-Push: 401 with a Basic challenge for no credentials, a wrong password, or a user name that
+        does not log in. iOS 27 sends `bob` and `bob@example.org` at once and takes the one that logs in; when both
+        were answered, it asked for the server by hand."""
+        body = POX.format(email="bob@example.org", schema=MOBILE).encode()
+        for headers, why in [({}, "no credentials"), (basic("bob@example.org", "wrong"), "a wrong password"),
+                             (basic("bob", "bob-pw"), "the bare user name")]:
+            r, data = request(HTTPS, "POST", "/autodiscover/autodiscover.xml", host="autodiscover.example.org",
+                              body=body, headers=headers)
+            self.assertEqual(r.status, 401, why)
+            self.assertIn("Basic", r.getheader("WWW-Authenticate"), why)
+            self.assertNotIn(b"MobileSync", data, why)
 
     def test_v2_json(self):
         r, data = request(HTTPS, "GET", "/autodiscover/autodiscover.json/v1.0/alice%40example.org?Protocol=Imap",
@@ -274,8 +294,9 @@ class Protocol(unittest.TestCase):
         body = POX.format(email="carol@example.org", schema=OUTLOOK).encode()
         c = Raw(HTTPS, secure=True)
         chunks = b"".join(b"%x;ext=1\r\n%s\r\n" % (len(body[i:i + 100]), body[i:i + 100]) for i in range(0, len(body), 100))
+        auth = basic("carol@example.org", "carol-pw")["Authorization"].encode()
         c.send(b"POST /autodiscover/autodiscover.xml HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n"
-               b"Expect: 100-continue\r\n\r\n")
+               b"Authorization: " + auth + b"\r\nExpect: 100-continue\r\n\r\n")
         status, _, _ = c.response()
         self.assertEqual(status, 100)
         c.send(chunks + b"0\r\nX-Trailer: 1\r\n\r\n")
