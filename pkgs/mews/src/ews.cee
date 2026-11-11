@@ -326,6 +326,12 @@ async fn resolveFolderElement(
         }
         return Ok(null);
     }
+    if (isTopFolderId(id.view().bytes())) {
+        return match (virtualFolder(TOP)) {
+            Ok(f) => Ok(f),
+            Err(_) => Err(EwsError.OutOfMemory),
+        };
+    }
     if (isRootFolderId(id.view().bytes())) {
         return match (virtualFolder(ROOT)) {
             Ok(f) => Ok(f),
@@ -376,9 +382,10 @@ fn folderClass(f: borrow Folder) -> StringView =>
         TASKS) "IPF.Task" else if (f.id ==
         NOTES) "IPF.StickyNote" else if (f.id == JOURNAL) "IPF.Journal" else "IPF.Note";
 
-/// A folder's id: the per-user root's for ROOT (`msgfolderroot`), else `f:<id>` (negative for virtual folders).
+/// A folder's id: the per-user ids for ROOT (`msgfolderroot`) and TOP (`root`), else `f:<id>` (negative for
+/// virtual folders).
 fn folderIdOf(f: borrow Folder, userId: i64, out: borrow mut String) -> Result<void, AllocError> =>
-    if (f.id == ROOT) rootFolderId(userId, out) else folderId(f.id, out);
+    if (f.id == ROOT) rootFolderId(userId, out) else if (f.id == TOP) topFolderId(userId, out) else folderId(f.id, out);
 
 /// A `t:Folder`, its members in schema order (Apple's EWS deserializer aborts on any other order): FolderId,
 /// ParentFolderId, FolderClass, DisplayName, TotalCount, ChildFolderCount, ExtendedProperty, UnreadCount. Every
@@ -396,7 +403,7 @@ fn writeFolder(
     folderChangeKey(f.uidValidity, mut key)?;
     var parent = String.create();
     if (f.id == ROOT) {
-        folderId(TOP, mut parent)?;
+        topFolderId(userId, mut parent)?;
     } else if (f.id != TOP) {
         rootFolderId(userId, mut parent)?;
     }

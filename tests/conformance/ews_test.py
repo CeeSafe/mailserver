@@ -180,6 +180,28 @@ class Folders(unittest.TestCase):
                                auth=basic(OTHER, OTHER_PASSWORD)))[0]
         self.assertEqual(theirs.findtext("m:ResponseCode", namespaces=NS), "ErrorItemNotFound")
 
+    def test_roots_are_per_user(self):
+        # macOS takes the id of the distinguished folder `root` as the account's identity: with one id for every
+        # user, adding a second account of the same server fails with "This account already exists".
+        def roots(auth):
+            got = call('<m:GetFolder><m:FolderShape><t:BaseShape>IdOnly</t:BaseShape></m:FolderShape><m:FolderIds>'
+                       '<t:DistinguishedFolderId Id="root"/><t:DistinguishedFolderId Id="msgfolderroot"/>'
+                       '</m:FolderIds></m:GetFolder>', auth=auth)
+            return [m.find("m:Folders/t:Folder", NS) for m in messages(got)]
+        mine, theirs = roots(None), roots(basic(OTHER, OTHER_PASSWORD))
+        top, store = (f.find("t:FolderId", NS).get("Id") for f in mine)
+        self.assertNotEqual(top, theirs[0].find("t:FolderId", NS).get("Id"))
+        self.assertNotEqual(store, theirs[1].find("t:FolderId", NS).get("Id"))
+        self.assertEqual(mine[1].find("t:ParentFolderId", NS).get("Id"), top)
+        # By its opaque id, the root is found again and holds the top of the information store.
+        again = ok(call(f"<m:GetFolder><m:FolderShape><t:BaseShape>Default</t:BaseShape></m:FolderShape>"
+                        f"<m:FolderIds>{folder_ref(folder_id=top)}</m:FolderIds></m:GetFolder>"))
+        self.assertEqual(again.find("m:Folders/t:Folder/t:FolderId", NS).get("Id"), top)
+        found = ok(call(f"<m:FindFolder Traversal=\"Shallow\"><m:FolderShape><t:BaseShape>IdOnly</t:BaseShape>"
+                        f"</m:FolderShape><m:ParentFolderIds>{folder_ref(folder_id=top)}</m:ParentFolderIds>"
+                        f"</m:FindFolder>"))
+        self.assertEqual([f.get("Id") for f in found.iterfind(".//t:FolderId", NS)], [store])
+
     def test_apple_mail_hierarchy(self):
         # Apple Mail 16's sequence (captured from a crash): GetFolder IdOnly for the distinguished folders, then
         # SyncFolderHierarchy asking for ParentFolderId, FolderClass, PR_ENTRYID and PR_ATTR_HIDDEN. It asserts that

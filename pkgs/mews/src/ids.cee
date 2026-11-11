@@ -1,5 +1,7 @@
 // EWS's opaque ids, in the C# server's format (EwsIdEncoder): base64 of `f:<mailbox id>` for a folder,
 // `root:<user id>` for the virtual root (per user: Apple's accountsd takes it as the account's identity),
+// `top:<user id>` for the mailbox's true root above it (per user for the same reason: macOS refuses a second
+// account whose root has the id of one it already has, with "This account already exists"),
 // `<mailbox id>:<uid>` for a message, and `ck:<16 hex digits of a SHA-256>` for a change key. Mailbox ids are this
 // store's, so ids a client cached against the C# server are not found after the cutover and it syncs again.
 
@@ -41,6 +43,15 @@ public fn folderId(mailboxId: i64, out: borrow mut String) -> Result<void, Alloc
 public fn rootFolderId(userId: i64, out: borrow mut String) -> Result<void, AllocError> {
     var raw = Vector<u8>.create();
     raw.extend("root:".bytes())?;
+    decimal(mut raw, userId)?;
+    out.clear();
+    return base64Of(raw.view(), out);
+}
+
+/// The id of the user's true root (DistinguishedFolderId `root`), the parent of the virtual root.
+public fn topFolderId(userId: i64, out: borrow mut String) -> Result<void, AllocError> {
+    var raw = Vector<u8>.create();
+    raw.extend("top:".bytes())?;
     decimal(mut raw, userId)?;
     out.clear();
     return base64Of(raw.view(), out);
@@ -93,6 +104,16 @@ public fn isRootFolderId(id: Slice<u8>) -> bool {
     }
     let r = raw.view();
     return r == "root".bytes() || (r.length > 5 && r[0..5] == "root:".bytes());
+}
+
+/// Whether `id` is a true root's id (any user's).
+public fn isTopFolderId(id: Slice<u8>) -> bool {
+    var raw = Vector<u8>.create();
+    if (!unbase64(id, mut raw)) {
+        return false;
+    }
+    let r = raw.view();
+    return r.length > 4 && r[0..4] == "top:".bytes();
 }
 
 /// [mailbox id, uid] of a message id; null when it is not one.
